@@ -12,6 +12,22 @@ _Avoid_: GPU capacity manager
 An absolute desired limit for one quota dimension and scope.
 _Avoid_: Quota increment, quota request amount
 
+**Quota mutation plan**:
+A time-bounded, single-use authorization to create or amend one exact quota preference against freshly validated provider state.
+_Avoid_: Confirmation token, change request
+
+**Quota contact**:
+The verified individual email supplied to Google for a quota-preference mutation. It is distinct from the authenticated principal that performs the mutation.
+_Avoid_: Acting principal, credential identity
+
+**Preference reconciliation**:
+The provider-managed progression from accepted desired quota state to a settled grant and enforced effective quota.
+_Avoid_: Immediate quota update, synchronous mutation
+
+**Effective-confirmed**:
+A mutation outcome backed by a fresh effective-quota observation that matches the settled granted preference.
+_Avoid_: Success, completed
+
 **Effective quota**:
 The quota limit currently granted for one quota dimension and scope.
 _Avoid_: Available capacity
