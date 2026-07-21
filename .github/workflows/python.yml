@@ -73,6 +73,8 @@ jobs:
     name: Python ${{ matrix.python }} tests
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      PYTHON_VERSION: ${{ matrix.python }}
     strategy:
       fail-fast: false
       matrix:
@@ -94,10 +96,10 @@ jobs:
           enable-cache: true
 
       - name: Synchronize locked environment
-        run: uv sync --locked --python ${{ matrix.python }}
+        run: uv sync --locked --python "$PYTHON_VERSION"
 
       - name: Run tests with branch coverage
-        run: uv run --locked --no-sync --python ${{ matrix.python }} pytest
+        run: uv run --locked --no-sync --python "$PYTHON_VERSION" pytest
 
   package-smoke:
     name: ${{ matrix.os }} package smoke
