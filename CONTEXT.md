@@ -101,15 +101,27 @@ Provider-produced, read-only evidence about the likelihood and expected runtime 
 _Avoid_: Available capacity, inventory, stock
 
 **Spot advice comparison**:
-A read-only comparison that keeps one exact Spot VM configuration fixed while evaluating explicit candidate locations or all catalog-compatible provider-supported locations with per-location coverage and evidence.
+A read-only comparison that keeps one exact Spot VM configuration fixed while evaluating one or more exact obtainability candidates with per-candidate coverage and evidence.
 _Avoid_: Accelerator availability search, global capacity search
+
+**Obtainability candidate**:
+One immutable provider-request snapshot identified by its endpoint region,
+explicit candidate zones, exact machine configuration, VM quantity, and
+distribution shape. A regional provider score belongs to the complete
+candidate and is never copied onto an individual zone.
+_Avoid_: Location row, regional capacity
 
 **Obtainability workspace**:
 The primary interactive workspace for building an exact Spot VM configuration and comparing its current obtainability, estimated uptime, historical preemption, price, and coverage across candidate locations.
 _Avoid_: Spot workspace, capacity search
 
 **Obtainability rank**:
-A transparent lexicographic ordering of comparable location evidence: provider obtainability band descending, product-defined 30-day p90 preemption band ascending, then current total-request price quartile ascending. Each component and derivation remains visible; the rank is not a capacity score or guarantee.
+A transparent lexicographic ordering of independently attributable, complete
+candidate evidence: provider obtainability band descending, exact 30-day p90
+preemption rate ascending, then exact current total-request hourly price
+ascending. Canonical candidate identity breaks an otherwise exact tie. Each
+component and derivation remains visible; the rank is not a capacity score or
+guarantee.
 _Avoid_: Composite score, best location, availability rank
 
 **Obtainability score**:

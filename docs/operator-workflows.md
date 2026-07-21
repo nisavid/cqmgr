@@ -142,13 +142,20 @@ and evidence semantics are recorded in [Spot capacity-advice
 contracts](research/spot-capacity-advice-contracts.md).
 
 From an accelerator constraint set or a resolved workload requirement, the
-operator supplies or confirms:
+operator supplies or confirms one or more obtainability candidates. Each
+candidate supplies:
 
 - the Spot provisioning model;
 - an exact machine type and any required attached GPU type and count;
 - the number of VMs;
 - a target distribution shape; and
-- one region with optional candidate zones.
+- one endpoint region with explicit candidate zones when the request is
+  zone-constrained.
+
+Every candidate retains its complete immutable request identity. A comparison
+may include several regional candidates for the same fixed machine
+configuration, quantity, and distribution intent. A provider score for one
+regional candidate is never relabeled as evidence for an individual zone.
 
 The result keeps its request configuration visible and presents the provider's
 current obtainability score, estimated uptime, recommended zonal shards,

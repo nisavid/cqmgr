@@ -35,6 +35,9 @@ distribution contract](docs/verification-distribution-contract.md).
 
 Start with:
 
+- [the V1 product requirements](docs/product-requirements.md) for the complete
+  implementation handoff, safety invariants, acceptance gates, and execution
+  sequence;
 - [the product context](PRODUCT.md) for users, purpose, and design principles;
 - [the domain glossary](CONTEXT.md) for canonical language;
 - [operator workflows](docs/operator-workflows.md) for the shared interaction

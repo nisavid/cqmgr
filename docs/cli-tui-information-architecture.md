@@ -167,7 +167,8 @@ The first-release shared facets and canonical values are:
 | Location | A lowercase canonical Google Cloud region, zone, or `global`. |
 | Quota scope | One of `global`, `regional`, or `zonal`. |
 | Quota pool | A stable lowercase catalog identifier such as `standard`, `preemptible`, `committed`, or `virtual-workstation`. |
-| Catalog state | One of `discovered`, `cataloged`, or `guided`. |
+| Cataloged | Boolean `true` or `false`; provider presence never implies recognized product semantics. |
+| Guided | Boolean `true` or `false`; a guided workflow may be currently immutable. |
 | Mutability | Boolean `true` or `false`, derived only after fresh exact-slice validation. |
 | Reconciliation | One of `submitted`, `reconciling`, `settled`, `failed`, `superseded`, or `unknown`. |
 | Grant satisfaction | One of `unknown`, `none`, `partial`, or `full`. |
@@ -181,6 +182,12 @@ provider values remain visible as provider evidence and are never coerced into
 a known semantic category; product status axes use their explicit `unknown`
 values when authoritative classification is unavailable. The first release has
 no general boolean expression language.
+
+Provider discovery, catalog recognition, guided-workflow coverage, and current
+mutability are independent facts. Provider discovery is presence and
+provenance, not an exclusive maturity enum. The model and fixtures must
+preserve discovered-only, cataloged-but-unguided, guided-but-currently-
+immutable, and validated generic-mutable slices.
 
 ## TUI shell
 
@@ -235,7 +242,11 @@ inspector.
 ## Obtainability workspace
 
 An obtainability comparison fixes one exact supported Spot VM configuration
-while varying candidate locations. The configuration must be cataloged,
+while varying exact obtainability candidates. Each candidate is one immutable
+provider-request snapshot: endpoint region, explicit candidate zones, machine
+configuration, VM quantity, and distribution shape. One comparison may contain
+multiple regional candidates, but a provider's regional score belongs to its
+complete candidate and is never duplicated onto a zone row. The configuration must be cataloged,
 Spot-eligible, and owned by the Compute Engine management plane. Unsupported
 TPU, non-Spot, or uncataloged configurations remain visible with an exact
 coverage reason and cannot start a provider advice query. A comparison can start
@@ -253,11 +264,23 @@ catalog-compatible, provider-supported location; no flow broadens the candidate
 set silently.
 
 Comparable candidates use the transparent obtainability rank: provider
-obtainability band descending, product-defined 30-day p90 preemption band
-ascending, then current total-request price quartile ascending. Candidates
-with unsupported, unavailable, incomplete, or otherwise noncomparable required
-evidence appear in a separate unranked section with per-component reasons.
-Missing evidence is never coerced to a worst value.
+obtainability band descending, exact 30-day p90 preemption rate ascending, then
+the exact current total-request hourly price ascending. The provider's
+documented high, medium, and low bands define the first component. The p90 is
+derived only when the provider returns one candidate-attributable rate for each
+of the previous 30 provider-defined daily buckets: sort the rates ascending and
+select the nearest-rank value at `ceil(0.90 * 30)`, the 27th value. Current
+total-request price is the provider hourly-price interval containing the
+candidate retrieval time, multiplied by the requested VM quantity, only when
+that price represents the complete machine request. Canonical candidate
+identity is the final ascending tie-breaker.
+
+Every ranked component and derivation remains visible. A candidate whose
+history or price cannot be attributed to the complete request, including an N1
+attached-GPU request without supported history, appears in a separate unranked
+section with per-component reasons. Unsupported, unavailable, stale, or
+incomplete required evidence is likewise unranked and is never coerced to a
+worst value.
 
 The first release does not collect, import, display, filter, or rank latency
 evidence. It does not probe regional endpoints or provision measurement
