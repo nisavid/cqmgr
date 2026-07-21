@@ -75,6 +75,11 @@ Spot capacity advice remains provider evidence inside the result.
 
 ## Resource-scope resolution
 
+V1 resource-scoped operations accept canonical project resource scopes only.
+Folder and organization names return a typed rejected-precondition result and
+never cause a descendant or ambient project to be inferred. The domain and
+structured resource-scope shape retain all three variants for future support.
+
 A resource-scoped operation resolves its resource scope in this order:
 
 1. an explicit `--resource-scope` input;
@@ -268,11 +273,21 @@ result. A freshly verified no-op produces no plan, durable handle, export, or
 Apply capability; its operation result carries the exact no-op reason and bound
 evidence.
 
+In v1, portable means transferable between CLI and TUI and exportable for
+review. A per-installation key authenticates the plan. Another installation may
+inspect its canonical contents but cannot Apply it; cross-host Apply requires a
+fresh Preview.
+
 `plan review` and `plan apply` accept either a local digest handle or an
-explicit plan file. Both verify integrity and expiry before proceeding. Review
-shows the complete bound resource scope, exact slice, quota target, current
-evidence, principal, warnings, acknowledgements, expiry, and Apply capability.
-Apply never rebuilds or refreshes a different plan silently.
+explicit plan file. Review always validates canonical encoding and the content
+digest. When the issuing installation key is available, it also authenticates
+the issuer; a foreign plan is displayed explicitly as unauthenticated with no
+Apply capability. Apply requires canonical and digest validation, issuer
+authentication by the local installation, an unused local consumption record,
+and unexpired evidence. Review shows the complete bound resource scope, exact
+slice, quota target, current evidence, principal, warnings, acknowledgements,
+expiry, authentication state, and Apply capability. Apply never rebuilds or
+refreshes a different plan silently.
 
 After provider acceptance, the TUI returns to the quota inspector with the
 affected slice selected. Watch is available as a separate focused route; Apply

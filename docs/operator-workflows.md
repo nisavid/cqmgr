@@ -9,7 +9,9 @@ and reconciliation observations.
 This contract defines operator intent and transitions. The exact surface
 structure is defined in [CLI and TUI information
 architecture](cli-tui-information-architecture.md). Output schemas remain in
-the status contract, and the implementation stack remains undecided.
+the status contract. The implementation stack and provider boundaries are
+defined in the [runtime and integration
+architecture](runtime-integration-architecture.md).
 
 ## Shared domain operations
 
@@ -39,10 +41,12 @@ an operation launcher. It may restore a recent resource-scope selection or use
 an explicitly configured selection. It does not require the operator to select
 the same resource scope again at every launch.
 
-The active canonical project, folder, or organization remains prominent beside
-every quota view and detail surface. Ambient `gcloud` or Application Default
-Credentials settings never silently replace it. Switching the resource scope
-is a deliberate inspector action. Apply requires the operator to
+The active canonical project remains prominent beside every quota view and
+detail surface. V1 rejects folder and organization operations without selecting
+or inferring a project; those resource-scope variants remain reserved for later
+support. Ambient `gcloud` or Application Default Credentials settings never
+silently replace the project. Switching the resource scope is a deliberate
+inspector action. Apply requires the operator to
 confirm the exact resource scope again; a noninteractive Apply supplies the
 same explicit resource-scope acknowledgement as input.
 

@@ -2,9 +2,16 @@
 
 Research date: 2026-07-14
 
+Selection and platform revalidation date: 2026-07-21
+
 This note compares credible implementation and distribution stacks for a small
 cross-platform Cloud Quotas manager CLI/TUI. It records constraints and
 trade-offs; it does not select a stack.
+
+The selected Python, Textual, Click, uv, and Google client architecture is
+defined in the [runtime and integration
+architecture](../runtime-integration-architecture.md) and [ADR
+0001](../adr/0001-python-runtime-and-google-cloud-integration.md).
 
 ## Constraints shared by every stack
 
@@ -108,7 +115,10 @@ There are two distinct delivery models:
   package's executable on `PATH`. uv can manage the required Python, but uv
   itself becomes an installation prerequisite. uv's Tier 1 platforms are
   macOS arm64/x86_64, Linux x86_64, and Windows x86_64; Linux arm64 and Windows
-  arm64 are Tier 2. [uv tools][uv-tools] [uv platform policy][uv-platforms]
+  arm64 are Tier 2. That uv classification is not a product support promise:
+  the current `grpcio` dependency has no Windows arm64 wheel, so the v1 matrix
+  must exclude or separately resolve that target. [uv tools][uv-tools]
+  [uv platform policy][uv-platforms] [grpcio package][grpcio]
 - Freeze one executable per target with PyInstaller. Users then do not need
   Python installed, but PyInstaller is not a cross-compiler: artifacts are
   specific to the build OS, Python version, and word size. Linux artifacts also
@@ -166,39 +176,32 @@ API compatibility directly or depend on non-Google client libraries. That is a
 material scope increase for this product, not merely a language preference.
 [Ratatui installation][ratatui] [Cloud Quotas client libraries][cloud-quotas-libraries]
 
-## Installation and support questions to settle
+## Remaining verification and support questions
 
-The stack decision should explicitly answer these independent questions:
+The selected Python/Textual package model leaves these questions for the
+verification and distribution contract:
 
-1. Is the supported target set only macOS/Linux/Windows on amd64 and arm64, or
-   does it include older Windows, Linux distributions with older `glibc`,
-   FreeBSD, or other architectures?
-2. Is a zero-runtime direct binary a product requirement, or is a managed
-   Python/Node installation acceptable for the intended operators?
-3. Must installation work through Homebrew, WinGet, Scoop, apt/rpm, and npm or
-   PyPI on the first release, or are signed release archives sufficient?
-4. Are macOS notarization and Windows code signing release gates?
-5. Does the UI need a reusable widget/style system and browser rendering, or is
-   a focused terminal state machine enough?
-6. Which terminals and shells form the test matrix, especially Windows
+1. Which exact macOS, Linux, and Windows versions and architectures form the v1
+   support matrix, including the current Windows arm64 `grpcio` gap?
+2. Which terminals and shells form the matrix, especially Windows
    Terminal/PowerShell, SSH sessions, low-color terminals, redirected output,
    and non-interactive CI?
+3. Which signing, provenance, PyPI publication, and dependency-upgrade checks
+   are release gates?
 
-## Small validation spikes that would retire uncertainty
+## Remaining validation spikes
 
-These spikes can compare the options without committing the product to one:
-
-- Authenticate through local user ADC and service-account impersonation, then
-  list a bounded page of GPU-related `QuotaInfo` records with the v1 client.
-- Render a filterable table, a quota-preference form, a pending/reconciled
-  status, and an API error in each serious TUI candidate.
-- Build macOS arm64/x86_64, Linux amd64/arm64, and Windows amd64 artifacts; run
-  them on clean hosts without a development toolchain.
-- Measure compressed artifact size, cold start, resident memory, screen-reader
-  usability, cancellation behavior, and behavior in a narrow or low-color
-  terminal.
-- Exercise redirected output and a non-interactive command path separately
-  from the TUI so automation does not depend on terminal rendering.
+- Authenticate through local user ADC and externally configured
+  service-account impersonation, then list a bounded page of GPU-related
+  `QuotaInfo` records with the v1 client.
+- Render the approved Textual inspector, request composer, lifecycle status,
+  narrow layout, and provider error, then verify keyboard and cancellation
+  behavior with Pilot.
+- Build an sdist and pure-Python wheel, resolve it as an external uv tool on
+  each candidate platform, and exercise redirected and non-interactive CLI
+  behavior separately from the TUI.
+- Measure cold start, resident memory, reading order, and low-color behavior on
+  the supported terminal matrix.
 
 [adc]: https://cloud.google.com/docs/authentication/application-default-credentials
 [adc-local]: https://cloud.google.com/docs/authentication/set-up-adc-local-dev-environment
@@ -211,6 +214,7 @@ These spikes can compare the options without committing the product to one:
 [go-ports]: https://go.dev/doc/install/source#environment
 [goreleaser-build]: https://goreleaser.com/customization/builds/builders/go/
 [goreleaser-quick-start]: https://goreleaser.com/getting-started/quick-start/
+[grpcio]: https://pypi.org/project/grpcio/
 [ink]: https://github.com/vadimdemedes/ink
 [ink-v7]: https://github.com/vadimdemedes/ink/releases/tag/v7.0.0
 [node-cloud-quotas]: https://www.npmjs.com/package/@google-cloud/cloudquotas
