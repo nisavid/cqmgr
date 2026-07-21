@@ -1,9 +1,10 @@
 # Status, output, and watch contract
 
-Cloud Quotas reports every domain operation through the same surface-neutral
+Cloud Quota Manager reports every domain operation through the same surface-neutral
 result model. Human CLI output, TUI presentation, JSON automation, audit
-evidence, and Watch streams preserve the same target, observations, outcomes,
-and diagnostics without treating provider acceptance as effective quota.
+evidence, and Watch streams preserve the same resource scope, observations,
+outcomes, and diagnostics without treating provider acceptance as effective
+quota.
 
 This contract defines behavior and stable machine semantics. The CLI command
 tree, option spelling, TUI navigation, and polling implementation belong to
@@ -13,22 +14,22 @@ their owning interface and runtime decisions.
 
 Each operation declares the condition it promises before it can report
 success. Exit code `0` means that the operation reached that boundary with the
-required evidence; it never means that every quota mutation is fully
+required evidence; it never means that every quota request is fully
 fulfilled.
 
 | Domain operation | Success boundary | Required result facts |
 | --- | --- | --- |
-| Establish target | The canonical project, folder, or organization is resolved from explicit input or an explicitly selected profile. | Target type and canonical resource name; acting principal and impersonation chain; resolution source. |
-| Browse quota | The requested logical page or bounded query is read with complete required provider evidence. | Canonical target; query and page identity; exact slices; constraint-set relationships; source observation times; continuation identity when present. |
-| Inspect slice | One complete exact effective quota slice and its required related evidence are read. | Provider identity; dimensions and scope; effective value; usage; preference; eligibility; related constraints; independent source times and completeness. |
+| Establish resource scope | The canonical project, folder, or organization is resolved from explicit input, an explicitly named profile, a direct local selection, or the explicitly selected local profile. | Resource-scope type and canonical resource name; acting principal and impersonation chain; resolution source. |
+| Browse quota | The requested logical page or bounded query is read with complete required provider evidence. | Canonical resource scope; query and page identity; exact slices; constraint-set relationships; source observation times; continuation identity when present. |
+| Inspect slice | One complete exact effective quota slice and its required related evidence are read. | Provider identity; dimensions and quota scope; effective value; usage; provider quota preference; eligibility; related constraints; independent source times and completeness. |
 | Resolve requirement | The supplied workload requirement resolves without guessing to a supported constraint set. | Normalized requirement; owning service and management plane; exact slices; compatibility and ambiguity evidence. |
 | Assess Spot advice | The exact supported VM request is assessed for the requested evidence. | Full machine configuration, quantity, distribution, locations, provider coverage, Preview status, observation or interval times, and every available advice datum. |
-| Compose preference | One absolute desired value is validated against one exact mutable slice and current evidence. | Exact slice; desired value and unit; prior desired, granted, effective, and usage values; direction; required warnings and acknowledgements. |
-| Preview plan | A portable, integrity-protected mutation plan is produced, or a settled identical desired value is freshly verified as a no-op. | Bound target, slice, evidence, identity, intent, principal, warnings, acknowledgements, expiry, digest, and apply capability or no-op reason. |
+| Compose request | One absolute quota target is validated against one exact mutable slice and current evidence. | Exact slice; quota target and unit; prior desired, granted, effective, and usage values; direction; required warnings and acknowledgements. |
+| Preview plan | A portable, integrity-protected quota request plan is produced, or an identical quota target against a settled request is freshly verified as a no-op. | Bound resource scope, slice, evidence, identity, intent, principal, warnings, and acknowledgements; plan expiry, digest, and Apply capability when a plan is produced, otherwise the no-op reason. |
 | Review plan | The plan is parsed, its integrity and expiry are checked, and all bound evidence is presented without applying it. | Every bound plan fact, verification state, expiry, and unresolved acknowledgement. |
-| Apply plan | The provider preference is proven accepted under the bound intent. A verified no-op has no Apply capability. | Plan digest; target and slice; desired value; provider preference identity, etag, and trace when present; submitted observation; audit reference. |
-| Watch preference | The explicitly selected Watch condition is reached. | Preference identity; selected condition; orthogonal status; desired, granted, and effective values; all material observations and final outcome. |
-| Inspect audit | The requested bounded audit query is read completely. | Query and record identities; canonical targets; observation times; continuity metadata. |
+| Apply plan | The provider quota preference is proven accepted under the bound intent. A verified no-op has no Apply capability. | Plan digest; resource scope and slice; quota target; provider preference identity, etag, and trace when present; submitted observation; audit reference. |
+| Watch request | The explicitly selected Watch condition is reached. | Quota request and provider preference identity; selected condition; orthogonal status; target, granted, and effective values; all material observations and final outcome. |
+| Inspect audit | The requested bounded audit query is read completely. | Query and record identities; canonical resource scopes; observation times; continuity metadata. |
 | Verify audit | The requested records and rotation checkpoints form a valid chain. | Verified range and checkpoints, or the exact first continuity failure and affected range. |
 
 Apply therefore succeeds at `submitted`. A verified no-op is a successful
@@ -43,9 +44,9 @@ An intentionally bounded page with a continuation identity is complete for
 that page. A failed required page, source, or refresh is an incomplete
 observation rather than successful pagination.
 
-## Preference status
+## Quota request status
 
-Preference status has three independent axes. Surfaces may derive a concise
+Quota request status has three independent axes. Surfaces may derive a concise
 headline, but automation reads the axes and values directly.
 
 ### Reconciliation
@@ -79,7 +80,7 @@ infer grant satisfaction from a headline or warning.
   value; and
 - `confirmed`: a fresh effective observation equals the settled granted value.
 
-`confirmed` may coexist with a partial grant. `fully-fulfilled` is the stronger
+`confirmed` may coexist with a partial grant. `fulfilled` is the stronger
 derived condition in which reconciliation is `settled`, grant satisfaction is
 `full`, and effective confirmation is `confirmed` for equal desired, granted,
 and effective values.
@@ -92,14 +93,14 @@ top-level schema.
 
 ```json
 {
-  "schema": "cloud-quotas.operation-result/v1",
-  "operation": "preference.watch",
-  "target": {
+  "schema": "cqmgr.operation-result/v1",
+  "operation": "request.watch",
+  "resource_scope": {
     "type": "project",
     "name": "projects/example-project"
   },
   "boundary": {
-    "condition": "fully-fulfilled",
+    "condition": "fulfilled",
     "reached": false
   },
   "outcome": {
@@ -122,8 +123,9 @@ The envelope contract is:
   ignore unknown fields.
 - `operation` is a stable symbolic domain-operation name independent of CLI
   spelling or TUI location.
-- `target` is required for target-scoped operations and uses the canonical
-  provider resource name. It never comes from an unreported ambient project.
+- `resource_scope` is required for resource-scoped operations and uses the
+  canonical provider resource name. It never comes from an unreported ambient
+  project.
 - `boundary.condition` names the operation's promised condition;
   `boundary.reached` is authoritative for success.
 - `outcome.code` is a stable symbolic outcome. `outcome.exit_class` is the
@@ -162,19 +164,19 @@ Tables may reorder, wrap, truncate with an explicit marker, or become grouped
 views for terminal width and accessibility. Scripts must use the versioned
 structured result.
 
-Presentation changes may not remove the facts needed to identify the target,
+Presentation changes may not remove the facts needed to identify the resource scope,
 interpret the operation boundary, or act safely. In particular:
 
-- every target-scoped result identifies the canonical target;
+- every resource-scoped result identifies the canonical resource scope;
 - quota results preserve exact slice identity, dimensions, scope, native unit,
   source times, and completeness;
-- mutation results preserve desired, granted, and effective values as separate
+- quota request results preserve desired, granted, and effective values as separate
   facts and show all three status axes;
 - plan and Apply results preserve principal, plan digest, expiry, warnings,
   acknowledgements, and provider identity without exposing the quota contact;
 - Spot advice preserves its exact request configuration, coverage, Preview
   status, and observation or interval time; and
-- errors identify the operation, target when known, stable symbolic code, safe
+- errors identify the operation, resource scope when known, stable symbolic code, safe
   message, and actionable next step.
 
 State and severity use words and symbols, not color alone. Human output works
@@ -194,16 +196,16 @@ outcome supplies the precise symbolic reason.
 
 | Exit | Class | Meaning and representative cases |
 | ---: | --- | --- |
-| `0` | Success | The selected operation boundary was reached with complete required evidence. A settled Watch may return a partial grant successfully because settlement, not full grant, was requested. |
+| `0` | Success | The selected operation boundary was reached with complete required evidence. |
 | `2` | Usage | CLI syntax, option shape, or input decoding is invalid. A structured envelope is returned when the invocation can be decoded far enough to form one. |
 | `3` | Rejected precondition | The request is well formed but unsupported, ineligible, ambiguous, missing an acknowledgement, or otherwise barred before execution. |
 | `4` | Authorization | Authentication, permission, or allowed principal/contact verification prevents the operation. |
 | `5` | Stale or conflicting | Bound evidence drifted, a plan expired, an etag conflicted, identity was ambiguous, or a different intent occupies the deterministic preference identity. |
 | `6` | Incomplete evidence | Usable observations are returned, but a required source, page, refresh, or local read is missing. |
-| `7` | Requested outcome unmet | A conclusive provider or verification outcome cannot satisfy the selected boundary, including a settled partial grant for a fully granted Watch, provider failure or supersession, or an invalid audit chain. |
+| `7` | Requested outcome unmet | A conclusive provider or verification outcome cannot satisfy the selected boundary, including a settled partial or zero grant for a granted or fulfilled Watch, provider failure or supersession, or an invalid audit chain. |
 | `8` | Timeout | The caller's deadline arrived before the selected condition. The result retains the last material observation and resume identity. |
 | `9` | Operational failure | A provider, transport, serialization, audit persistence, or local internal failure prevents a trustworthy result in another class. |
-| `130` | Interrupted | The caller interrupted the operation. No provider mutation is canceled or reversed implicitly. |
+| `130` | Interrupted | The caller interrupted the operation. No provider quota request is canceled or reversed implicitly. |
 
 Diagnostics do not compete to select a process code. The operation's final
 outcome selects exactly one exit class. Quiet mode and output format never
@@ -227,7 +229,7 @@ codes.
 
 An incomplete observation preserves every usable item and identifies each
 failed source, page, or refresh. Its envelope has `complete: false`, an exit
-class of `6`, and source-specific diagnostics. It never satisfies a mutation
+class of `6`, and source-specific diagnostics. It never satisfies a quota request
 gate that requires the missing evidence. A fully unavailable operation returns
 the more specific authorization, precondition, timeout, conflict, or
 operational class when one is known instead of claiming partial data.
@@ -239,15 +241,14 @@ represented explicitly.
 
 ## Watch conditions
 
-A noninteractive Watch always selects one condition explicitly. An interactive
-surface may offer the same choices, but it makes the selected condition visible
-before starting.
+A Watch always selects one condition and one deadline explicitly. An
+interactive surface may offer deadline presets, but it selects neither input
+silently.
 
-| Condition | Reached when | Settled partial grant |
+| Condition | Reached when | Settled partial or zero grant |
 | --- | --- | --- |
-| `settled` | Reconciliation is `settled` and a granted value is authoritative. | Exit `0`; retain desired and granted values and emit a warning unless human quiet presentation suppresses it. |
-| `fully-granted` | Reconciliation is `settled` and granted equals desired. | Exit `7` as soon as the conclusive partial settlement is observed. |
-| `fully-fulfilled` | Reconciliation is `settled`, granted equals desired, and a fresh effective observation equals both. | Keep watching until full fulfillment or the caller's deadline. A partial settlement alone does not terminate this condition. |
+| `granted` | Reconciliation is `settled` and granted equals the quota target. | Exit `7` as soon as the conclusive settlement is observed. |
+| `fulfilled` | `granted` is reached and a fresh effective observation equals the target and granted values. | Exit `7` as soon as the conclusive settlement is observed. |
 
 Provider `failed` or `superseded` state terminates any condition it makes
 impossible with exit `7`. A transient or recoverable unknown observation stays
@@ -263,12 +264,14 @@ not produce public events.
 
 ```json
 {
-  "schema": "cloud-quotas.watch-event/v1",
+  "schema": "cqmgr.watch-event/v1",
   "stream_id": "opaque-run-identity",
   "sequence": 4,
   "event": "status-changed",
   "observed_at": "2026-07-21T02:07:00Z",
-  "preference": {},
+  "request": {
+    "provider_preference": {}
+  },
   "status": {
     "reconciliation": "settled",
     "grant_satisfaction": "partial",
@@ -291,7 +294,7 @@ there is enough process lifetime to serialize it.
 On timeout, the terminal result uses exit `8` and includes the selected
 condition, deadline, elapsed duration, last material observation, and
 preference identity needed to resume. Timeout describes the Watch operation,
-not the underlying mutation, and never relabels that mutation as failed.
+not the underlying quota request, and never relabels that request as failed.
 
 On interruption, the manager emits a terminal interrupted event when possible,
 exits `130`, and leaves the provider preference unchanged. A later Watch can
@@ -302,10 +305,10 @@ resume from the deterministic preference identity.
 The caller controls the deadline, not the polling cadence. The runtime owns an
 adaptive schedule that:
 
-- stays within Cloud Quotas read budgets across concurrent observations;
+- stays within Google Cloud Quotas API read budgets across concurrent observations;
 - honors provider retry guidance and throttling;
 - applies bounded backoff and jitter to transient failures;
-- avoids synchronizing many watches against the same target;
+- avoids synchronizing many watches against the same resource scope;
 - refreshes preference and effective quota independently at the freshness
   required by the selected condition; and
 - emits only material observations.
@@ -318,7 +321,7 @@ the Watch contract or caller deadline.
 
 Every preview and Apply result references its append-only audit record without
 exposing secret material. Watch observations that are retained in the audit log
-use the same operation, target, preference identity, status axes, values,
+use the same operation, resource scope, preference identity, status axes, values,
 timestamps, outcome, and diagnostic codes as the public result.
 
 Failure to persist and fsync the pre-Apply intent prevents the provider call and

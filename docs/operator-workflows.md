@@ -1,26 +1,27 @@
 # Operator workflow contract
 
-Cloud Quotas presents one domain workflow through an interactive TUI,
+Cloud Quota Manager presents one domain workflow through an interactive TUI,
 scriptable CLI commands, and structured automation. The surfaces may arrange
-controls differently, but they operate on the same targets, effective quota
-slices, accelerator constraint sets, quota preferences, mutation plans, and
-reconciliation observations.
+controls differently, but they operate on the same resource scopes, effective
+quota slices, accelerator constraint sets, quota requests, quota request plans,
+and reconciliation observations.
 
-This contract defines operator intent and transitions. It does not choose CLI
-command spelling, output schemas, keyboard bindings, component layout, or an
-implementation stack.
+This contract defines operator intent and transitions. The exact surface
+structure is defined in [CLI and TUI information
+architecture](cli-tui-information-architecture.md). Output schemas remain in
+the status contract, and the implementation stack remains undecided.
 
 ## Shared domain operations
 
 Every surface exposes these operations independently:
 
-1. establish or change a resource-container context;
+1. establish or change a resource-scope selection;
 2. browse effective quota slices and accelerator constraint sets;
 3. inspect one exact effective quota slice and its related evidence;
 4. resolve an optional accelerator workload requirement to its constraint set;
 5. assess supported Spot capacity advice for an exact VM configuration;
 6. compose an absolute desired value for one exact mutable slice;
-7. preview and review a portable quota mutation plan;
+7. preview and review a portable quota request plan;
 8. apply one reviewed plan deliberately;
 9. observe preference reconciliation and effective quota confirmation; and
 10. inspect and verify local audit evidence.
@@ -34,16 +35,16 @@ hold.
 ## TUI default: quota inspector
 
 The TUI opens on the quota inspector rather than a workload questionnaire or
-an operation launcher. It may restore a recent target or use an explicitly
-configured target. It does not require the operator to select the same target
-again at every launch.
+an operation launcher. It may restore a recent resource-scope selection or use
+an explicitly configured selection. It does not require the operator to select
+the same resource scope again at every launch.
 
 The active canonical project, folder, or organization remains prominent beside
 every quota view and detail surface. Ambient `gcloud` or Application Default
-Credentials settings never silently replace it. Switching the target is a
-deliberate inspector action. Applying a mutation requires the operator to
-confirm the exact target scope again; a noninteractive apply supplies the same
-explicit target acknowledgement as input.
+Credentials settings never silently replace it. Switching the resource scope
+is a deliberate inspector action. Apply requires the operator to
+confirm the exact resource scope again; a noninteractive Apply supplies the
+same explicit resource-scope acknowledgement as input.
 
 The inspector groups recognized GPU and TPU slices into accelerator constraint
 sets. Related regional, global, and zonal slices and separate quota pools stay
@@ -67,7 +68,7 @@ alone.
 
 Selecting a slice opens a detail pane that keeps these facts together:
 
-- canonical resource container, service, quota ID, dimensions, scope, and unit;
+- canonical resource scope, service, quota ID, dimensions, quota scope, and unit;
 - effective value and source timestamp;
 - usage and its separate source timestamp when available;
 - adjustment eligibility and provider rollout state;
@@ -77,7 +78,7 @@ Selecting a slice opens a detail pane that keeps these facts together:
 - acting principal and impersonation chain; and
 - valid next operations.
 
-A mutable exact slice offers a preference composer in this pane. The operator
+A mutable exact slice offers a quota request composer in this pane. The operator
 enters an absolute desired value, not an increment. Creating a new preference
 and amending a settled or reconciling preference use the same flow. An amendment
 also shows the prior desired value, whether a pending request will be
@@ -93,7 +94,7 @@ observe-only slices explain why composition cannot continue.
 ## Review and apply
 
 Preview leaves the detail pane for a dedicated plan review. The review keeps
-the selected constraint set and active target visible while presenting the
+the selected constraint set and active resource scope visible while presenting the
 bound exact slice, current and desired values, existing preference state,
 principal, warnings, acknowledgements, quota-contact source, evidence ages,
 plan expiry, and expected consequences.
@@ -101,26 +102,28 @@ plan expiry, and expected consequences.
 The review makes clear that apply changes only the selected slice. Companion
 constraints may warn but are never changed implicitly. Dangerous decreases,
 unlimited-value transitions, missing evidence, drift, ongoing rollouts, and
-expert acknowledgements follow the safety and mutation contract; the workflow
+expert acknowledgements follow the safety and quota request contract; the workflow
 does not weaken those gates for convenience.
 
-Apply requires an explicit confirmation of the canonical target scope. It then
+Apply requires an explicit confirmation of the canonical resource scope. It then
 revalidates and consumes the single-use plan using the same principal. A stale
 or drifted plan returns to reviewable evidence instead of silently rebuilding
 or applying a different intent.
 
 ## After apply and reconciliation
 
-After a provider accepts a preference, the TUI returns to the quota inspector
-with the affected slice selected. The row and detail pane show submitted,
-reconciling, preference-settled or granted, failed, superseded, unknown, and
-effective-confirmed as distinct states. Acceptance never appears as an
-effective quota change.
+After the provider accepts a quota preference, the TUI returns to the quota
+inspector with the affected slice selected. The row and detail pane show the
+separate reconciliation, grant-satisfaction, and effective-confirmation axes.
+They may derive a concise submitted, reconciling, request-settled, granted,
+failed, superseded, unknown, or fulfilled headline from those simultaneous
+facts, but the headline never replaces or flattens the axes. Acceptance never
+appears as an effective quota change.
 
 The inspector updates lifecycle observations inline and offers a focused Watch
 operation for longer-running reconciliation. Only a fresh effective-quota
-observation matching the settled granted preference becomes
-effective-confirmed. Preference reconciliation remains separate from VM,
+observation matching the settled grant becomes effective-confirmed. Quota
+request reconciliation remains separate from VM,
 queued-resource, reservation, or physical-capacity state.
 
 Timeouts and transport failures enter an explicit reconciliation result. The
@@ -193,14 +196,15 @@ The CLI and TUI share operation inputs, validation, plans, warnings,
 acknowledgements, lifecycle vocabulary, and audit records. Surface equivalence
 does not require identical navigation:
 
-- the TUI keeps target, constraint context, and lifecycle state visible across
+- the TUI keeps resource scope, constraint context, and lifecycle state visible across
   interactive transitions;
 - the CLI requires sufficient explicit input for each standalone operation and
   returns the same evidence in stable human-readable and structured forms; and
 - automation never depends on terminal rendering or an interactive prompt.
 
 Exact CLI command names, TUI screen boundaries, keyboard behavior, pagination,
-and filter syntax belong to the interface specification that follows this
-workflow decision. Stable operation boundaries, status axes, human and
-structured results, exit classes, diagnostics, and Watch behavior are defined
-in the [status, output, and watch contract](status-output-watch-contracts.md).
+filter syntax, and cross-surface plan handoff are defined in [CLI and TUI
+information architecture](cli-tui-information-architecture.md). Stable
+operation boundaries, status axes, human and structured results, exit classes,
+diagnostics, and Watch behavior are defined in the [status, output, and watch
+contract](status-output-watch-contracts.md).

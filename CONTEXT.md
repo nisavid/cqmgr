@@ -56,13 +56,13 @@ _Avoid_: Granted, fulfilled
 The surface-neutral state of a quota request expressed on separate reconciliation, grant-satisfaction, and effective-confirmation axes. Human headlines are derived from these simultaneous facts.
 _Avoid_: Single lifecycle status, provider state detail
 
-**Fully granted**:
+**Granted**:
 A settled quota request whose granted value equals its quota target. It does not by itself prove that the effective quota enforces that value.
 _Avoid_: Request-settled, effective-confirmed
 
-**Fully fulfilled**:
-A fully granted quota request backed by a fresh effective-quota observation equal to its target and granted values.
-_Avoid_: Accepted, request-settled, fully granted
+**Fulfilled**:
+A granted quota request backed by a fresh effective-quota observation equal to its target and granted values.
+_Avoid_: Accepted, request-settled, granted
 
 **Operation success boundary**:
 The lifecycle condition an operation promises to reach before reporting success. Preview may reach a verified no-op; Apply reaches its boundary only when the provider accepts the bound quota request. Only a watch that requests effective confirmation promises `effective-confirmed`.
@@ -77,7 +77,7 @@ A versioned, ordered record emitted when a material reconciliation or effective-
 _Avoid_: Poll result, repeated snapshot
 
 **Watch condition**:
-The explicitly selected lifecycle observation a watch promises to reach. A settled condition accepts any settled grant, a fully granted condition requires the grant to equal the quota target, and a fully fulfilled condition additionally requires fresh effective quota to equal both. A fully granted watch fails on a settled partial grant; a fully fulfilled watch continues until fulfillment or its caller-controlled timeout.
+The explicitly selected lifecycle observation a watch promises to reach. A granted condition requires the grant to equal the quota target. A fulfilled condition additionally requires fresh effective quota to equal both. Either condition fails on a settled partial or zero grant and times out at its caller-controlled deadline when the required evidence remains inconclusive.
 _Avoid_: Polling duration, success
 
 **Incomplete observation**:
