@@ -1,19 +1,19 @@
 <!-- SEED: re-run $impeccable document once there is implemented UI to capture actual tokens and components. -->
 ---
-name: Cloud Quotas
-description: The Mineral Instrument for exact accelerator quota operations.
+name: Cloud Quota Manager
+description: The Mineral Instrument for exact accelerator quota and obtainability operations.
 ---
 
-# Design System: Cloud Quotas
+# Design System: Cloud Quota Manager
 
 ## Overview
 
 **Creative North Star: "The Mineral Instrument"**
 
-Cloud Quotas is a precise operational instrument composed from believable
-natural materials. Rock carries structure, metal carries boundaries and
-control, and gemstones carry compact live signals. The material language is
-timeless and functional: it should feel carefully made, not themed.
+Cloud Quota Manager is a precise operational instrument composed from
+believable natural materials. Rock carries structure, metal carries boundaries
+and control, and gemstones carry compact live signals. The material language
+is timeless and functional: it should feel carefully made, not themed.
 
 The primary user works in a terminal beside an editor or cloud tool, often for
 long sessions in subdued ambient light. Dark surfaces therefore use quiet rock
@@ -97,8 +97,8 @@ run the full required length.
 
 **Character:** Guidance is composed and immediately readable. Commands,
 revisions, quota identities, metrics, and structured evidence remain
-recognizably monospaced. The user's terminal font is authoritative; Cloud
-Quotas relies on weight, spacing, alignment, symbols, and color rather than a
+recognizably monospaced. The user's terminal font is authoritative; Cloud Quota
+Manager relies on weight, spacing, alignment, symbols, and color rather than a
 bundled typeface.
 
 ### Hierarchy
@@ -120,11 +120,11 @@ make all prose feel like a daemon log.
 
 ## Elevation
 
-Cloud Quotas is flat and integrated at rest. Rock tone changes and structural
-metal boundaries establish depth; panes are worked into their containing
-instrument. Shadows are not a default material. Polished-metal luster and
-gemstone depth may add local dimensionality on capable surfaces, but never turn
-every control into a floating object.
+Cloud Quota Manager is flat and integrated at rest. Rock tone changes and
+structural metal boundaries establish depth; panes are worked into their
+containing instrument. Shadows are not a default material. Polished-metal
+luster and gemstone depth may add local dimensionality on capable surfaces,
+but never turn every control into a floating object.
 
 Motion is responsive state feedback only: approximately 150-200 ms for focus,
 selection, progress, structural change, and active gem light. There are no
