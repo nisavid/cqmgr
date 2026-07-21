@@ -30,18 +30,14 @@ jobs:
         with:
           comment-summary-in-pr: ${{ github.event.pull_request.head.repo.full_name == github.repository && 'always' || 'never' }}
           fail-on-severity: low
+          # Keep this SPDX list aligned with the Python metadata policy below.
+          # HPND-Markus-Kuhn is the SPDX half of wcwidth's accepted dual license;
+          # pip-licenses reports that package through its combined metadata label.
           allow-licenses: >-
             Apache-2.0,
             BSD-2-Clause,
             BSD-3-Clause,
             HPND-Markus-Kuhn,
-            ISC,
-            LGPL-2.1-only,
-            LGPL-2.1-or-later,
-            LGPL-3.0-only,
-            LGPL-3.0-or-later,
             MIT,
-            MPL-2.0,
-            PSF-2.0,
-            Python-2.0
+            PSF-2.0
           retry-on-snapshot-warnings: true
