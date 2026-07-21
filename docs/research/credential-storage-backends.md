@@ -204,8 +204,12 @@ atomic replacement, deletion, recovery, and key selection. The download is a
 multi-component native stack including agent, pinentry, and libraries. Official
 downloads list an approximately 8 MB compressed source archive and an
 approximately 15 MB archive with required libraries; installed and packaged
-sizes are larger and platform-specific. The suite is GPL-licensed.
-([GnuPG downloads](https://gnupg.org/download/index.html))
+sizes are larger and platform-specific. GnuPG is GPLv3-or-later, while bundled
+components use their own licenses, including Libgcrypt under LGPLv2.1-or-later;
+every distributed artifact and component therefore requires separate license
+review.
+([GnuPG downloads](https://gnupg.org/download/index.html),
+[Libgcrypt licensing](https://www.gnupg.org/software/libgcrypt/index.html))
 
 The GnuPG project recommends GPGME for programmatic use, and GPGME has official
 Python 3 bindings. That avoids parsing human CLI output but retains the native
@@ -329,9 +333,9 @@ not final operator decisions.
    carry the new secret without argv, environment, or plaintext files. Do not
    support any CLI operation that requires those transports.
 
-## Acceptance gates before a backend decision
+## Acceptance gates before admitting a later backend
 
-Run the following spike for every candidate that remains in scope:
+Run the following spike before enabling or approving any deferred backend:
 
 1. Install and smoke-test the exact supported version on GitHub-hosted macOS,
    Linux, and Windows x86-64 and macOS/Linux arm64. Record when CI exercises

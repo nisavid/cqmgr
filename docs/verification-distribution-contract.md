@@ -252,7 +252,7 @@ the dependable screen-reader and automation surface.
 
 | Cadence | Required evidence |
 | --- | --- |
-| Every pull request | Locked sync and build; Ruff; Pyrefly; all Python 3.12–3.14 core contracts on Linux; representative smoke on every stable supported OS; CLI, Pilot, persistence, package, vulnerability, and license checks appropriate to the diff. No cloud identity is available to fork or untrusted pull requests. |
+| Every pull request | Locked sync and build; Ruff; Pyrefly; all Python 3.12–3.14 core contracts on Linux; representative smoke on every stable supported OS; CLI, Pilot, persistence, package, vulnerability, and license checks appropriate to the diff. No cloud identity is available to forked or otherwise untrusted pull requests. |
 | Scheduled | Full stable OS/architecture and Python matrix; compatibility canaries; real keyring backends; high-iteration property, mutation, crash, subprocess, and concurrency tests; fresh dependency resolution; bounded live-read-only provider canaries. |
 | Release commit | Every supported platform at its oldest and latest stable image; every Python minor; real supported keyrings; source distribution and wheel installation; exact dependency and artifact policy; all deep tests; live-read-only canaries; provenance and publication preflight. |
 | Post-publication | Exact-version PyPI uv-tool installation and offline smoke on the supported matrix; published hashes, attestations, GitHub Release assets, tag, version, and commit agreement. |
@@ -291,10 +291,17 @@ transport are explicit. Both canaries use exact resource and quota projects,
 services, regions, page limits, retry limits, and wall-clock deadlines.
 
 The identity deliberately lacks quota-update, service-enablement, and resource
-provisioning permissions. The canary composition contains no create, update,
-patch, delete, Preview, Apply, or `validateOnly` port. A permission audit proves
-those capabilities absent. The workflow never enables an API, changes quota,
-creates capacity, or relies on ambient `gcloud` state.
+provisioning permissions. The ordinary canary composition contains no create,
+update, patch, delete, quota-request Preview, Apply, or `validateOnly` port. The
+separate Spot canary exposes only the documented read-only capacity-advice
+operation despite its provider Preview lifecycle. A permission audit proves all
+other mutation-shaped capabilities absent. Adapter contract tests assert the
+exact RPC or HTTP method and path template for every allowlisted operation,
+including `POST .../advice/capacity` and `POST .../advice/capacityHistory`.
+Sanitized live traces retain and verify only those method names and path
+templates; any request outside the allowlist fails the canary. The workflow
+never enables an API, changes quota, creates capacity, or relies on ambient
+`gcloud` state.
 
 Scheduled canaries and the exact release commit's canaries are release gates.
 Live evidence retains only normalized source, coverage, shape, timing, and

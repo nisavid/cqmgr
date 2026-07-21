@@ -137,6 +137,76 @@ command can be formed. It is unavailable for an incomplete draft. An Apply
 command retains a visibly incomplete acknowledgement placeholder rather than a
 value copied from the bound plan or active resource scope.
 
+### Public option vocabulary
+
+V1 option names are public compatibility surface. Options have no abbreviated
+forms; the three-letter aliases apply only to commands and subcommands. Every
+operational option follows the leaf command it configures, including shared
+options; root or intermediate-group placement is rejected as usage input.
+Informational `--help` is valid on the root, every group, and every leaf command;
+`--version` is valid on the root only. The following shared options are
+canonical:
+
+| Purpose | Canonical option |
+| --- | --- |
+| Explicit project or named profile | `--resource-scope RESOURCE_SCOPE`; `--profile NAME` |
+| Result presentation | `--output human` or `--output json`; one-shot commands default to `human` regardless of TTY state. `request watch` accepts only `--output human` or `--output jsonl`, defaulting to `human` on a TTY and `jsonl` otherwise. |
+| Terminal presentation | `--no-color`; `--quiet` suppresses human progress and non-result prose, including suppressible warnings, but never result facts, acknowledgements, structured diagnostics, pre-result failures, or the exit class. |
+| Bounded continuation | `--limit COUNT`; `--cursor CURSOR` |
+| Help and version | `--help` on any command or group; root-only `--version` |
+
+Quota queries use `--text TEXT` and repeatable `--service SERVICE`,
+`--accelerator ACCELERATOR`, `--location LOCATION`, `--quota-scope SCOPE`,
+`--quota-pool POOL`, `--cataloged true|false`, `--guided true|false`,
+`--mutable true|false`, `--reconciliation STATE`, `--grant-satisfaction STATE`,
+and `--effective-confirmation STATE`. Repeatable `--sort FIELD[:asc|desc]`
+defines sort priority. Public sort fields are `quota-id`, `display-name`,
+`service`, `accelerator`, `location`, `quota-scope`, `quota-pool`, `effective`,
+`usage`, `desired`, `granted`, `reconciliation`, `grant-satisfaction`,
+`effective-confirmation`, and `evidence-age`; an inapplicable field is rejected
+instead of ignored. Repetition within one facet is OR; distinct facets are AND,
+as defined by the quota query contract.
+
+Commands that identify one exact quota slice use `--service SERVICE`,
+`--quota-id QUOTA_ID`, `--location LOCATION`, and repeatable
+`--dimension KEY=VALUE`. Commands that resolve a workload add
+`--management-plane compute|tpu`, `--accelerator ACCELERATOR`,
+`--accelerator-count COUNT`, `--machine-type MACHINE_TYPE`,
+`--topology TOPOLOGY`, `--provisioning-model MODEL`, and
+`--consumption-mode MODE`; each command requires only the fields applicable to
+the selected management plane and rejects contradictory fields.
+
+`obtainability compare` uses `--machine-type MACHINE_TYPE`, optional
+`--gpu-type GPU_TYPE` plus `--gpu-count COUNT`, `--vm-count COUNT`,
+`--distribution-shape SHAPE`, and either repeatable
+`--candidate REGION[=ZONE[,ZONE...]]` or `--all-compatible-locations`. The two
+candidate forms are mutually exclusive. Each `--candidate` value defines one
+complete endpoint-region and explicit-zone component of an immutable candidate;
+no zone is inferred from a different candidate.
+
+`request compose` and `request preview` add `--target VALUE`, repeatable
+`--acknowledge CODE`, and optional `--quota-contact-stdin`; no contact value is
+accepted in argv. This protected per-operation input precedes any reference from
+an explicitly named or selected profile and the verified direct-user identity,
+using the normative contact-resolution order. Stable acknowledgement codes are
+`decrease-below-usage`, `decrease-over-ten-percent`, and
+`unlimited-transition`. A rejected-precondition result lists every required
+code, and an unknown code is rejected as usage input. `--quota-contact-stdin`
+reads exactly one UTF-8 line, removes one trailing LF and optional preceding CR,
+and rejects an empty value, NUL, embedded line break, invalid UTF-8, or remaining
+bytes. `request preview` alone accepts `--plan-out PATH`.
+`request watch` uses `--preference PREFERENCE`, `--condition granted|fulfilled`,
+and an absolute RFC 3339 `--deadline TIMESTAMP`. `plan review` and `plan apply`
+accept exactly one of `--plan DIGEST` or `--plan-file PATH`; Apply additionally
+requires `--acknowledge-resource-scope RESOURCE_SCOPE`.
+
+Named local objects and audit records use positional identifiers: `profile get
+NAME`, `profile select NAME`, `config get KEY`, `config set KEY VALUE`, and
+`audit inspect RECORD_ID`. `audit list` uses repeatable `--operation OPERATION`
+and `--outcome OUTCOME`, plus `--since TIMESTAMP`, `--until TIMESTAMP`,
+`--limit`, and `--cursor`. `audit verify` uses optional `--from RECORD_ID` and
+`--through RECORD_ID`; omitting both verifies the complete retained chain.
+
 ## Quota query contract
 
 `quota list` and the quota inspector operate on a bounded logical query. The
@@ -225,8 +295,9 @@ The quota inspector is an adaptive workbench:
 
 The rail selects a service or accelerator catalog group; it does not hide
 discovered generic slices. The ledger preserves exact slice identity, quota
-scope, effective and usage values, desired and granted values, catalog state,
-eligibility, evidence age, and completeness.
+scope, effective and usage values, desired and granted values, independent
+cataloged, guided, and mutable facts, eligibility, evidence age, and
+completeness.
 
 Quota request status appears as one adaptive cell with labeled reconciliation,
 grant-satisfaction, and effective-confirmation axes. A narrow ledger may show a
@@ -340,7 +411,9 @@ unknown-lineage, or superseded tokens return rejected-precondition before
 polling. Omitting `--resume` starts a new observation stream rather than claiming
 a resume.
 
-A settled partial or zero grant conclusively fails either requested condition.
+A settled grant that differs from the target conclusively fails either requested
+condition. A zero grant therefore succeeds when the target is zero and fails
+when the target is greater than zero.
 The underlying request still remains visibly request-settled with its exact
 grant. Interactive deadline presets are conveniences only; none is selected
 silently.

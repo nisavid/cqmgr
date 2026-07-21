@@ -51,8 +51,9 @@ The accepted handoff commit explicitly supersedes conflicting earlier tracker
 answers. V1 resource-scoped operations accept projects only; folder and
 organization variants remain schema-reserved and return rejected-precondition
 without inference or provider access. V1 Watch conditions are exactly
-`granted` and `fulfilled`; partial or zero settlement terminates either as
-requested-outcome-unmet.
+`granted` and `fulfilled`; a settled grant that differs from the target
+terminates either as requested-outcome-unmet, including zero when the target is
+greater than zero.
 
 ## Users and outcome
 
