@@ -11,8 +11,8 @@ domain operations, evidence, warnings, and outcomes.
 ## Planned capabilities
 
 - inspect exact effective quota slices and their related constraint sets;
-- compare current Spot obtainability advice, historical preemption, price, and
-  explicitly sourced latency evidence across compatible locations;
+- compare current Spot obtainability advice, historical preemption, and price
+  across compatible locations;
 - preview one exact quota target with its identity, consequences, and fresh
   provider evidence;
 - apply a time-bounded quota request plan deliberately;
@@ -31,6 +31,8 @@ Start with:
 - [the domain glossary](CONTEXT.md) for canonical language;
 - [operator workflows](docs/operator-workflows.md) for the shared interaction
   contract;
+- [CLI and TUI information architecture](docs/cli-tui-information-architecture.md)
+  for command, navigation, query, and plan-handoff behavior;
 - [provider research](docs/research/) for source-backed constraints;
 - [GitHub Issues](https://github.com/nisavid/cqmgr/issues) for the live
   Wayfinder frontier.
