@@ -77,6 +77,7 @@ uv run ruff format --check .
 uv run ruff check .
 uv run pyrefly check
 uv run lint-imports --no-cache
+uv run pip-licenses --from mixed --allow-only "Apache-2.0;Apache-2.0 OR BSD-2-Clause;BSD-2-Clause;BSD-3-Clause;BSD License;MIT;MIT License;PSF-2.0"
 uv run pytest
 uv build --clear --no-sources
 uv run python scripts/verify_distribution.py dist
