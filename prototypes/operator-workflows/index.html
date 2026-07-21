@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Cloud Quotas workflow prototype</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="instrument-bar">
+      <div class="brand-lockup">
+        <span class="brand-mark" aria-hidden="true">◆</span>
+        <div>
+          <strong>Cloud Quotas</strong>
+          <span id="variant-name">Workflow prototype</span>
+        </div>
+      </div>
+      <dl class="session-facts" aria-label="Active session">
+        <div><dt>Target</dt><dd>project · atlas-ml-dev</dd></div>
+        <div><dt>Principal</dt><dd>ivan@example.com</dd></div>
+        <div><dt>Evidence</dt><dd><span class="signal signal-good">●</span> fresh · 42s</dd></div>
+      </dl>
+      <div class="prototype-badge">READ-ONLY PROTOTYPE</div>
+    </header>
+
+    <main id="app" tabindex="-1"></main>
+
+    <aside class="variant-switcher" aria-label="Prototype variants">
+      <span>Compare structure</span>
+      <a href="?variant=A" data-variant="A"><b>A</b> Workload first</a>
+      <a href="?variant=B" data-variant="B"><b>B</b> Evidence first</a>
+      <a href="?variant=C" data-variant="C"><b>C</b> Operation first</a>
+    </aside>
+
+    <script src="app.js"></script>
+  </body>
+</html>
+
