@@ -12,6 +12,10 @@ on:
     - cron: "43 10 * * 1"
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions: read-all
 
 jobs:
@@ -20,7 +24,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # Required for OIDC-backed Scorecard result publishing.
       id-token: write
+      # Required to upload SARIF results to code scanning.
       security-events: write
     steps:
       - name: Checkout repository
