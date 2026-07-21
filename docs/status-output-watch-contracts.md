@@ -26,7 +26,7 @@ fulfilled.
 | Assess Spot advice | The exact supported VM request is assessed for the requested evidence. | Full machine configuration, quantity, distribution, locations, provider coverage, Preview status, observation or interval times, and every available advice datum. |
 | Compose request | One absolute quota target is validated against one exact mutable slice and current evidence. | Exact slice; quota target and unit; prior desired, granted, effective, and usage values; direction; required warnings and acknowledgements. |
 | Preview plan | A locally portable, integrity-protected quota request plan is produced, or an identical quota target against a settled request is freshly verified as a no-op. V1 Apply capability is bound to the issuing installation. | Bound resource scope, slice, evidence, identity, intent, principal, warnings, and acknowledgements; plan expiry, digest, issuing-installation trust, and Apply capability when a plan is produced, otherwise the no-op reason. |
-| Review plan | The plan is parsed, its integrity and expiry are checked, and all bound evidence is presented without applying it. | Every bound plan fact, verification state, expiry, and unresolved acknowledgement. |
+| Review plan | Canonical plan bytes and their digest are verified and all trustworthy bound evidence is presented without applying it. Expiry, foreign issuer, prior consumption, or unresolved acknowledgements remove Apply capability but do not make safe inspection fail. | Every bound plan fact, canonical and digest verification state, expiry, issuer and consumption state, unresolved acknowledgements, Apply capability, and exact incapability reasons. |
 | Apply plan | The provider quota preference is proven accepted under the bound intent. A verified no-op has no Apply capability. | Plan digest; resource scope and slice; quota target; provider preference identity, etag, and trace when present; submitted observation; audit reference. |
 | Watch request | The explicitly selected Watch condition is reached. | Quota request and provider preference identity; selected condition; orthogonal status; target, granted, and effective values; all material observations and final outcome. |
 | Inspect audit | The requested bounded audit query is read completely. | Query and record identities; canonical resource scopes; observation times; continuity metadata. |
@@ -43,6 +43,14 @@ and do not report success.
 An intentionally bounded page with a continuation identity is complete for
 that page. A failed required page, source, or refresh is an incomplete
 observation rather than successful pagination.
+
+Plan review separates trustworthy inspection from applicability. Canonical,
+digest-valid bytes reach the Review boundary even when the plan is expired,
+foreign-issued, already consumed, or has unresolved acknowledgements; the
+result sets `apply_capability` to `false` with exact reasons. Invalid canonical
+encoding or a digest mismatch prevents trusted review and returns a
+non-success result. Apply against a plan that is no longer applicable returns
+the appropriate stale, conflicting, authorization, or precondition class.
 
 ## Quota request status
 
@@ -201,7 +209,7 @@ outcome supplies the precise symbolic reason.
 | `2` | Usage | CLI syntax, option shape, or input decoding is invalid. A structured envelope is returned when the invocation can be decoded far enough to form one. |
 | `3` | Rejected precondition | The request is well formed but unsupported, ineligible, ambiguous, missing an acknowledgement, or otherwise barred before execution. |
 | `4` | Authorization | Authentication, permission, or allowed principal/contact verification prevents the operation. |
-| `5` | Stale or conflicting | Bound evidence drifted, a plan expired, an etag conflicted, identity was ambiguous, or a different intent occupies the deterministic preference identity. |
+| `5` | Stale or conflicting | An operation that requires current applicability found bound evidence drift, an expired or consumed plan, an etag conflict, ambiguous identity, or a different intent at the deterministic preference identity. Safe Review of trustworthy but non-applicable plan bytes still succeeds with `apply_capability: false`. |
 | `6` | Incomplete evidence | Usable observations are returned, but a required source, page, refresh, or local read is missing. |
 | `7` | Requested outcome unmet | A conclusive provider or verification outcome cannot satisfy the selected boundary, including a settled partial or zero grant for a granted or fulfilled Watch, provider failure or supersession, or an invalid audit chain. |
 | `8` | Timeout | The caller's deadline arrived before the selected condition. The result retains the last material observation and resume identity. |

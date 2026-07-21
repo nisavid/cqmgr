@@ -123,9 +123,13 @@ Pure tests cover:
 
 - resource-scope and profile precedence;
 - exact effective-quota-slice identity and dimension normalization;
+- independent discovered, cataloged, guided, and mutable predicates and their
+  filter combinations;
 - units, integer quantities, unknown provider values, and schema enums;
 - status axes, headlines, completeness, operation boundaries, and exit classes;
 - cursor binding and pagination completeness;
+- deterministic obtainability-candidate identity and lexicographic ranking,
+  including exact ties and unranked non-attributable evidence;
 - plan canonicalization, digest stability, authentication, expiry, tamper
   rejection, and single-use state;
 - redaction and the exclusion of credentials, quota contacts, raw provider
@@ -144,6 +148,8 @@ cancellation cover every operation and exit class. Required mutation-safety
 scenarios include:
 
 - a verified no-op Preview returns no plan;
+- canonical, digest-valid expired, foreign, consumed, or unacknowledged plans
+  remain safely reviewable with no Apply capability;
 - stale, missing, incomplete, or ambiguous evidence causes zero provider
   writes;
 - acknowledgement, resource scope, principal, contact binding, etag, expiry,
