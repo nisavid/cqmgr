@@ -13,6 +13,7 @@ EXPECTED_ARTIFACT_COUNT = 2
 PROJECT_VERSION = tomllib.loads(Path("pyproject.toml").read_text())["project"][
     "version"
 ]
+RUNTIME_GUARD_MARKER = "CQMGR-RUNTIME-GUARD-ACTIVE"
 RUNTIME_GUARD = """
 import sys
 
@@ -32,10 +33,13 @@ def block_network(event, arguments):
 
 sys.meta_path.insert(0, BlockForbiddenImports())
 sys.addaudithook(block_network)
+print("CQMGR-RUNTIME-GUARD-ACTIVE", file=sys.stderr)
 """
 
 
-def _run(command: list[str], *, cwd: Path, environment: dict[str, str]) -> str:
+def _run(
+    command: list[str], *, cwd: Path, environment: dict[str, str]
+) -> tuple[str, str]:
     completed = subprocess.run(  # noqa: S603
         command,
         cwd=cwd,
@@ -45,7 +49,7 @@ def _run(command: list[str], *, cwd: Path, environment: dict[str, str]) -> str:
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
-    return completed.stdout
+    return completed.stdout, completed.stderr
 
 
 def smoke_artifact(artifact: Path, python: str) -> None:
@@ -93,14 +97,16 @@ def smoke_artifact(artifact: Path, python: str) -> None:
             }
         )
         executable = bin_directory / ("cqmgr.exe" if os.name == "nt" else "cqmgr")
-        help_output = _run(
+        help_output, help_errors = _run(
             [str(executable), "--help"], cwd=temporary, environment=runtime_environment
         )
-        version_output = _run(
+        version_output, version_errors = _run(
             [str(executable), "--version"],
             cwd=temporary,
             environment=runtime_environment,
         )
+        assert RUNTIME_GUARD_MARKER in help_errors
+        assert RUNTIME_GUARD_MARKER in version_errors
         assert help_output.startswith("Usage: cqmgr")
         assert "--version" in help_output
         assert version_output == f"cqmgr, version {PROJECT_VERSION}\n"
