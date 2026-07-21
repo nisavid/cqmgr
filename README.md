@@ -21,9 +21,11 @@ domain operations, evidence, warnings, and outcomes.
 
 ## Project status
 
-This repository contains product planning, provider-contract research, and an
-interaction prototype. It does not yet ship a `cqmgr` executable, and the
-planning work does not authorize live quota mutations.
+This repository contains the installable Python and quality baseline, product
+planning, provider-contract research, and an interaction prototype. The
+`cqmgr` executable currently exposes package help and version metadata; product
+workflows are not implemented, and this work does not authorize live quota
+mutations.
 
 The approved implementation baseline is CPython 3.12–3.14, `pyproject.toml`,
 uv, Ruff, Pyrefly, Click, and Textual. Once a package is published, the primary
@@ -57,3 +59,26 @@ Start with:
 The preserved interactive prototype lives on the
 [`prototype/operator-workflows`](https://github.com/nisavid/cqmgr/tree/prototype/operator-workflows/prototypes/operator-workflows)
 branch.
+
+## Install and develop
+
+Until `cqmgr` is published on PyPI, install the local checkout with uv:
+
+```console
+uv tool install .
+cqmgr --help
+```
+
+Contributors use the committed lock and run the complete local baseline with:
+
+```console
+uv sync --locked
+uv run ruff format --check .
+uv run ruff check .
+uv run pyrefly check
+uv run lint-imports --no-cache
+uv run pytest
+uv build --clear --no-sources
+uv run python scripts/verify_distribution.py dist
+uv run python scripts/smoke_tool_install.py dist --python 3.14
+```

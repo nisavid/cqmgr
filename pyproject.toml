@@ -1,0 +1,181 @@
+[build-system]
+requires = ["uv_build>=0.11.30,<0.12"]
+build-backend = "uv_build"
+
+[project]
+name = "cqmgr"
+version = "0.1.0"
+description = "Inspect effective cloud quota and manage exact quota requests."
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Ivan D Vasin", email = "ivan@nisavid.io" },
+]
+keywords = ["cloud", "gcp", "quota"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: Console",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Typing :: Typed",
+]
+dependencies = [
+  "click>=8.1,<9",
+  "textual>=8,<9",
+]
+
+[project.urls]
+Homepage = "https://github.com/nisavid/cqmgr"
+Issues = "https://github.com/nisavid/cqmgr/issues"
+Repository = "https://github.com/nisavid/cqmgr"
+
+[project.scripts]
+cqmgr = "cqmgr.cli:main"
+
+[dependency-groups]
+dev = [
+  "import-linter>=2.9,<3",
+  "pyrefly>=1.1,<1.2",
+  "pytest>=9,<10",
+  "pytest-cov>=7,<8",
+  "ruff>=0.15,<0.16",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+required-version = ">=0.11.29,<0.12"
+required-environments = [
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "sys_platform == 'darwin' and platform_machine == 'x86_64'",
+  "sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "sys_platform == 'win32' and platform_machine == 'AMD64'",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  "COM812",
+  "D203",
+  "D213",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/**" = ["INP001", "S101"]
+"tests/**" = ["S101"]
+
+[tool.pyrefly]
+disable-project-excludes-heuristics = true
+project-includes = ["src", "tests", "scripts"]
+project-excludes = []
+python-version = "3.12"
+preset = "strict"
+search-path = ["src"]
+use-ignore-files = false
+
+[tool.pytest.ini_options]
+addopts = [
+  "--cov=cqmgr",
+  "--cov-branch",
+  "--cov-report=term-missing:skip-covered",
+  "--cov-fail-under=90",
+  "--strict-config",
+  "--strict-markers",
+]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["cqmgr"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true
+
+[tool.importlinter]
+root_packages = ["cqmgr"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Application and adapters depend inward"
+type = "layers"
+layers = [
+  "cqmgr.adapters",
+  "cqmgr.application",
+  "cqmgr.domain",
+]
+
+[[tool.importlinter.contracts]]
+name = "Domain remains implementation independent"
+type = "forbidden"
+source_modules = ["cqmgr.domain"]
+forbidden_modules = [
+  "aiohttp",
+  "click",
+  "cqmgr.adapters",
+  "cqmgr.application",
+  "cqmgr.bootstrap",
+  "cqmgr.cli",
+  "cqmgr.tui",
+  "google",
+  "grpc",
+  "http",
+  "httpx",
+  "json",
+  "keyring",
+  "os",
+  "pathlib",
+  "requests",
+  "shutil",
+  "socket",
+  "subprocess",
+  "tempfile",
+  "textual",
+  "tomllib",
+  "urllib",
+]
+
+[[tool.importlinter.contracts]]
+name = "Application remains independent of interfaces and adapters"
+type = "forbidden"
+source_modules = ["cqmgr.application"]
+forbidden_modules = [
+  "click",
+  "cqmgr.adapters",
+  "cqmgr.bootstrap",
+  "cqmgr.cli",
+  "cqmgr.tui",
+  "google",
+  "keyring",
+  "textual",
+]
+
+[[tool.importlinter.contracts]]
+name = "Adapters remain independent of entry points and composition"
+type = "forbidden"
+source_modules = ["cqmgr.adapters"]
+forbidden_modules = [
+  "cqmgr.bootstrap",
+  "cqmgr.cli",
+  "cqmgr.tui",
+]
+
+[[tool.importlinter.contracts]]
+name = "Entry points do not bypass application operations"
+type = "forbidden"
+source_modules = [
+  "cqmgr.cli",
+  "cqmgr.tui",
+]
+forbidden_modules = ["cqmgr.domain"]
