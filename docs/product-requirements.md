@@ -192,6 +192,15 @@ Schema versions, operation names, symbolic outcomes, diagnostic codes,
 completeness, provenance, and global exit classes are stable contracts. Human
 layout is not a parsing contract.
 
+V1 Watch accepts only provider preferences backed by a durable local cqmgr Apply
+record and plan digest; it does not adopt unrelated provider requests. An
+initial Watch binds the preference, intent ID, condition, and deadline. Every
+event emits a non-secret, locally authenticated opaque resume token that binds
+the exact request, condition, provider lineage, and durable checkpoint. Resume
+accepts that token plus a new deadline and fails closed before polling when its
+installation, Apply record, complete request identity, durable checkpoint, or
+applicable etag-or-stable-trace lineage evidence cannot be verified.
+
 ## Mutation safety invariants
 
 These requirements are hard gates rather than interface guidance:
@@ -370,7 +379,7 @@ the handoff.
 | 10 | Obtainability vertical slice | Implement supported Spot advice and history adapters, comparison and transparent ranking, coverage handling, and equivalent CLI behavior. | 8, 9 |
 | 11 | Compose, Preview, and plan review | Implement target validation, dangerous-change gates, no-op behavior, plan issuance/export/review, cross-surface handoff, and zero-write safety proofs. | 4, 5, 7, 8, 9 |
 | 12 | Apply and deterministic reconciliation | Implement exact preference create/amend, fresh revalidation, acknowledgements, durable dispatch, read-after-unknown reconciliation, audit outcomes, and at-most-one-write proofs. | 11 |
-| 13 | Watch and lifecycle observation | Implement adaptive polling, material event streams, resume identity, deadlines, interruption, and `granted` and `fulfilled` conditions. | 12 |
+| 13 | Watch and lifecycle observation | Implement adaptive polling, material event streams, Apply-record intent binding, authenticated resume tokens, deadlines, interruption, and `granted` and `fulfilled` conditions. | 12 |
 | 14 | Textual shell and quota inspector | Deliver the adaptive shell, scope instrument, Quotas workspace, filters, exact-slice detail, Audit workspace, keyboard behavior, and CLI fallback over read-only operations. | 9 |
 | 15 | Textual obtainability workspace | Deliver exact-configuration composition, candidate coverage, transparent ranking, unranked evidence, and Copy CLI behavior. | 10, 14 |
 | 16 | Textual mutation and lifecycle routes | Deliver compose, Plan Review, Apply, and Watch routes with locked scope, acknowledgements, return context, and cross-surface equivalence. | 11, 12, 13, 14 |
