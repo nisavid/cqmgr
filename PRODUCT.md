@@ -10,11 +10,11 @@ web
 
 ## Users
 
-The primary user is a terminal-fluent cloud or platform engineer who inspects
-and manages accelerator quota across one or more Google Cloud resource
-containers. The secondary user is an ML or application developer who relies on
-guided workflows to diagnose and request the exact constraints for a workload
-without becoming a quota-domain specialist.
+Cloud Quota Manager serves two co-primary users: a terminal-fluent cloud or
+platform engineer who inspects and manages accelerator quota across Google
+Cloud resource scopes, and an ML or application developer who needs guided
+workflows to diagnose and request the exact constraints for a workload without
+becoming a quota-domain specialist.
 
 The product's first-release surfaces are CLI and TUI. The platform marker
 selects Impeccable's non-mobile product rulebook; it does not promise a browser
@@ -22,11 +22,12 @@ interface.
 
 ## Product Purpose
 
-Cloud Quotas turns authoritative provider state into a safe operator workflow:
-understand the effective constraints on an accelerator workload, compare
+Cloud Quota Manager turns authoritative provider state into a safe operator
+workflow: understand the effective constraints on an accelerator workload, compare
 supported Spot capacity advice without treating it as a guarantee, preview one
-exact quota-preference mutation with its evidence and consequences, apply it
-deliberately, and follow reconciliation to an honest outcome.
+exact quota target with its evidence and consequences, apply the resulting
+quota request plan deliberately, and follow reconciliation to an honest
+outcome.
 
 Success means an operator can move from a quota or accelerator question to an
 effective-confirmed change, or to a precise explanation of what remains
@@ -34,8 +35,8 @@ pending or constrained, without confusing quota with physical capacity.
 
 ## Positioning
 
-Cloud Quotas turns live provider truth into an exact, evidenced mutation
-workflow without confusing quota with capacity.
+Cloud Quota Manager turns live provider truth into an exact, evidenced quota
+action without confusing quota with capacity.
 
 ## Brand Personality
 

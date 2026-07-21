@@ -1,0 +1,3 @@
+# Preserve installed third-party skill content byte-for-byte. Upstream files may
+# contain whitespace that should not be normalized by this repository.
+.agents/** -whitespace
