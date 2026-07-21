@@ -54,6 +54,7 @@ print(json.dumps(sorted(
         check=False,
         capture_output=True,
         text=True,
+        timeout=30,
     )
 
     assert completed.returncode == 0, completed.stderr
@@ -73,6 +74,7 @@ def test_python_module_exposes_root_help() -> None:
         check=False,
         capture_output=True,
         text=True,
+        timeout=30,
     )
 
     assert completed.returncode == 0, completed.stderr
