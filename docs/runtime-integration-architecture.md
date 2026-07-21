@@ -19,6 +19,10 @@ authorize a live quota request.
 | Static typing | Pyrefly, configured in `pyproject.toml` and run through `uv run`. |
 | Tests | pytest plus operation, adapter, CLI, and Textual Pilot test layers specified by the verification contract. |
 
+The [verification and distribution
+contract](verification-distribution-contract.md) owns the exact platform,
+terminal, keyring, CI, packaging, and release gates for this stack.
+
 Direct runtime dependencies use bounded compatible ranges. The development
 lock records exact versions. Dependency upgrades are deliberate changes that
 run the complete required checks. Published package metadata does not attempt
@@ -336,11 +340,11 @@ V1 does not claim native Textual screen-reader integration without validation.
 The verification contract must test reading order and supported terminal
 behavior and state the limitation directly.
 
-## Deferred decisions
+## Deferred capabilities
 
-The verification and distribution contract owns exact operating-system,
+The verification and distribution contract resolves the operating-system,
 architecture, terminal, keyring-backend, CI, PyPI publication, and release
-matrices. This architecture intentionally defers:
+matrices. This architecture still defers:
 
 - folder and organization operations;
 - cross-host plan signing, trust registration, and distributed consumption;
@@ -349,5 +353,4 @@ matrices. This architecture intentionally defers:
 - frozen executables and platform package-manager feeds; and
 - a native TUI screen-reader support claim.
 
-These items do not block an implementation-ready v1 when the verification and
-distribution contract has defined its supported matrix and release gates.
+These items do not block an implementation-ready v1.
