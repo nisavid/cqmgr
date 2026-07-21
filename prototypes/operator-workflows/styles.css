@@ -122,7 +122,7 @@ select {
 .scope-tree { border-right: 2px solid var(--metal-500); background: var(--rock-900); }
 .scope-tree button { width: 100%; padding: 10px 16px; border: 0; border-bottom: 1px solid var(--rock-800); color: var(--stone-300); background: transparent; text-align: left; cursor: pointer; }
 .scope-tree button.active { color: var(--stone-100); background: var(--rock-800); box-shadow: inset 3px 0 0 var(--sapphire); }
-.ledger-workspace { display: grid; grid-template-rows: auto minmax(290px, 1fr) 235px; }
+.ledger-workspace { display: grid; grid-template-rows: auto minmax(290px, 1fr) 275px; }
 .ledger-toolbar { display: flex; gap: 9px; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--rock-700); }
 .ledger-toolbar .grow { flex: 1; }
 .ledger-table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -131,8 +131,12 @@ select {
 .ledger-table tbody tr { cursor: pointer; }
 .ledger-table tbody tr:hover { background: var(--rock-850); }
 .ledger-table tbody tr.selected { background: #202b32; box-shadow: inset 3px 0 0 var(--sapphire); }
-.inspector { display: grid; grid-template-columns: 1.35fr .75fr; border-top: 2px solid var(--metal-500); background: var(--rock-900); }
+.inspector { display: grid; grid-template-columns: 1.15fr .85fr .7fr; border-top: 2px solid var(--metal-500); background: var(--rock-900); }
 .inspector > section { padding: 14px; border-right: 1px solid var(--rock-700); }
+.capacity-advice { background: #181f22; }
+.advice-score { display: flex; align-items: baseline; gap: 10px; margin-top: 10px; }
+.advice-score strong { color: var(--emerald); font: 28px var(--mono); }
+.advice-score span { color: var(--emerald); font: 700 11px var(--mono); }
 .kv-grid { display: grid; grid-template-columns: 135px 1fr; gap: 8px 12px; margin-top: 11px; }
 .kv-grid dt { color: var(--stone-500); }
 .kv-grid dd { margin: 0; font: 12px var(--mono); overflow-wrap: anywhere; }
@@ -178,4 +182,3 @@ select {
 @media (prefers-reduced-motion: no-preference) {
   button, a, tr { transition: background-color 160ms, border-color 160ms, color 160ms; }
 }
-
