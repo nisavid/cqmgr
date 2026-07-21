@@ -57,22 +57,25 @@ def smoke_artifact(artifact: Path, python: str) -> None:
     with tempfile.TemporaryDirectory() as temporary_directory:
         temporary = Path(temporary_directory)
         bin_directory = temporary / "bin"
+        install_home = temporary / "install-home"
         runtime_home = temporary / "runtime-home"
+        install_home.mkdir()
         runtime_home.mkdir()
         install_environment = os.environ.copy()
         install_environment.update(
             {
-                "APPDATA": str(runtime_home / "appdata"),
-                "HOME": str(runtime_home),
-                "LOCALAPPDATA": str(runtime_home / "local-appdata"),
+                "APPDATA": str(install_home / "appdata"),
+                "HOME": str(install_home),
+                "LOCALAPPDATA": str(install_home / "local-appdata"),
                 "UV_CACHE_DIR": str(temporary / "uv-cache"),
                 "UV_NO_PROGRESS": "1",
+                "UV_PYTHON_INSTALL_DIR": str(temporary / "uv-python"),
                 "UV_TOOL_BIN_DIR": str(bin_directory),
                 "UV_TOOL_DIR": str(temporary / "uv-tools"),
-                "XDG_CACHE_HOME": str(runtime_home / "xdg-cache"),
-                "XDG_CONFIG_HOME": str(runtime_home / "xdg-config"),
-                "XDG_DATA_HOME": str(runtime_home / "xdg-data"),
-                "XDG_STATE_HOME": str(runtime_home / "xdg-state"),
+                "XDG_CACHE_HOME": str(install_home / "xdg-cache"),
+                "XDG_CONFIG_HOME": str(install_home / "xdg-config"),
+                "XDG_DATA_HOME": str(install_home / "xdg-data"),
+                "XDG_STATE_HOME": str(install_home / "xdg-state"),
             }
         )
         _run(
@@ -90,10 +93,17 @@ def smoke_artifact(artifact: Path, python: str) -> None:
         runtime_environment.update(
             {
                 "ALL_PROXY": "http://127.0.0.1:9",
+                "APPDATA": str(runtime_home / "appdata"),
+                "HOME": str(runtime_home),
                 "HTTP_PROXY": "http://127.0.0.1:9",
                 "HTTPS_PROXY": "http://127.0.0.1:9",
+                "LOCALAPPDATA": str(runtime_home / "local-appdata"),
                 "NO_PROXY": "",
                 "PYTHONPATH": str(guard_directory),
+                "XDG_CACHE_HOME": str(runtime_home / "xdg-cache"),
+                "XDG_CONFIG_HOME": str(runtime_home / "xdg-config"),
+                "XDG_DATA_HOME": str(runtime_home / "xdg-data"),
+                "XDG_STATE_HOME": str(runtime_home / "xdg-state"),
             }
         )
         executable = bin_directory / ("cqmgr.exe" if os.name == "nt" else "cqmgr")
