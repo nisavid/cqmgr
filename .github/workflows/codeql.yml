@@ -38,7 +38,7 @@ jobs:
         uses: github/codeql-action/init@7188fc363630916deb702c7fdcf4e481b751f97a # v4
         with:
           build-mode: none
-          languages: actions
+          languages: actions,python
           config: |
             queries:
               - uses: security-and-quality

@@ -1,1 +1,7 @@
 .impeccable/config.local.json
+.coverage
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+dist/
