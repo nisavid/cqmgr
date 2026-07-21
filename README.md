@@ -25,6 +25,12 @@ This repository contains product planning, provider-contract research, and an
 interaction prototype. It does not yet ship a `cqmgr` executable, and the
 planning work does not authorize live quota mutations.
 
+The approved implementation baseline is CPython 3.12–3.14, `pyproject.toml`,
+uv, Ruff, Pyrefly, Click, and Textual. Once a package is published, the primary
+installation path will be `uv tool install cqmgr`. The runtime and provider
+boundaries are defined in the [runtime and integration
+architecture](docs/runtime-integration-architecture.md).
+
 Start with:
 
 - [the product context](PRODUCT.md) for users, purpose, and design principles;
@@ -33,6 +39,9 @@ Start with:
   contract;
 - [CLI and TUI information architecture](docs/cli-tui-information-architecture.md)
   for command, navigation, query, and plan-handoff behavior;
+- [runtime and integration architecture](docs/runtime-integration-architecture.md)
+  for the Python stack, dependency direction, configuration, authentication,
+  provider adapters, and local plan trust boundary;
 - [provider research](docs/research/) for source-backed constraints;
 - [GitHub Issues](https://github.com/nisavid/cqmgr/issues) for the live
   Wayfinder frontier.
