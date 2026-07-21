@@ -49,6 +49,13 @@ jobs:
       - name: Check package boundaries
         run: uv run --locked --no-sync lint-imports --no-cache
 
+      - name: Check dependency licenses
+        run: >-
+          uv run --locked --no-sync pip-licenses
+          --from mixed
+          --allow-only
+          "Apache-2.0;Apache-2.0 OR BSD-2-Clause;BSD-2-Clause;BSD-3-Clause;BSD License;MIT;MIT License;PSF-2.0"
+
       - name: Build distributions
         run: uv build --clear --no-sources
 
