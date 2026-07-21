@@ -136,10 +136,10 @@ The default adapters use official Python clients:
 | Spot capacity advice | `google-cloud-compute-v1beta` behind an independently disableable read-only port. |
 | Project canonicalization | The official Resource Manager client behind a project resolver. |
 
-Cloud Quotas and Spot advice packages are pinned to bounded versions behind
-ports because their Python package or provider lifecycle is Beta or Preview.
-Pure mapping contract tests protect domain semantics from generated-client
-changes.
+Cloud Quotas and Spot advice packages use bounded compatible version ranges
+behind ports because their Python package or provider lifecycle is Beta or
+Preview; exact development versions are recorded in `uv.lock`. Pure mapping
+contract tests protect domain semantics from generated-client changes.
 
 Direct REST is not a parallel default implementation. It is permitted only when
 an official client lacks a required field or method already present in the

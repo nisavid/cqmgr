@@ -188,9 +188,9 @@ provenance, and release policy.
 ## Required implementation validation
 
 - Authenticate through short-lived workload identity and externally configured
-  service-account impersonation, then list a bounded page of GPU-related
-  `QuotaInfo` records with the v1 client. Direct-user ADC receives hermetic
-  contract coverage and an advisory live smoke.
+  service-account impersonation, then call `GetQuotaInfo` with an explicitly
+  configured, stable GPU quota name using the v1 client. Direct-user ADC receives
+  hermetic contract coverage and an advisory live smoke.
 - Render the approved Textual inspector, request composer, lifecycle status,
   narrow layout, and provider error, then verify keyboard and cancellation
   behavior with Pilot.

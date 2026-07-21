@@ -15,7 +15,8 @@ composed at startup.
 
 Official Google Python clients are the default integration boundary. Direct
 REST is permitted only behind the same ports when an official client lacks a
-required published schema, and `cqmgr` never executes `gcloud` or reads its
+required field or method already present in the published provider schema, and
+`cqmgr` never executes `gcloud` or reads its
 active account or project at runtime. Local development may use `gcloud auth
 application-default login` to create or repair Application Default Credentials,
 which `cqmgr` consumes through `google-auth`.

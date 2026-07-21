@@ -211,7 +211,7 @@ outcome supplies the precise symbolic reason.
 | `4` | Authorization | Authentication, permission, or allowed principal/contact verification prevents the operation. |
 | `5` | Stale or conflicting | An operation that requires current applicability found bound evidence drift, an expired or consumed plan, an etag conflict, ambiguous identity, or a different intent at the deterministic preference identity. Safe Review of trustworthy but non-applicable plan bytes still succeeds with `apply_capability: false`. |
 | `6` | Incomplete evidence | Usable observations are returned, but a required source, page, refresh, or local read is missing. |
-| `7` | Requested outcome unmet | A conclusive provider or verification outcome cannot satisfy the selected boundary, including a settled partial or zero grant for a granted or fulfilled Watch, provider failure or supersession, or an invalid audit chain. |
+| `7` | Requested outcome unmet | A conclusive provider or verification outcome cannot satisfy the selected boundary, including a settled grant that differs from the target for a granted or fulfilled Watch, provider failure or supersession, or an invalid audit chain. |
 | `8` | Timeout | The caller's deadline arrived before the selected condition. The result retains the last material observation and resume identity. |
 | `9` | Operational failure | A provider, transport, serialization, audit persistence, or local internal failure prevents a trustworthy result in another class. |
 | `130` | Interrupted | The caller interrupted the operation. No provider quota request is canceled or reversed implicitly. |
@@ -254,10 +254,10 @@ A Watch always selects one condition and one deadline explicitly. An
 interactive surface may offer deadline presets, but it selects neither input
 silently.
 
-| Condition | Reached when | Settled partial or zero grant |
+| Condition | Reached when | Settled grant differs from target |
 | --- | --- | --- |
-| `granted` | Reconciliation is `settled` and granted equals the quota target. | Exit `7` as soon as the conclusive settlement is observed. |
-| `fulfilled` | `granted` is reached and a fresh effective observation equals the target and granted values. | Exit `7` as soon as the conclusive settlement is observed. |
+| `granted` | Reconciliation is `settled` and granted equals the quota target. | Exit `7` when the settled grant differs from the target, including zero when the target is greater than zero. |
+| `fulfilled` | `granted` is reached and a fresh effective observation equals the target and granted values. | Exit `7` when the settled grant differs from the target, including zero when the target is greater than zero. |
 
 Provider `failed` or `superseded` state terminates any condition it makes
 impossible with exit `7`. A transient or recoverable unknown observation stays

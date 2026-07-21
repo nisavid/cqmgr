@@ -42,9 +42,10 @@ an explicitly configured selection. It does not require the operator to select
 the same resource scope again at every launch.
 
 The active canonical project remains prominent beside every quota view and
-detail surface. V1 rejects folder and organization operations without selecting
-or inferring a project; those resource-scope variants remain reserved for later
-support. Ambient `gcloud` or Application Default Credentials settings never
+detail surface. V1 accepts only project resource scopes and always rejects folder
+and organization resource scopes. Inference or provider access for those scopes
+is not part of V1; those variants remain reserved for later support. Ambient `gcloud` or
+Application Default Credentials settings never
 silently replace the project. Switching the resource scope is a deliberate
 inspector action. Apply requires the operator to
 confirm the exact resource scope again; a noninteractive Apply supplies the
@@ -146,7 +147,7 @@ operator supplies or confirms one or more obtainability candidates. Each
 candidate supplies:
 
 - the Spot provisioning model;
-- an exact machine type and any required attached GPU type and count;
+- an exact machine type and any required GPU type and count to attach;
 - the number of VMs;
 - a target distribution shape; and
 - one endpoint region with explicit candidate zones when the request is

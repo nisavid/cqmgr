@@ -12,11 +12,11 @@ domain operations, evidence, warnings, and outcomes.
 
 - inspect exact effective quota slices and their related constraint sets;
 - compare current Spot obtainability advice, historical preemption, and price
-  across compatible locations;
+  across exact candidates while preserving candidate identity and evidence;
 - preview one exact quota target with its identity, consequences, and fresh
   provider evidence;
 - apply a time-bounded quota request plan deliberately;
-- follow reconciliation through granted and effective-confirmed outcomes;
+- follow reconciliation through explicit `granted` and `fulfilled` outcomes;
 - preserve honest unknown, incomplete, partial, and unsupported states.
 
 ## Project status

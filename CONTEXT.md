@@ -77,7 +77,7 @@ A versioned, ordered record emitted when a material reconciliation or effective-
 _Avoid_: Poll result, repeated snapshot
 
 **Watch condition**:
-The explicitly selected lifecycle observation a watch promises to reach. A granted condition requires the grant to equal the quota target. A fulfilled condition additionally requires fresh effective quota to equal both. Either condition fails on a settled partial or zero grant and times out at its caller-controlled deadline when the required evidence remains inconclusive.
+The explicitly selected lifecycle observation a watch promises to reach. A granted condition requires the grant to equal the quota target. A fulfilled condition additionally requires fresh effective quota to equal both. Either condition fails when a settled grant differs from the target, including zero when the target is greater than zero, and times out at its caller-controlled deadline when the required evidence remains inconclusive.
 _Avoid_: Polling duration, success
 
 **Incomplete observation**:
