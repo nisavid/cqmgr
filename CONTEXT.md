@@ -36,6 +36,18 @@ _Avoid_: Available capacity
 The physical resources that may be provisioned within effective quota. Effective quota does not guarantee capacity.
 _Avoid_: Quota
 
+**Spot capacity advice**:
+Provider-produced, read-only evidence about the likelihood and expected runtime of obtaining a specified Spot VM configuration in candidate locations. It is Preview guidance, not quota, a reservation, or a capacity guarantee.
+_Avoid_: Available capacity, inventory, stock
+
+**Obtainability score**:
+The provider's current likelihood score that a specified Spot VM request with an exact machine configuration, quantity, distribution shape, and candidate locations will succeed.
+_Avoid_: Availability, capacity probability, success guarantee
+
+**Historical preemption rate**:
+The provider's daily aggregate ratio of preempted Spot VMs to all matching Spot VMs that stopped, for one supported machine type and location. It is not the operator's fleet interruption rate.
+_Avoid_: Failure rate, uptime, project preemption rate
+
 **Effective quota slice**:
 One effective quota identified by its resource container, service, quota ID, exact dimensions, and applicable scope.
 _Avoid_: Quota row, accelerator quota

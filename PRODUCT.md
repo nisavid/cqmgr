@@ -23,7 +23,8 @@ interface.
 ## Product Purpose
 
 Cloud Quotas turns authoritative provider state into a safe operator workflow:
-understand the effective constraints on an accelerator workload, preview one
+understand the effective constraints on an accelerator workload, compare
+supported Spot capacity advice without treating it as a guarantee, preview one
 exact quota-preference mutation with its evidence and consequences, apply it
 deliberately, and follow reconciliation to an honest outcome.
 
@@ -52,6 +53,10 @@ and mutation consequences.
 - **Provider truth before guidance.** Present authoritative identity and state
   first, then add accelerator-specific explanation without replacing the
   source facts.
+- **Advice is evidence, not a promise.** Present Spot obtainability, estimated
+  uptime, and preemption history with their exact configuration, source,
+  freshness, Preview status, and coverage limits. Never relabel them as quota
+  or guaranteed capacity.
 - **Exact target, complete context.** Keep the selected effective quota slice,
   related constraint set, acting identity, and consequences visible around
   every planned mutation.
