@@ -200,5 +200,7 @@ does not require identical navigation:
 - automation never depends on terminal rendering or an interactive prompt.
 
 Exact CLI command names, TUI screen boundaries, keyboard behavior, pagination,
-filter syntax, structured-output schemas, and exit-status rules belong to the
-architecture and interface specification that follows this workflow decision.
+and filter syntax belong to the interface specification that follows this
+workflow decision. Stable operation boundaries, status axes, human and
+structured results, exit classes, diagnostics, and Watch behavior are defined
+in the [status, output, and watch contract](status-output-watch-contracts.md).

@@ -24,6 +24,42 @@ _Avoid_: Acting principal, credential identity
 The provider-managed progression from accepted desired quota state to a settled grant and enforced effective quota.
 _Avoid_: Immediate quota update, synchronous mutation
 
+**Preference-settled**:
+The provider has ended reconciliation and reported the granted value. Settlement may grant all, some, or none of the desired value.
+_Avoid_: Granted, fulfilled
+
+**Preference status**:
+The surface-neutral state of a quota preference expressed on separate reconciliation, grant-satisfaction, and effective-confirmation axes. Human headlines are derived from these simultaneous facts.
+_Avoid_: Single lifecycle status, provider state detail
+
+**Fully granted**:
+A settled preference whose granted value equals its desired value. It does not by itself prove that the effective quota enforces that value.
+_Avoid_: Preference-settled, effective-confirmed
+
+**Fully fulfilled**:
+A fully granted preference backed by a fresh effective-quota observation equal to its desired and granted values.
+_Avoid_: Accepted, preference-settled, fully granted
+
+**Operation success boundary**:
+The lifecycle condition an operation promises to reach before reporting success. Preview may reach a verified no-op; Apply reaches its boundary only when the provider accepts the bound preference. Only a watch that requests effective confirmation promises `effective-confirmed`.
+_Avoid_: Quota update succeeded, command completed
+
+**Operation result**:
+A versioned, surface-neutral record that identifies an operation, target, declared boundary, outcome, completeness, observation times, diagnostics, and operation-specific data whether or not the boundary was reached.
+_Avoid_: Raw provider response, rendered command output
+
+**Watch event**:
+A versioned, ordered record emitted when a material reconciliation or effective-quota observation changes. Polling ticks and unchanged refreshes are not watch events; a terminal event carries the final operation result.
+_Avoid_: Poll result, repeated snapshot
+
+**Watch condition**:
+The explicitly selected lifecycle observation a watch promises to reach. A settled condition accepts any settled grant, a fully granted condition requires granted to equal desired, and a fully fulfilled condition additionally requires fresh effective quota to equal both. A fully granted watch fails on a settled partial grant; a fully fulfilled watch continues until fulfillment or its caller-controlled timeout.
+_Avoid_: Polling duration, success
+
+**Incomplete observation**:
+Usable provider evidence returned with one or more required sources, pages, or refreshes missing. It remains visible with source failures and a non-success operation result, and it cannot satisfy a mutation gate.
+_Avoid_: Partial success, partial grant
+
 **Effective-confirmed**:
 A mutation outcome backed by a fresh effective-quota observation that matches the settled granted preference.
 _Avoid_: Success, completed
