@@ -77,8 +77,9 @@ uv run ruff format --check .
 uv run ruff check .
 uv run pyrefly check
 uv run lint-imports --no-cache
-uv run pip-licenses --from mixed --allow-only "Apache-2.0;Apache-2.0 OR BSD-2-Clause;BSD-2-Clause;BSD-3-Clause;BSD License;MIT;MIT License;PSF-2.0"
+uv run pip-licenses --from mixed --allow-only "Apache-2.0;Apache-2.0 OR BSD-2-Clause;Apache Software License;BSD-2-Clause;BSD-3-Clause;BSD License;MIT;MIT License;MPL-2.0;PSF-2.0"
 uv run pytest
+uv run coverage report --include="src/cqmgr/domain/status.py,src/cqmgr/domain/results.py,src/cqmgr/domain/redaction.py" --fail-under=100
 uv build --clear --no-sources
 uv run python scripts/verify_distribution.py dist
 uv run python scripts/smoke_tool_install.py dist --python 3.14
