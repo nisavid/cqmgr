@@ -195,10 +195,14 @@ code, and an unknown code is rejected as usage input. `--quota-contact-stdin`
 reads exactly one UTF-8 line, removes one trailing LF and optional preceding CR,
 and rejects an empty value, NUL, embedded line break, invalid UTF-8, or remaining
 bytes. `request preview` alone accepts `--plan-out PATH`.
-`request watch` uses `--preference PREFERENCE`, `--condition granted|fulfilled`,
-and an absolute RFC 3339 `--deadline TIMESTAMP`. `plan review` and `plan apply`
-accept exactly one of `--plan DIGEST` or `--plan-file PATH`; Apply additionally
-requires `--acknowledge-resource-scope RESOURCE_SCOPE`.
+An initial `request watch` uses `--preference PREFERENCE`,
+`--intent-id INTENT_ID`, `--condition granted|fulfilled`, and an absolute RFC
+3339 `--deadline TIMESTAMP`. A resumed Watch uses `--resume TOKEN` instead of the
+three initial-Watch identity options and requires a new absolute `--deadline`;
+shared presentation options remain available. `plan review` and `plan apply`
+accept exactly one of
+`--plan DIGEST` or `--plan-file PATH`; Apply additionally requires
+`--acknowledge-resource-scope RESOURCE_SCOPE`.
 
 Named local objects and audit records use positional identifiers: `profile get
 NAME`, `profile select NAME`, `config get KEY`, `config set KEY VALUE`, and
@@ -404,12 +408,12 @@ cqmgr Apply record; it does not adopt an unrelated provider preference as a
 watchable intent. Every event emits the locally authenticated opaque resume token
 defined by the Watch stream contract.
 
-A resumed invocation supplies `--resume TOKEN` and a new absolute `--deadline`
-only. `--resume` is mutually exclusive with `--preference`, `--intent-id`, and
-`--condition` because the token binds them. Invalid, foreign-installation,
-unknown-lineage, or superseded tokens return rejected-precondition before
-polling. Omitting `--resume` starts a new observation stream rather than claiming
-a resume.
+A resumed invocation supplies `--resume TOKEN` instead of `--preference`,
+`--intent-id`, and `--condition`, because the token binds them, and requires a
+new absolute `--deadline`. Shared presentation options remain available.
+Invalid, foreign-installation, unknown-lineage, or superseded tokens return
+rejected-precondition before polling. Omitting `--resume` starts a new
+observation stream rather than claiming a resume.
 
 A settled grant that differs from the target conclusively fails either requested
 condition. A zero grant therefore succeeds when the target is zero and fails
