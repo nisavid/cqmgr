@@ -5,7 +5,7 @@ Research date: 2026-07-14
 Selection and platform revalidation date: 2026-07-21
 
 This note compares credible implementation and distribution stacks for a small
-cross-platform Cloud Quotas manager CLI/TUI. It records constraints and
+cross-platform Cloud Quota Manager CLI/TUI. It records constraints and
 trade-offs; it does not select a stack.
 
 The selected Python, Textual, Click, uv, and Google client architecture is
@@ -96,7 +96,8 @@ requires Python 3.10 or newer, including Python 3.14. Its v1 client covers the
 same list/get/create/update operations as the Go client. Textual 8.2.8 is
 marked Production/Stable, supports Python 3.9 through 3.14, and declares
 macOS, Linux, Windows 10, and Windows 11 support. The Cloud client therefore
-sets the effective floor at Python 3.10. [Python Cloud Quotas package][python-cloud-quotas]
+sets a dependency floor of Python 3.10; the selected product floor is Python
+3.12. [Python Cloud Quotas package][python-cloud-quotas]
 [Python Cloud Quotas client][python-cloud-quotas-client]
 [Textual package][textual]
 
@@ -176,24 +177,20 @@ API compatibility directly or depend on non-Google client libraries. That is a
 material scope increase for this product, not merely a language preference.
 [Ratatui installation][ratatui] [Cloud Quotas client libraries][cloud-quotas-libraries]
 
-## Remaining verification and support questions
+## Selected verification and support contract
 
-The selected Python/Textual package model leaves these questions for the
-verification and distribution contract:
+The [verification and distribution
+contract](../verification-distribution-contract.md) resolves the supported
+platform and terminal matrix, the Windows arm64 dependency gate, native
+keyring support, layered tests, live-read-only canaries, PyPI artifacts,
+provenance, and release policy.
 
-1. Which exact macOS, Linux, and Windows versions and architectures form the v1
-   support matrix, including the current Windows arm64 `grpcio` gap?
-2. Which terminals and shells form the matrix, especially Windows
-   Terminal/PowerShell, SSH sessions, low-color terminals, redirected output,
-   and non-interactive CI?
-3. Which signing, provenance, PyPI publication, and dependency-upgrade checks
-   are release gates?
+## Required implementation validation
 
-## Remaining validation spikes
-
-- Authenticate through local user ADC and externally configured
+- Authenticate through short-lived workload identity and externally configured
   service-account impersonation, then list a bounded page of GPU-related
-  `QuotaInfo` records with the v1 client.
+  `QuotaInfo` records with the v1 client. Direct-user ADC receives hermetic
+  contract coverage and an advisory live smoke.
 - Render the approved Textual inspector, request composer, lifecycle status,
   narrow layout, and provider error, then verify keyboard and cancellation
   behavior with Pilot.

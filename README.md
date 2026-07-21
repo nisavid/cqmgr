@@ -29,7 +29,9 @@ The approved implementation baseline is CPython 3.12–3.14, `pyproject.toml`,
 uv, Ruff, Pyrefly, Click, and Textual. Once a package is published, the primary
 installation path will be `uv tool install cqmgr`. The runtime and provider
 boundaries are defined in the [runtime and integration
-architecture](docs/runtime-integration-architecture.md).
+architecture](docs/runtime-integration-architecture.md). The supported platform,
+test, installation, and release gates are defined in the [verification and
+distribution contract](docs/verification-distribution-contract.md).
 
 Start with:
 
@@ -42,6 +44,9 @@ Start with:
 - [runtime and integration architecture](docs/runtime-integration-architecture.md)
   for the Python stack, dependency direction, configuration, authentication,
   provider adapters, and local plan trust boundary;
+- [verification and distribution contract](docs/verification-distribution-contract.md)
+  for supported platforms, test layers, live-read-only canaries, package
+  installation, and release gates;
 - [provider research](docs/research/) for source-backed constraints;
 - [GitHub Issues](https://github.com/nisavid/cqmgr/issues) for the live
   Wayfinder frontier.
