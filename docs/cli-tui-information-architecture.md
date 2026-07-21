@@ -82,6 +82,12 @@ A resource-scoped operation resolves its resource scope in this order:
 3. the explicit local selection made by `scope select`; then
 4. the resource scope in the explicitly selected local profile.
 
+An explicitly named profile that exists but has no resource scope returns a
+typed rejected-precondition result. It does not fall through to a direct local
+selection or to the explicitly selected profile. An unknown named profile also
+returns rejected-precondition. This preserves the caller's explicit profile
+intent without classifying a well-formed lookup miss as invalid syntax.
+
 `scope clear` removes only the direct resource-scope selection and reveals the
 selected profile's resource scope when one exists. `profile select` never
 overrides a direct selection made by `scope select`.
@@ -110,9 +116,14 @@ valid result can be formed. Color is optional, and no-color output retains the
 same words, ordering, and safety facts.
 
 A TUI-generated equivalent command uses canonical full command names and
-includes every non-secret operation input. It replaces a required quota-contact
-value with an explicit operator-input placeholder and excludes credentials and
-other secret material. It never supplies an Apply acknowledgement on the
+includes every non-secret operation input. It never inserts a quota-contact
+placeholder as an argument value. When protected per-operation contact input is
+required, the copied command includes `--quota-contact-stdin` and the TUI renders
+a separate, non-copyable instruction to provide exactly one line on stdin;
+the option reads exactly one UTF-8 line, strips one trailing LF and optional CR,
+and rejects empty, invalid, multiline, NUL-containing, or trailing input.
+Missing or invalid input fails closed. Credentials and other secret material
+are excluded. The command never supplies an Apply acknowledgement on the
 operator's behalf.
 
 The TUI names this affordance **Copy CLI**. It is available on a fully specified
@@ -134,6 +145,12 @@ service or catalog group, filter set, sort, and evidence contract. A result
 does not claim a global total before the bounded collection is exhausted.
 Coverage, scanned provider pages, continuation state, observation times, and
 incomplete sources remain visible.
+
+Supplying a cursor without query options resumes its bound query. Supplying a
+cursor with query options is valid only when every supplied option matches the
+cursor's bound resource scope, service or catalog group, filters, sort, and
+evidence contract. A mismatch returns rejected-precondition with exit class `3`
+before provider access; it never substitutes either query.
 
 The first-release shared facets and canonical values are:
 
@@ -270,6 +287,20 @@ conditions are:
   target; and
 - `fulfilled`: `granted` is reached and a fresh effective-quota observation
   equals the target and granted values.
+
+An initial `request watch` supplies `--preference PREFERENCE`,
+`--intent-id INTENT_ID`, `--condition granted|fulfilled`, and an absolute
+`--deadline TIMESTAMP`. V1 accepts only an intent ID backed by a durable local
+cqmgr Apply record; it does not adopt an unrelated provider preference as a
+watchable intent. Every event emits the locally authenticated opaque resume token
+defined by the Watch stream contract.
+
+A resumed invocation supplies `--resume TOKEN` and a new absolute `--deadline`
+only. `--resume` is mutually exclusive with `--preference`, `--intent-id`, and
+`--condition` because the token binds them. Invalid, foreign-installation,
+unknown-lineage, or superseded tokens return rejected-precondition before
+polling. Omitting `--resume` starts a new observation stream rather than claiming
+a resume.
 
 A settled partial or zero grant conclusively fails either requested condition.
 The underlying request still remains visibly request-settled with its exact

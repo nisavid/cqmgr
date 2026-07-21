@@ -152,10 +152,11 @@ Unavailable optional evidence is explicit. For example, historical Spot
 advice excluded by documented provider coverage is `unsupported`, with its
 coverage reason, rather than `null`, zero, or an incomplete observation.
 
-Credentials, tokens, quota-contact values, sensitive annotations, and raw
-provider bodies are excluded. Safe provider metadata may include HTTP or gRPC
-status, a documented reason, preference identity, etag, and trace or request
-identity.
+Credentials, access or bearer tokens, quota-contact values, sensitive
+annotations, and raw provider bodies are excluded. Safe provider metadata may
+include HTTP or gRPC status, a documented reason, preference identity, etag, and
+trace or request identity. The locally authenticated opaque Watch resume token
+is a read-only control artifact and contains none of the excluded values.
 
 ## Human-readable output
 
@@ -262,20 +263,64 @@ self-contained record for the initial authoritative observation, each material
 status or evidence change, and the terminal result. Unchanged polling ticks do
 not produce public events.
 
+Every record carries the same complete request identity. `request.resource_scope`
+contains the canonical project name. `request.provider_preference` contains the
+canonical preference resource name, service, quota ID, and complete dimension
+map. `request.target` and `request.unit` preserve the watched intent even when a
+preference is later amended or superseded. `request.intent_id` is the applied
+plan digest and must resolve to a durable local cqmgr Apply record for the same
+preference, target, and unit. V1 does not adopt an unrelated provider preference
+as a watchable intent. A producer may not emit an empty or provider-defined
+identity object in place of these fields.
+
+Every event also emits `resume`, an opaque `cqmgr.watch-resume/v1` token
+authenticated by the issuing installation. It binds the intent ID, selected
+condition, complete request identity, last observed provider etag and trace ID
+when present, and checkpoint sequence. It contains no credential or quota
+contact. Before an initial event, Watch verifies the current preference target
+and trace ID against the Apply record. When no stable trace ID exists, the current
+etag must equal the Apply response etag; otherwise lineage is unknown and Watch
+returns rejected-precondition rather than treating a same-target amendment as
+the original intent. Resume applies the same checks to its authenticated token
+and durable checkpoint, rejects any later local Apply for the same preference as
+superseded, and treats a changed provider trace ID as superseded. When no stable
+trace ID exists, an etag change across the observation gap is unknown lineage and
+rejects resume rather than guessing whether reconciliation or a same-target
+amendment occurred. Each material event carries a new token for its durable
+checkpoint.
+
 ```json
 {
   "schema": "cqmgr.watch-event/v1",
   "stream_id": "opaque-run-identity",
   "sequence": 4,
   "event": "status-changed",
+  "resume": "cqmgr.watch-resume/v1:opaque-authenticated-token",
   "observed_at": "2026-07-21T02:07:00Z",
   "request": {
-    "provider_preference": {}
+    "resource_scope": "projects/123456789",
+    "condition": "fulfilled",
+    "intent_id": "sha256:opaque-applied-plan-digest",
+    "target": "8",
+    "unit": "1",
+    "provider_preference": {
+      "name": "projects/123456789/locations/global/quotaPreferences/gpu-region",
+      "service": "compute.googleapis.com",
+      "quota_id": "GPUS-PER-GPU-FAMILY-per-project-region",
+      "dimensions": {
+        "gpu_family": "NVIDIA_H100",
+        "region": "us-central1"
+      }
+    }
   },
   "status": {
-    "reconciliation": "settled",
-    "grant_satisfaction": "partial",
-    "effective_confirmation": "mismatch"
+    "reconciliation": "reconciling",
+    "grant_satisfaction": "unknown",
+    "effective_confirmation": "unobserved",
+    "desired": "8",
+    "granted": null,
+    "effective": null,
+    "unit": "1"
   },
   "diagnostics": []
 }
@@ -283,8 +328,8 @@ not produce public events.
 
 `sequence` increases within one stream. A resumed Watch creates a new stream,
 starts with the current authoritative observation, and retains the deterministic
-preference identity and selected condition; it does not pretend that events
-missed while disconnected were observed.
+preference identity, intent ID, and selected condition from the verified resume
+token; it does not pretend that events missed while disconnected were observed.
 
 The terminal event has `event: "terminal"` and carries the complete operation
 result. It is emitted when the selected condition is reached, a conclusive
@@ -293,12 +338,12 @@ there is enough process lifetime to serialize it.
 
 On timeout, the terminal result uses exit `8` and includes the selected
 condition, deadline, elapsed duration, last material observation, and
-preference identity needed to resume. Timeout describes the Watch operation,
-not the underlying quota request, and never relabels that request as failed.
+latest resume token. Timeout describes the Watch operation, not the underlying
+quota request, and never relabels that request as failed.
 
 On interruption, the manager emits a terminal interrupted event when possible,
 exits `130`, and leaves the provider preference unchanged. A later Watch can
-resume from the deterministic preference identity.
+resume from the latest verified resume token.
 
 ## Polling ownership
 
