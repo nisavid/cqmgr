@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import re
@@ -70,7 +71,16 @@ class FilesystemQuotaQuerySnapshots:
         try:
             _publish_exclusive(path, data)
         except FileExistsError:
-            existing = _read_trusted_file(path)
+            try:
+                existing = _read_repository_file(
+                    self._root,
+                    self._snapshots.name,
+                    path.name,
+                )
+            except QuotaSnapshotOperationalError:
+                raise
+            except OSError as error:
+                raise _operational_error(error) from error
             if existing != data:
                 msg = "quota query snapshot ID conflicts with retained evidence"
                 raise QuotaSnapshotConflictError(msg) from None
@@ -89,7 +99,11 @@ class FilesystemQuotaQuerySnapshots:
         _require_utc_now(now)
         path = self._snapshot_path(snapshot_id)
         try:
-            data = _read_trusted_file(path)
+            data = _read_repository_file(
+                self._root,
+                self._snapshots.name,
+                path.name,
+            )
         except QuotaSnapshotOperationalError:
             raise
         except FileNotFoundError as error:
@@ -157,7 +171,12 @@ class FilesystemQuotaQuerySnapshots:
             msg = "quota query cursor is malformed"
             raise MalformedQuotaCursorError(msg)
         try:
-            data = _read_trusted_file(self._cursor_path(cursor))
+            path = self._cursor_path(cursor)
+            data = _read_repository_file(
+                self._root,
+                self._cursors.name,
+                path.name,
+            )
         except QuotaSnapshotOperationalError:
             raise
         except FileNotFoundError as error:
@@ -256,6 +275,70 @@ def _read_trusted_file(path: Path) -> bytes:
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            msg = "quota snapshot state must be a regular file"
+            raise QuotaSnapshotOperationalError(msg)
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            return stream.read()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _read_repository_file(root: Path, directory: str, filename: str) -> bytes:
+    """Read through no-follow directory descriptors on supported platforms."""
+    if os.name == "nt" or not hasattr(os, "O_DIRECTORY"):  # pragma: win32 cover
+        for path in (root, root / directory):
+            if path.is_symlink():
+                msg = "quota snapshot directory must not be a symlink"
+                raise QuotaSnapshotOperationalError(msg)
+        return _read_trusted_file(root / directory / filename)
+
+    root_descriptor = _open_trusted_directory(root)
+    try:
+        directory_descriptor = _open_trusted_directory(
+            directory,
+            directory_descriptor=root_descriptor,
+        )
+        try:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(filename, flags, dir_fd=directory_descriptor)
+            except OSError as error:
+                if error.errno == errno.ELOOP:
+                    msg = "quota snapshot state file must not be a symlink"
+                    raise QuotaSnapshotOperationalError(msg) from error
+                raise
+            return _read_regular_descriptor(descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        os.close(root_descriptor)
+
+
+def _open_trusted_directory(
+    path: Path | str,
+    *,
+    directory_descriptor: int | None = None,
+) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, dir_fd=directory_descriptor)
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode):
+        os.close(descriptor)
+        msg = "quota snapshot state directory must be a directory"
+        raise QuotaSnapshotOperationalError(msg)
+    return descriptor
+
+
+def _read_regular_descriptor(descriptor: int) -> bytes:
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
