@@ -266,6 +266,11 @@ share the same plan repository. An exported plan may be reviewed elsewhere but
 cannot be Applied by another installation; cross-host verification requires a
 fresh Preview in v1.
 
+Local repository directories and records are private to the active account.
+POSIX hosts enforce owner-only directory and file modes. Windows hosts replace
+inherited DACLs with a protected full-control entry for the active account;
+failure to establish that boundary blocks local plan persistence.
+
 If the selected OS-keyring backend or plan-authentication secret is unavailable,
 read-only provider operations and local configuration and audit inspection
 remain available, and `plan review` may still present a foreign or
@@ -274,10 +279,13 @@ with a typed diagnostic that distinguishes an unsupported or unavailable
 keyring from an operational keyring failure. No file-backed secret fallback is
 created silently.
 
-One local consumption ledger enforces single use. Apply acquires an exclusive
-lease and records consumption before the provider call. A dispatched plan is
-never reusable. An interrupted or ambiguous dispatch quarantines the plan and
-requires deterministic provider reconciliation or a new Preview.
+One authenticated local consumption ledger and one immutable native-keyring
+consumption marker enforce single use. Apply acquires an exclusive lease,
+creates and verifies the digest-bound marker once, and records dispatch before
+the provider call. A dispatched plan is never reusable, including after an
+older authentic filesystem snapshot is replayed. An interrupted or ambiguous
+dispatch quarantines the plan and requires deterministic provider
+reconciliation or a new Preview.
 Recovery uses the durable lease deadline and ledger state, not process-ID
 liveness. Before the deadline an abandoned dispatch remains inapplicable; at
 the deadline it becomes quarantined. Missing ledger state beside plan bytes is

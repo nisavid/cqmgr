@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import hmac
 import json
 import os
 import re
 import secrets
 import stat
+import subprocess
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -20,7 +22,13 @@ from cqmgr.application.ports.plans import (
     PlanRepositoryOutcome,
     PlanRepositoryStatus,
 )
-from cqmgr.application.ports.secrets import SecretValue
+from cqmgr.application.ports.secrets import (
+    SecretPurpose,
+    SecretStore,
+    SecretStoreReference,
+    SecretStoreStatus,
+    SecretValue,
+)
 from cqmgr.domain.plan_consumption import (
     PlanLedgerDecision,
     PlanLedgerRecord,
@@ -37,6 +45,7 @@ _STATE_SCHEMA = "cqmgr.plan-state/v1"
 _DIGEST = re.compile(r"sha256:([0-9a-f]{64})\Z")
 _AUTHENTICATION = re.compile(r"hmac-sha256:[0-9a-f]{64}\Z")
 _MINIMUM_AUTHENTICATION_KEY_BYTES = 32
+_CONSUMPTION_MARKER_SCHEMA = b"cqmgr.plan-consumption/v1:"
 _PRIVATE_FILE_MODE = 0o600
 _PRIVATE_DIRECTORY_MODE = 0o700
 
@@ -50,6 +59,7 @@ class LocalPlanRepository:
     def __init__(
         self,
         root: Path,
+        consumption_store: SecretStore,
         *,
         lock: NativePlanInterprocessLock | None = None,
     ) -> None:
@@ -57,6 +67,7 @@ class LocalPlanRepository:
         self._root = root
         self._plans = root / "plans"
         self._states = root / "state"
+        self._consumption_store = consumption_store
         for directory in (self._root, self._plans, self._states):
             _ensure_private_directory(directory)
         self._lock = lock or NativePlanInterprocessLock(root / ".plan-repository.lock")
@@ -76,7 +87,14 @@ class LocalPlanRepository:
             return PlanRepositoryOutcome(PlanRepositoryStatus.CONFLICT)
         if not authenticated:
             return PlanRepositoryOutcome(PlanRepositoryStatus.CONFLICT)
-        return self._with_lock(lambda: self._store_locked(plan, digest_hex, key))
+        return self._with_lock(
+            lambda: self._store_locked(
+                plan,
+                digest_hex,
+                decoded.plan.installation_id,
+                key,
+            )
+        )
 
     def load(
         self,
@@ -141,8 +159,12 @@ class LocalPlanRepository:
             )
         )
 
-    def _store_locked(
-        self, plan: EncodedPlan, digest_hex: str, key: bytes
+    def _store_locked(  # noqa: PLR0911
+        self,
+        plan: EncodedPlan,
+        digest_hex: str,
+        installation_id: str,
+        key: bytes,
     ) -> PlanRepositoryOutcome:
         plan_path = self._plans / f"{digest_hex}.plan"
         state_path = self._states / f"{digest_hex}.json"
@@ -160,6 +182,26 @@ class LocalPlanRepository:
             else:
                 record = _LedgerRecord.available()
                 self._write_record(digest_hex, record, key)
+            marker_status = self._read_consumption_marker(
+                digest_hex,
+                installation_id,
+                key,
+            )
+            if marker_status is SecretStoreStatus.AVAILABLE:
+                if record.state in {
+                    PlanLedgerState.DISPATCHED,
+                    PlanLedgerState.CONSUMED,
+                    PlanLedgerState.QUARANTINED,
+                }:
+                    return _outcome_for_record(record, authenticated=True)
+                return PlanRepositoryOutcome(
+                    PlanRepositoryStatus.QUARANTINED,
+                    state=PlanLedgerState.QUARANTINED,
+                    reason=StableSymbol("consumption-marker-exists"),
+                    authenticated=True,
+                )
+            if marker_status is not SecretStoreStatus.MISSING:
+                return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
             if not plan_path.exists():
                 _atomic_write(plan_path, plan.bytes, _PRIVATE_FILE_MODE)
         except (OSError, ValueError):
@@ -171,7 +213,7 @@ class LocalPlanRepository:
             )
         return _outcome_for_record(record)
 
-    def _load_locked(  # noqa: PLR0911
+    def _load_locked(  # noqa: C901, PLR0911
         self, digest: str, digest_hex: str, key: bytes, now: datetime
     ) -> PlanRepositoryOutcome:
         plan_path = self._plans / f"{digest_hex}.plan"
@@ -209,6 +251,27 @@ class LocalPlanRepository:
                     state=record.state,
                     authenticated=False,
                 )
+            record = self._recover_record(digest_hex, key, now)
+            marker_status = self._read_consumption_marker(
+                digest_hex,
+                decoded.plan.installation_id,
+                key,
+            )
+            if marker_status is SecretStoreStatus.AVAILABLE:
+                if record.state in {
+                    PlanLedgerState.DISPATCHED,
+                    PlanLedgerState.CONSUMED,
+                    PlanLedgerState.QUARANTINED,
+                }:
+                    return _outcome_for_record(record, authenticated=True)
+                return PlanRepositoryOutcome(
+                    PlanRepositoryStatus.QUARANTINED,
+                    state=PlanLedgerState.QUARANTINED,
+                    reason=StableSymbol("consumption-marker-exists"),
+                    authenticated=True,
+                )
+            if marker_status is not SecretStoreStatus.MISSING:
+                return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
         except (OSError, PlanDecodeError, TypeError, ValueError):
             return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
         return _outcome_for_record(
@@ -247,7 +310,7 @@ class LocalPlanRepository:
             PlanRepositoryStatus.EXPORTED, plan_bytes=plan_bytes
         )
 
-    def _acquire_lease_locked(  # noqa: PLR0911
+    def _acquire_lease_locked(  # noqa: C901, PLR0911
         self,
         digest: str,
         digest_hex: str,
@@ -265,6 +328,26 @@ class LocalPlanRepository:
                     authenticated=False,
                 )
             record = self._recover_record(digest_hex, key, now)
+            marker_status = self._read_consumption_marker(
+                digest_hex,
+                decoded.plan.installation_id,
+                key,
+            )
+            if marker_status is SecretStoreStatus.AVAILABLE:
+                if record.state in {
+                    PlanLedgerState.DISPATCHED,
+                    PlanLedgerState.CONSUMED,
+                    PlanLedgerState.QUARANTINED,
+                }:
+                    return _outcome_for_record(record, authenticated=True)
+                return PlanRepositoryOutcome(
+                    PlanRepositoryStatus.QUARANTINED,
+                    state=PlanLedgerState.QUARANTINED,
+                    reason=StableSymbol("consumption-marker-exists"),
+                    authenticated=True,
+                )
+            if marker_status is not SecretStoreStatus.MISSING:
+                return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
         except (OSError, PlanDecodeError, TypeError, ValueError):
             return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
         if decoded.plan.is_expired(now):
@@ -412,7 +495,7 @@ class LocalPlanRepository:
             )
         )
 
-    def _transition_with_lease_locked(  # noqa: C901, PLR0911, PLR0913
+    def _transition_with_lease_locked(  # noqa: C901, PLR0911, PLR0912, PLR0913
         self,
         lease: PlanLease,
         digest_hex: str,
@@ -449,6 +532,14 @@ class LocalPlanRepository:
                         state=PlanLedgerState.AVAILABLE,
                         reason=StableSymbol("plan-expired"),
                     )
+            else:
+                _plan_bytes, decoded = self._read_local_plan(lease.digest, digest_hex)
+                if not decoded.authenticate(key):
+                    return PlanRepositoryOutcome(
+                        PlanRepositoryStatus.CONFLICT,
+                        state=record.state,
+                        authenticated=False,
+                    )
         except (OSError, PlanDecodeError, ValueError):
             return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
         transition = (
@@ -456,6 +547,47 @@ class LocalPlanRepository:
             if required is PlanLedgerState.LEASED
             else record.complete(token=lease.token)
         )
+        if (
+            target is PlanLedgerState.DISPATCHED
+            and transition.decision is PlanLedgerDecision.IDEMPOTENT
+        ):
+            return PlanRepositoryOutcome(
+                PlanRepositoryStatus.CONFLICT,
+                state=record.state,
+                reason=StableSymbol("dispatch-already-recorded"),
+                authenticated=True,
+            )
+        if transition.decision is PlanLedgerDecision.ACCEPTED:
+            if target is PlanLedgerState.DISPATCHED:
+                marker_status = self._create_consumption_marker(
+                    digest_hex,
+                    decoded.plan.installation_id,
+                    key,
+                )
+                if marker_status is not SecretStoreStatus.CREATED:
+                    outcome_status = (
+                        PlanRepositoryStatus.CONFLICT
+                        if marker_status is SecretStoreStatus.CONFLICT
+                        else PlanRepositoryStatus.FAILED
+                    )
+                    return PlanRepositoryOutcome(
+                        outcome_status,
+                        state=record.state,
+                        reason=StableSymbol("consumption-marker-conflict"),
+                        authenticated=True,
+                    )
+            elif target is PlanLedgerState.CONSUMED:
+                marker_status = self._read_consumption_marker(
+                    digest_hex,
+                    decoded.plan.installation_id,
+                    key,
+                )
+                if marker_status is not SecretStoreStatus.AVAILABLE:
+                    return PlanRepositoryOutcome(
+                        PlanRepositoryStatus.FAILED,
+                        state=record.state,
+                        reason=StableSymbol("consumption-marker-unavailable"),
+                    )
         if transition.decision in {
             PlanLedgerDecision.ACCEPTED,
             PlanLedgerDecision.EXPIRED,
@@ -570,6 +702,35 @@ class LocalPlanRepository:
         )
         _atomic_write(self._states / f"{digest_hex}.json", data, _PRIVATE_FILE_MODE)
 
+    def _read_consumption_marker(
+        self,
+        digest_hex: str,
+        installation_id: str,
+        key: bytes,
+    ) -> SecretStoreStatus:
+        reference = _consumption_marker_reference(digest_hex, installation_id)
+        expected = _consumption_marker_value(digest_hex, key)
+        outcome = self._consumption_store.get(reference)
+        if outcome.status is not SecretStoreStatus.AVAILABLE:
+            return outcome.status
+        if outcome.secret is None or not hmac.compare_digest(
+            outcome.secret.reveal(),
+            expected.reveal(),
+        ):
+            return SecretStoreStatus.CONFLICT
+        return SecretStoreStatus.AVAILABLE
+
+    def _create_consumption_marker(
+        self,
+        digest_hex: str,
+        installation_id: str,
+        key: bytes,
+    ) -> SecretStoreStatus:
+        return self._consumption_store.create(
+            _consumption_marker_reference(digest_hex, installation_id),
+            _consumption_marker_value(digest_hex, key),
+        ).status
+
     def _read_local_plan(self, digest: str, digest_hex: str):  # noqa: ANN202
         plan_path = self._plans / f"{digest_hex}.plan"
         if (
@@ -635,6 +796,29 @@ def _record_authentication(
     return f"hmac-sha256:{hmac.digest(key, data, 'sha256').hex()}"
 
 
+def _consumption_marker_reference(
+    digest_hex: str,
+    installation_id: str,
+) -> SecretStoreReference:
+    digest_identity = base64.urlsafe_b64encode(bytes.fromhex(digest_hex)[:24]).decode(
+        "ascii"
+    )
+    return SecretStoreReference(
+        installation_id=installation_id,
+        purpose=SecretPurpose.PLAN_CONSUMPTION,
+        item_id=f"item-{digest_identity}",
+    )
+
+
+def _consumption_marker_value(digest_hex: str, key: bytes) -> SecretValue:
+    marker = hmac.digest(
+        key,
+        _CONSUMPTION_MARKER_SCHEMA + digest_hex.encode("ascii"),
+        "sha256",
+    )
+    return SecretValue(marker)
+
+
 def _ensure_private_directory(path: Path) -> None:
     missing: list[Path] = []
     candidate = path
@@ -647,8 +831,10 @@ def _ensure_private_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_DIRECTORY_MODE)
     for directory in reversed(missing):
         directory.chmod(_PRIVATE_DIRECTORY_MODE)
+        _restrict_windows_acl(directory)
         _fsync_directory(directory.parent)
     path.chmod(_PRIVATE_DIRECTORY_MODE)
+    _restrict_windows_acl(path)
 
 
 def _atomic_write(path: Path, data: bytes, mode: int) -> None:
@@ -661,6 +847,7 @@ def _atomic_write(path: Path, data: bytes, mode: int) -> None:
             os.fsync(handle.fileno())
         temporary.replace(path)
         path.chmod(mode)
+        _restrict_windows_acl(path)
         _fsync_directory(path.parent)
     except BaseException:
         with suppress(OSError):
@@ -678,6 +865,7 @@ def _atomic_publish_no_replace(path: Path, data: bytes, mode: int) -> None:
             os.fsync(handle.fileno())
         temporary.chmod(mode)
         os.link(temporary, path)
+        _restrict_windows_acl(path)
         _fsync_directory(path.parent)
     finally:
         with suppress(OSError):
@@ -692,6 +880,35 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _restrict_windows_acl(path: Path) -> None:
+    if os.name != "nt":
+        return
+    system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
+    executable = rf"{system_root}\System32\icacls.exe"
+    username = os.environ.get("USERNAME")
+    if not username:
+        msg = "Windows account identity is unavailable"
+        raise OSError(msg)
+    domain = os.environ.get("USERDOMAIN")
+    principal = f"{domain}\\{username}" if domain else username
+    permission = "(OI)(CI)F" if path.is_dir() else "F"
+    completed = subprocess.run(  # noqa: S603
+        [
+            executable,
+            str(path),
+            "/inheritance:r",
+            "/grant:r",
+            f"{principal}:{permission}",
+        ],
+        check=False,
+        capture_output=True,
+        timeout=10,
+    )
+    if completed.returncode != 0:
+        msg = "Windows private ACL enforcement failed"
+        raise OSError(msg)
 
 
 def _format_time(value: datetime) -> str:
