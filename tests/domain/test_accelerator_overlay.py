@@ -12,6 +12,7 @@ from cqmgr.domain.accelerator_overlay import (
     GpuWorkloadRequirement,
     OverlayMapping,
     ProvisioningModel,
+    QuotaConstraintAssessment,
     QuotaSelector,
     ResolutionFailureReason,
     ResolvedQuotaRequirement,
@@ -344,6 +345,57 @@ def test_overlay_returns_exact_regional_and_global_constraint_references() -> No
         )
 
 
+def test_global_companion_exposes_each_region_anchored_constraint_set() -> None:
+    """A shared global slice relates regions without combining alternatives."""
+    central = _evidence(
+        "GPUS-PER-GPU-FAMILY-per-project-region",
+        service="compute.googleapis.com",
+        dimensions=(("gpu_family", "NVIDIA_H100"), ("region", "us-central1")),
+        scope=QuotaScope.REGIONAL,
+        unit="1",
+        locations=("us-central1",),
+        display_name="GPUs per family per region",
+    )
+    east = replace(
+        central,
+        identity=replace(
+            central.identity,
+            dimensions=NormalizedDimensions(
+                (("gpu_family", "NVIDIA_H100"), ("region", "us-east1"))
+            ),
+        ),
+        applicable_locations=("us-east1",),
+    )
+    global_ = _evidence(
+        "GPUS-ALL-REGIONS-per-project",
+        service="compute.googleapis.com",
+        dimensions=(),
+        scope=QuotaScope.GLOBAL,
+        unit="1",
+        locations=("global",),
+        display_name="GPUs (all regions)",
+    )
+
+    results = MAINTAINED_ACCELERATOR_OVERLAY.constraint_sets(
+        global_,
+        (east, global_, central),
+    )
+    classified = MAINTAINED_ACCELERATOR_OVERLAY.classify(
+        global_, freshly_validated_mutable=False
+    )
+
+    assert classified.predicates.cataloged
+    assert classified.predicates.guided
+    assert classified.accelerator_id is None
+    assert tuple(
+        tuple(reference.slice_identity for reference in result.references)
+        for result in results
+    ) == (
+        (global_.identity, central.identity),
+        (global_.identity, east.identity),
+    )
+
+
 def _gpu_requirement() -> GpuWorkloadRequirement:
     return GpuWorkloadRequirement(
         accelerator_id=AcceleratorId("nvidia-h100"),
@@ -354,6 +406,29 @@ def _gpu_requirement() -> GpuWorkloadRequirement:
         region="us-central1",
         zone="us-central1-a",
     )
+
+
+def _gpu_quota_pair() -> tuple[EffectiveQuotaEvidence, EffectiveQuotaEvidence]:
+    """Return the independently limiting regional and global GPU slices."""
+    regional = _evidence(
+        "GPUS-PER-GPU-FAMILY-per-project-region",
+        service="compute.googleapis.com",
+        dimensions=(("gpu_family", "NVIDIA_H100"), ("region", "us-central1")),
+        scope=QuotaScope.REGIONAL,
+        unit="1",
+        locations=("us-central1",),
+        display_name="GPUs per family per region",
+    )
+    global_ = _evidence(
+        "GPUS-ALL-REGIONS-per-project",
+        service="compute.googleapis.com",
+        dimensions=(),
+        scope=QuotaScope.GLOBAL,
+        unit="1",
+        locations=("global",),
+        display_name="GPUs (all regions)",
+    )
+    return regional, global_
 
 
 def _gpu_catalog_evidence(*, include_machine: bool = True) -> WorkloadCatalogEvidence:
@@ -417,6 +492,94 @@ def test_gpu_resolver_returns_native_amount_owner_and_exact_constraints() -> Non
     assert tuple(
         reference.slice_identity for reference in result.constraint_set.references
     ) == (global_.identity, regional.identity)
+
+
+def test_resolved_requirement_retains_exact_constraint_sufficiency() -> None:
+    """Each independently limiting slice states whether quota permits the request."""
+    regional, global_ = _gpu_quota_pair()
+    resolved = MAINTAINED_ACCELERATOR_OVERLAY.resolve(
+        _gpu_requirement(), (regional, global_), _gpu_catalog_evidence()
+    )
+    assessments = (
+        QuotaConstraintAssessment(
+            global_.identity,
+            QuotaQuantity(64, QuotaUnit("1")),
+            QuotaQuantity(60, QuotaUnit("1")),
+            resolved.required_amount,
+            permits=False,
+        ),
+        QuotaConstraintAssessment(
+            regional.identity,
+            QuotaQuantity(64, QuotaUnit("1")),
+            QuotaQuantity(55, QuotaUnit("1")),
+            resolved.required_amount,
+            permits=True,
+        ),
+    )
+
+    assessed = replace(resolved, assessments=assessments)
+
+    assert assessed.assessments == assessments
+    assert assessed.permits is False
+    assert resolved.permits is None
+    with pytest.raises(ValueError, match="must equal usage plus required"):
+        replace(assessments[0], permits=True)
+
+
+def test_constraint_sufficiency_rejects_ambiguous_or_incoherent_evidence() -> None:
+    """Sufficiency cannot be constructed from untyped, mixed, or partial facts."""
+    regional, global_ = _gpu_quota_pair()
+    resolved = MAINTAINED_ACCELERATOR_OVERLAY.resolve(
+        _gpu_requirement(), (regional, global_), _gpu_catalog_evidence()
+    )
+    global_assessment = QuotaConstraintAssessment(
+        global_.identity,
+        QuotaQuantity(64, QuotaUnit("1")),
+        QuotaQuantity(1, QuotaUnit("1")),
+        resolved.required_amount,
+        permits=True,
+    )
+    regional_assessment = replace(global_assessment, identity=regional.identity)
+
+    with pytest.raises(TypeError, match="exact slice identity"):
+        replace(global_assessment, identity=object())  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="QuotaQuantity"):
+        replace(global_assessment, usage=object())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="one native unit"):
+        replace(global_assessment, usage=QuotaQuantity(1, QuotaUnit("core")))
+    with pytest.raises(TypeError, match="permits must be boolean"):
+        replace(global_assessment, permits=1)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="assessments must contain"):
+        replace(resolved, assessments=[global_assessment])  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="typed workload"):
+        replace(resolved, requirement=object())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="owning_service"):
+        replace(resolved, owning_service="Compute")
+    with pytest.raises(TypeError, match="required_amount"):
+        replace(resolved, required_amount=object())  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="conversion"):
+        replace(resolved, conversion=object())  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="constraint_set"):
+        replace(resolved, constraint_set=object())  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="assessments must contain"):
+        replace(resolved, assessments=(object(),))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="every exact constraint"):
+        replace(
+            resolved,
+            assessments=(regional_assessment, global_assessment),
+        )
+    wrong_required = QuotaConstraintAssessment(
+        global_.identity,
+        QuotaQuantity(64, QuotaUnit("1")),
+        QuotaQuantity(1, QuotaUnit("1")),
+        QuotaQuantity(7, QuotaUnit("1")),
+        permits=True,
+    )
+    with pytest.raises(ValueError, match="resolved required amount"):
+        replace(
+            resolved,
+            assessments=(wrong_required, regional_assessment),
+        )
 
 
 def test_gpu_resolver_fails_when_a_required_companion_slice_is_missing() -> None:
@@ -585,6 +748,11 @@ def test_tpu_requirement_makes_management_plane_specific_shape_explicit() -> Non
 
     with pytest.raises(ValueError, match="does not match"):
         replace(legacy, workload_consumer=WorkloadConsumer.GKE)
+    with pytest.raises(ValueError, match="legacy topology"):
+        replace(
+            _compute_tpu_requirement(WorkloadConsumer.GKE),
+            topology="2x2",
+        )
     for non_zone in ("us-central1", "a"):
         with pytest.raises(ValueError, match="exact canonical zone"):
             replace(legacy, zone=non_zone)

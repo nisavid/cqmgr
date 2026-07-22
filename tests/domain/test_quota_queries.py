@@ -424,3 +424,84 @@ def test_query_item_retains_its_anchored_constraint_set() -> None:
                 (ConstraintReference(item.identity),),
             ),
         )
+
+
+def test_query_item_retains_multiple_anchored_sets_without_singular_guess() -> None:
+    """A shared global companion preserves each regional constraint set."""
+    regional_central = _item(
+        "H100-CENTRAL",
+        display_name="NVIDIA H100",
+        accelerator="nvidia-h100",
+        location="us-central1",
+    )
+    regional_east = _item(
+        "H100-EAST",
+        display_name="NVIDIA H100",
+        accelerator="nvidia-h100",
+        location="us-east1",
+    )
+    global_item = replace(
+        regional_central,
+        identity=replace(
+            regional_central.identity,
+            quota_id="GPU-GLOBAL",
+            dimensions=NormalizedDimensions(()),
+            quota_scope=QuotaScope.GLOBAL,
+        ),
+        location="global",
+    )
+    central_set = AcceleratorConstraintSet(
+        AcceleratorId("nvidia-h100"),
+        (
+            ConstraintReference(global_item.identity),
+            ConstraintReference(regional_central.identity),
+        ),
+    )
+    east_set = AcceleratorConstraintSet(
+        AcceleratorId("nvidia-h100"),
+        (
+            ConstraintReference(global_item.identity),
+            ConstraintReference(regional_east.identity),
+        ),
+    )
+
+    retained = replace(
+        global_item,
+        constraint_sets=(east_set, central_set),
+        constraint_set=None,
+    )
+
+    assert retained.constraint_sets == (central_set, east_set)
+    assert retained.constraint_set is None
+    with pytest.raises(TypeError, match="constraint_sets"):
+        replace(global_item, constraint_sets=[central_set])  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="constraint_sets"):
+        replace(global_item, constraint_sets=(object(),))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="ambiguous"):
+        replace(
+            global_item,
+            constraint_sets=(central_set, east_set),
+            constraint_set=central_set,
+        )
+    with pytest.raises(ValueError, match="must not repeat"):
+        replace(global_item, constraint_sets=(central_set, central_set))
+    with pytest.raises(ValueError, match="accelerator must match"):
+        replace(
+            global_item,
+            constraint_sets=(
+                AcceleratorConstraintSet(
+                    AcceleratorId("nvidia-l4"),
+                    (ConstraintReference(global_item.identity),),
+                ),
+            ),
+        )
+    with pytest.raises(ValueError, match="must reference the query item"):
+        replace(
+            global_item,
+            constraint_sets=(
+                AcceleratorConstraintSet(
+                    AcceleratorId("nvidia-h100"),
+                    (ConstraintReference(regional_central.identity),),
+                ),
+            ),
+        )
