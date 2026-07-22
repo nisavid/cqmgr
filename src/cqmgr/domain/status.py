@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from cqmgr.domain.quotas import QuotaQuantity
 from cqmgr.domain.schemas import ProviderSymbol
+from cqmgr.domain.time import require_utc
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 
 class Reconciliation(StrEnum):
@@ -93,7 +97,7 @@ def _validate_evidence(  # noqa: PLR0913
     _require_quantity(desired, "desired", optional=False)
     _require_quantity(granted, "granted")
     _require_quantity(effective, "effective")
-    _require_utc(status_observed_at, "status_observed_at")
+    require_utc(status_observed_at, "status_observed_at")
     if effective is not None and effective_observed_at is None:
         msg = (
             "effective and effective_observed_at must both be present or both be absent"
@@ -105,7 +109,7 @@ def _validate_evidence(  # noqa: PLR0913
         )
         raise ValueError(msg)
     if effective_observed_at is not None:
-        _require_utc(effective_observed_at, "effective_observed_at")
+        require_utc(effective_observed_at, "effective_observed_at")
     if not _same_unit(baseline, desired, granted, effective):
         msg = "status quantities must use one explicit unit"
         raise ValueError(msg)
@@ -144,15 +148,6 @@ def _derive_effective_confirmation(
     if not _same_unit(granted, effective) or effective.value != granted.value:
         return EffectiveConfirmation.MISMATCH
     return EffectiveConfirmation.CONFIRMED
-
-
-def _require_utc(value: object, field_name: str) -> None:
-    if not isinstance(value, datetime):
-        msg = f"{field_name} must be a datetime"
-        raise TypeError(msg)
-    if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
-        msg = f"{field_name} must be an aware UTC timestamp"
-        raise ValueError(msg)
 
 
 def _derive_axes(  # noqa: PLR0913

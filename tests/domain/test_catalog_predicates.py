@@ -101,6 +101,18 @@ def test_empty_catalog_filter_matches_every_combination() -> None:
     )
 
 
+def test_unselected_catalog_facets_remain_unconstrained() -> None:
+    """A partial filter ignores omitted facts in both matching directions."""
+    catalog_filter = CatalogFilter(discovered=True, mutable=False)
+    first = _predicates((True, False, False, False))
+    second = _predicates((True, True, True, False))
+
+    assert catalog_filter.matches(first)
+    assert catalog_filter.matches(second)
+    assert first.matches(catalog_filter)
+    assert second.matches(catalog_filter)
+
+
 @pytest.mark.parametrize("value", [0, 1, "true", None])
 def test_catalog_predicate_rejects_non_boolean_fact(value: object) -> None:
     """Truth-like provider values cannot silently become product facts."""

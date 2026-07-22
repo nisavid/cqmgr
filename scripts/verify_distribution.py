@@ -38,6 +38,7 @@ EXPECTED_PACKAGE_FILES = {
     PurePosixPath("domain/schemas.py"),
     PurePosixPath("domain/scopes.py"),
     PurePosixPath("domain/status.py"),
+    PurePosixPath("domain/time.py"),
     PurePosixPath("py.typed"),
     PurePosixPath("tui.py"),
 }

@@ -117,6 +117,7 @@ class ProviderMetadata:
         """Require status-shaped integers and explicitly scrubbed text."""
         if self.http_status is not None and (
             isinstance(self.http_status, bool)
+            or not isinstance(self.http_status, int)
             or not _MIN_HTTP_STATUS <= self.http_status <= _MAX_HTTP_STATUS
         ):
             msg = "HTTP status must be an integer from 100 through 599"
