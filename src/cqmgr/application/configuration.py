@@ -8,7 +8,7 @@ from enum import StrEnum
 
 from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 
-CONFIG_SCHEMA = "cqmgr.config/v2"
+CONFIG_SCHEMA = "cqmgr.config/v1"
 SELECTION_STATE_SCHEMA = "cqmgr.selection-state/v1"
 
 _PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
