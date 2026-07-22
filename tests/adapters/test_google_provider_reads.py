@@ -556,6 +556,117 @@ def test_schema_skew_keeps_page_evidence_incomplete() -> None:
     assert result.diagnostics[0].code.value == "provider-schema-invalid"
 
 
+@pytest.mark.parametrize("missing", ["eligibility", "details"])
+def test_missing_required_quota_info_messages_are_incomplete(missing: str) -> None:
+    """Absent nested messages cannot become false or zero effective evidence."""
+    item = cloudquotas_v1.QuotaInfo(_quota_info_pages()[0].items[0])
+    pb = cloudquotas_v1.QuotaInfo.pb(item)
+    if missing == "eligibility":
+        pb.ClearField("quota_increase_eligibility")
+    else:
+        pb.dimensions_infos[0].ClearField("details")
+
+    result = asyncio.run(
+        GoogleEffectiveQuotaReader(
+            FakeCloudQuotasPages(info_pages=[QuotaInfoPage((item,), "")]),
+            _policy(RecordingBudget()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(EffectiveQuotaReadRequest(_context(), "compute.googleapis.com"))
+    )
+
+    assert result.values == ()
+    assert not result.complete
+    assert result.diagnostics[0].code.value == "provider-schema-invalid"
+
+
+def test_missing_preference_config_is_incomplete() -> None:
+    """An absent quotaConfig cannot become a preferred value of zero."""
+    item = cloudquotas_v1.QuotaPreference(_preference_page().items[0])
+    cloudquotas_v1.QuotaPreference.pb(item).ClearField("quota_config")
+
+    result = asyncio.run(
+        GoogleQuotaPreferenceReader(
+            FakeCloudQuotasPages(preference_pages=[QuotaPreferencePage((item,), "")]),
+            _policy(RecordingBudget()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(QuotaPreferenceReadRequest(_context()))
+    )
+
+    assert result.values == ()
+    assert not result.complete
+    assert result.diagnostics[0].code.value == "provider-schema-invalid"
+
+
+def test_provider_resource_names_must_match_normalized_identity() -> None:
+    """Scalar identity cannot override a mismatched provider resource name."""
+    info = cloudquotas_v1.QuotaInfo(_quota_info_pages()[0].items[0])
+    info.name = (
+        "projects/415104041262/locations/global/services/wrong.googleapis.com/"
+        "quotaInfos/wrong"
+    )
+    preference = cloudquotas_v1.QuotaPreference(_preference_page().items[0])
+    preference.name = "projects/415104041262/locations/global/notPreferences/bad"
+
+    info_result = asyncio.run(
+        GoogleEffectiveQuotaReader(
+            FakeCloudQuotasPages(info_pages=[QuotaInfoPage((info,), "")]),
+            _policy(RecordingBudget()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(EffectiveQuotaReadRequest(_context(), "compute.googleapis.com"))
+    )
+    preference_result = asyncio.run(
+        GoogleQuotaPreferenceReader(
+            FakeCloudQuotasPages(
+                preference_pages=[QuotaPreferencePage((preference,), "")]
+            ),
+            _policy(RecordingBudget()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(QuotaPreferenceReadRequest(_context()))
+    )
+
+    assert not info_result.complete
+    assert info_result.values == ()
+    assert not preference_result.complete
+    assert preference_result.values == ()
+
+
+@pytest.mark.parametrize("preferred", [-1, 0])
+def test_preference_accepts_documented_lower_boundary(preferred: int) -> None:
+    """Unlimited minus one and ordinary zero remain valid absolute targets."""
+    item = cloudquotas_v1.QuotaPreference(_preference_page().items[0])
+    item.quota_config.preferred_value = preferred
+    result = asyncio.run(
+        GoogleQuotaPreferenceReader(
+            FakeCloudQuotasPages(preference_pages=[QuotaPreferencePage((item,), "")]),
+            _policy(RecordingBudget()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(QuotaPreferenceReadRequest(_context()))
+    )
+    assert result.complete
+    assert result.values[0].preferred_value == preferred
+
+
+def test_preference_below_provider_minimum_is_incomplete() -> None:
+    """Schema-skew below the documented -1 minimum fails closed."""
+    item = cloudquotas_v1.QuotaPreference(_preference_page().items[0])
+    item.quota_config.preferred_value = -2
+    result = asyncio.run(
+        GoogleQuotaPreferenceReader(
+            FakeCloudQuotasPages(preference_pages=[QuotaPreferencePage((item,), "")]),
+            _policy(RecordingBudget()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(QuotaPreferenceReadRequest(_context()))
+    )
+    assert not result.complete
+    assert result.values == ()
+
+
 def test_monitoring_reader_preserves_all_points_intervals_values_and_labels() -> None:
     """Usage remains separate time-series evidence without invented freshness."""
     budget = RecordingBudget()

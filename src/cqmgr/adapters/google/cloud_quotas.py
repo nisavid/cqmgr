@@ -303,8 +303,16 @@ def _map_quota_info(
     info: cloudquotas_v1.QuotaInfo,
     request: EffectiveQuotaReadRequest,
 ) -> list[EffectiveQuotaEvidence]:
-    if info.service != request.service or not info.name.startswith(
-        f"{request.context.project.resource_scope.canonical_name}/locations/global/"
+    scope = request.context.project.resource_scope.canonical_name
+    expected_name = (
+        f"{scope}/locations/global/services/{info.service}/quotaInfos/{info.quota_id}"
+    )
+    info_pb = cloudquotas_v1.QuotaInfo.pb(info)
+    if (
+        info.service != request.service
+        or info.name != expected_name
+        or not info_pb.HasField("quota_increase_eligibility")
+        or not info.dimensions_infos
     ):
         msg = "QuotaInfo identity does not match request"
         raise ValueError(msg)
@@ -315,6 +323,10 @@ def _map_quota_info(
     )
     results = []
     for dimensions_info in info.dimensions_infos:
+        dimensions_pb = cloudquotas_v1.DimensionsInfo.pb(dimensions_info)
+        if not dimensions_pb.HasField("details"):
+            msg = "QuotaInfo dimension slice requires details"
+            raise ValueError(msg)
         dimensions = NormalizedDimensions(dimensions_info.dimensions.items())
         identity = EffectiveQuotaSliceIdentity(
             resource_scope=request.context.project.resource_scope,
@@ -352,8 +364,15 @@ def _map_preference(
     request: QuotaPreferenceReadRequest,
 ) -> QuotaPreferenceEvidence:
     scope = request.context.project.resource_scope.canonical_name
-    prefix = f"{scope}/locations/global/"
-    if not preference.name.startswith(prefix):
+    prefix = f"{scope}/locations/global/quotaPreferences/"
+    preference_id = preference.name.removeprefix(prefix)
+    preference_pb = cloudquotas_v1.QuotaPreference.pb(preference)
+    if (
+        not preference.name.startswith(prefix)
+        or not preference_id
+        or "/" in preference_id
+        or not preference_pb.HasField("quota_config")
+    ):
         msg = "QuotaPreference identity does not match request"
         raise ValueError(msg)
     dimensions = NormalizedDimensions(preference.dimensions.items())

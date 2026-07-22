@@ -255,19 +255,7 @@ class QuotaPreferenceEvidence:
         if not isinstance(self.identity, EffectiveQuotaSliceIdentity):
             msg = "quota preference requires exact slice identity"
             raise TypeError(msg)
-        for name, value in (
-            ("preferred_value", self.preferred_value),
-            ("granted_value", self.granted_value),
-        ):
-            if value is None and name == "granted_value":
-                continue
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or not SIGNED_64_MIN <= value <= SIGNED_64_MAX
-            ):
-                msg = f"{name} must be a signed 64-bit integer"
-                raise ValueError(msg)
+        _require_preference_values(self.preferred_value, self.granted_value)
         if not isinstance(self.reconciling, bool):
             msg = "quota preference reconciling must be boolean"
             raise TypeError(msg)
@@ -283,6 +271,22 @@ class QuotaPreferenceEvidence:
         ):
             msg = "quota preference origin must use QuotaPreferenceOrigin"
             raise TypeError(msg)
+
+
+def _require_preference_values(preferred: object, granted: object) -> None:
+    for name, value in (("preferred_value", preferred), ("granted_value", granted)):
+        if value is None and name == "granted_value":
+            continue
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not SIGNED_64_MIN <= value <= SIGNED_64_MAX
+        ):
+            msg = f"{name} must be a signed 64-bit integer"
+            raise ValueError(msg)
+    if isinstance(preferred, int) and preferred < -1:
+        msg = "preferred_value must be at least -1"
+        raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True)
