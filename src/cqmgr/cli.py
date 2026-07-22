@@ -178,7 +178,15 @@ def scope_select(
     try:
         parsed = parse_resource_scope_name(resource_scope)
     except (TypeError, ValueError) as error:
-        raise click.BadParameter(str(error), param_hint="RESOURCE_SCOPE") from error
+        reason = str(error)
+        operations = build_local_operations()
+        _run(
+            operations,
+            "scope.select",
+            lambda: operations.scope_selection_usage_failure(reason),
+            LocalPresentation(output, no_color, quiet),
+        )
+        return
     operations = build_local_operations()
     _run(
         operations,

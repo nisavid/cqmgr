@@ -74,6 +74,7 @@ class RetryDisposition(StrEnum):
     """Closed guidance for whether and when an operation may be retried."""
 
     NEVER = "never"
+    AFTER_UPGRADE = "after-upgrade"
     AFTER_REFRESH = "after-refresh"
     AFTER_NEW_PREVIEW = "after-new-preview"
     AFTER_BACKOFF = "after-backoff"

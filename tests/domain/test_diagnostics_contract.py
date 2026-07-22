@@ -112,6 +112,7 @@ def test_severity_and_retry_disposition_are_closed() -> None:
     )
     assert tuple(member.value for member in RetryDisposition) == (
         "never",
+        "after-upgrade",
         "after-refresh",
         "after-new-preview",
         "after-backoff",

@@ -62,7 +62,7 @@ def test_missing_files_load_independent_empty_snapshots(tmp_path: Path) -> None:
     assert not state_path.exists()
 
 
-def test_v0_configuration_is_migrated_in_memory_and_written_as_v1(
+def test_v0_configuration_is_migrated_in_memory_and_written_as_v2(
     tmp_path: Path,
 ) -> None:
     """The supported forward migration renames legacy project profile fields."""
@@ -76,7 +76,7 @@ def test_v0_configuration_is_migrated_in_memory_and_written_as_v1(
     run(repository.update(lambda snapshot: snapshot))
 
     assert migrated.profile("primary").resource_scope == project("123")
-    assert 'schema = "cqmgr.config/v1"' in path.read_text()
+    assert 'schema = "cqmgr.config/v2"' in path.read_text()
     assert 'resource_scope = "projects/123"' in path.read_text()
     assert "project =" not in path.read_text()
 
@@ -84,7 +84,7 @@ def test_v0_configuration_is_migrated_in_memory_and_written_as_v1(
 @pytest.mark.parametrize(
     ("contents", "error"),
     [
-        ('schema = "cqmgr.config/v2"\n', UnsupportedStoredSchemaError),
+        ('schema = "cqmgr.config/v3"\n', UnsupportedStoredSchemaError),
         ('schema = "cqmgr.config/v1"\nsecret = "value"\n', InvalidStoredDataError),
         (
             'schema = "cqmgr.config/v1"\n[interface]\nno_color = "yes"\n',
@@ -103,6 +103,17 @@ def test_configuration_rejects_invalid_or_newer_versions(
     path.write_text(contents)
 
     with pytest.raises(error):
+        run(TomlConfigRepository(path).read())
+
+
+def test_configuration_classifies_filesystem_read_failure_as_operational(
+    tmp_path: Path,
+) -> None:
+    """An unreadable path is not mislabeled as malformed operator content."""
+    path = tmp_path / "config.toml"
+    path.mkdir()
+
+    with pytest.raises(StoredDataOperationalError):
         run(TomlConfigRepository(path).read())
 
 
@@ -182,6 +193,25 @@ def test_configuration_round_trip_preserves_safe_profile_fields(tmp_path: Path) 
     run(repository.update(lambda _: expected))
 
     assert run(repository.read()) == expected
+
+
+def test_v1_keyring_reference_configuration_migrates_to_v2(tmp_path: Path) -> None:
+    """The tightened typed reference shape has an explicit forward migration."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'schema = "cqmgr.config/v1"\n\n'
+        "[profiles.primary]\n"
+        'quota_contact_keyring_reference = "cqmgr:quota-contact:primary"\n'
+    )
+    repository = TomlConfigRepository(path)
+
+    migrated = run(repository.read())
+    run(repository.update(lambda snapshot: snapshot))
+
+    assert migrated.profile("primary").quota_contact_keyring_reference == (
+        QuotaContactKeyringReference("primary")
+    )
+    assert 'schema = "cqmgr.config/v2"' in path.read_text()
 
 
 @pytest.mark.parametrize(
