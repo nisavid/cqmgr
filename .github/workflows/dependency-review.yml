@@ -25,6 +25,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Verify license-exception versions
+        run: python3 scripts/verify_dependency_license_exceptions.py uv.lock
+
       - name: Review dependency changes
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
@@ -42,4 +45,9 @@ jobs:
             MIT-0,
             MPL-2.0,
             PSF-2.0
+          # The preceding exact-lock guard requires re-review on version changes.
+          # Installed and upstream metadata declare MIT and 3-clause BSD.
+          allow-dependencies-licenses: >-
+            pkg:pypi/charset-normalizer@3.4.9,
+            pkg:pypi/protobuf@7.35.1
           retry-on-snapshot-warnings: true
