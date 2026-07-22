@@ -386,6 +386,28 @@ def test_query_snapshot_binding_rejects_ambiguous_state() -> None:
         QuotaQuerySnapshot(cast("QuerySnapshotMetadata", object()), ())
     with pytest.raises(TypeError, match="items"):
         QuotaQuerySnapshot(metadata, cast("tuple[QuotaQueryItem, ...]", ("item",)))
+    with pytest.raises(ValueError, match="bound query source"):
+        QuotaQuerySnapshot(
+            metadata,
+            (
+                _item(
+                    identity=replace(
+                        _identity(),
+                        resource_scope=ResourceScope(
+                            ResourceScopeKind.PROJECT, "projects/987"
+                        ),
+                    )
+                ),
+            ),
+        )
+    with pytest.raises(ValueError, match="bound query source"):
+        QuotaQuerySnapshot(
+            metadata,
+            (_item(identity=replace(_identity(), service="tpu.googleapis.com")),),
+        )
+    item = _item()
+    with pytest.raises(ValueError, match="must be unique"):
+        QuotaQuerySnapshot(metadata, (item, item))
 
 
 def test_filters_match_text_dimensions_and_every_independent_facet() -> None:

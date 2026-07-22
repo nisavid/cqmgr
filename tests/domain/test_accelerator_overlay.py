@@ -486,6 +486,37 @@ def test_gpu_resolver_fails_when_an_exact_constraint_is_ineligible() -> None:
 
     assert rejected.value.reason is ResolutionFailureReason.INELIGIBLE
 
+    fixed_but_eligible = replace(
+        global_,
+        fixed=True,
+        eligibility=QuotaIncreaseEligibility(
+            eligible=True,
+            reason=ProviderSymbol(
+                "INELIGIBILITY_REASON_UNSPECIFIED", QuotaIneligibilityReason
+            ),
+        ),
+    )
+    regional_eligible = replace(
+        regional,
+        fixed=False,
+        eligibility=QuotaIncreaseEligibility(
+            eligible=True,
+            reason=ProviderSymbol(
+                "INELIGIBILITY_REASON_UNSPECIFIED", QuotaIneligibilityReason
+            ),
+        ),
+    )
+    assert regional_eligible.eligibility.eligible
+    assert fixed_but_eligible.eligibility.eligible
+    assert fixed_but_eligible.fixed
+    with pytest.raises(WorkloadResolutionError) as fixed:
+        MAINTAINED_ACCELERATOR_OVERLAY.resolve(
+            _gpu_requirement(),
+            (regional_eligible, fixed_but_eligible),
+            _gpu_catalog_evidence(),
+        )
+    assert fixed.value.reason is ResolutionFailureReason.INELIGIBLE
+
 
 def test_gpu_resolver_requires_exact_fixed_shape_count_and_coherent_location() -> None:
     """A fixed machine shape cannot be resized or paired with another region."""

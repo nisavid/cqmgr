@@ -449,6 +449,18 @@ class QuotaQuerySnapshot:
         ):
             msg = "items must be QuotaQueryItem values"
             raise TypeError(msg)
+        query = self.metadata.query
+        if any(
+            item.identity.resource_scope != query.resource_scope
+            or item.identity.service not in query.services
+            for item in self.items
+        ):
+            msg = "snapshot items must remain within the bound query source"
+            raise ValueError(msg)
+        identities = tuple(item.identity for item in self.items)
+        if len(set(identities)) != len(identities):
+            msg = "snapshot item identities must be unique"
+            raise ValueError(msg)
 
     def sorted_items(self) -> tuple[QuotaQueryItem, ...]:
         """Filter and globally sort only a complete collected snapshot."""

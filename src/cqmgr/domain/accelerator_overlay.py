@@ -820,7 +820,10 @@ def _require_eligible_constraints(
     """Require every exact limiting slice to be provider-eligible for guidance."""
     by_identity = {evidence.identity: evidence for evidence in evidences}
     if any(
-        not by_identity[reference.slice_identity].eligibility.eligible
+        (
+            not by_identity[reference.slice_identity].eligibility.eligible
+            or by_identity[reference.slice_identity].fixed
+        )
         for reference in constraint_set.references
     ):
         raise WorkloadResolutionError(
