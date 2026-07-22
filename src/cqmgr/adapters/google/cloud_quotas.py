@@ -321,10 +321,24 @@ def _map_quota_info(
         eligible=info.quota_increase_eligibility.is_eligible,
         reason=reason,
     )
+    declared_dimensions = tuple(info.dimensions)
+    declared_dimension_set = set(declared_dimensions)
+    if any(not dimension for dimension in declared_dimensions) or len(
+        declared_dimension_set
+    ) != len(declared_dimensions):
+        msg = "QuotaInfo declared dimensions are invalid"
+        raise ValueError(msg)
     results = []
     for dimensions_info in info.dimensions_infos:
         dimensions_pb = cloudquotas_v1.DimensionsInfo.pb(dimensions_info)
-        if not dimensions_pb.HasField("details"):
+        dimension_keys = set(dimensions_info.dimensions)
+        applicable_locations = tuple(dimensions_info.applicable_locations)
+        if (
+            not dimensions_pb.HasField("details")
+            or not applicable_locations
+            or any(not location for location in applicable_locations)
+            or not dimension_keys.issubset(declared_dimension_set)
+        ):
             msg = "QuotaInfo dimension slice requires details"
             raise ValueError(msg)
         dimensions = NormalizedDimensions(dimensions_info.dimensions.items())
@@ -343,8 +357,8 @@ def _map_quota_info(
                     QuotaUnit(info.metric_unit),
                 ),
                 metric=info.metric,
-                declared_dimensions=tuple(info.dimensions),
-                applicable_locations=tuple(dimensions_info.applicable_locations),
+                declared_dimensions=declared_dimensions,
+                applicable_locations=applicable_locations,
                 eligibility=eligibility,
                 fixed=info.is_fixed,
                 concurrent=info.is_concurrent,
