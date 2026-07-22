@@ -45,6 +45,9 @@ SLICE = EffectiveQuotaSliceIdentity(
 )
 UNIT = QuotaUnit("1")
 LOCAL_KEY = b"l" * 32
+SHA256_A = "sha256:" + ("a" * 64)
+SHA256_B = "sha256:" + ("b" * 64)
+HMAC_SHA256_C = "hmac-sha256:" + ("c" * 64)
 
 
 def _plan() -> QuotaRequestPlan:
@@ -65,7 +68,7 @@ def _plan() -> QuotaRequestPlan:
         contact_binding=ContactBinding(
             source=StableSymbol("selected-profile"),
             source_identity="profile:accelerators",
-            value_digest="hmac-sha256:contact-binding",
+            value_digest=HMAC_SHA256_C,
         ),
         warnings=(StableSymbol("remaining-companion-bottleneck"),),
         required_acknowledgements=(StableSymbol("decrease-over-ten-percent"),),
@@ -74,12 +77,12 @@ def _plan() -> QuotaRequestPlan:
         evidence=(
             EvidenceBinding(
                 name=StableSymbol("eligibility"),
-                value_digest="sha256:eligibility",
+                value_digest=SHA256_A,
                 observed_at=NOW,
             ),
             EvidenceBinding(
                 name=StableSymbol("policy"),
-                value_digest="sha256:policy",
+                value_digest=SHA256_B,
                 observed_at=NOW,
             ),
         ),
@@ -97,7 +100,7 @@ def test_plan_encoding_is_canonical_stable_and_authenticated() -> None:
     assert encoded.digest.startswith("sha256:")
     assert encoded.bytes.endswith(b"\n")
     assert b"operator@example.invalid" in encoded.bytes
-    assert b"contact-binding" in encoded.bytes
+    assert HMAC_SHA256_C.encode() in encoded.bytes
     assert b"quota-contact" not in encoded.bytes
 
     decoded = PlanCodec.decode(encoded.bytes)
@@ -178,6 +181,14 @@ def test_digest_valid_malformed_content_still_fails_closed(
         PlanCodec.decode(_mutated_plan_bytes(path, value))
 
 
+def test_digest_valid_semantically_noncanonical_plan_fails_closed() -> None:
+    """Canonical JSON cannot hide a noncanonical semantic timestamp spelling."""
+    with pytest.raises(PlanDecodeError, match="semantically canonical"):
+        PlanCodec.decode(
+            _mutated_plan_bytes(("issued_at",), "2026-07-21T12:00:00.000000Z")
+        )
+
+
 def test_codec_rejects_invalid_boundary_types_and_envelope_shapes() -> None:
     """The public codec never guesses across malformed untrusted boundaries."""
     with pytest.raises(TypeError, match="QuotaRequestPlan"):
@@ -228,6 +239,10 @@ def test_plan_value_types_reject_invalid_and_secret_bearing_shapes() -> None:
         ContactBinding(StableSymbol("profile"), "", "hmac-sha256:value")
     with pytest.raises(ValueError, match="value_digest"):
         ContactBinding(StableSymbol("profile"), "profile:name", "raw@example.invalid")
+    with pytest.raises(ValueError, match="value_digest"):
+        ContactBinding(
+            StableSymbol("profile"), "profile:name", "hmac-sha256:" + ("A" * 64)
+        )
     with pytest.raises(TypeError, match="evidence name"):
         EvidenceBinding(cast("StableSymbol", "policy"), "sha256:value", NOW)
     with pytest.raises(ValueError, match="value_digest"):
@@ -289,7 +304,7 @@ def test_review_validation_and_every_ledger_state_fail_closed() -> None:
         required_acknowledgements=(StableSymbol("unlimited-transition"),),
     )
     common = {
-        "digest": "sha256:digest",
+        "digest": SHA256_A,
         "authenticated": True,
         "local_installation_id": plan.installation_id,
         "now": NOW,

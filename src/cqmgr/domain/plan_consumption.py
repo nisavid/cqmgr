@@ -11,7 +11,6 @@ from cqmgr.domain.results import StableSymbol
 from cqmgr.domain.time import require_utc
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
     from datetime import datetime
 
 
@@ -39,17 +38,60 @@ class PlanLedgerRecord:
     state: PlanLedgerState
     lease_token: str | None = None
     lease_expires_at: datetime | None = None
-    owner_pid: int | None = None
     reason: StableSymbol | None = None
+
+    def __post_init__(self) -> None:
+        """Require one unambiguous durable shape for each ledger state."""
+        if not isinstance(self.state, PlanLedgerState):
+            msg = "plan ledger state must be a PlanLedgerState"
+            raise TypeError(msg)
+        if self.lease_token is not None and (
+            not isinstance(self.lease_token, str) or not self.lease_token
+        ):
+            msg = "plan ledger lease token must be non-empty"
+            raise ValueError(msg)
+        if self.lease_expires_at is not None:
+            require_utc(self.lease_expires_at, "lease_expires_at")
+        if self.reason is not None and not isinstance(self.reason, StableSymbol):
+            msg = "plan ledger reason must be a StableSymbol"
+            raise TypeError(msg)
+        if self.state is PlanLedgerState.AVAILABLE and any(
+            value is not None
+            for value in (self.lease_token, self.lease_expires_at, self.reason)
+        ):
+            msg = "available plan ledger state cannot retain lease metadata"
+            raise ValueError(msg)
+        if self.state in {PlanLedgerState.LEASED, PlanLedgerState.DISPATCHED} and (
+            self.lease_token is None
+            or self.lease_expires_at is None
+            or self.reason is not None
+        ):
+            msg = "leased and dispatched states require exact lease metadata"
+            raise ValueError(msg)
+        if self.state is PlanLedgerState.CONSUMED and (
+            self.lease_token is None
+            or self.lease_expires_at is not None
+            or self.reason is not None
+        ):
+            msg = "consumed state requires only its exact lease token"
+            raise ValueError(msg)
+        if self.state is PlanLedgerState.QUARANTINED and (
+            self.lease_expires_at is not None or self.reason is None
+        ):
+            msg = "quarantined state requires a reason and no live deadline"
+            raise ValueError(msg)
 
     @classmethod
     def available(cls) -> PlanLedgerRecord:
         """Build the initial reusable state."""
         return cls(PlanLedgerState.AVAILABLE)
 
-    def recover(
-        self, now: datetime, owner_alive: Callable[[int], bool]
-    ) -> PlanLedgerTransition:
+    @classmethod
+    def quarantined(cls, reason: StableSymbol) -> PlanLedgerRecord:
+        """Build a terminal fail-closed state without dispatch authority."""
+        return cls(PlanLedgerState.QUARANTINED, reason=reason)
+
+    def recover(self, now: datetime) -> PlanLedgerTransition:
         """Release stale pre-dispatch work and quarantine ambiguous dispatch."""
         require_utc(now, "now")
         if (
@@ -60,15 +102,14 @@ class PlanLedgerRecord:
             return PlanLedgerTransition(PlanLedgerDecision.EXPIRED, self.available())
         if (
             self.state is PlanLedgerState.DISPATCHED
-            and self.owner_pid is not None
-            and not owner_alive(self.owner_pid)
+            and self.lease_expires_at is not None
+            and now >= self.lease_expires_at
         ):
             return PlanLedgerTransition(
                 PlanLedgerDecision.ACCEPTED,
                 PlanLedgerRecord(
                     PlanLedgerState.QUARANTINED,
                     lease_token=self.lease_token,
-                    owner_pid=self.owner_pid,
                     reason=StableSymbol("ambiguous-dispatch"),
                 ),
             )
@@ -79,7 +120,6 @@ class PlanLedgerRecord:
         *,
         token: str,
         expires_at: datetime,
-        owner_pid: int,
     ) -> PlanLedgerTransition:
         """Create one lease only from available state."""
         require_utc(expires_at, "expires_at")
@@ -91,7 +131,6 @@ class PlanLedgerRecord:
                 PlanLedgerState.LEASED,
                 lease_token=token,
                 lease_expires_at=expires_at,
-                owner_pid=owner_pid,
             ),
         )
 
@@ -109,7 +148,7 @@ class PlanLedgerRecord:
             PlanLedgerRecord(
                 PlanLedgerState.DISPATCHED,
                 lease_token=token,
-                owner_pid=self.owner_pid,
+                lease_expires_at=self.lease_expires_at,
             ),
         )
 
@@ -124,7 +163,6 @@ class PlanLedgerRecord:
             PlanLedgerRecord(
                 PlanLedgerState.CONSUMED,
                 lease_token=token,
-                owner_pid=self.owner_pid,
             ),
         )
 
@@ -144,7 +182,6 @@ class PlanLedgerRecord:
             PlanLedgerRecord(
                 PlanLedgerState.QUARANTINED,
                 lease_token=token,
-                owner_pid=self.owner_pid,
                 reason=reason,
             ),
         )

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
 
 from cqmgr.domain.time import require_utc
+
+_SHA256_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -30,6 +33,7 @@ class PlanRepositoryStatus(StrEnum):
     QUARANTINED = "quarantined"
     MISSING = "missing"
     CONFLICT = "conflict"
+    EXPIRED = "expired"
     FAILED = "failed"
 
 
@@ -51,7 +55,10 @@ class PlanLease:
 
     def __post_init__(self) -> None:
         """Require a non-empty opaque lease and UTC expiry."""
-        if not isinstance(self.digest, str) or not self.digest.startswith("sha256:"):
+        if (
+            not isinstance(self.digest, str)
+            or _SHA256_DIGEST.fullmatch(self.digest) is None
+        ):
             msg = "lease digest must use sha256"
             raise ValueError(msg)
         if not isinstance(self.token, str) or not self.token:

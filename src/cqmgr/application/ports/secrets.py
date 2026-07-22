@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import re
+import secrets
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol, Self
 
 SECRET_SERVICE_NAMESPACE = "io.nisavid.cqmgr"  # noqa: S105
 _MAXIMUM_OPAQUE_IDENTIFIER_LENGTH = 128
+_GENERATED_ITEM_ID = re.compile(r"item-[A-Za-z0-9_-]{32}\Z")
 
 
 class SecretBackendKind(StrEnum):
@@ -63,6 +66,15 @@ class SecretStoreReference:
     purpose: SecretPurpose
     item_id: str
 
+    @classmethod
+    def generate(cls, installation_id: str, purpose: SecretPurpose) -> Self:
+        """Create one collision-resistant immutable cqmgr-owned item reference."""
+        return cls(
+            installation_id=installation_id,
+            purpose=purpose,
+            item_id=f"item-{secrets.token_urlsafe(24)}",
+        )
+
     def __post_init__(self) -> None:
         """Restrict item components to bounded opaque identifiers."""
         if not isinstance(self.purpose, SecretPurpose):
@@ -75,6 +87,9 @@ class SecretStoreReference:
             if not _is_opaque_identifier(value):
                 msg = f"{name} must be a bounded opaque identifier"
                 raise ValueError(msg)
+        if _GENERATED_ITEM_ID.fullmatch(self.item_id) is None:
+            msg = "item_id must be a generated immutable reference"
+            raise ValueError(msg)
 
     @property
     def service(self) -> str:

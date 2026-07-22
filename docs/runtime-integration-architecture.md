@@ -201,6 +201,9 @@ profile, then a verified direct-user ADC identity. A plan binds the exact source
 kind, source identity, and keyed value. Apply re-resolves that same source; a
 missing keyring item or unavailable fallback fails closed without continuing to
 the next source. Plans and audit evidence retain no quota-contact value.
+Keyring references use cqmgr-owned collision-resistant random item identities.
+Secrets are create-once; rotation creates and verifies a new immutable item and
+atomically switches only the non-secret reference.
 
 ## V1 capability boundaries
 
@@ -275,6 +278,10 @@ One local consumption ledger enforces single use. Apply acquires an exclusive
 lease and records consumption before the provider call. A dispatched plan is
 never reusable. An interrupted or ambiguous dispatch quarantines the plan and
 requires deterministic provider reconciliation or a new Preview.
+Recovery uses the durable lease deadline and ledger state, not process-ID
+liveness. Before the deadline an abandoned dispatch remains inapplicable; at
+the deadline it becomes quarantined. Missing ledger state beside plan bytes is
+ambiguous and quarantined rather than reconstructed as available.
 
 Storage ports express these behaviors directly:
 

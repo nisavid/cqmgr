@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import hmac
+from importlib import import_module
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
 
 from keyring.errors import InitError, KeyringError, KeyringLocked
@@ -18,9 +20,19 @@ from cqmgr.application.ports.secrets import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from cqmgr.adapters.persistence.native_plan_lock import NativePlanInterprocessLock
 
 _VALUE_PREFIX = "cqmgr-secret/v1:"
+_NATIVE_BACKEND_IDENTITIES = {
+    ("keyring.backends.macOS", "Keyring"): SecretBackendKind.MACOS_KEYCHAIN,
+    (
+        "keyring.backends.Windows",
+        "WinVaultKeyring",
+    ): SecretBackendKind.WINDOWS_CREDENTIAL_LOCKER,
+    ("keyring.backends.SecretService", "Keyring"): SecretBackendKind.SECRET_SERVICE,
+}
 
 
 class _KeyringBackend(Protocol):
@@ -35,14 +47,19 @@ class NativeSecretStore:
     """Create-once native-store operations with cqmgr process serialization."""
 
     def __init__(
-        self, backend: _KeyringBackend, lock: NativePlanInterprocessLock
+        self,
+        backend: _KeyringBackend,
+        lock: NativePlanInterprocessLock,
     ) -> None:
-        """Classify an injected in-process backend without accessing it."""
+        """Classify an injected backend against trusted concrete class identities."""
         self._backend = backend
         self._lock = lock
         backend_type = type(backend)
         self._backend_identity = f"{backend_type.__module__}.{backend_type.__name__}"
-        self._kind = _classify_backend(backend_type.__module__, backend_type.__name__)
+        trusted = _trusted_native_backend_types()
+        self._kind = trusted.get(backend_type) or _classify_blocked_backend(
+            backend_type.__module__, backend_type.__name__
+        )
 
     def probe(self) -> SecretStoreProbe:
         """Return the allowlist classification without opening the keyring."""
@@ -52,8 +69,11 @@ class NativeSecretStore:
         """Read one exact item under the shared cqmgr keyring lock."""
         if not self.probe().mutation_capable:
             return SecretStoreOutcome(SecretStoreStatus.UNSUPPORTED)
-        with self._lock:
-            return self._get_unlocked(reference)
+        try:
+            with self._lock:
+                return self._get_unlocked(reference)
+        except Exception as error:  # noqa: BLE001
+            return _failure(error)
 
     def create(  # noqa: PLR0911
         self, reference: SecretStoreReference, secret: SecretValue
@@ -62,39 +82,39 @@ class NativeSecretStore:
         if not self.probe().mutation_capable:
             return SecretStoreOutcome(SecretStoreStatus.UNSUPPORTED)
         encoded = _encode(secret)
-        with self._lock:
-            existing = self._get_raw(reference)
-            if isinstance(existing, SecretStoreOutcome):
-                if existing.status is not SecretStoreStatus.MISSING:
-                    return existing
-            else:
-                return SecretStoreOutcome(SecretStoreStatus.CONFLICT)
-            try:
+        try:
+            with self._lock:
+                existing = self._get_raw(reference)
+                if isinstance(existing, SecretStoreOutcome):
+                    if existing.status is not SecretStoreStatus.MISSING:
+                        return existing
+                else:
+                    return SecretStoreOutcome(SecretStoreStatus.CONFLICT)
                 self._backend.set_password(
                     reference.service, reference.username, encoded
                 )
-            except Exception as error:  # noqa: BLE001
-                return _failure(error)
-            verified = self._get_raw(reference)
-            if isinstance(verified, SecretStoreOutcome):
-                return verified
-            if not hmac.compare_digest(verified, encoded):
-                return SecretStoreOutcome(SecretStoreStatus.CONFLICT)
-            return SecretStoreOutcome(SecretStoreStatus.CREATED)
+                verified = self._get_raw(reference)
+                if isinstance(verified, SecretStoreOutcome):
+                    return verified
+                if not hmac.compare_digest(verified, encoded):
+                    return SecretStoreOutcome(SecretStoreStatus.CONFLICT)
+                return SecretStoreOutcome(SecretStoreStatus.CREATED)
+        except Exception as error:  # noqa: BLE001
+            return _failure(error)
 
     def delete(self, reference: SecretStoreReference) -> SecretStoreOutcome:
         """Delete one existing exact item without exposing its value."""
         if not self.probe().mutation_capable:
             return SecretStoreOutcome(SecretStoreStatus.UNSUPPORTED)
-        with self._lock:
-            existing = self._get_raw(reference)
-            if isinstance(existing, SecretStoreOutcome):
-                return existing
-            try:
+        try:
+            with self._lock:
+                existing = self._get_raw(reference)
+                if isinstance(existing, SecretStoreOutcome):
+                    return existing
                 self._backend.delete_password(reference.service, reference.username)
-            except Exception as error:  # noqa: BLE001
-                return _failure(error)
-            return SecretStoreOutcome(SecretStoreStatus.DELETED)
+                return SecretStoreOutcome(SecretStoreStatus.DELETED)
+        except Exception as error:  # noqa: BLE001
+            return _failure(error)
 
     def _get_unlocked(self, reference: SecretStoreReference) -> SecretStoreOutcome:
         raw = self._get_raw(reference)
@@ -148,16 +168,26 @@ def _decode(value: str) -> SecretValue:
     return SecretValue(decoded)
 
 
-def _classify_backend(  # noqa: PLR0911
+def _trusted_native_backend_types() -> Mapping[type[object], SecretBackendKind]:
+    trusted: dict[type[object], SecretBackendKind] = {}
+    for (module_name, class_name), kind in _NATIVE_BACKEND_IDENTITIES.items():
+        try:
+            module = import_module(module_name)
+        except (ImportError, OSError):
+            continue
+        backend_type = getattr(module, class_name, None)
+        if (
+            isinstance(backend_type, type)
+            and backend_type.__module__ == module_name
+            and getattr(module, class_name) is backend_type
+        ):
+            trusted[backend_type] = kind
+    return MappingProxyType(trusted)
+
+
+def _classify_blocked_backend(  # noqa: PLR0911
     module: str, name: str
 ) -> SecretBackendKind:
-    identity = (module, name)
-    if identity == ("keyring.backends.macOS", "Keyring"):
-        return SecretBackendKind.MACOS_KEYCHAIN
-    if identity == ("keyring.backends.Windows", "WinVaultKeyring"):
-        return SecretBackendKind.WINDOWS_CREDENTIAL_LOCKER
-    if identity == ("keyring.backends.SecretService", "Keyring"):
-        return SecretBackendKind.SECRET_SERVICE
     if module == "keyring.backends.kwallet":
         return SecretBackendKind.KWALLET
     if module == "keyring.backends.fail":
@@ -168,6 +198,9 @@ def _classify_backend(  # noqa: PLR0911
         return SecretBackendKind.PLAINTEXT
     if name == "EncryptedKeyring" or "file" in module.lower():
         return SecretBackendKind.FILE_BACKED
-    if name.casefold().endswith("keyring"):
+    if (
+        name.casefold().endswith("keyring")
+        or (module, name) in _NATIVE_BACKEND_IDENTITIES
+    ):
         return SecretBackendKind.THIRD_PARTY
     return SecretBackendKind.UNKNOWN
