@@ -1,0 +1,49 @@
+{
+  "pages": [
+    {
+      "items": {
+        "zones/us-central1-a": {
+          "machineTypes": [
+            {
+              "name": "a3-highgpu-8g",
+              "accelerators": [
+                {
+                  "guestAcceleratorType": "nvidia-h100-80gb",
+                  "guestAcceleratorCount": 8
+                }
+              ],
+              "deprecated": {"state": "DEPRECATED"}
+            }
+          ]
+        }
+      },
+      "nextPageToken": "public-compute-page-2",
+      "unreachables": []
+    },
+    {
+      "items": {
+        "zones/us-central1-b": {
+          "machineTypes": [
+            {
+              "name": "ct6e-standard-4t",
+              "accelerators": [
+                {
+                  "guestAcceleratorType": "tpu-v6e",
+                  "guestAcceleratorCount": 4
+                }
+              ]
+            }
+          ]
+        },
+        "zones/us-east1-d": {
+          "warning": {
+            "code": "NO_RESULTS_ON_PAGE",
+            "message": "Public documentation example: no matching machine types."
+          }
+        }
+      },
+      "nextPageToken": "",
+      "unreachables": ["zones/us-west8-a"]
+    }
+  ]
+}
