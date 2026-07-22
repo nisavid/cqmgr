@@ -206,7 +206,7 @@ def test_compute_reader_keeps_valid_items_when_a_scope_item_is_malformed() -> No
         name="a3-highgpu-8g",
         zone="us-central1-a",
         self_link=(
-            "https://www.googleapis.com/compute/v1/projects/123456789/"
+            "https://www.googleapis.com/compute/v1/projects/public-schema-project/"
             "zones/us-central1-a/machineTypes/a3-highgpu-8g"
         ),
         deprecated=compute_v1.DeprecationStatus(state="PROVIDER_NEW_STATE"),
@@ -215,7 +215,7 @@ def test_compute_reader_keeps_valid_items_when_a_scope_item_is_malformed() -> No
         name="bad-shape",
         zone="us-central1-a",
         self_link=(
-            "https://www.googleapis.com/compute/v1/projects/123456789/"
+            "https://www.googleapis.com/compute/v1/projects/public-schema-project/"
             "zones/us-central1-a/machineTypes/bad-shape"
         ),
         accelerators=[
@@ -266,7 +266,8 @@ def test_compute_reader_rejects_items_outside_the_requested_project_and_zone() -
                         name="ct6e-standard-4t",
                         zone="us-east1-b",
                         self_link=(
-                            "https://www.googleapis.com/compute/v1/projects/123456789/"
+                            "https://www.googleapis.com/compute/v1/projects/"
+                            "public-schema-project/"
                             "zones/us-east1-b/machineTypes/ct6e-standard-4t"
                         ),
                     ),
@@ -274,7 +275,8 @@ def test_compute_reader_rejects_items_outside_the_requested_project_and_zone() -
                         name="a3-highgpu-8g",
                         zone="us-central1-a",
                         self_link=(
-                            "https://www.googleapis.com/compute/v1/projects/123456789/"
+                            "https://www.googleapis.com/compute/v1/projects/"
+                            "public-schema-project/"
                             "zones/us-central1-a/machineTypes/another-machine"
                         ),
                     ),
