@@ -70,6 +70,9 @@ class InterfaceSettings:
 
     def get(self, key: InterfaceSettingKey) -> bool:
         """Read one public interface setting."""
+        if not isinstance(key, InterfaceSettingKey):
+            msg = "interface setting key must be an InterfaceSettingKey"
+            raise TypeError(msg)
         if key is InterfaceSettingKey.NO_COLOR:
             return self.no_color
         if key is InterfaceSettingKey.VIM_NAVIGATION:
@@ -83,6 +86,9 @@ class InterfaceSettings:
         value: bool,
     ) -> InterfaceSettings:
         """Return settings with one validated public key changed."""
+        if not isinstance(key, InterfaceSettingKey):
+            msg = "interface setting key must be an InterfaceSettingKey"
+            raise TypeError(msg)
         if not isinstance(value, bool):
             msg = "interface setting value must be bool"
             raise TypeError(msg)
