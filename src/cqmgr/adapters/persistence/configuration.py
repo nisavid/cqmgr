@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -22,6 +23,7 @@ from cqmgr.application.configuration import (
     ConfigSnapshot,
     InterfaceSettings,
     Profile,
+    QuotaContactKeyringReference,
     SelectionState,
 )
 from cqmgr.application.ports.configuration import (
@@ -182,9 +184,16 @@ def _decode_config(document: dict[str, object]) -> ConfigSnapshot:
                         profile.get("adc_quota_project"),
                         f"profiles.{name}.adc_quota_project",
                     ),
-                    quota_contact_keyring_reference=_optional_string(
-                        profile.get("quota_contact_keyring_reference"),
-                        f"profiles.{name}.quota_contact_keyring_reference",
+                    quota_contact_keyring_reference=(
+                        QuotaContactKeyringReference.parse(reference)
+                        if (
+                            reference := _optional_string(
+                                profile.get("quota_contact_keyring_reference"),
+                                f"profiles.{name}.quota_contact_keyring_reference",
+                            )
+                        )
+                        is not None
+                        else None
                     ),
                     interface=_interface(
                         profile.get("interface"),
@@ -278,7 +287,7 @@ def _render_config(snapshot: ConfigSnapshot) -> str:
         if profile.quota_contact_keyring_reference is not None:
             lines.append(
                 "quota_contact_keyring_reference = "
-                + _toml_string(profile.quota_contact_keyring_reference)
+                + _toml_string(profile.quota_contact_keyring_reference.canonical_name)
             )
         lines.extend(("", f"[profiles.{profile_name}.interface]"))
         lines.extend(_render_interface(profile.interface))
@@ -374,8 +383,7 @@ class TomlConfigRepository:
             else ConfigSnapshot()
         )
 
-    def read(self) -> ConfigSnapshot:
-        """Read a validated snapshot while recovering abandoned temp files."""
+    def _read(self) -> ConfigSnapshot:
         try:
             with _exclusive_lock(self._lock_path):
                 _cleanup_temporary_files(self._path)
@@ -383,8 +391,11 @@ class TomlConfigRepository:
         except OSError as error:
             raise _operational_error(self._path, error) from error
 
-    def update(self, transform: ConfigTransform) -> ConfigSnapshot:
-        """Serialize one atomic read-modify-write configuration update."""
+    async def read(self) -> ConfigSnapshot:
+        """Read a validated snapshot without blocking the application loop."""
+        return await asyncio.to_thread(self._read)
+
+    def _update(self, transform: ConfigTransform) -> ConfigSnapshot:
         try:
             with _exclusive_lock(self._lock_path):
                 _cleanup_temporary_files(self._path)
@@ -396,6 +407,10 @@ class TomlConfigRepository:
                 return updated
         except OSError as error:
             raise _operational_error(self._path, error) from error
+
+    async def update(self, transform: ConfigTransform) -> ConfigSnapshot:
+        """Serialize one atomic update without blocking the application loop."""
+        return await asyncio.to_thread(self._update, transform)
 
 
 class TomlSelectionStateRepository:
@@ -413,8 +428,7 @@ class TomlSelectionStateRepository:
             else SelectionState()
         )
 
-    def read(self) -> SelectionState:
-        """Read validated selection state while recovering abandoned temp files."""
+    def _read(self) -> SelectionState:
         try:
             with _exclusive_lock(self._lock_path):
                 _cleanup_temporary_files(self._path)
@@ -422,8 +436,11 @@ class TomlSelectionStateRepository:
         except OSError as error:
             raise _operational_error(self._path, error) from error
 
-    def update(self, transform: SelectionTransform) -> SelectionState:
-        """Serialize one atomic read-modify-write state update."""
+    async def read(self) -> SelectionState:
+        """Read validated state without blocking the application loop."""
+        return await asyncio.to_thread(self._read)
+
+    def _update(self, transform: SelectionTransform) -> SelectionState:
         try:
             with _exclusive_lock(self._lock_path):
                 _cleanup_temporary_files(self._path)
@@ -435,3 +452,7 @@ class TomlSelectionStateRepository:
                 return updated
         except OSError as error:
             raise _operational_error(self._path, error) from error
+
+    async def update(self, transform: SelectionTransform) -> SelectionState:
+        """Serialize one atomic update without blocking the application loop."""
+        return await asyncio.to_thread(self._update, transform)

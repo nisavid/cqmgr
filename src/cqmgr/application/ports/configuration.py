@@ -19,11 +19,11 @@ class UnsupportedConfigurationSchemaError(ConfigurationRepositoryError):
 class ConfigRepository(Protocol):
     """Read and atomically update operator-owned configuration."""
 
-    def read(self) -> ConfigSnapshot:
+    async def read(self) -> ConfigSnapshot:
         """Read one validated, migrated snapshot."""
         ...  # pragma: no cover
 
-    def update(self, transform: ConfigTransform) -> ConfigSnapshot:
+    async def update(self, transform: ConfigTransform) -> ConfigSnapshot:
         """Atomically apply one read-modify-write transformation."""
         ...  # pragma: no cover
 
@@ -31,11 +31,11 @@ class ConfigRepository(Protocol):
 class SelectionStateRepository(Protocol):
     """Read and atomically update independent mutable selection state."""
 
-    def read(self) -> SelectionState:
+    async def read(self) -> SelectionState:
         """Read one validated, migrated state snapshot."""
         ...  # pragma: no cover
 
-    def update(self, transform: SelectionTransform) -> SelectionState:
+    async def update(self, transform: SelectionTransform) -> SelectionState:
         """Atomically apply one read-modify-write transformation."""
         ...  # pragma: no cover
 

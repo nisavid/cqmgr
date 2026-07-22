@@ -12,6 +12,7 @@ CONFIG_SCHEMA = "cqmgr.config/v1"
 SELECTION_STATE_SCHEMA = "cqmgr.selection-state/v1"
 
 _PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_QUOTA_CONTACT_KEYRING_PREFIX = "cqmgr:quota-contact:"
 
 
 class ConfigurationError(ValueError):
@@ -107,13 +108,69 @@ class InterfaceSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class QuotaContactKeyringReference:
+    """Closed native-keyring item identity for one profile's quota contact."""
+
+    profile_name: str
+
+    def __post_init__(self) -> None:
+        """Restrict references to the same safe grammar as profile identity."""
+        if (
+            not isinstance(self.profile_name, str)
+            or _PROFILE_NAME.fullmatch(self.profile_name) is None
+        ):
+            msg = "quota-contact keyring reference profile name is invalid"
+            raise ValueError(msg)
+
+    @classmethod
+    def parse(cls, value: str) -> QuotaContactKeyringReference:
+        """Parse only the complete cqmgr-owned native-keyring reference grammar."""
+        if not isinstance(value, str):
+            msg = "quota-contact keyring reference must be a string"
+            raise TypeError(msg)
+        if not value.startswith(_QUOTA_CONTACT_KEYRING_PREFIX):
+            msg = "quota-contact keyring reference must use the cqmgr keyring grammar"
+            raise ValueError(msg)
+        profile_name = value.removeprefix(_QUOTA_CONTACT_KEYRING_PREFIX)
+        try:
+            reference = cls(profile_name)
+        except ValueError as error:
+            msg = "quota-contact keyring reference must use the cqmgr keyring grammar"
+            raise ValueError(msg) from error
+        if reference.canonical_name != value:
+            msg = "quota-contact keyring reference must use the cqmgr keyring grammar"
+            raise ValueError(msg)
+        return reference
+
+    @property
+    def backend(self) -> str:
+        """Name the required native OS-keyring backend class."""
+        return "os-keyring"
+
+    @property
+    def service(self) -> str:
+        """Return the fixed keyring service name."""
+        return "cqmgr"
+
+    @property
+    def account(self) -> str:
+        """Return the non-secret keyring account identity."""
+        return f"quota-contact:{self.profile_name}"
+
+    @property
+    def canonical_name(self) -> str:
+        """Return the validated persisted reference representation."""
+        return f"{_QUOTA_CONTACT_KEYRING_PREFIX}{self.profile_name}"
+
+
+@dataclass(frozen=True, slots=True)
 class Profile:
     """One declarative local profile without credentials or operation intent."""
 
     name: str
     resource_scope: ResourceScope | None = None
     adc_quota_project: ResourceScope | None = None
-    quota_contact_keyring_reference: str | None = None
+    quota_contact_keyring_reference: QuotaContactKeyringReference | None = None
     interface: InterfaceSettings = InterfaceSettings()
 
     def __post_init__(self) -> None:
@@ -137,13 +194,16 @@ class Profile:
                 msg = "ADC quota project must be a canonical project resource scope"
                 raise ValueError(msg)
         reference = self.quota_contact_keyring_reference
-        if reference is not None and (
-            not isinstance(reference, str)
-            or not reference
-            or any(character.isspace() for character in reference)
-        ):
-            msg = "quota-contact keyring reference must be a non-empty opaque token"
-            raise ValueError(msg)
+        if reference is not None:
+            if not isinstance(reference, QuotaContactKeyringReference):
+                msg = (
+                    "quota-contact keyring reference must be a "
+                    "QuotaContactKeyringReference"
+                )
+                raise TypeError(msg)
+            if reference.profile_name != self.name:
+                msg = "quota-contact keyring reference must match the profile name"
+                raise ValueError(msg)
         if not isinstance(self.interface, InterfaceSettings):
             msg = "profile interface must be InterfaceSettings"
             raise TypeError(msg)

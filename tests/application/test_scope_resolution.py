@@ -12,6 +12,7 @@ from cqmgr.application.configuration import (
     InterfaceSettings,
     Profile,
     ProfileResourceScopeError,
+    QuotaContactKeyringReference,
     ScopeResolutionSource,
     SelectionState,
     UnsupportedResourceScopeError,
@@ -129,3 +130,50 @@ def test_interface_settings_reject_non_enum_keys() -> None:
         settings.get(invalid)
     with pytest.raises(TypeError, match="InterfaceSettingKey"):
         settings.replace(invalid, value=True)
+
+
+def test_quota_contact_uses_a_closed_profile_bound_os_keyring_reference() -> None:
+    """Profiles can retain only safe native-keyring item identity metadata."""
+    reference = QuotaContactKeyringReference("primary")
+
+    assert reference.canonical_name == "cqmgr:quota-contact:primary"
+    assert reference.service == "cqmgr"
+    assert reference.account == "quota-contact:primary"
+    assert (
+        Profile(
+            name="primary",
+            quota_contact_keyring_reference=reference,
+        ).quota_contact_keyring_reference
+        == reference
+    )
+
+    with pytest.raises(TypeError, match="QuotaContactKeyringReference"):
+        Profile(
+            name="primary",
+            quota_contact_keyring_reference=cast(
+                "QuotaContactKeyringReference",
+                "operator@example.com",
+            ),
+        )
+    with pytest.raises(ValueError, match="profile name"):
+        Profile(
+            name="primary",
+            quota_contact_keyring_reference=QuotaContactKeyringReference("secondary"),
+        )
+
+
+@pytest.mark.parametrize(
+    "unsafe_value",
+    [
+        "operator@example.com",
+        "raw quota contact",
+        "credential-json",
+        "cqmgr:quota-contact:operator@example.com",
+    ],
+)
+def test_keyring_reference_parser_rejects_raw_contact_and_credentials(
+    unsafe_value: str,
+) -> None:
+    """Only the complete closed cqmgr native-keyring grammar is accepted."""
+    with pytest.raises(ValueError, match="keyring reference"):
+        QuotaContactKeyringReference.parse(unsafe_value)
