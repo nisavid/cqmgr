@@ -6,17 +6,22 @@ import stat
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+import cqmgr.adapters.persistence.quota_snapshots as persistence
 from cqmgr.adapters.persistence.quota_snapshots import FilesystemQuotaQuerySnapshots
 from cqmgr.application.ports.quota_snapshots import (
     ExpiredQuotaCursorError,
+    ExpiredQuotaSnapshotError,
     MalformedQuotaCursorError,
     QuotaCursorQueryMismatchError,
     QuotaSnapshotConflictError,
+    QuotaSnapshotNotFoundError,
     QuotaSnapshotOperationalError,
     QuotaSnapshotStoredDataError,
+    ResolvedQuotaQueryCursor,
     UnknownQuotaCursorError,
     UnsupportedQuotaSnapshotSchemaError,
 )
@@ -287,3 +292,210 @@ def test_repository_rejects_newer_and_corrupt_snapshot_state(tmp_path: Path) -> 
     path.write_text("not-json")
     with pytest.raises(QuotaSnapshotStoredDataError):
         repository.load(snapshot.metadata.snapshot_id, now=NOW)
+
+
+def test_repository_boundaries_reject_wrong_types_and_unknown_snapshots(
+    tmp_path: Path,
+) -> None:
+    """Application inputs cannot be coerced into repository identities or records."""
+    with pytest.raises(TypeError, match="root must be a Path"):
+        FilesystemQuotaQuerySnapshots(cast("Path", str(tmp_path)))
+    repository = FilesystemQuotaQuerySnapshots(tmp_path / "snapshots")
+    with pytest.raises(TypeError, match="QuotaQuerySnapshot"):
+        repository.save(cast("QuotaQuerySnapshot", object()))
+    for snapshot_id in ("", cast("str", 1)):
+        with pytest.raises(ValueError, match="snapshot_id"):
+            repository.load(snapshot_id, now=NOW)
+    with pytest.raises(TypeError, match="now must be a datetime"):
+        repository.load("snapshot-1", now=cast("datetime", "now"))
+    with pytest.raises(QuotaSnapshotNotFoundError):
+        repository.load("snapshot-unknown", now=NOW)
+
+
+def test_repository_reports_direct_snapshot_expiry(tmp_path: Path) -> None:
+    """Expired evidence cannot be loaded outside cursor resolution either."""
+    repository = FilesystemQuotaQuerySnapshots(tmp_path / "snapshots")
+    snapshot = _snapshot()
+    repository.save(snapshot)
+
+    with pytest.raises(ExpiredQuotaSnapshotError):
+        repository.load(snapshot.metadata.snapshot_id, now=snapshot.metadata.expires_at)
+
+
+@pytest.mark.parametrize("offset", [True, -1, 2, 1.5])
+def test_cursor_issue_rejects_positions_outside_the_snapshot(
+    tmp_path: Path,
+    offset: object,
+) -> None:
+    """Continuation positions stay integral and within retained row bounds."""
+    repository = FilesystemQuotaQuerySnapshots(tmp_path / "snapshots")
+    snapshot = _snapshot()
+    repository.save(snapshot)
+
+    with pytest.raises(MalformedQuotaCursorError, match="outside"):
+        repository.issue(snapshot.metadata.snapshot_id, cast("int", offset), now=NOW)
+
+
+@pytest.mark.parametrize("token", ["short", "!" * 43, cast("str", 1)])
+def test_cursor_issue_rejects_nonopaque_token_sources(
+    tmp_path: Path,
+    token: str,
+) -> None:
+    """A broken randomness source cannot publish guessable or malformed handles."""
+    repository = FilesystemQuotaQuerySnapshots(
+        tmp_path / "snapshots",
+        token_factory=lambda: token,
+    )
+    snapshot = _snapshot()
+    repository.save(snapshot)
+
+    with pytest.raises(MalformedQuotaCursorError, match="token source"):
+        repository.issue(snapshot.metadata.snapshot_id, 0, now=NOW)
+
+
+def test_cursor_issue_stops_after_repeated_random_collision(tmp_path: Path) -> None:
+    """A stuck randomness source preserves the existing binding and fails closed."""
+    repository = FilesystemQuotaQuerySnapshots(
+        tmp_path / "snapshots",
+        token_factory=lambda: TOKEN,
+    )
+    snapshot = _snapshot()
+    repository.save(snapshot)
+    repository.issue(snapshot.metadata.snapshot_id, 0, now=NOW)
+
+    with pytest.raises(QuotaSnapshotOperationalError, match="unique"):
+        repository.issue(snapshot.metadata.snapshot_id, 1, now=NOW)
+    assert repository.resolve(TOKEN, now=NOW).offset == 0
+
+
+def test_cursor_resolution_rejects_missing_snapshot_and_out_of_range_binding(
+    tmp_path: Path,
+) -> None:
+    """A binding never authorizes missing evidence or a position beyond its rows."""
+    root = tmp_path / "snapshots"
+    repository = FilesystemQuotaQuerySnapshots(root, token_factory=lambda: TOKEN)
+    snapshot = _snapshot()
+    repository.save(snapshot)
+    cursor = repository.issue(snapshot.metadata.snapshot_id, 0, now=NOW)
+    snapshot_path = next((root / "snapshots").glob("*.json"))
+    snapshot_bytes = snapshot_path.read_bytes()
+    snapshot_path.unlink()
+    with pytest.raises(UnknownQuotaCursorError):
+        repository.resolve(cursor.value, now=NOW)
+
+    snapshot_path.write_bytes(snapshot_bytes)
+    cursor_path = next((root / "cursors").glob("*.json"))
+    cursor_path.write_bytes(
+        b'{"offset":2,"schema":"cqmgr.quota-query-cursor/v1",'
+        b'"snapshot_id":"snapshot-public-1"}\n'
+    )
+    with pytest.raises(QuotaSnapshotStoredDataError, match="exceeds"):
+        repository.resolve(cursor.value, now=NOW)
+
+
+def test_repository_rejects_mismatched_snapshot_identity_on_disk(
+    tmp_path: Path,
+) -> None:
+    """The hashed lookup key cannot be rebound by copying another valid record."""
+    repository = FilesystemQuotaQuerySnapshots(tmp_path / "snapshots")
+    snapshot = _snapshot()
+    repository.save(snapshot)
+    stored_path = next((tmp_path / "snapshots" / "snapshots").glob("*.json"))
+    requested_path = repository._snapshot_path("snapshot-other")  # noqa: SLF001
+    requested_path.write_bytes(stored_path.read_bytes())
+
+    with pytest.raises(QuotaSnapshotStoredDataError, match="identity"):
+        repository.load("snapshot-other", now=NOW)
+
+
+def test_repository_translates_filesystem_failures_and_cleans_temporary_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed publication returns an operational outcome without partial files."""
+    repository = FilesystemQuotaQuerySnapshots(tmp_path / "snapshots")
+    snapshot = _snapshot()
+
+    def fail_link(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError
+
+    monkeypatch.setattr(persistence.os, "link", fail_link)
+    with pytest.raises(QuotaSnapshotOperationalError, match="PermissionError"):
+        repository.save(snapshot)
+    assert list((tmp_path / "snapshots").rglob("*.tmp")) == []
+
+
+def test_repository_rejects_symlinked_storage_directory(tmp_path: Path) -> None:
+    """Installation-local state cannot be redirected through a directory symlink."""
+    target = tmp_path / "target"
+    target.mkdir()
+    root = tmp_path / "snapshots"
+    root.symlink_to(target, target_is_directory=True)
+    repository = FilesystemQuotaQuerySnapshots(root)
+
+    with pytest.raises(QuotaSnapshotOperationalError, match="symlink"):
+        repository.save(_snapshot())
+
+
+def test_repository_translates_read_and_cursor_publication_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Filesystem denial remains a typed local failure at every public operation."""
+    repository = FilesystemQuotaQuerySnapshots(
+        tmp_path / "snapshots",
+        token_factory=lambda: TOKEN,
+    )
+    snapshot = _snapshot()
+    repository.save(snapshot)
+
+    def deny_read(_path: Path) -> bytes:
+        raise PermissionError
+
+    monkeypatch.setattr(persistence, "_read_trusted_file", deny_read)
+    with pytest.raises(QuotaSnapshotOperationalError, match="PermissionError"):
+        repository.load(snapshot.metadata.snapshot_id, now=NOW)
+    with pytest.raises(QuotaSnapshotOperationalError, match="PermissionError"):
+        repository.resolve(TOKEN, now=NOW)
+
+    monkeypatch.undo()
+
+    original_publish = persistence._publish_exclusive  # noqa: SLF001
+
+    def selectively_deny_cursor(path: Path, data: bytes) -> None:
+        if path.parent.name == "cursors":
+            raise PermissionError
+        original_publish(path, data)
+
+    monkeypatch.setattr(persistence, "_publish_exclusive", selectively_deny_cursor)
+    with pytest.raises(QuotaSnapshotOperationalError, match="PermissionError"):
+        repository.issue(snapshot.metadata.snapshot_id, 0, now=NOW)
+
+
+def test_repository_rejects_nonregular_state_and_unusable_root(tmp_path: Path) -> None:
+    """State reads and private-directory preparation reject filesystem aliases."""
+    root = tmp_path / "snapshots"
+    repository = FilesystemQuotaQuerySnapshots(root)
+    snapshot = _snapshot()
+    repository.save(snapshot)
+    snapshot_path = next((root / "snapshots").glob("*.json"))
+    snapshot_path.unlink()
+    snapshot_path.mkdir()
+    with pytest.raises(QuotaSnapshotOperationalError, match="regular file"):
+        repository.load(snapshot.metadata.snapshot_id, now=NOW)
+
+    unusable = tmp_path / "not-a-directory"
+    unusable.write_text("occupied")
+    with pytest.raises(QuotaSnapshotOperationalError, match="FileExistsError"):
+        FilesystemQuotaQuerySnapshots(unusable).save(snapshot)
+
+
+def test_resolved_cursor_requires_a_snapshot_and_nonnegative_offset() -> None:
+    """The application cursor port exposes only typed validated resolutions."""
+    snapshot = _snapshot()
+    assert ResolvedQuotaQueryCursor(snapshot, 0).snapshot == snapshot
+    with pytest.raises(TypeError, match="snapshot"):
+        ResolvedQuotaQueryCursor(cast("QuotaQuerySnapshot", object()), 0)
+    for offset in (True, -1, 1.5):
+        with pytest.raises(ValueError, match="offset"):
+            ResolvedQuotaQueryCursor(snapshot, cast("int", offset))
