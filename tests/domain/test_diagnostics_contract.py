@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import fields
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import pytest
 
@@ -19,9 +19,6 @@ from cqmgr.domain.diagnostics import (
     Severity,
 )
 from cqmgr.domain.redaction import REDACTION_MARKER, RedactedText
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable
 
 
 def _diagnostic(code: str, *, severity: Severity = Severity.ERROR) -> Diagnostic:
@@ -216,7 +213,7 @@ def test_diagnostics_preserves_order_and_returns_new_values_on_append() -> None:
 
 def test_diagnostics_rejects_untyped_items() -> None:
     """The ordered collection cannot become an untyped message list."""
-    unsafe_items = cast("Iterable[Diagnostic]", ("unsafe raw diagnostic",))
+    unsafe_items = cast("tuple[Diagnostic, ...]", ("unsafe raw diagnostic",))
 
     with pytest.raises(TypeError, match="only Diagnostic"):
         Diagnostics(unsafe_items)
