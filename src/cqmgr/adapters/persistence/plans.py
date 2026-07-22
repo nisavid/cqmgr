@@ -51,19 +51,39 @@ _PRIVATE_DIRECTORY_MODE = 0o700
 _WINDOWS_PRIVATE_ACL_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
 $target = $env:CQMGR_ACL_TARGET
-$acl = Get-Acl -LiteralPath $target
-$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+try {
+    $acl = Get-Acl -LiteralPath $target
+} catch {
+    exit 11
+}
+try {
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+} catch {
+    exit 12
+}
 $inheritance = ''
 if (Test-Path -LiteralPath $target -PathType Container) {
     $inheritance = 'OICI'
 }
 $sddl = "D:P(A;${inheritance};FA;;;$($identity.Value))"
-$acl.SetSecurityDescriptorSddlForm(
-    $sddl,
-    [System.Security.AccessControl.AccessControlSections]::Access
-)
-Set-Acl -LiteralPath $target -AclObject $acl
-$verifiedAcl = Get-Acl -LiteralPath $target
+try {
+    $acl.SetSecurityDescriptorSddlForm(
+        $sddl,
+        [System.Security.AccessControl.AccessControlSections]::Access
+    )
+} catch {
+    exit 13
+}
+try {
+    Set-Acl -LiteralPath $target -AclObject $acl
+} catch {
+    exit 14
+}
+try {
+    $verifiedAcl = Get-Acl -LiteralPath $target
+} catch {
+    exit 15
+}
 $verified = @($verifiedAcl.Access)
 if (-not $verifiedAcl.AreAccessRulesProtected) {
     exit 21
@@ -71,9 +91,13 @@ if (-not $verifiedAcl.AreAccessRulesProtected) {
 if ($verified.Count -ne 1) {
     exit 22
 }
-$verifiedIdentity = $verified[0].IdentityReference.Translate(
-    [System.Security.Principal.SecurityIdentifier]
-)
+try {
+    $verifiedIdentity = $verified[0].IdentityReference.Translate(
+        [System.Security.Principal.SecurityIdentifier]
+    )
+} catch {
+    exit 23
+}
 if ($verifiedIdentity.Value -ne $identity.Value) {
     exit 23
 }
