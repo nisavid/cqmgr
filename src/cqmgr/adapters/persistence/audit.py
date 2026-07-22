@@ -71,6 +71,7 @@ _WINDOWS_MACHINE_PATH_PATTERN: Final = re.compile(
     r"(?i)(?<!\w)(?:[A-Z]:[\\/]|\\\\)[^\s,;]+"
 )
 _RAW_PROVIDER_BODY_PATTERN: Final = re.compile(r"(?s)(?:\{.*\}|\[.*\])")
+_RAW_PROVIDER_BODY_FACT_NAMES: Final = frozenset({"provider-body"})
 _GOOGLE_ACCESS_TOKEN_PATTERN: Final = re.compile(r"(?<!\w)ya29\.[A-Za-z0-9._~-]+")
 
 
@@ -245,7 +246,13 @@ class FilesystemAuditJournal:
                 scrub(draft.correlation_id) if draft.correlation_id else None
             ),
             facts=tuple(
-                AuditFact(fact.name, scrub(fact.value)) for fact in draft.facts
+                AuditFact(
+                    fact.name,
+                    RedactedText(REDACTION_MARKER)
+                    if fact.name.value in _RAW_PROVIDER_BODY_FACT_NAMES
+                    else scrub(fact.value),
+                )
+                for fact in draft.facts
             ),
         )
 

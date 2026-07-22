@@ -64,6 +64,31 @@ def test_every_pre_dispatch_failure_proves_zero_provider_writes(
     assert provider_writes == 0
 
 
+def test_successful_dispatch_records_and_returns_terminal_result() -> None:
+    """A provider result becomes successful only after its durable terminal record."""
+    recorded: list[str] = []
+
+    async def dispatch() -> str:
+        return "provider-accepted"
+
+    result = asyncio.run(
+        AuditedWriteCoordinator[str]().run(
+            hooks=WriteSafetyHooks(
+                pre_dispatch=(lambda: None,),
+                record_terminal=recorded.append,
+                record_critical_unknown=lambda _outcome: None,
+                quarantine=lambda _identity: None,
+            ),
+            dispatch=dispatch,
+            reconciliation_identity=RedactedText("quotaPreferences/request-1"),
+            quarantine_identity=RedactedText("plan-digest-1"),
+        )
+    )
+
+    assert result == "provider-accepted"
+    assert recorded == [result]
+
+
 def test_post_dispatch_audit_failure_records_critical_unknown_and_quarantine() -> None:
     """One dispatched write retains both deterministic recovery identities."""
     provider_writes = 0
@@ -99,6 +124,37 @@ def test_post_dispatch_audit_failure_records_critical_unknown_and_quarantine() -
     assert caught.value.outcome.reconciliation_identity.value == (
         "quotaPreferences/request-1"
     )
+
+
+@pytest.mark.parametrize("dispatch_error", [TimeoutError(), asyncio.CancelledError()])
+def test_dispatch_exception_records_critical_unknown_and_quarantine(
+    dispatch_error: BaseException,
+) -> None:
+    """Entering provider dispatch makes every missing response ambiguous."""
+    unknowns: list[CriticalUnknownOutcome] = []
+    quarantined: list[RedactedText] = []
+
+    async def dispatch() -> str:
+        raise dispatch_error
+
+    with pytest.raises(CriticalUnknownDispatchError) as caught:
+        asyncio.run(
+            AuditedWriteCoordinator[str]().run(
+                hooks=WriteSafetyHooks(
+                    pre_dispatch=(lambda: None,),
+                    record_terminal=lambda _result: None,
+                    record_critical_unknown=unknowns.append,
+                    quarantine=quarantined.append,
+                ),
+                dispatch=dispatch,
+                reconciliation_identity=RedactedText("quotaPreferences/request-1"),
+                quarantine_identity=RedactedText("plan-digest-1"),
+            )
+        )
+
+    assert caught.value.__cause__ is dispatch_error
+    assert unknowns == [caught.value.outcome]
+    assert quarantined == [caught.value.outcome.quarantine_identity]
 
 
 def test_post_dispatch_recovery_attempts_are_isolated_behind_typed_error() -> None:
@@ -158,3 +214,16 @@ def test_critical_unknown_requires_nonempty_safe_recovery_identities(
 
     with pytest.raises(ValueError, match="must not be empty"):
         CriticalUnknownOutcome(**values)
+
+
+@pytest.mark.parametrize("field", ["reconciliation_identity", "quarantine_identity"])
+def test_critical_unknown_rejects_raw_recovery_identities(field: str) -> None:
+    """Raw strings cannot cross the durable recovery identity boundary."""
+    values: dict[str, object] = {
+        "reconciliation_identity": RedactedText("quotaPreferences/request-1"),
+        "quarantine_identity": RedactedText("plan-digest-1"),
+    }
+    values[field] = "raw-identity"
+
+    with pytest.raises(TypeError, match="must be RedactedText"):
+        CriticalUnknownOutcome(**values)  # type: ignore[arg-type]

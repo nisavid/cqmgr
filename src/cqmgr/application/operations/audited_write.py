@@ -39,7 +39,7 @@ class CriticalUnknownDispatchError(Exception):
         self,
         outcome: CriticalUnknownOutcome,
         *,
-        recovery_failures: tuple[Exception, ...] = (),
+        recovery_failures: tuple[BaseException, ...] = (),
     ) -> None:
         """Retain the exact identities needed for deterministic recovery."""
         super().__init__("provider write has a critical unknown durable outcome")
@@ -75,18 +75,18 @@ class AuditedWriteCoordinator[Result]:
         )
         for guard in hooks.pre_dispatch:
             guard()
-        result = await dispatch()
         try:
+            result = await dispatch()
             hooks.record_terminal(result)
-        except Exception as error:
-            recovery_failures: list[Exception] = []
+        except BaseException as error:
+            recovery_failures: list[BaseException] = []
             for recovery in (
                 lambda: hooks.quarantine(outcome.quarantine_identity),
                 lambda: hooks.record_critical_unknown(outcome),
             ):
                 try:
                     recovery()
-                except Exception as recovery_error:  # noqa: BLE001 - retained evidence
+                except BaseException as recovery_error:  # noqa: BLE001
                     recovery_failures.append(recovery_error)
             raise CriticalUnknownDispatchError(
                 outcome,
