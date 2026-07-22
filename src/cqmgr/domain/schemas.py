@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 OPERATION_RESULT_SCHEMA = "cqmgr.operation-result/v1"
+QUOTA_REQUEST_PLAN_SCHEMA = "cqmgr.quota-request-plan/v1"
 WATCH_EVENT_SCHEMA = "cqmgr.watch-event/v1"
 
 
