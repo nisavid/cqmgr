@@ -185,6 +185,26 @@ def test_snapshot_decoder_rejects_noncanonical_bytes() -> None:
         decode_snapshot_record(noncanonical)
 
 
+@pytest.mark.parametrize(
+    "schema", ["cqmgr.quota-query-snapshot/v1", "cqmgr.quota-query-snapshot/v2"]
+)
+def test_snapshot_decoder_rejects_negative_retained_usage(schema: str) -> None:
+    """No supported snapshot generation can restore impossible quota usage."""
+    document = json.loads(encode_snapshot_record(quota_snapshot()))
+    item = document["snapshot"]["items"][0]
+    item["usage_value"]["value"] = "-1"
+    document["schema"] = schema
+    if schema.endswith("/v1"):
+        item["constraint_set"] = item.pop("constraint_sets")[0]
+    encoded = (
+        json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode()
+
+    with pytest.raises(QuotaSnapshotStoredDataError, match="malformed"):
+        decode_snapshot_record(encoded)
+
+
 def test_cursor_binding_decoder_rejects_noncanonical_bytes() -> None:
     """Internal cursor bindings also have exactly one persisted byte shape."""
     canonical = encode_cursor_binding("snapshot-public-1", 1)

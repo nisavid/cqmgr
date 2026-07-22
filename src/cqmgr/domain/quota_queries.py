@@ -318,6 +318,10 @@ def _require_query_item_quantities(
     if len({value.unit for _, value in quantities if value is not None}) > 1:
         msg = "query item quantities must use one native quota unit"
         raise ValueError(msg)
+    usage = dict(quantities)["usage_value"]
+    if usage is not None and usage.value < 0:
+        msg = "query item usage_value must be non-negative"
+        raise ValueError(msg)
 
 
 def _require_query_item_status_types(
