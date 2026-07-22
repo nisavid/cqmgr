@@ -7,7 +7,7 @@
             {
               "name": "a3-highgpu-8g",
               "zone": "us-central1-a",
-              "selfLink": "https://www.googleapis.com/compute/v1/projects/123456789/zones/us-central1-a/machineTypes/a3-highgpu-8g",
+              "selfLink": "https://www.googleapis.com/compute/v1/projects/public-schema-project/zones/us-central1-a/machineTypes/a3-highgpu-8g",
               "accelerators": [
                 {
                   "guestAcceleratorType": "nvidia-h100-80gb",
@@ -29,7 +29,7 @@
             {
               "name": "ct6e-standard-4t",
               "zone": "us-central1-b",
-              "selfLink": "https://www.googleapis.com/compute/v1/projects/123456789/zones/us-central1-b/machineTypes/ct6e-standard-4t",
+              "selfLink": "https://www.googleapis.com/compute/v1/projects/public-schema-project/zones/us-central1-b/machineTypes/ct6e-standard-4t",
               "accelerators": [
                 {
                   "guestAcceleratorType": "tpu-v6e",

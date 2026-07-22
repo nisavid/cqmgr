@@ -336,6 +336,7 @@ def test_compute_reader_preserves_scopes_lifecycle_accelerators_and_warnings() -
         LocationCoverageState.FAILED,
     ]
     assert not result.complete
+    assert all(call[0] == "public-schema-project" for call in client.calls)
     assert all(call[3] is True for call in client.calls)
 
 

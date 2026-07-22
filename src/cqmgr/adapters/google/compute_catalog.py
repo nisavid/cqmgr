@@ -199,9 +199,7 @@ class GoogleComputeMachineTypeReader:
         if not isinstance(request, ComputeMachineTypeReadRequest):
             msg = "Compute catalog reader requires ComputeMachineTypeReadRequest"
             raise TypeError(msg)
-        project = request.context.project.resource_scope.canonical_name.removeprefix(
-            "projects/"
-        )
+        project = request.context.project.project_id
         token = ""
         attempted = 0
         completed = 0
