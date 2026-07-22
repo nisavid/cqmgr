@@ -61,6 +61,11 @@ The application-facing secret-store port contains only:
 - create-once `create(reference, secret)`; and
 - `delete(reference)`.
 
+Plan-consumption markers use a separate create/read-only port. Ordinary secret
+operations reject marker references, and marker operations require the plan
+repository to own the exact shared cqmgr lock instance. No public operation can
+delete or replace a marker.
+
 Outcomes distinguish missing, locked or cancelled, unavailable, unsupported,
 and failed. References contain a stable cqmgr service namespace, installation
 identity, purpose, and collision-resistant bounded random item identity; they

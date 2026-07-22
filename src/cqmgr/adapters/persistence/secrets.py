@@ -12,6 +12,7 @@ from keyring.errors import InitError, KeyringError, KeyringLocked
 
 from cqmgr.application.ports.secrets import (
     SecretBackendKind,
+    SecretPurpose,
     SecretStoreOutcome,
     SecretStoreProbe,
     SecretStoreReference,
@@ -70,6 +71,8 @@ class NativeSecretStore:
 
     def get(self, reference: SecretStoreReference) -> SecretStoreOutcome:
         """Read one exact item under the shared cqmgr keyring lock."""
+        if reference.purpose is SecretPurpose.PLAN_CONSUMPTION:
+            return SecretStoreOutcome(SecretStoreStatus.UNSUPPORTED)
         if not self.probe().mutation_capable:
             return SecretStoreOutcome(SecretStoreStatus.UNSUPPORTED)
         try:
@@ -78,35 +81,26 @@ class NativeSecretStore:
         except Exception as error:  # noqa: BLE001
             return _failure(error)
 
-    def create(  # noqa: PLR0911
+    def create(
         self, reference: SecretStoreReference, secret: SecretValue
     ) -> SecretStoreOutcome:
         """Create and verify one item without replacing an existing value."""
+        if reference.purpose is SecretPurpose.PLAN_CONSUMPTION:
+            return SecretStoreOutcome(SecretStoreStatus.UNSUPPORTED)
         if not self.probe().mutation_capable:
             return SecretStoreOutcome(SecretStoreStatus.UNSUPPORTED)
-        encoded = _encode(secret)
         try:
             with self._lock:
-                existing = self._get_raw(reference)
-                if isinstance(existing, SecretStoreOutcome):
-                    if existing.status is not SecretStoreStatus.MISSING:
-                        return existing
-                else:
-                    return SecretStoreOutcome(SecretStoreStatus.CONFLICT)
-                self._backend.set_password(
-                    reference.service, reference.username, encoded
-                )
-                verified = self._get_raw(reference)
-                if isinstance(verified, SecretStoreOutcome):
-                    return verified
-                if not hmac.compare_digest(verified, encoded):
-                    return SecretStoreOutcome(SecretStoreStatus.CONFLICT)
-                return SecretStoreOutcome(SecretStoreStatus.CREATED)
+                return self._create_unlocked(reference, secret)
         except Exception as error:  # noqa: BLE001
             return _failure(error)
 
-    def delete(self, reference: SecretStoreReference) -> SecretStoreOutcome:
+    def delete(  # noqa: PLR0911
+        self, reference: SecretStoreReference
+    ) -> SecretStoreOutcome:
         """Delete one existing exact item without exposing its value."""
+        if reference.purpose is SecretPurpose.PLAN_CONSUMPTION:
+            return SecretStoreOutcome(SecretStoreStatus.UNSUPPORTED)
         if not self.probe().mutation_capable:
             return SecretStoreOutcome(SecretStoreStatus.UNSUPPORTED)
         try:
@@ -124,6 +118,32 @@ class NativeSecretStore:
         except Exception as error:  # noqa: BLE001
             return _failure(error)
 
+    def get_consumption_marker(
+        self, reference: SecretStoreReference
+    ) -> SecretStoreOutcome:
+        """Read a marker only while its repository owns the shared lock."""
+        if reference.purpose is not SecretPurpose.PLAN_CONSUMPTION:
+            return SecretStoreOutcome(SecretStoreStatus.UNSUPPORTED)
+        if not self.probe().mutation_capable:
+            return SecretStoreOutcome(SecretStoreStatus.UNSUPPORTED)
+        if not self._lock.owned_by_current_thread:
+            return SecretStoreOutcome(SecretStoreStatus.FAILED)
+        return self._get_unlocked(reference)
+
+    def create_consumption_marker(
+        self,
+        reference: SecretStoreReference,
+        secret: SecretValue,
+    ) -> SecretStoreOutcome:
+        """Create a marker only while its repository owns the shared lock."""
+        if reference.purpose is not SecretPurpose.PLAN_CONSUMPTION:
+            return SecretStoreOutcome(SecretStoreStatus.UNSUPPORTED)
+        if not self.probe().mutation_capable:
+            return SecretStoreOutcome(SecretStoreStatus.UNSUPPORTED)
+        if not self._lock.owned_by_current_thread:
+            return SecretStoreOutcome(SecretStoreStatus.FAILED)
+        return self._create_unlocked(reference, secret)
+
     def _get_unlocked(self, reference: SecretStoreReference) -> SecretStoreOutcome:
         raw = self._get_raw(reference)
         if isinstance(raw, SecretStoreOutcome):
@@ -133,6 +153,26 @@ class NativeSecretStore:
         except ValueError:
             return SecretStoreOutcome(SecretStoreStatus.FAILED)
         return SecretStoreOutcome.available(secret)
+
+    def _create_unlocked(
+        self,
+        reference: SecretStoreReference,
+        secret: SecretValue,
+    ) -> SecretStoreOutcome:
+        encoded = _encode(secret)
+        existing = self._get_raw(reference)
+        if isinstance(existing, SecretStoreOutcome):
+            if existing.status is not SecretStoreStatus.MISSING:
+                return existing
+        else:
+            return SecretStoreOutcome(SecretStoreStatus.CONFLICT)
+        self._backend.set_password(reference.service, reference.username, encoded)
+        verified = self._get_raw(reference)
+        if isinstance(verified, SecretStoreOutcome):
+            return verified
+        if not hmac.compare_digest(verified, encoded):
+            return SecretStoreOutcome(SecretStoreStatus.CONFLICT)
+        return SecretStoreOutcome(SecretStoreStatus.CREATED)
 
     def _get_raw(self, reference: SecretStoreReference) -> str | SecretStoreOutcome:
         try:

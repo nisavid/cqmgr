@@ -61,6 +61,12 @@ class NativePlanInterprocessLock:
         """Return the stable local lock path."""
         return self._path
 
+    @property
+    def owned_by_current_thread(self) -> bool:
+        """Return whether the caller already holds this exact lock instance."""
+        with self._thread_condition:
+            return self._owner_thread_id == get_ident() and self._handle is not None
+
     def __enter__(self) -> Self:
         """Acquire the lock within its bounded timeout."""
         deadline = time.monotonic() + self._timeout_seconds
