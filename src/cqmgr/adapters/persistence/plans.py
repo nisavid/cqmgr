@@ -23,8 +23,8 @@ from cqmgr.application.ports.plans import (
     PlanRepositoryStatus,
 )
 from cqmgr.application.ports.secrets import (
+    ConsumptionMarkerStore,
     SecretPurpose,
-    SecretStore,
     SecretStoreReference,
     SecretStoreStatus,
     SecretValue,
@@ -59,7 +59,7 @@ class LocalPlanRepository:
     def __init__(
         self,
         root: Path,
-        consumption_store: SecretStore,
+        consumption_store: ConsumptionMarkerStore,
         *,
         lock: NativePlanInterprocessLock | None = None,
     ) -> None:
@@ -710,7 +710,7 @@ class LocalPlanRepository:
     ) -> SecretStoreStatus:
         reference = _consumption_marker_reference(digest_hex, installation_id)
         expected = _consumption_marker_value(digest_hex, key)
-        outcome = self._consumption_store.get(reference)
+        outcome = self._consumption_store.get_consumption_marker(reference)
         if outcome.status is not SecretStoreStatus.AVAILABLE:
             return outcome.status
         if outcome.secret is None or not hmac.compare_digest(
@@ -726,7 +726,7 @@ class LocalPlanRepository:
         installation_id: str,
         key: bytes,
     ) -> SecretStoreStatus:
-        return self._consumption_store.create(
+        return self._consumption_store.create_consumption_marker(
             _consumption_marker_reference(digest_hex, installation_id),
             _consumption_marker_value(digest_hex, key),
         ).status
@@ -841,6 +841,8 @@ def _atomic_write(path: Path, data: bytes, mode: int) -> None:
     temporary = path.with_name(f".{path.name}.{secrets.token_hex(12)}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
+        temporary.chmod(mode)
+        _restrict_windows_acl(temporary)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
             handle.flush()
@@ -851,6 +853,8 @@ def _atomic_write(path: Path, data: bytes, mode: int) -> None:
         _fsync_directory(path.parent)
     except BaseException:
         with suppress(OSError):
+            os.close(descriptor)
+        with suppress(OSError):
             temporary.unlink(missing_ok=True)
         raise
 
@@ -858,15 +862,25 @@ def _atomic_write(path: Path, data: bytes, mode: int) -> None:
 def _atomic_publish_no_replace(path: Path, data: bytes, mode: int) -> None:
     temporary = path.with_name(f".{path.name}.{secrets.token_hex(12)}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    linked = False
     try:
+        temporary.chmod(mode)
+        _restrict_windows_acl(temporary)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        temporary.chmod(mode)
         os.link(temporary, path)
+        linked = True
         _restrict_windows_acl(path)
         _fsync_directory(path.parent)
+    except BaseException:
+        with suppress(OSError):
+            os.close(descriptor)
+        if linked:
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
+        raise
     finally:
         with suppress(OSError):
             temporary.unlink(missing_ok=True)
@@ -899,6 +913,10 @@ def _restrict_windows_acl(path: Path) -> None:
             executable,
             str(path),
             "/inheritance:r",
+            "/remove:g",
+            "*S-1-1-0",
+            "*S-1-5-11",
+            "*S-1-5-32-545",
             "/grant:r",
             f"{principal}:{permission}",
         ],

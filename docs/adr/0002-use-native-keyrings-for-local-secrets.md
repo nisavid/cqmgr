@@ -36,12 +36,16 @@ is never replaced or deleted. Filesystem ledger recovery checks it before
 issuing authority, so replaying an older authentic ledger snapshot cannot make
 a dispatched plan reusable.
 
-A local interprocess lock serializes cqmgr callers. The portable keyring API
-does not provide compare-and-swap, so arbitrary external writers are not
-participants in this concurrency protocol. An observable verification mismatch
-fails closed. A client that writes cqmgr's private namespace out of band is
-unsupported tampering; cqmgr does not claim to preserve an invisible external
-write racing its single create operation.
+A create/read-only marker port is separate from the rotatable-secret port.
+Ordinary get, create, and delete operations reject marker references. The plan
+repository invokes marker operations only while it owns the exact shared cqmgr
+interprocess-lock instance, so filesystem authority and its native marker are
+serialized without a recursive lock acquisition. The portable keyring API does
+not provide compare-and-swap, so arbitrary external writers are not participants
+in this concurrency protocol. An observable verification mismatch fails closed.
+A client that writes cqmgr's private namespace out of band is unsupported
+tampering; cqmgr does not claim to preserve an invisible external write racing
+its single create operation.
 
 Native keyrings provide the narrowest plaintext-transfer boundary for the
 selected Python package. Command-line password managers expose secrets or

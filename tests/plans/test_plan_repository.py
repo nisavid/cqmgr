@@ -12,17 +12,21 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from stat import S_IMODE
 from typing import cast, override
+from unittest.mock import patch
 
 import pytest
 from hypothesis.stateful import RuleBasedStateMachine, precondition, rule
 
 import cqmgr.adapters.persistence.plans as plan_persistence
+from cqmgr.adapters.persistence import secrets as secret_adapter
 from cqmgr.adapters.persistence.native_plan_lock import NativePlanInterprocessLock
 from cqmgr.adapters.persistence.plans import LocalPlanRepository
+from cqmgr.adapters.persistence.secrets import NativeSecretStore
 from cqmgr.adapters.serialization.plans import PlanCodec
 from cqmgr.application.ports.plans import EncodedPlan, PlanLease, PlanRepositoryStatus
 from cqmgr.application.ports.secrets import (
     SecretBackendKind,
+    SecretPurpose,
     SecretStoreOutcome,
     SecretStoreProbe,
     SecretStoreReference,
@@ -66,13 +70,15 @@ class _MemoryConsumptionStore:
     def probe(self) -> SecretStoreProbe:
         return SecretStoreProbe(SecretBackendKind.MACOS_KEYCHAIN, "test-memory")
 
-    def get(self, reference: SecretStoreReference) -> SecretStoreOutcome:
+    def get_consumption_marker(
+        self, reference: SecretStoreReference
+    ) -> SecretStoreOutcome:
         value = self.values.get(reference)
         if value is None:
             return SecretStoreOutcome(SecretStoreStatus.MISSING)
         return SecretStoreOutcome.available(value)
 
-    def create(
+    def create_consumption_marker(
         self,
         reference: SecretStoreReference,
         secret: SecretValue,
@@ -83,9 +89,27 @@ class _MemoryConsumptionStore:
         return SecretStoreOutcome(SecretStoreStatus.CREATED)
 
     def delete(self, reference: SecretStoreReference) -> SecretStoreOutcome:
+        if reference.purpose is SecretPurpose.PLAN_CONSUMPTION:
+            return SecretStoreOutcome(SecretStoreStatus.UNSUPPORTED)
         if self.values.pop(reference, None) is None:
             return SecretStoreOutcome(SecretStoreStatus.MISSING)
         return SecretStoreOutcome(SecretStoreStatus.DELETED)
+
+
+class _MemoryNativeKeyring:
+    """Concrete keyring seam for shared-lock composition coverage."""
+
+    def __init__(self) -> None:
+        self.values: dict[tuple[str, str], str] = {}
+
+    def get_password(self, service: str, username: str) -> str | None:
+        return self.values.get((service, username))
+
+    def set_password(self, service: str, username: str, password: str) -> None:
+        self.values[(service, username)] = password
+
+    def delete_password(self, service: str, username: str) -> None:
+        del self.values[(service, username)]
 
 
 _CONSUMPTION_STORES: dict[Path, _MemoryConsumptionStore] = {}
@@ -205,6 +229,24 @@ def test_local_store_is_content_addressed_and_export_is_atomic_owner_only(
     assert S_IMODE((tmp_path / "repository").stat().st_mode) == PRIVATE_DIRECTORY_MODE
 
 
+def test_repository_and_native_marker_store_compose_under_one_shared_lock(
+    tmp_path: Path,
+) -> None:
+    """Repository-owned locking encloses marker I/O without recursive acquire."""
+    root = tmp_path / "repository"
+    lock = NativePlanInterprocessLock(root / ".plan-repository.lock")
+    backend = _MemoryNativeKeyring()
+    with patch.object(
+        secret_adapter,
+        "_trusted_native_backend_types",
+        return_value={type(backend): SecretBackendKind.MACOS_KEYCHAIN},
+    ):
+        marker_store = NativeSecretStore(backend, lock)
+    repository = LocalPlanRepository(root, marker_store, lock=lock)
+
+    assert repository.store(_encoded(), PLAN_KEY).status is PlanRepositoryStatus.STORED
+
+
 def test_first_use_durably_publishes_each_created_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -228,11 +270,22 @@ def test_first_use_durably_publishes_each_created_directory(
 @pytest.mark.skipif(os.name != "nt", reason="Windows ACL contract")
 def test_windows_repository_removes_broad_plan_read_access(tmp_path: Path) -> None:
     """Plan and ledger paths retain only the active Windows account ACL."""
+    system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
+    executable = rf"{system_root}\System32\icacls.exe"
+    subprocess.run(  # noqa: S603
+        [
+            executable,
+            str(tmp_path),
+            "/grant",
+            "*S-1-1-0:(OI)(CI)R",
+        ],
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
     encoded = _encoded()
     repository = _repository(tmp_path)
     repository.store(encoded, PLAN_KEY)
-    system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
-    executable = rf"{system_root}\System32\icacls.exe"
 
     for path in (
         tmp_path,
@@ -250,6 +303,7 @@ def test_windows_repository_removes_broad_plan_read_access(tmp_path: Path) -> No
         )
         acl = completed.stdout.casefold()
         assert "everyone:" not in acl
+        assert "s-1-1-0:" not in acl
         assert "builtin\\users:" not in acl
 
 
@@ -742,6 +796,9 @@ def test_authentic_ledger_replay_cannot_authorize_a_second_provider_write(
         PLAN_KEY,
         writes,
     )
+    marker_store = _CONSUMPTION_STORES[tmp_path.resolve()]
+    marker_reference = next(iter(marker_store.values))
+    assert marker_store.delete(marker_reference).status is SecretStoreStatus.UNSUPPORTED
     state_path.write_bytes(authentic_available_state)
     replay = _attempt_fake_provider_write(
         repository,
@@ -814,6 +871,26 @@ def test_concurrent_different_exports_never_overwrite(tmp_path: Path) -> None:
     assert statuses.count(PlanRepositoryStatus.EXPORTED.value) == 1
     assert statuses.count(PlanRepositoryStatus.CONFLICT.value) == 1
     assert destination.read_bytes() in {first.bytes, second.bytes}
+
+
+def test_export_acl_failure_leaves_no_published_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed privacy boundary cannot leave review bytes at the final path."""
+    encoded = _encoded()
+    repository = _repository(tmp_path / "repository")
+    destination = tmp_path / "review" / "request.plan"
+
+    def fail_final_path(path: Path) -> None:
+        if path == destination:
+            message = "injected ACL failure"
+            raise OSError(message)
+
+    monkeypatch.setattr(plan_persistence, "_restrict_windows_acl", fail_final_path)
+
+    assert repository.export(encoded, destination).status is PlanRepositoryStatus.FAILED
+    assert not destination.exists()
 
 
 def test_lease_validation_conflicts_expiry_and_quarantine_are_durable(

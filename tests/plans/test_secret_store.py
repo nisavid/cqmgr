@@ -156,6 +156,14 @@ def _reference() -> SecretStoreReference:
     )
 
 
+def _marker_reference() -> SecretStoreReference:
+    return SecretStoreReference(
+        installation_id="installation-123",
+        purpose=SecretPurpose.PLAN_CONSUMPTION,
+        item_id="item-" + ("m" * 32),
+    )
+
+
 def _trusted_store(
     backend: _FakeKeyring,
     lock: NativePlanInterprocessLock,
@@ -236,6 +244,16 @@ def test_blocked_backends_never_receive_secret_operations(
     )
     delete_outcome = store.delete(_reference())
     assert delete_outcome.status is SecretStoreStatus.UNSUPPORTED
+    with NativePlanInterprocessLock(tmp_path / "marker.lock"):
+        marker_outcomes = (
+            store.get_consumption_marker(_marker_reference()),
+            store.create_consumption_marker(
+                _marker_reference(), SecretValue(b"m" * 32)
+            ),
+        )
+    assert {outcome.status for outcome in marker_outcomes} == {
+        SecretStoreStatus.UNSUPPORTED
+    }
     assert backend.calls == []
 
 
@@ -270,6 +288,36 @@ def test_create_is_once_verified_and_never_replaces_an_existing_secret(
     assert missing.status is SecretStoreStatus.MISSING
     assert backend.calls.count("delete") == 1
     assert backend.calls.count("set") == 1
+
+
+def test_plan_consumption_marker_is_not_delete_capable(tmp_path: Path) -> None:
+    """The immutable anti-rollback anchor cannot cross the delete port."""
+    backend = _backend("keyring.backends.macOS")
+    lock = NativePlanInterprocessLock(tmp_path / "marker.lock")
+    store = _trusted_store(
+        backend,
+        lock,
+    )
+    reference = _marker_reference()
+    marker = SecretValue(b"m" * 32)
+
+    assert store.create(reference, marker).status is SecretStoreStatus.UNSUPPORTED
+    assert store.get(reference).status is SecretStoreStatus.UNSUPPORTED
+    assert store.delete(reference).status is SecretStoreStatus.UNSUPPORTED
+    assert (
+        store.create_consumption_marker(reference, marker).status
+        is SecretStoreStatus.FAILED
+    )
+
+    with lock:
+        assert (
+            store.create_consumption_marker(reference, marker).status
+            is SecretStoreStatus.CREATED
+        )
+        loaded = store.get_consumption_marker(reference)
+
+    assert loaded.status is SecretStoreStatus.AVAILABLE
+    assert loaded.secret == marker
 
 
 def test_shared_store_serializes_concurrent_threads(tmp_path: Path) -> None:

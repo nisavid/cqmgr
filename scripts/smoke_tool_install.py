@@ -10,6 +10,7 @@ import tomllib
 from pathlib import Path
 
 EXPECTED_ARTIFACT_COUNT = 2
+CHECKOUT_ROOT = Path(__file__).resolve().parent.parent
 PROJECT_VERSION = tomllib.loads(Path("pyproject.toml").read_text())["project"][
     "version"
 ]
@@ -52,7 +53,12 @@ def _run(
     return completed.stdout, completed.stderr
 
 
-def smoke_artifact(artifact: Path, python: str) -> None:
+def smoke_artifact(
+    artifact: Path,
+    python: str,
+    *,
+    native_keyring_round_trip: bool,
+) -> None:
     """Install one artifact and run offline-safe metadata commands."""
     with tempfile.TemporaryDirectory() as temporary_directory:
         temporary = Path(temporary_directory)
@@ -121,6 +127,21 @@ def smoke_artifact(artifact: Path, python: str) -> None:
         assert "--version" in help_output
         assert version_output == f"cqmgr, version {PROJECT_VERSION}\n"
         assert list(runtime_home.rglob("*")) == []
+        persistence_environment = runtime_environment.copy()
+        persistence_environment.pop("PYTHONPATH")
+        tool_environment = temporary / "uv-tools" / "cqmgr"
+        interpreter = tool_environment / (
+            "Scripts/python.exe" if os.name == "nt" else "bin/python"
+        )
+        command = [
+            str(interpreter),
+            str(CHECKOUT_ROOT / "scripts/artifact_persistence_smoke.py"),
+            str(runtime_home / "persistence-smoke"),
+            str(CHECKOUT_ROOT),
+        ]
+        if native_keyring_round_trip:
+            command.append("--native-keyring-round-trip")
+        _run(command, cwd=temporary, environment=persistence_environment)
 
 
 def main() -> None:
@@ -128,6 +149,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("dist_dir", type=Path)
     parser.add_argument("--python", default="3.14")
+    parser.add_argument("--native-keyring-round-trip", action="store_true")
     arguments = parser.parse_args()
     artifacts = sorted(
         path
@@ -136,7 +158,11 @@ def main() -> None:
     )
     assert len(artifacts) == EXPECTED_ARTIFACT_COUNT
     for artifact in artifacts:
-        smoke_artifact(artifact, arguments.python)
+        smoke_artifact(
+            artifact,
+            arguments.python,
+            native_keyring_round_trip=arguments.native_keyring_round_trip,
+        )
 
 
 if __name__ == "__main__":

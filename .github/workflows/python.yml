@@ -138,6 +138,13 @@ jobs:
           name: distributions
           path: dist
 
+      - name: Provision ephemeral Linux Secret Service
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install --no-install-recommends --yes
+          dbus-x11 gnome-keyring
+
       - name: Exercise native persistence contracts
         run: >-
           uv run --locked --python 3.14 pytest --no-cov -q
@@ -148,20 +155,21 @@ jobs:
           foreign_key_is_rejected_across_processes_before_provider_dispatch or
           windows_repository_removes_broad_plan_read_access"
 
-      - name: Probe the installed native keyring backend
-        run: >-
-          uv run --locked --python 3.14 pytest --no-cov -q
-          tests/plans/test_secret_store.py
-          -k "runtime_keyring_backend_is_classified_without_mutation"
-
-      - name: Verify the native keyring round trip
+      - name: Smoke-test installed artifacts and native keyring
         if: runner.os != 'Linux'
-        env:
-          CQMGR_REQUIRE_NATIVE_KEYRING_SMOKE: "1"
         run: >-
-          uv run --locked --python 3.14 pytest --no-cov -q
-          tests/plans/test_secret_store.py
-          -k "runtime_supported_keyring_round_trip"
+          uv run --python 3.14 python scripts/smoke_tool_install.py
+          dist --python 3.14 --native-keyring-round-trip
 
-      - name: Smoke-test isolated tool installations
-        run: uv run --python 3.14 python scripts/smoke_tool_install.py dist --python 3.14
+      - name: Smoke-test installed artifacts with Linux Secret Service
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          dbus-run-session -- bash -euo pipefail -c '
+            export XDG_RUNTIME_DIR="${RUNNER_TEMP}/cqmgr-keyring-runtime"
+            mkdir -p "${XDG_RUNTIME_DIR}"
+            chmod 700 "${XDG_RUNTIME_DIR}"
+            eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
+            uv run --python 3.14 python scripts/smoke_tool_install.py \
+              dist --python 3.14 --native-keyring-round-trip
+          '

@@ -191,7 +191,21 @@ class SecretStore(Protocol):
         """Create one exact reference without replacing an existing item."""
 
     def delete(self, reference: SecretStoreReference) -> SecretStoreOutcome:
-        """Delete one exact reference."""
+        """Delete one exact rotatable-secret reference."""
+
+
+class ConsumptionMarkerStore(Protocol):
+    """Create/get-only seam for immutable plan-consumption markers."""
+
+    def get_consumption_marker(
+        self, reference: SecretStoreReference
+    ) -> SecretStoreOutcome:
+        """Read one exact marker reference."""
+
+    def create_consumption_marker(
+        self, reference: SecretStoreReference, secret: SecretValue
+    ) -> SecretStoreOutcome:
+        """Create one exact marker without replacement."""
 
 
 def _is_opaque_identifier(value: object) -> bool:

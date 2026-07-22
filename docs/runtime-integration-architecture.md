@@ -286,6 +286,9 @@ the provider call. A dispatched plan is never reusable, including after an
 older authentic filesystem snapshot is replayed. An interrupted or ambiguous
 dispatch quarantines the plan and requires deterministic provider
 reconciliation or a new Preview.
+The repository and marker adapter share one exact cqmgr lock instance. Marker
+operations expose only create and read, require the repository to own that lock,
+and are rejected through the ordinary rotatable-secret API.
 Recovery uses the durable lease deadline and ledger state, not process-ID
 liveness. Before the deadline an abandoned dispatch remains inapplicable; at
 the deadline it becomes quarantined. Missing ledger state beside plan bytes is
