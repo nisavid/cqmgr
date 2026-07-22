@@ -16,6 +16,7 @@ from cqmgr.application.configuration import (
 from cqmgr.application.operations.local import LocalOperations
 from cqmgr.application.ports.configuration import (
     ConfigurationRepositoryError,
+    ConfigurationRepositoryOperationalError,
     UnsupportedConfigurationSchemaError,
 )
 from cqmgr.domain.results import ExitClass
@@ -194,13 +195,19 @@ def test_repository_failures_have_closed_exit_classification() -> None:
     newer = run(
         service.repository_failure(
             "config.get",
-            UnsupportedConfigurationSchemaError("cqmgr.config/v2"),
+            UnsupportedConfigurationSchemaError("cqmgr.config/v3"),
         )
     )
     invalid = run(
         service.repository_failure(
             "scope.show",
             ConfigurationRepositoryError("invalid TOML"),
+        )
+    )
+    unavailable = run(
+        service.repository_failure(
+            "scope.show",
+            ConfigurationRepositoryOperationalError("permission denied"),
         )
     )
 
@@ -220,3 +227,7 @@ def test_repository_failures_have_closed_exit_classification() -> None:
     assert "Upgrade cqmgr" in str(newer.diagnostics[0].message)
     assert "Repair or restore" in str(invalid.diagnostics[0].message)
     assert newer.data.guidance == str(newer.diagnostics[0].message)
+    assert newer.diagnostics[0].retry.value == "after-upgrade"
+    assert unavailable.outcome.code.value == "local-state-unavailable"
+    assert unavailable.completeness.gaps[0].reason.value == ("local-state-unavailable")
+    assert "permissions and storage availability" in unavailable.data.guidance

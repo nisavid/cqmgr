@@ -28,6 +28,7 @@ from cqmgr.application.configuration import (
 )
 from cqmgr.application.ports.configuration import (
     ConfigurationRepositoryError,
+    ConfigurationRepositoryOperationalError,
     UnsupportedConfigurationSchemaError,
 )
 from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
     )
 
 _CONFIG_SCHEMA_V0 = "cqmgr.config/v0"
+_CONFIG_SCHEMA_V1 = "cqmgr.config/v1"
 _SELECTION_SCHEMA_V0 = "cqmgr.selection-state/v0"
 _SCHEMA_VERSION = re.compile(r"cqmgr\.(config|selection-state)/v([0-9]+)\Z")
 
@@ -61,7 +63,7 @@ class UnsupportedStoredSchemaError(
     """Stored data uses a newer schema that this build cannot interpret."""
 
 
-class StoredDataOperationalError(StoredDataError):
+class StoredDataOperationalError(ConfigurationRepositoryOperationalError):
     """A filesystem or locking failure prevented trustworthy local state."""
 
 
@@ -130,7 +132,12 @@ def _resource_scope(value: object, location: str) -> ResourceScope | None:
     raise InvalidStoredDataError(msg)
 
 
-def _schema(value: object, expected_kind: str, current: str) -> str:
+def _schema(
+    value: object,
+    expected_kind: str,
+    current: str,
+    supported: frozenset[str],
+) -> str:
     if not isinstance(value, str):
         msg = "schema must be a string"
         raise InvalidStoredDataError(msg)
@@ -139,10 +146,14 @@ def _schema(value: object, expected_kind: str, current: str) -> str:
         msg = f"invalid {expected_kind} schema {value!r}"
         raise InvalidStoredDataError(msg)
     version = int(match.group(2))
-    if version > 1:
+    current_match = _SCHEMA_VERSION.fullmatch(current)
+    if current_match is None:  # pragma: no cover - module-owned constant
+        msg = f"invalid current {expected_kind} schema {current!r}"
+        raise RuntimeError(msg)
+    if version > int(current_match.group(2)):
         msg = f"unsupported newer {expected_kind} schema {value!r}"
         raise UnsupportedStoredSchemaError(msg)
-    if value not in {current, current.removesuffix("v1") + "v0"}:
+    if value not in supported:
         msg = f"unsupported {expected_kind} schema {value!r}"
         raise InvalidStoredDataError(msg)
     return value
@@ -150,7 +161,12 @@ def _schema(value: object, expected_kind: str, current: str) -> str:
 
 def _decode_config(document: dict[str, object]) -> ConfigSnapshot:
     _expect_keys(document, {"schema", "interface", "profiles"}, "configuration")
-    schema = _schema(document.get("schema"), "config", CONFIG_SCHEMA)
+    schema = _schema(
+        document.get("schema"),
+        "config",
+        CONFIG_SCHEMA,
+        frozenset((_CONFIG_SCHEMA_V0, _CONFIG_SCHEMA_V1, CONFIG_SCHEMA)),
+    )
     interface = _interface(document.get("interface"), "interface")
     profiles_table = _table(document.get("profiles", {}), "profiles")
     profiles: list[Profile] = []
@@ -222,6 +238,7 @@ def _decode_selection(document: dict[str, object]) -> SelectionState:
         document.get("schema"),
         "selection-state",
         SELECTION_STATE_SCHEMA,
+        frozenset((_SELECTION_SCHEMA_V0, SELECTION_STATE_SCHEMA)),
     )
     if schema == SELECTION_STATE_SCHEMA and "direct_project" in document:
         msg = "direct_project is only valid in selection-state/v0"
@@ -252,7 +269,9 @@ def _load(path: Path) -> dict[str, object]:
     try:
         with path.open("rb") as stream:
             document = tomllib.load(stream)
-    except (OSError, tomllib.TOMLDecodeError) as error:
+    except OSError as error:
+        raise _operational_error(path, error) from error
+    except tomllib.TOMLDecodeError as error:
         msg = f"cannot read valid TOML from {path.name}: {error}"
         raise InvalidStoredDataError(msg) from error
     return _table(document, "document")

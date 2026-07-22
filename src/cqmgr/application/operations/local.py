@@ -19,6 +19,7 @@ from cqmgr.application.configuration import (
 )
 from cqmgr.application.ports.configuration import (
     ConfigurationRepositoryError,
+    ConfigurationRepositoryOperationalError,
     UnsupportedConfigurationSchemaError,
 )
 from cqmgr.domain.diagnostics import (
@@ -163,14 +164,24 @@ class LocalOperations:
     ) -> OperationResult[RepositoryFailureData]:
         """Classify unsupported newer state separately from corrupt local state."""
         unsupported = isinstance(error, UnsupportedConfigurationSchemaError)
+        operational = isinstance(error, ConfigurationRepositoryOperationalError)
         outcome = (
-            "unsupported-configuration-schema" if unsupported else "invalid-local-state"
+            "unsupported-configuration-schema"
+            if unsupported
+            else "local-state-unavailable"
+            if operational
+            else "invalid-local-state"
         )
         guidance = (
             "Upgrade cqmgr to a version that supports this local-state schema, "
             "then retry."
             if unsupported
-            else "Repair or restore the cqmgr local-state file, then retry."
+            else (
+                "Check cqmgr local-state file permissions and storage availability, "
+                "then retry."
+                if operational
+                else "Repair or restore the cqmgr local-state file, then retry."
+            )
         )
         diagnostic = Diagnostic(
             code=DiagnosticCode(outcome),
@@ -178,7 +189,7 @@ class LocalOperations:
             phase=DiagnosticPhase("local-state-read"),
             source=DiagnosticSource("local-state"),
             retry=(
-                RetryDisposition.NEVER
+                RetryDisposition.AFTER_UPGRADE
                 if unsupported
                 else RetryDisposition.AFTER_REFRESH
             ),
@@ -272,6 +283,21 @@ class LocalOperations:
             outcome="succeeded",
             exit_class=ExitClass.SUCCESS,
             data=self._scope_data(updated, selected_resolution),
+        )
+
+    async def scope_selection_usage_failure(
+        self,
+        reason: str,
+    ) -> OperationResult[ScopeOperationData]:
+        """Return one typed usage result after the leaf invocation was decoded."""
+        return self._result(
+            operation="scope.select",
+            resource_scope=None,
+            boundary="resource-scope-valid",
+            reached=False,
+            outcome="invalid-resource-scope",
+            exit_class=ExitClass.USAGE,
+            data=self._scope_data(SelectionState(), None, reason=reason),
         )
 
     async def scope_clear(self) -> OperationResult[ScopeOperationData]:

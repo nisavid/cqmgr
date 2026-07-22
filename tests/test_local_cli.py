@@ -168,6 +168,34 @@ def test_folder_selection_is_rejected_without_replacing_project(tmp_path: Path) 
     assert json.loads(shown.stdout)["resource_scope"]["name"] == "projects/123"
 
 
+def test_decoded_json_scope_syntax_failure_returns_a_structured_usage_result(
+    tmp_path: Path,
+) -> None:
+    """A recognized JSON invocation preserves its result form on input failure."""
+    result = CliRunner().invoke(
+        main,
+        [
+            "scope",
+            "select",
+            "--resource-scope",
+            "not-canonical",
+            "--output",
+            "json",
+        ],
+        env=local_environment(tmp_path),
+    )
+
+    assert result.exit_code == click.UsageError.exit_code
+    assert result.stderr == ""
+    payload = json.loads(result.stdout)
+    assert payload["operation"] == "scope.select"
+    assert payload["outcome"] == {"code": "invalid-resource-scope", "exit_class": 2}
+    assert payload["boundary"] == {
+        "condition": "resource-scope-valid",
+        "reached": False,
+    }
+
+
 def test_profile_and_config_commands_use_separate_files(tmp_path: Path) -> None:
     """Profile selection never rewrites operator-owned profile configuration."""
     environment = local_environment(tmp_path)
@@ -390,7 +418,7 @@ print(json.dumps(sorted(
     ("schema", "expected_exit", "expected_outcome"),
     [
         (
-            "cqmgr.config/v2",
+            "cqmgr.config/v3",
             REJECTED_PRECONDITION_EXIT,
             "unsupported-configuration-schema",
         ),
@@ -418,10 +446,9 @@ def test_invalid_configuration_returns_a_typed_result(
     assert payload["outcome"]["code"] == expected_outcome
     assert payload["boundary"] == {"condition": "local-state-valid", "reached": False}
     assert payload["complete"] is False
-    assert [item["code"]["value"] for item in payload["diagnostics"]] == [
-        expected_outcome
-    ]
-    assert payload["diagnostics"][0]["source"]["value"] == "local-state"
+    assert [item["code"] for item in payload["diagnostics"]] == [expected_outcome]
+    assert payload["diagnostics"][0]["phase"] == "local-state-read"
+    assert payload["diagnostics"][0]["source"] == "local-state"
     assert payload["data"]["guidance"] == payload["diagnostics"][0]["message"]
 
 

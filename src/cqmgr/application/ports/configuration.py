@@ -16,6 +16,10 @@ class UnsupportedConfigurationSchemaError(ConfigurationRepositoryError):
     """Stored state uses a newer schema that cannot be interpreted safely."""
 
 
+class ConfigurationRepositoryOperationalError(ConfigurationRepositoryError):
+    """Filesystem or locking failure prevented trustworthy local-state access."""
+
+
 class ConfigRepository(Protocol):
     """Read and atomically update operator-owned configuration."""
 
