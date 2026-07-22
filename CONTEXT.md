@@ -142,6 +142,7 @@ _Avoid_: Static hardware list, quota allowlist
 
 **Accelerator constraint set**:
 The related effective quota slices that can independently limit one accelerator workload, such as regional and all-regions GPU limits.
+One exact slice can participate in multiple location-anchored sets; a shared global companion does not combine alternative regions.
 _Avoid_: Synthesized quota, combined quota
 
 **Quota pool**:

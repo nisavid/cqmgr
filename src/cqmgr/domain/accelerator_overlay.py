@@ -255,8 +255,8 @@ class TpuWorkloadRequirement:
             _require_location(self.region, "Compute TPU region")
             _require_nonempty(self.machine_type, "Compute TPU machine_type")
             _require_zone_in_region(self.zone, self.region, "Compute TPU")
-            if self.runtime_version is not None:
-                msg = "Compute TPU does not accept a legacy runtime_version"
+            if self.topology is not None or self.runtime_version is not None:
+                msg = "Compute TPU does not accept legacy topology or runtime_version"
                 raise ValueError(msg)
         elif (
             self.region is not None
@@ -311,6 +311,37 @@ class WorkloadCatalogEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class QuotaConstraintAssessment:
+    """Quota sufficiency for one independently limiting exact slice."""
+
+    identity: EffectiveQuotaSliceIdentity
+    effective: QuotaQuantity
+    usage: QuotaQuantity
+    required: QuotaQuantity
+    permits: bool
+
+    def __post_init__(self) -> None:
+        """Require exact native-unit arithmetic and its derived conclusion."""
+        if not isinstance(self.identity, EffectiveQuotaSliceIdentity):
+            msg = "quota constraint assessment requires an exact slice identity"
+            raise TypeError(msg)
+        quantities = (self.effective, self.usage, self.required)
+        if any(not isinstance(quantity, QuotaQuantity) for quantity in quantities):
+            msg = "quota constraint assessment values must be QuotaQuantity"
+            raise TypeError(msg)
+        if len({quantity.unit for quantity in quantities}) != 1:
+            msg = "quota constraint assessment values must use one native unit"
+            raise ValueError(msg)
+        if not isinstance(self.permits, bool):
+            msg = "quota constraint assessment permits must be boolean"
+            raise TypeError(msg)
+        expected = self.usage.value + self.required.value <= self.effective.value
+        if self.permits is not expected:
+            msg = "quota constraint permits must equal usage plus required sufficiency"
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True, slots=True)
 class ResolvedQuotaRequirement:
     """Native-unit workload requirement bound to exact quota constraints."""
 
@@ -319,6 +350,7 @@ class ResolvedQuotaRequirement:
     required_amount: QuotaQuantity
     conversion: UnitConversionEvidence
     constraint_set: AcceleratorConstraintSet
+    assessments: tuple[QuotaConstraintAssessment, ...] = ()
 
     def __post_init__(self) -> None:
         """Require complete typed resolution evidence."""
@@ -339,6 +371,29 @@ class ResolvedQuotaRequirement:
         if not isinstance(self.constraint_set, AcceleratorConstraintSet):
             msg = "resolved constraint_set must be AcceleratorConstraintSet"
             raise TypeError(msg)
+        if not isinstance(self.assessments, tuple) or any(
+            not isinstance(assessment, QuotaConstraintAssessment)
+            for assessment in self.assessments
+        ):
+            msg = "resolved assessments must contain QuotaConstraintAssessment"
+            raise TypeError(msg)
+        if self.assessments:
+            identities = tuple(
+                reference.slice_identity for reference in self.constraint_set.references
+            )
+            if tuple(item.identity for item in self.assessments) != identities:
+                msg = "resolved assessments must match every exact constraint in order"
+                raise ValueError(msg)
+            if any(item.required != self.required_amount for item in self.assessments):
+                msg = "resolved assessments must retain the resolved required amount"
+                raise ValueError(msg)
+
+    @property
+    def permits(self) -> bool | None:
+        """Whether every assessed quota constraint permits the workload."""
+        if not self.assessments:
+            return None
+        return all(assessment.permits for assessment in self.assessments)
 
 
 @dataclass(frozen=True, slots=True)
@@ -520,6 +575,17 @@ class SemanticAcceleratorOverlay:
             msg = "live quota evidence matches more than one overlay mapping"
             raise AmbiguousOverlayMatchError(msg)
         mapping = matches[0] if matches else None
+        companion_matches = tuple(
+            candidate
+            for candidate in self.mappings
+            if any(
+                selector.matches(evidence) for selector in candidate.companion_selectors
+            )
+        )
+        cataloged = mapping is not None or bool(companion_matches)
+        guided = (mapping is not None and mapping.guided) or any(
+            candidate.guided for candidate in companion_matches
+        )
         return QuotaQueryItem(
             identity=evidence.identity,
             display_name=evidence.quota_display_name,
@@ -528,8 +594,8 @@ class SemanticAcceleratorOverlay:
             quota_pool=None if mapping is None else mapping.quota_pool,
             predicates=CatalogPredicates(
                 discovered=True,
-                cataloged=mapping is not None,
-                guided=mapping is not None and mapping.guided,
+                cataloged=cataloged,
+                guided=guided,
                 mutable=freshly_validated_mutable,
             ),
             effective_value=evidence.effective_value,
@@ -589,6 +655,44 @@ class SemanticAcceleratorOverlay:
             for identity in sorted(identities, key=_identity_key)
         )
         return AcceleratorConstraintSet(accelerator_id, references)
+
+    def constraint_sets(
+        self,
+        evidence: EffectiveQuotaEvidence,
+        evidences: tuple[EffectiveQuotaEvidence, ...],
+    ) -> tuple[AcceleratorConstraintSet, ...]:
+        """Return every independently anchored set containing one exact slice."""
+        if not isinstance(evidence, EffectiveQuotaEvidence):
+            msg = "constraint evidence must be EffectiveQuotaEvidence"
+            raise TypeError(msg)
+        if not isinstance(evidences, tuple) or any(
+            not isinstance(item, EffectiveQuotaEvidence) for item in evidences
+        ):
+            msg = "constraint evidences must be EffectiveQuotaEvidence values"
+            raise TypeError(msg)
+        anchor_reference = ConstraintReference(evidence.identity)
+        constraint_sets = []
+        for mapping in self.mappings:
+            for primary in evidences:
+                if (
+                    primary.identity.resource_scope != evidence.identity.resource_scope
+                    or not mapping.selector.matches(primary)
+                ):
+                    continue
+                constraint_set = self.constraint_set(
+                    mapping.accelerator_id,
+                    primary,
+                    evidences,
+                )
+                if (
+                    constraint_set is not None
+                    and anchor_reference in constraint_set.references
+                ):
+                    constraint_sets.append(constraint_set)
+        if len(set(constraint_sets)) != len(constraint_sets):
+            msg = "exact slice resolves to a duplicated anchored constraint set"
+            raise AmbiguousOverlayMatchError(msg)
+        return tuple(sorted(constraint_sets, key=_constraint_set_key))
 
     def resolve(
         self,
@@ -877,6 +981,15 @@ def _identity_key(identity: EffectiveQuotaSliceIdentity) -> tuple[object, ...]:
         identity.quota_id,
         identity.dimensions.items,
         identity.quota_scope.value,
+    )
+
+
+def _constraint_set_key(value: AcceleratorConstraintSet) -> tuple[object, ...]:
+    return (
+        value.accelerator_id.value,
+        tuple(
+            _identity_key(reference.slice_identity) for reference in value.references
+        ),
     )
 
 

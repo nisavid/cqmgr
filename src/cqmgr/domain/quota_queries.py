@@ -16,6 +16,7 @@ from cqmgr.domain.catalog import (
     CatalogPredicates,
 )
 from cqmgr.domain.quotas import (
+    ConstraintReference,
     EffectiveQuotaSliceIdentity,
     QuotaQuantity,
     QuotaScope,
@@ -191,7 +192,8 @@ class QuotaQueryFilters:
             raise TypeError(msg)
         checks = (
             not self.services or item.identity.service in self.services,
-            not self.accelerators or item.accelerator_id in self.accelerators,
+            not self.accelerators
+            or bool(set(self.accelerators).intersection(_item_accelerator_ids(item))),
             not self.locations or item.location in self.locations,
             not self.quota_scopes or item.identity.quota_scope in self.quota_scopes,
             not self.quota_pools or item.quota_pool in self.quota_pools,
@@ -206,6 +208,14 @@ class QuotaQueryFilters:
             self.text is None or _matches_text(item, self.text),
         )
         return all(checks)
+
+
+def _item_accelerator_ids(item: QuotaQueryItem) -> frozenset[AcceleratorId]:
+    """Return every accelerator identity represented by one exact slice."""
+    values = {constraint_set.accelerator_id for constraint_set in item.constraint_sets}
+    if item.accelerator_id is not None:
+        values.add(item.accelerator_id)
+    return frozenset(values)
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +236,7 @@ class QuotaQueryItem:
     grant_satisfaction: GrantSatisfaction = GrantSatisfaction.UNKNOWN
     effective_confirmation: EffectiveConfirmation = EffectiveConfirmation.UNOBSERVED
     evidence_observed_at: datetime | None = None
+    constraint_sets: tuple[AcceleratorConstraintSet, ...] = ()
     constraint_set: AcceleratorConstraintSet | None = None
 
     def __post_init__(self) -> None:
@@ -272,7 +283,18 @@ class QuotaQueryItem:
         )
         if self.evidence_observed_at is not None:
             require_utc(self.evidence_observed_at, "evidence_observed_at")
-        _require_constraint_set(self.accelerator_id, self.constraint_set)
+        constraint_sets = _normalize_constraint_sets(
+            self.identity,
+            self.accelerator_id,
+            self.constraint_sets,
+            self.constraint_set,
+        )
+        object.__setattr__(self, "constraint_sets", constraint_sets)
+        object.__setattr__(
+            self,
+            "constraint_set",
+            constraint_sets[0] if len(constraint_sets) == 1 else None,
+        )
 
 
 def _require_status_filter_types(
@@ -307,18 +329,54 @@ def _require_query_item_status_types(
             raise TypeError(msg)
 
 
-def _require_constraint_set(
+def _normalize_constraint_sets(
+    identity: EffectiveQuotaSliceIdentity,
     accelerator_id: AcceleratorId | None,
+    constraint_sets: tuple[AcceleratorConstraintSet, ...],
     constraint_set: AcceleratorConstraintSet | None,
-) -> None:
-    if constraint_set is None:
-        return
-    if not isinstance(constraint_set, AcceleratorConstraintSet):
+) -> tuple[AcceleratorConstraintSet, ...]:
+    if not isinstance(constraint_sets, tuple) or any(
+        not isinstance(item, AcceleratorConstraintSet) for item in constraint_sets
+    ):
+        msg = "constraint_sets must contain AcceleratorConstraintSet values"
+        raise TypeError(msg)
+    if constraint_set is not None and not isinstance(
+        constraint_set, AcceleratorConstraintSet
+    ):
         msg = "constraint_set must be AcceleratorConstraintSet or None"
         raise TypeError(msg)
-    if accelerator_id != constraint_set.accelerator_id:
-        msg = "constraint_set accelerator must match the query item"
+    if constraint_set is not None:
+        if constraint_sets and constraint_sets != (constraint_set,):
+            msg = "singular constraint_set is ambiguous with constraint_sets"
+            raise ValueError(msg)
+        constraint_sets = (constraint_set,)
+    if len(set(constraint_sets)) != len(constraint_sets):
+        msg = "constraint_sets must not repeat an anchored relationship"
         raise ValueError(msg)
+    if accelerator_id is not None and any(
+        item.accelerator_id != accelerator_id for item in constraint_sets
+    ):
+        msg = "constraint set accelerator must match the query item"
+        raise ValueError(msg)
+    if any(
+        ConstraintReference(identity) not in item.references for item in constraint_sets
+    ):
+        msg = "every constraint set must reference the query item identity"
+        raise ValueError(msg)
+    return tuple(sorted(constraint_sets, key=_constraint_set_key))
+
+
+def _constraint_set_key(value: AcceleratorConstraintSet) -> tuple[object, ...]:
+    return tuple(
+        (
+            reference.slice_identity.resource_scope.canonical_name,
+            reference.slice_identity.service,
+            reference.slice_identity.quota_id,
+            reference.slice_identity.dimensions.items,
+            reference.slice_identity.quota_scope.value,
+        )
+        for reference in value.references
+    )
 
 
 @dataclass(frozen=True, slots=True)
