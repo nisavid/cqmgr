@@ -491,7 +491,15 @@ def test_tpu_requests_reject_noncanonical_zone(zone: str) -> None:
 
 def test_official_compute_wrapper_uses_partial_success_without_retry() -> None:
     """The sync wrapper requests partial success and disables generated retry."""
-    page = compute_v1.MachineTypeAggregatedList(next_page_token="public-next")
+    page = compute_v1.MachineTypeAggregatedList(
+        next_page_token="public-next",
+        warning=compute_v1.Warning(code="NO_RESULTS_ON_PAGE"),
+        items={
+            "zones/us-central1-a": compute_v1.MachineTypesScopedList(
+                warning=compute_v1.Warning(code="NO_RESULTS_ON_PAGE")
+            )
+        },
+    )
 
     class Pager:
         pages = iter((page,))
@@ -527,6 +535,8 @@ def test_official_compute_wrapper_uses_partial_success_without_retry() -> None:
     assert request.page_token == "public-page"
     assert cast("tuple[object, object, object]", client.call)[1:] == (None, 2.5)
     assert result.next_page_token == "public-next"
+    assert result.warning_code == "NO_RESULTS_ON_PAGE"
+    assert result.scopes[0].warning_code == "NO_RESULTS_ON_PAGE"
 
 
 def test_official_compute_wrapper_bounds_sync_dispatch_concurrency() -> None:

@@ -150,7 +150,7 @@ class OfficialComputeMachineTypesPageClient:
             ComputeMachineTypesScope(
                 scope=scope,
                 machine_types=tuple(scoped.machine_types),
-                warning_code=getattr(scoped.warning, "code", "") or None,
+                warning_code=_warning_code(scoped.warning),
             )
             for scope, scoped in sorted(response.items.items())
         )
@@ -158,8 +158,16 @@ class OfficialComputeMachineTypesPageClient:
             scopes=scopes,
             next_page_token=response.next_page_token,
             unreachable_scopes=tuple(response.unreachables),
-            warning_code=getattr(response.warning, "code", "") or None,
+            warning_code=_warning_code(response.warning),
         )
+
+
+def _warning_code(warning: object) -> str | None:
+    code = getattr(warning, "code", None)
+    if not code:
+        return None
+    name = getattr(code, "name", None)
+    return name if isinstance(name, str) and name else str(code)
 
 
 class GoogleComputeMachineTypeReader:

@@ -260,7 +260,7 @@ class GoogleTpuLocationReader(_GoogleTpuCatalogReader):
             completed += 1
             for item in page.items:
                 try:
-                    mapped = TpuLocation(item.name, item.location_id)
+                    mapped = _map_location(item, parent)
                 except (TypeError, ValueError):
                     diagnostic = schema_diagnostic("tpu-locations-read", "cloud-tpu")
                     diagnostics.append(diagnostic)
@@ -332,6 +332,8 @@ class GoogleTpuAcceleratorTypeReader(_GoogleTpuCatalogReader):
             source=CatalogEvidenceSource.TPU_ACCELERATOR_TYPES,
             phase="tpu-accelerator-types-read",
             read_page=self._client.accelerator_types,
+            resource_collection="acceleratorTypes",
+            item_identity=lambda item: item.type_,
             map_item=lambda item: _map_accelerator(item, request.zone),
         )
 
@@ -354,6 +356,8 @@ class GoogleTpuRuntimeVersionReader(_GoogleTpuCatalogReader):
             source=CatalogEvidenceSource.TPU_RUNTIME_VERSIONS,
             phase="tpu-runtime-versions-read",
             read_page=self._client.runtime_versions,
+            resource_collection="runtimeVersions",
+            item_identity=lambda item: item.version,
             map_item=lambda item: TpuRuntimeVersion(
                 name=item.name,
                 zone=request.zone,
@@ -370,6 +374,8 @@ async def _read_zone_pages[ItemT, ResultT](  # noqa: C901, PLR0913
     source: CatalogEvidenceSource,
     phase: str,
     read_page: Callable[..., Awaitable[_TpuPage[ItemT]]],
+    resource_collection: str,
+    item_identity: Callable[[ItemT], str],
     map_item: Callable[[ItemT], ResultT],
 ) -> CatalogRead[ResultT]:
     if not isinstance(context, ProviderReadContext):
@@ -405,7 +411,15 @@ async def _read_zone_pages[ItemT, ResultT](  # noqa: C901, PLR0913
         completed += 1
         for item in page.items:
             try:
-                values.append(map_item(item))
+                values.append(
+                    _map_child(
+                        item,
+                        parent,
+                        resource_collection,
+                        item_identity,
+                        map_item,
+                    )
+                )
             except (TypeError, ValueError, OverflowError):
                 diagnostics.append(schema_diagnostic(phase, "cloud-tpu"))
         token = page.next_page_token
@@ -440,6 +454,26 @@ async def _read_zone_pages[ItemT, ResultT](  # noqa: C901, PLR0913
         [coverage],
         reader._now,  # noqa: SLF001
     )
+
+
+def _map_location(item: locations_pb2.Location, parent: str) -> TpuLocation:
+    if item.name != f"{parent}/locations/{item.location_id}":
+        msg = "TPU location identity does not match its read parent"
+        raise ValueError(msg)
+    return TpuLocation(item.name, item.location_id)
+
+
+def _map_child[ItemT, ResultT](
+    item: ItemT,
+    parent: str,
+    collection: str,
+    item_identity: Callable[[ItemT], str],
+    map_item: Callable[[ItemT], ResultT],
+) -> ResultT:
+    if getattr(item, "name", None) != (f"{parent}/{collection}/{item_identity(item)}"):
+        msg = "TPU catalog item identity does not match its read parent"
+        raise ValueError(msg)
+    return map_item(item)
 
 
 def _map_accelerator(
