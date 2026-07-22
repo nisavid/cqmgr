@@ -143,6 +143,19 @@ class _SlowFakeKeyring(_FakeKeyring):
                 self.active_calls -= 1
 
 
+class _WriteFailingKeyring(_FakeKeyring):
+    """Backend seam whose initial read succeeds before its write fails."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self._write_error = error
+
+    @override
+    def set_password(self, service: str, username: str, password: str) -> None:
+        self.calls.append("set")
+        raise self._write_error
+
+
 def _backend(module: str, name: str = "Keyring") -> _FakeKeyring:
     backend_type = type(name, (_FakeKeyring,), {"__module__": module})
     return backend_type()
@@ -318,6 +331,33 @@ def test_plan_consumption_marker_is_not_delete_capable(tmp_path: Path) -> None:
 
     assert loaded.status is SecretStoreStatus.AVAILABLE
     assert loaded.secret == marker
+
+
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [
+        (KeyringLocked("sensitive-detail-1"), SecretStoreStatus.LOCKED_OR_CANCELLED),
+        (InitError("sensitive-detail-2"), SecretStoreStatus.UNAVAILABLE),
+        (KeyringError("sensitive-detail-3"), SecretStoreStatus.FAILED),
+    ],
+)
+def test_consumption_marker_write_errors_remain_typed(
+    tmp_path: Path,
+    error: Exception,
+    status: SecretStoreStatus,
+) -> None:
+    """A failed marker write returns its closed outcome without error detail."""
+    backend = _WriteFailingKeyring(error)
+    lock = NativePlanInterprocessLock(tmp_path / "marker.lock")
+    store = _trusted_store(backend, lock)
+
+    with lock:
+        outcome = store.create_consumption_marker(
+            _marker_reference(), SecretValue(b"m" * 32)
+        )
+
+    assert outcome.status is status
+    assert outcome.secret is None
 
 
 def test_shared_store_serializes_concurrent_threads(tmp_path: Path) -> None:
