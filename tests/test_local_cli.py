@@ -418,7 +418,7 @@ print(json.dumps(sorted(
     ("schema", "expected_exit", "expected_outcome"),
     [
         (
-            "cqmgr.config/v3",
+            "cqmgr.config/v2",
             REJECTED_PRECONDITION_EXIT,
             "unsupported-configuration-schema",
         ),

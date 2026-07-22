@@ -195,7 +195,7 @@ def test_repository_failures_have_closed_exit_classification() -> None:
     newer = run(
         service.repository_failure(
             "config.get",
-            UnsupportedConfigurationSchemaError("cqmgr.config/v3"),
+            UnsupportedConfigurationSchemaError("cqmgr.config/v2"),
         )
     )
     invalid = run(

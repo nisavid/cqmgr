@@ -43,7 +43,6 @@ if TYPE_CHECKING:
     )
 
 _CONFIG_SCHEMA_V0 = "cqmgr.config/v0"
-_CONFIG_SCHEMA_V1 = "cqmgr.config/v1"
 _SELECTION_SCHEMA_V0 = "cqmgr.selection-state/v0"
 _SCHEMA_VERSION = re.compile(r"cqmgr\.(config|selection-state)/v([0-9]+)\Z")
 
@@ -165,7 +164,7 @@ def _decode_config(document: dict[str, object]) -> ConfigSnapshot:
         document.get("schema"),
         "config",
         CONFIG_SCHEMA,
-        frozenset((_CONFIG_SCHEMA_V0, _CONFIG_SCHEMA_V1, CONFIG_SCHEMA)),
+        frozenset((_CONFIG_SCHEMA_V0, CONFIG_SCHEMA)),
     )
     interface = _interface(document.get("interface"), "interface")
     profiles_table = _table(document.get("profiles", {}), "profiles")
