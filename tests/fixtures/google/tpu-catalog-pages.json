@@ -1,0 +1,53 @@
+{
+  "locationPages": [
+    {
+      "locations": [
+        {
+          "name": "projects/123456789/locations/us-central1-b",
+          "locationId": "us-central1-b",
+          "displayName": "Iowa public example"
+        }
+      ],
+      "nextPageToken": "public-location-page-2"
+    },
+    {
+      "locations": [
+        {
+          "name": "projects/123456789/locations/us-east5-a",
+          "locationId": "us-east5-a",
+          "displayName": "Columbus public example"
+        }
+      ],
+      "nextPageToken": ""
+    }
+  ],
+  "acceleratorPages": {
+    "us-central1-b": [
+      {
+        "acceleratorTypes": [
+          {
+            "name": "projects/123456789/locations/us-central1-b/acceleratorTypes/v6e-8",
+            "type": "v6e-8",
+            "acceleratorConfigs": [
+              {"type": "V6E", "topology": "2x4"}
+            ]
+          }
+        ],
+        "nextPageToken": ""
+      }
+    ]
+  },
+  "runtimePages": {
+    "us-central1-b": [
+      {
+        "runtimeVersions": [
+          {
+            "name": "projects/123456789/locations/us-central1-b/runtimeVersions/tpu-vm-base",
+            "version": "tpu-vm-base"
+          }
+        ],
+        "nextPageToken": ""
+      }
+    ]
+  }
+}
