@@ -131,16 +131,10 @@ class GoogleReadPolicy:
                 BudgetCommitUnknownError,
                 CoordinationCancelledError,
                 CoordinationDeadlineExceededError,
-            ):
+            ) as error:
                 return ProviderCallResult(
                     None,
-                    _diagnostic(
-                        phase,
-                        provider,
-                        "provider-read-budget-unavailable",
-                        "The shared read budget could not safely authorize this call.",
-                        RetryDisposition.AFTER_REFRESH,
-                    ),
+                    _budget_failure(phase, provider, error),
                 )
             try:
                 context.cancellation.raise_if_cancelled()
@@ -211,6 +205,38 @@ def _is_transient(error: Exception) -> bool:
             google_exceptions.ServiceUnavailable,
             google_exceptions.TooManyRequests,
         ),
+    )
+
+
+def _budget_failure(
+    phase: str,
+    provider: str,
+    error: BudgetCommitUnknownError
+    | CoordinationCancelledError
+    | CoordinationDeadlineExceededError,
+) -> Diagnostic:
+    if isinstance(error, CoordinationCancelledError):
+        return _diagnostic(
+            phase,
+            provider,
+            "provider-read-cancelled",
+            "The provider read was cancelled before dispatch.",
+            RetryDisposition.AFTER_REFRESH,
+        )
+    if isinstance(error, CoordinationDeadlineExceededError):
+        return _diagnostic(
+            phase,
+            provider,
+            "provider-read-deadline-exceeded",
+            "The provider read exceeded its caller-controlled deadline.",
+            RetryDisposition.AFTER_REFRESH,
+        )
+    return _diagnostic(
+        phase,
+        provider,
+        "provider-read-budget-unavailable",
+        "The shared read budget could not safely authorize this call.",
+        RetryDisposition.AFTER_REFRESH,
     )
 
 

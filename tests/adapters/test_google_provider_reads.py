@@ -31,6 +31,8 @@ from cqmgr.application.ports.coordination import (
     BudgetGrant,
     BudgetRequest,
     CancellationToken,
+    CoordinationCancelledError,
+    CoordinationDeadlineExceededError,
 )
 from cqmgr.application.ports.provider_reads import (
     EffectiveQuotaReadRequest,
@@ -163,6 +165,27 @@ class CancellingBudget(RecordingBudget):
         )
         cancellation.cancel()
         return grant
+
+
+class FailingBudget(RecordingBudget):
+    """Raise one typed local coordination outcome before provider dispatch."""
+
+    def __init__(self, error: Exception) -> None:
+        """Retain the typed outcome."""
+        super().__init__()
+        self.error = error
+
+    @override
+    async def acquire(
+        self,
+        request: BudgetRequest,
+        *,
+        deadline: float,
+        cancellation: CancellationToken,
+    ) -> BudgetGrant:
+        """Raise without recording a successful durable budget charge."""
+        del request, deadline, cancellation
+        raise self.error
 
 
 class NoJitter:
@@ -541,6 +564,36 @@ def test_cancellation_after_budget_commit_stops_before_dispatch() -> None:
     assert client.calls == []
 
 
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [
+        (CoordinationCancelledError(), "provider-read-cancelled"),
+        (
+            CoordinationDeadlineExceededError(),
+            "provider-read-deadline-exceeded",
+        ),
+    ],
+)
+def test_budget_wait_preserves_typed_stop_outcome(
+    error: Exception,
+    code: str,
+) -> None:
+    """Cancellation and deadline expiry while waiting retain their semantics."""
+    client = FakeCloudQuotasPages(info_pages=_quota_info_pages())
+    result = asyncio.run(
+        GoogleEffectiveQuotaReader(
+            client,
+            _policy(FailingBudget(error)),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(EffectiveQuotaReadRequest(_context(), "compute.googleapis.com"))
+    )
+
+    assert not result.complete
+    assert result.diagnostics[0].code.value == code
+    assert client.calls == []
+
+
 def test_unavailable_adc_stops_before_budget_or_provider_access() -> None:
     """Unreadable credentials cannot dispatch a provider call."""
     budget = RecordingBudget()
@@ -635,6 +688,32 @@ def test_missing_required_quota_info_messages_are_incomplete(missing: str) -> No
 
     assert result.values == ()
     assert not result.complete
+    assert result.diagnostics[0].code.value == "provider-schema-invalid"
+
+
+@pytest.mark.parametrize("mutation", ["locations", "location-value", "dimension"])
+def test_incomplete_quota_info_slice_identity_is_rejected(mutation: str) -> None:
+    """A slice requires covered locations and only declared dimension keys."""
+    item = cloudquotas_v1.QuotaInfo(_quota_info_pages()[0].items[0])
+    slice_ = item.dimensions_infos[0]
+    if mutation == "locations":
+        del slice_.applicable_locations[:]
+    elif mutation == "location-value":
+        slice_.applicable_locations[0] = ""
+    else:
+        slice_.dimensions["future_dimension"] = "future-value"
+
+    result = asyncio.run(
+        GoogleEffectiveQuotaReader(
+            FakeCloudQuotasPages(info_pages=[QuotaInfoPage((item,), "")]),
+            _policy(RecordingBudget()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(EffectiveQuotaReadRequest(_context(), "compute.googleapis.com"))
+    )
+
+    assert not result.complete
+    assert result.values == ()
     assert result.diagnostics[0].code.value == "provider-schema-invalid"
 
 
