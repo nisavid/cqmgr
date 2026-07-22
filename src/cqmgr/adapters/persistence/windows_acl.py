@@ -27,7 +27,11 @@ try {
 if ($isDirectory) {
     $inheritance = 'OICI'
 }
-$sddl = "D:P(A;${inheritance};FA;;;$($identity.Value))"
+$sddl = "O:$($identity.Value)D:P(A;${inheritance};FA;;;$($identity.Value))"
+$sections = (
+    [System.Security.AccessControl.AccessControlSections]::Owner -bor
+    [System.Security.AccessControl.AccessControlSections]::Access
+)
 try {
     if ($isDirectory) {
         $acl = New-Object System.Security.AccessControl.DirectorySecurity
@@ -36,7 +40,7 @@ try {
     }
     $acl.SetSecurityDescriptorSddlForm(
         $sddl,
-        [System.Security.AccessControl.AccessControlSections]::Access
+        $sections
     )
 } catch {
     exit 13
@@ -54,18 +58,24 @@ try {
     if ($isDirectory) {
         $verifiedAcl = [System.IO.Directory]::GetAccessControl(
             $target,
-            [System.Security.AccessControl.AccessControlSections]::Access
+            $sections
         )
     } else {
         $verifiedAcl = [System.IO.File]::GetAccessControl(
             $target,
-            [System.Security.AccessControl.AccessControlSections]::Access
+            $sections
         )
     }
 } catch {
     exit 15
 }
 $verified = @($verifiedAcl.Access)
+$verifiedOwner = $verifiedAcl.GetOwner(
+    [System.Security.Principal.SecurityIdentifier]
+)
+if ($verifiedOwner.Value -ne $identity.Value) {
+    exit 26
+}
 if (-not $verifiedAcl.AreAccessRulesProtected) {
     exit 21
 }
