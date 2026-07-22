@@ -3,14 +3,13 @@
     {
       "metric": {
         "type": "serviceruntime.googleapis.com/quota/allocation/usage",
-        "labels": {"service": "compute.googleapis.com", "quota_metric": "compute.googleapis.com/gpus_per_gpu_family"}
+        "labels": {"quota_metric": "compute.googleapis.com/gpus_per_gpu_family"}
       },
-      "resource": {"type": "consumer_quota", "labels": {"project_id": "public-schema-project", "location": "us-central1"}},
+      "resource": {"type": "consumer_quota", "labels": {"project_id": "public-schema-project", "service": "compute.googleapis.com", "location": "us-central1"}},
       "metricKind": "GAUGE",
       "valueType": "INT64",
       "points": [
-        {"interval": {"startTime": "2026-07-22T01:00:00Z", "endTime": "2026-07-22T02:00:00Z"}, "value": {"int64Value": "9223372036854775807"}},
-        {"interval": {"endTime": "2026-07-22T01:00:00Z"}, "value": {"doubleValue": 12.5}}
+        {"interval": {"startTime": "2026-07-22T02:00:00Z", "endTime": "2026-07-22T02:00:00Z"}, "value": {"int64Value": "9223372036854775807"}}
       ],
       "unit": "1",
       "futurePublicField": "ignored-schema-expansion"

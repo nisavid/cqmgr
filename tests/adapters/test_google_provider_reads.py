@@ -6,9 +6,10 @@ import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, cast, override
 
 import pytest
+from google.api import metric_pb2
 from google.api_core import exceptions as google_exceptions
 from google.cloud import cloudquotas_v1, monitoring_v3
 from google.protobuf import json_format
@@ -49,7 +50,6 @@ FIXTURES = Path(__file__).parents[1] / "fixtures" / "google"
 NOW = datetime(2026, 7, 22, 3, tzinfo=UTC)
 TWO = 2
 GRANTED_VALUE = 64
-DOUBLE_USAGE = 12.5
 INFO_PAGE_SIZE = 17
 MONITORING_PAGE_SIZE = 23
 
@@ -142,6 +142,27 @@ class RecordingBudget:
         cancellation.raise_if_cancelled()
         self.requests.append(request)
         return BudgetGrant(charged_at=deadline - 1, request=request)
+
+
+class CancellingBudget(RecordingBudget):
+    """Commit a charge while cancellation races the return path."""
+
+    @override
+    async def acquire(
+        self,
+        request: BudgetRequest,
+        *,
+        deadline: float,
+        cancellation: CancellationToken,
+    ) -> BudgetGrant:
+        """Record a durable grant, then signal cancellation before dispatch."""
+        grant = await super().acquire(
+            request,
+            deadline=deadline,
+            cancellation=cancellation,
+        )
+        cancellation.cancel()
+        return grant
 
 
 class NoJitter:
@@ -483,6 +504,43 @@ def test_permanent_and_unknown_transport_failures_are_static_and_incomplete() ->
         assert budget.requests[0].adc_quota_project is None
 
 
+def test_not_found_is_a_permanent_provider_failure() -> None:
+    """A documented missing resource never receives unknown retry guidance."""
+    result = asyncio.run(
+        GoogleEffectiveQuotaReader(
+            FakeCloudQuotasPages(
+                info_pages=[google_exceptions.NotFound("private provider text")]
+            ),
+            _policy(RecordingBudget()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(EffectiveQuotaReadRequest(_context(), "compute.googleapis.com"))
+    )
+
+    assert not result.complete
+    assert result.diagnostics[0].code.value == "provider-read-not-found"
+    assert result.diagnostics[0].retry.value == "never"
+
+
+def test_cancellation_after_budget_commit_stops_before_dispatch() -> None:
+    """A committed conservative charge does not authorize a cancelled read."""
+    budget = CancellingBudget()
+    client = FakeCloudQuotasPages(info_pages=_quota_info_pages())
+    result = asyncio.run(
+        GoogleEffectiveQuotaReader(
+            client,
+            _policy(budget),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(EffectiveQuotaReadRequest(_context(), "compute.googleapis.com"))
+    )
+
+    assert not result.complete
+    assert result.diagnostics[0].code.value == "provider-read-cancelled"
+    assert len(budget.requests) == 1
+    assert client.calls == []
+
+
 def test_unavailable_adc_stops_before_budget_or_provider_access() -> None:
     """Unreadable credentials cannot dispatch a provider call."""
     budget = RecordingBudget()
@@ -685,13 +743,18 @@ def test_monitoring_reader_preserves_all_points_intervals_values_and_labels() ->
     )
 
     assert result.complete
-    observation = result.values[0]
-    assert observation.metric_labels.items[0][0] == "quota_metric"
-    assert len(observation.points) == TWO
-    assert observation.points[0].interval_start == datetime(2026, 7, 22, 1, tzinfo=UTC)
-    assert observation.points[0].value.value == 2**63 - 1
-    assert observation.points[1].interval_start is None
-    assert observation.points[1].value.value == DOUBLE_USAGE
+    (integer_observation,) = result.values
+    assert integer_observation.metric_labels.items[0][0] == "quota_metric"
+    assert len(integer_observation.points) == 1
+    assert integer_observation.points[0].interval_start == datetime(
+        2026, 7, 22, 2, tzinfo=UTC
+    )
+    assert integer_observation.points[0].value.value == 2**63 - 1
+    assert integer_observation.resource_labels.items == (
+        ("location", "us-central1"),
+        ("project_id", "public-schema-project"),
+        ("service", "compute.googleapis.com"),
+    )
     assert client.calls[0][1] == request.filter
 
 
@@ -731,6 +794,62 @@ def test_monitoring_schema_skew_and_partial_page_fail_closed() -> None:
         "provider-schema-invalid",
         "provider-read-transient-failure",
     }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "metric-kind",
+        "value-type",
+        "unit",
+        "quota-metric",
+        "project-id",
+        "resource-type",
+        "service",
+        "location",
+    ],
+)
+def test_monitoring_declarations_and_project_attribution_fail_closed(
+    mutation: str,
+) -> None:
+    """Schema-skewed or cross-project usage never becomes complete evidence."""
+    series = monitoring_v3.TimeSeries(_monitoring_page().items[0])
+    if mutation == "metric-kind":
+        series.metric_kind = metric_pb2.MetricDescriptor.MetricKind.CUMULATIVE
+    elif mutation == "value-type":
+        series.value_type = metric_pb2.MetricDescriptor.ValueType.DOUBLE
+        series.points[0].value.double_value = 12.5
+    elif mutation == "unit":
+        series.unit = "{requests}"
+    elif mutation == "quota-metric":
+        series.metric.labels["quota_metric"] = ""
+    elif mutation == "project-id":
+        series.resource.labels.pop("project_id")
+    elif mutation == "resource-type":
+        series.resource.type = "future_consumer_quota"
+    elif mutation == "service":
+        series.resource.labels["service"] = ""
+    else:
+        series.resource.labels.pop("location")
+    result = asyncio.run(
+        GoogleUsageReader(
+            FakeMonitoringPages([TimeSeriesPage((series,), "")]),
+            _policy(RecordingBudget()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(
+            UsageReadRequest(
+                _context(),
+                "public-filter",
+                datetime(2026, 7, 22, tzinfo=UTC),
+                datetime(2026, 7, 23, tzinfo=UTC),
+            )
+        )
+    )
+
+    assert not result.complete
+    assert result.values == ()
+    assert result.diagnostics[0].code.value == "provider-schema-invalid"
 
 
 @pytest.mark.parametrize("value", [0, -1, True, float("inf")])

@@ -142,6 +142,19 @@ class GoogleReadPolicy:
                         RetryDisposition.AFTER_REFRESH,
                     ),
                 )
+            try:
+                context.cancellation.raise_if_cancelled()
+            except CoordinationCancelledError:
+                return ProviderCallResult(
+                    None,
+                    _diagnostic(
+                        phase,
+                        provider,
+                        "provider-read-cancelled",
+                        "The provider read was cancelled before dispatch.",
+                        RetryDisposition.AFTER_REFRESH,
+                    ),
+                )
             remaining = context.deadline - self._monotonic()
             if remaining <= 0:
                 return ProviderCallResult(
@@ -219,6 +232,14 @@ def _provider_failure(phase: str, provider: str, error: Exception) -> Diagnostic
             provider,
             "provider-read-invalid-request",
             "The provider rejected the normalized read request.",
+            RetryDisposition.NEVER,
+        )
+    if isinstance(error, google_exceptions.NotFound):
+        return _diagnostic(
+            phase,
+            provider,
+            "provider-read-not-found",
+            "The requested provider resource was not found.",
             RetryDisposition.NEVER,
         )
     if _is_transient(error):
