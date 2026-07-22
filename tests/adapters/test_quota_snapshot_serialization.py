@@ -18,6 +18,7 @@ from cqmgr.application.ports.quota_snapshots import (
 )
 from cqmgr.domain.catalog import (
     ACCELERATOR_CATALOG_SCHEMA,
+    AcceleratorConstraintSet,
     AcceleratorId,
     CatalogMetadata,
     CatalogPredicates,
@@ -35,6 +36,7 @@ from cqmgr.domain.quota_queries import (
     SortDirection,
 )
 from cqmgr.domain.quotas import (
+    ConstraintReference,
     EffectiveQuotaSliceIdentity,
     NormalizedDimensions,
     QuotaQuantity,
@@ -71,16 +73,17 @@ def quota_snapshot(*, complete: bool = True) -> QuotaQuerySnapshot:
         ),
         sort=(QuotaSort(QuotaSortField.EFFECTIVE, SortDirection.DESC),),
     )
-    item = QuotaQueryItem(
-        identity=EffectiveQuotaSliceIdentity(
-            resource_scope=scope,
-            service="compute.googleapis.com",
-            quota_id="GPUS-PER-GPU-FAMILY-per-project-region",
-            dimensions=NormalizedDimensions(
-                (("gpu_family", "NVIDIA_H100"), ("region", "us-central1"))
-            ),
-            quota_scope=QuotaScope.REGIONAL,
+    identity = EffectiveQuotaSliceIdentity(
+        resource_scope=scope,
+        service="compute.googleapis.com",
+        quota_id="GPUS-PER-GPU-FAMILY-per-project-region",
+        dimensions=NormalizedDimensions(
+            (("gpu_family", "NVIDIA_H100"), ("region", "us-central1"))
         ),
+        quota_scope=QuotaScope.REGIONAL,
+    )
+    item = QuotaQueryItem(
+        identity=identity,
         display_name="NVIDIA H100 GPUs",
         accelerator_id=AcceleratorId("nvidia-h100"),
         location="us-central1",
@@ -99,6 +102,10 @@ def quota_snapshot(*, complete: bool = True) -> QuotaQuerySnapshot:
         grant_satisfaction=GrantSatisfaction.FULL,
         effective_confirmation=EffectiveConfirmation.CONFIRMED,
         evidence_observed_at=datetime(2026, 7, 22, 7, 59, tzinfo=UTC),
+        constraint_set=AcceleratorConstraintSet(
+            AcceleratorId("nvidia-h100"),
+            (ConstraintReference(identity),),
+        ),
     )
     return QuotaQuerySnapshot(
         metadata=QuerySnapshotMetadata(

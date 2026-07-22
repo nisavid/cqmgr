@@ -9,6 +9,7 @@ from functools import cmp_to_key
 from unicodedata import normalize
 
 from cqmgr.domain.catalog import (
+    AcceleratorConstraintSet,
     AcceleratorId,
     CatalogGroupId,
     CatalogMetadata,
@@ -225,6 +226,7 @@ class QuotaQueryItem:
     grant_satisfaction: GrantSatisfaction = GrantSatisfaction.UNKNOWN
     effective_confirmation: EffectiveConfirmation = EffectiveConfirmation.UNOBSERVED
     evidence_observed_at: datetime | None = None
+    constraint_set: AcceleratorConstraintSet | None = None
 
     def __post_init__(self) -> None:
         """Keep optional product metadata separate from canonical slice identity."""
@@ -270,6 +272,7 @@ class QuotaQueryItem:
         )
         if self.evidence_observed_at is not None:
             require_utc(self.evidence_observed_at, "evidence_observed_at")
+        _require_constraint_set(self.accelerator_id, self.constraint_set)
 
 
 def _require_status_filter_types(
@@ -302,6 +305,20 @@ def _require_query_item_status_types(
         if not isinstance(value, enum_type):
             msg = f"{name} must use {enum_type.__name__}"
             raise TypeError(msg)
+
+
+def _require_constraint_set(
+    accelerator_id: AcceleratorId | None,
+    constraint_set: AcceleratorConstraintSet | None,
+) -> None:
+    if constraint_set is None:
+        return
+    if not isinstance(constraint_set, AcceleratorConstraintSet):
+        msg = "constraint_set must be AcceleratorConstraintSet or None"
+        raise TypeError(msg)
+    if accelerator_id != constraint_set.accelerator_id:
+        msg = "constraint_set accelerator must match the query item"
+        raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True)
