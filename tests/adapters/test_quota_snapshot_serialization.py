@@ -140,7 +140,10 @@ def test_snapshot_record_round_trips_as_canonical_safe_json(
     assert encoded.endswith(b"\n")
     assert encoded == encode_snapshot_record(decode_snapshot_record(encoded))
     assert decode_snapshot_record(encoded) == snapshot
-    assert json.loads(encoded)["schema"] == "cqmgr.quota-query-snapshot/v1"
+    document = json.loads(encoded)
+    assert document["schema"] == "cqmgr.quota-query-snapshot/v2"
+    assert "constraint_sets" in document["snapshot"]["items"][0]
+    assert "constraint_set" not in document["snapshot"]["items"][0]
     for forbidden in (
         "provider-page-token",
         "private-credential",
@@ -154,7 +157,7 @@ def test_snapshot_record_round_trips_as_canonical_safe_json(
 @pytest.mark.parametrize(
     "document",
     [
-        b'{"schema":"cqmgr.quota-query-snapshot/v2"}\n',
+        b'{"schema":"cqmgr.quota-query-snapshot/v3"}\n',
         b'{"schema":"cqmgr.quota-query-snapshot/v0","snapshot":{}}\n',
         b'{"schema":"cqmgr.quota-query-snapshot/v1","unknown":true}\n',
         b"not-json\n",
@@ -166,7 +169,7 @@ def test_snapshot_decoder_rejects_newer_unknown_and_corrupt_state(
     """Stored schema drift and corruption fail closed without partial evidence."""
     expected = (
         UnsupportedQuotaSnapshotSchemaError
-        if b"/v2" in document
+        if b"/v3" in document
         else QuotaSnapshotStoredDataError
     )
     with pytest.raises(expected):
@@ -196,12 +199,21 @@ def test_snapshot_codec_round_trips_catalog_group_and_constraint_references() ->
     """Retained rows preserve guided group selection and exact related slices."""
     snapshot = quota_snapshot()
     item = snapshot.items[0]
+    accelerator_id = cast("AcceleratorId", item.accelerator_id)
+    first_companion = replace(item.identity, quota_id="GPUS-ALL-REGIONS-primary")
+    second_companion = replace(item.identity, quota_id="GPUS-ALL-REGIONS-secondary")
+    first_set = AcceleratorConstraintSet(
+        accelerator_id,
+        (ConstraintReference(item.identity), ConstraintReference(first_companion)),
+    )
+    second_set = AcceleratorConstraintSet(
+        accelerator_id,
+        (ConstraintReference(item.identity), ConstraintReference(second_companion)),
+    )
     constrained = replace(
         item,
-        constraint_set=AcceleratorConstraintSet(
-            cast("AcceleratorId", item.accelerator_id),
-            (ConstraintReference(item.identity),),
-        ),
+        constraint_set=None,
+        constraint_sets=(second_set, first_set),
     )
     grouped = replace(
         snapshot,
@@ -215,7 +227,29 @@ def test_snapshot_codec_round_trips_catalog_group_and_constraint_references() ->
         items=(constrained,),
     )
 
-    assert decode_snapshot_record(encode_snapshot_record(grouped)) == grouped
+    encoded = encode_snapshot_record(grouped)
+
+    assert decode_snapshot_record(encoded) == grouped
+    assert len(json.loads(encoded)["snapshot"]["items"][0]["constraint_sets"]) == len(
+        grouped.items[0].constraint_sets
+    )
+
+
+def test_snapshot_codec_migrates_unambiguous_legacy_constraint_set() -> None:
+    """A v1 singular relationship remains readable as one plural relationship."""
+    snapshot = quota_snapshot()
+    document = json.loads(encode_snapshot_record(snapshot))
+    item = document["snapshot"]["items"][0]
+    item["constraint_set"] = item.pop("constraint_sets")[0]
+    document["schema"] = "cqmgr.quota-query-snapshot/v1"
+    encoded = (
+        json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode()
+
+    decoded = decode_snapshot_record(encoded)
+
+    assert decoded.items[0].constraint_sets == (decoded.items[0].constraint_set,)
 
 
 def test_codec_entrypoints_reject_wrong_types_and_invalid_cursor_values() -> None:
