@@ -105,16 +105,14 @@ def _exercise_local_persistence(root: Path) -> None:
     repository = LocalPlanRepository(root, _MemoryConsumptionStore())
     authentication_key = SecretValue(key)
 
-    assert repository.store(encoded, authentication_key).status is (
-        PlanRepositoryStatus.STORED
-    )
+    stored = repository.store(encoded, authentication_key)
+    assert stored.status is PlanRepositoryStatus.STORED
     loaded = repository.load(encoded.digest, authentication_key, now)
     assert loaded.status is PlanRepositoryStatus.AVAILABLE
     assert loaded.plan_bytes == encoded.bytes
     destination = root.parent / "export" / "request.plan"
-    assert repository.export(encoded, destination).status is (
-        PlanRepositoryStatus.EXPORTED
-    )
+    exported = repository.export(encoded, destination)
+    assert exported.status is PlanRepositoryStatus.EXPORTED
     assert repository.read_export(destination).plan_bytes == encoded.bytes
 
 
@@ -134,12 +132,15 @@ def _exercise_native_keyring(root: Path, *, require_round_trip: bool) -> None:
     )
     value = SecretValue(secrets.token_bytes(32))
     try:
-        assert store.create(reference, value).status is SecretStoreStatus.CREATED
+        created = store.create(reference, value)
+        assert created.status is SecretStoreStatus.CREATED
         loaded = store.get(reference)
         assert loaded.status is SecretStoreStatus.AVAILABLE
         assert loaded.secret == value
-        assert store.delete(reference).status is SecretStoreStatus.DELETED
-        assert store.get(reference).status is SecretStoreStatus.MISSING
+        deleted = store.delete(reference)
+        assert deleted.status is SecretStoreStatus.DELETED
+        missing = store.get(reference)
+        assert missing.status is SecretStoreStatus.MISSING
     finally:
         if store.get(reference).status is SecretStoreStatus.AVAILABLE:
             store.delete(reference)

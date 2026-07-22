@@ -20,7 +20,6 @@ from hypothesis.stateful import RuleBasedStateMachine, precondition, rule
 import cqmgr.adapters.persistence.plans as plan_persistence
 from cqmgr.adapters.persistence import secrets as secret_adapter
 from cqmgr.adapters.persistence.native_plan_lock import NativePlanInterprocessLock
-from cqmgr.adapters.persistence.plans import LocalPlanRepository
 from cqmgr.adapters.persistence.secrets import NativeSecretStore
 from cqmgr.adapters.serialization.plans import PlanCodec
 from cqmgr.application.ports.plans import EncodedPlan, PlanLease, PlanRepositoryStatus
@@ -119,10 +118,10 @@ def _repository(
     root: Path,
     *,
     lock: NativePlanInterprocessLock | None = None,
-) -> LocalPlanRepository:
+) -> plan_persistence.LocalPlanRepository:
     resolved = root.resolve()
     store = _CONSUMPTION_STORES.setdefault(resolved, _MemoryConsumptionStore())
-    return LocalPlanRepository(root, store, lock=lock)
+    return plan_persistence.LocalPlanRepository(root, store, lock=lock)
 
 
 def _encoded():  # noqa: ANN202
@@ -194,7 +193,7 @@ def _crash_holding_lock(path: str) -> None:
 
 
 def _attempt_fake_provider_write(
-    repository: LocalPlanRepository,
+    repository: plan_persistence.LocalPlanRepository,
     digest: str,
     key: SecretValue,
     writes: list[str],
@@ -242,7 +241,7 @@ def test_repository_and_native_marker_store_compose_under_one_shared_lock(
         return_value={type(backend): SecretBackendKind.MACOS_KEYCHAIN},
     ):
         marker_store = NativeSecretStore(backend, lock)
-    repository = LocalPlanRepository(root, marker_store, lock=lock)
+    repository = plan_persistence.LocalPlanRepository(root, marker_store, lock=lock)
 
     assert repository.store(_encoded(), PLAN_KEY).status is PlanRepositoryStatus.STORED
 
@@ -822,7 +821,8 @@ def test_authentic_ledger_replay_cannot_authorize_a_second_provider_write(
     )
     marker_store = _CONSUMPTION_STORES[tmp_path.resolve()]
     marker_reference = next(iter(marker_store.values))
-    assert marker_store.delete(marker_reference).status is SecretStoreStatus.UNSUPPORTED
+    delete_marker = marker_store.delete(marker_reference)
+    assert delete_marker.status is SecretStoreStatus.UNSUPPORTED
     state_path.write_bytes(authentic_available_state)
     replay = _attempt_fake_provider_write(
         repository,
