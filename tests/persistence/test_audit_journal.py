@@ -1,5 +1,7 @@
 """Real-filesystem contracts for the append-only audit journal."""
 
+import base64
+import hashlib
 import json
 import multiprocessing
 from dataclasses import replace
@@ -99,8 +101,10 @@ def test_empty_journal_verifies_as_an_empty_retained_range(tmp_path: Path) -> No
 
 def test_segment_size_must_leave_room_for_a_rotation_checkpoint(tmp_path: Path) -> None:
     """A segment policy cannot rotate on every operation record."""
+    root = tmp_path / "journal"
     with pytest.raises(ValueError, match="at least two"):
-        FilesystemAuditJournal(tmp_path, max_records_per_segment=1)
+        FilesystemAuditJournal(root, max_records_per_segment=1)
+    assert not root.exists()
 
 
 def test_rotation_checkpoint_continues_the_hash_chain(tmp_path: Path) -> None:
@@ -151,6 +155,21 @@ def test_query_cursor_is_bounded_and_bound_to_filters(tmp_path: Path) -> None:
     tampered = (first_page.next_cursor or "")[:-2] + "AA"
     with pytest.raises(ValueError, match="invalid"):
         journal.query(replace(query, cursor=tampered))
+
+
+@pytest.mark.parametrize("payload", [[], "cursor", 1])
+def test_query_rejects_nonobject_cursor_payloads(
+    tmp_path: Path,
+    payload: object,
+) -> None:
+    """Well-encoded non-object JSON cursors normalize to the public cursor error."""
+    journal = FilesystemAuditJournal(tmp_path)
+    raw = json.dumps(payload).encode()
+    digest = hashlib.sha256(raw).hexdigest().encode()
+    cursor = base64.urlsafe_b64encode(raw + b"." + digest).decode()
+
+    with pytest.raises(ValueError, match="cursor is invalid"):
+        journal.query(AuditQuery(cursor=cursor))
 
 
 def test_query_filters_outcomes_and_closed_time_range(tmp_path: Path) -> None:

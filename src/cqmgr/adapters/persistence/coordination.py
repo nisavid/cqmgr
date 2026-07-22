@@ -154,7 +154,8 @@ class SharedBudgetCoordinator:
         for scope, identity in axes:
             limit = self._limits[scope]
             if request.units > limit.capacity:
-                raise CoordinationDeadlineExceededError
+                msg = "budget request units exceed configured capacity"
+                raise ValueError(msg)
             key = self._budget_key(scope, identity)
             existing = entries.get(key)
             if existing is None:

@@ -76,14 +76,14 @@ class FilesystemAuditJournal:
         failure_hook: Callable[[str], None] | None = None,
     ) -> None:
         """Open one installation-local journal and recover a stale manifest."""
+        if max_records_per_segment < _MIN_RECORDS_PER_SEGMENT:
+            msg = "audit segments must allow at least two records"
+            raise ValueError(msg)
         self._root = Path(root)
         self._root.mkdir(parents=True, exist_ok=True)
         self._max_records_per_segment = max_records_per_segment
         self._failure_hook = failure_hook or (lambda _stage: None)
         self._lock = InterprocessFileLock(self._root / ".journal.lock")
-        if max_records_per_segment < _MIN_RECORDS_PER_SEGMENT:
-            msg = "audit segments must allow at least two records"
-            raise ValueError(msg)
         with self._lock:
             if not (self._root / _MANIFEST_NAME).exists() and not tuple(
                 self._root.glob("audit-*.jsonl")
@@ -247,7 +247,7 @@ class FilesystemAuditJournal:
             segment=segment,
             draft=draft,
             previous_hash=previous_hash,
-            record_hash="",
+            record_hash=AUDIT_GENESIS_HASH,
         )
         digest = hashlib.sha256(cls._canonical_mapping(provisional)).hexdigest()
         return replace(provisional, record_hash=f"sha256:{digest}")
@@ -672,6 +672,7 @@ class FilesystemAuditJournal:
         except (
             ValueError,
             KeyError,
+            TypeError,
             json.JSONDecodeError,
             _InvalidCursorError,
         ) as error:
