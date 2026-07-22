@@ -7,6 +7,7 @@ import math
 import os
 import sys
 import time
+from threading import Condition, get_ident
 from typing import IO, TYPE_CHECKING, Self
 
 if TYPE_CHECKING:
@@ -52,6 +53,8 @@ class NativePlanInterprocessLock:
         self._timeout_seconds = timeout_seconds
         self._poll_seconds = poll_seconds
         self._handle: IO[bytes] | None = None
+        self._thread_condition = Condition()
+        self._owner_thread_id: int | None = None
 
     @property
     def path(self) -> Path:
@@ -60,39 +63,74 @@ class NativePlanInterprocessLock:
 
     def __enter__(self) -> Self:
         """Acquire the lock within its bounded timeout."""
-        if self._handle is not None:
-            msg = "interprocess lock is not reentrant"
-            raise RuntimeError(msg)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
-        handle = os.fdopen(descriptor, "r+b", buffering=0)
         deadline = time.monotonic() + self._timeout_seconds
-        while True:
+        self._reserve_thread_ownership(deadline)
+        handle: IO[bytes] | None = None
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
             try:
-                _try_lock(handle)
-                break
-            except OSError as error:
-                if not _is_contention(error):
-                    handle.close()
-                    raise
-                if time.monotonic() >= deadline:
-                    handle.close()
-                    msg = "timed out acquiring interprocess lock"
-                    raise InterprocessLockTimeoutError(msg) from error
-                time.sleep(self._poll_seconds)
+                handle = os.fdopen(descriptor, "r+b", buffering=0)
+            except BaseException:
+                os.close(descriptor)
+                raise
+            while True:
+                try:
+                    _try_lock(handle)
+                    break
+                except OSError as error:
+                    if not _is_contention(error):
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        msg = "timed out acquiring interprocess lock"
+                        raise InterprocessLockTimeoutError(msg) from error
+                    time.sleep(min(self._poll_seconds, remaining))
+        except BaseException:
+            if handle is not None:
+                handle.close()
+            self._release_thread_ownership()
+            raise
         self._handle = handle
         return self
 
+    def _reserve_thread_ownership(self, deadline: float) -> None:
+        thread_id = get_ident()
+        with self._thread_condition:
+            if self._owner_thread_id == thread_id:
+                msg = "interprocess lock is not reentrant"
+                raise RuntimeError(msg)
+            while self._owner_thread_id is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    msg = "timed out acquiring interprocess lock"
+                    raise InterprocessLockTimeoutError(msg)
+                self._thread_condition.wait(timeout=remaining)
+            self._owner_thread_id = thread_id
+
     def __exit__(self, *_error: object) -> None:
         """Release the operating-system lock and close its handle."""
-        handle = self._handle
-        self._handle = None
-        if handle is None:
-            return
+        with self._thread_condition:
+            if self._owner_thread_id is None:
+                return
+            if self._owner_thread_id != get_ident():
+                msg = "interprocess lock is owned by another thread"
+                raise RuntimeError(msg)
+            handle = self._handle
+        if handle is None:  # pragma: no cover - owner enters and exits synchronously
+            msg = "interprocess lock ownership is incomplete"
+            raise RuntimeError(msg)
         try:
             _unlock(handle)
         finally:
             handle.close()
+            self._handle = None
+            self._release_thread_ownership()
+
+    def _release_thread_ownership(self) -> None:
+        with self._thread_condition:
+            self._owner_thread_id = None
+            self._thread_condition.notify_all()
 
 
 def _try_lock(handle: IO[bytes]) -> None:
