@@ -1,0 +1,49 @@
+{
+  "pages": [
+    {
+      "quotaInfos": [
+        {
+          "name": "projects/415104041262/locations/global/services/compute.googleapis.com/quotaInfos/GPUS-PER-GPU-FAMILY-per-project-region",
+          "quotaId": "GPUS-PER-GPU-FAMILY-per-project-region",
+          "metric": "compute.googleapis.com/gpus_per_gpu_family",
+          "service": "compute.googleapis.com",
+          "isPrecise": true,
+          "refreshInterval": "60s",
+          "dimensions": ["region", "gpu_family"],
+          "metricDisplayName": "GPUs per family",
+          "quotaDisplayName": "GPUs per family per region",
+          "metricUnit": "1",
+          "quotaIncreaseEligibility": {
+            "isEligible": true,
+            "ineligibilityReason": "INELIGIBILITY_REASON_UNSPECIFIED"
+          },
+          "isFixed": false,
+          "isConcurrent": true,
+          "dimensionsInfos": [
+            {
+              "dimensions": {"region": "us-central1", "gpu_family": "NVIDIA_H100"},
+              "details": {"value": "9223372036854775807", "rolloutInfo": {"ongoingRollout": true}},
+              "applicableLocations": ["us-central1"]
+            }
+          ],
+          "futurePublicField": "ignored-schema-expansion"
+        }
+      ],
+      "nextPageToken": "public-page-2"
+    },
+    {
+      "quotaInfos": [
+        {
+          "name": "projects/415104041262/locations/global/services/compute.googleapis.com/quotaInfos/GPUS-ALL-REGIONS-per-project",
+          "quotaId": "GPUS-ALL-REGIONS-per-project",
+          "metric": "compute.googleapis.com/gpus_all_regions",
+          "service": "compute.googleapis.com",
+          "metricUnit": "1",
+          "quotaIncreaseEligibility": {"isEligible": false, "ineligibilityReason": "NOT_ENOUGH_USAGE_HISTORY"},
+          "dimensionsInfos": [{"dimensions": {}, "details": {"value": "128"}, "applicableLocations": ["global"]}]
+        }
+      ],
+      "nextPageToken": ""
+    }
+  ]
+}

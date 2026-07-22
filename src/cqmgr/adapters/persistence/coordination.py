@@ -163,11 +163,12 @@ class SharedBudgetCoordinator:
         now: float,
     ) -> tuple[dict[str, Any], float | None]:
         entries = dict(state["entries"])
-        axes = (
+        axes = [
             (BudgetScope.PROVIDER, request.provider),
             (BudgetScope.PROJECT, request.project),
-            (BudgetScope.ADC_QUOTA_PROJECT, request.adc_quota_project),
-        )
+        ]
+        if request.adc_quota_project is not None:
+            axes.append((BudgetScope.ADC_QUOTA_PROJECT, request.adc_quota_project))
         blocked_for: list[float] = []
         prepared: list[tuple[str, dict[str, Any]]] = []
         for scope, identity in axes:

@@ -1,0 +1,633 @@
+"""Read-only Cloud Quotas and Monitoring adapter contracts."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
+
+import pytest
+from google.api_core import exceptions as google_exceptions
+from google.cloud import cloudquotas_v1, monitoring_v3
+from google.protobuf import json_format
+
+from cqmgr.adapters.google.cloud_quotas import (
+    GoogleEffectiveQuotaReader,
+    GoogleQuotaPreferenceReader,
+    OfficialCloudQuotasPageClient,
+    QuotaInfoPage,
+    QuotaPreferencePage,
+)
+from cqmgr.adapters.google.monitoring import (
+    GoogleUsageReader,
+    OfficialMonitoringPageClient,
+    TimeSeriesPage,
+)
+from cqmgr.adapters.google.read_policy import GoogleReadPolicy
+from cqmgr.application.ports.coordination import (
+    BudgetGrant,
+    BudgetRequest,
+    CancellationToken,
+)
+from cqmgr.application.ports.provider_reads import (
+    EffectiveQuotaReadRequest,
+    ProviderReadContext,
+    QuotaPreferenceReadRequest,
+    UsageReadRequest,
+)
+from cqmgr.domain.identity import ADCIdentityEvidence, ADCQuotaProject, CredentialKind
+from cqmgr.domain.projects import CanonicalProject
+from cqmgr.domain.quotas import QuotaScope
+from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Mapping, Sequence
+
+FIXTURES = Path(__file__).parents[1] / "fixtures" / "google"
+NOW = datetime(2026, 7, 22, 3, tzinfo=UTC)
+TWO = 2
+GRANTED_VALUE = 64
+DOUBLE_USAGE = 12.5
+INFO_PAGE_SIZE = 17
+MONITORING_PAGE_SIZE = 23
+
+
+class OnePagePager:
+    """Minimal generated-pager shape for official request tests."""
+
+    def __init__(self, response: object) -> None:
+        """Retain one generated response."""
+        self.response = response
+
+    @property
+    def pages(self) -> AsyncIterator[object]:
+        """Return an async iterator containing the retained response."""
+
+        async def generate() -> AsyncIterator[object]:
+            yield self.response
+
+        return generate()
+
+
+class FakeOfficialCloudQuotasClient:
+    """Capture official request objects without network access."""
+
+    def __init__(self) -> None:
+        """Create an empty request ledger."""
+        self.calls: list[tuple[str, object, object, object]] = []
+
+    async def list_quota_infos(
+        self,
+        *,
+        request: object,
+        retry: object,
+        timeout: object,  # noqa: ASYNC109
+    ) -> OnePagePager:
+        """Return one empty generated QuotaInfo response."""
+        self.calls.append(("info", request, retry, timeout))
+        response = cloudquotas_v1.ListQuotaInfosResponse(
+            next_page_token="public-next-page"  # noqa: S106
+        )
+        return OnePagePager(response)
+
+    async def list_quota_preferences(
+        self,
+        *,
+        request: object,
+        retry: object,
+        timeout: object,  # noqa: ASYNC109
+    ) -> OnePagePager:
+        """Return one empty generated preference response."""
+        self.calls.append(("preference", request, retry, timeout))
+        response = cloudquotas_v1.ListQuotaPreferencesResponse()
+        return OnePagePager(response)
+
+
+class FakeOfficialMonitoringClient:
+    """Capture official Monitoring request objects without network access."""
+
+    def __init__(self) -> None:
+        """Create an empty request ledger."""
+        self.calls: list[tuple[object, object, object]] = []
+
+    async def list_time_series(
+        self,
+        *,
+        request: object,
+        retry: object,
+        timeout: object,  # noqa: ASYNC109
+    ) -> OnePagePager:
+        """Return one empty generated time-series response."""
+        self.calls.append((request, retry, timeout))
+        return OnePagePager(monitoring_v3.ListTimeSeriesResponse())
+
+
+class RecordingBudget:
+    """In-memory budget that records every provider attempt."""
+
+    def __init__(self) -> None:
+        """Create an empty call ledger."""
+        self.requests: list[BudgetRequest] = []
+
+    async def acquire(
+        self,
+        request: BudgetRequest,
+        *,
+        deadline: float,
+        cancellation: CancellationToken,
+    ) -> BudgetGrant:
+        """Record and grant one request."""
+        cancellation.raise_if_cancelled()
+        self.requests.append(request)
+        return BudgetGrant(charged_at=deadline - 1, request=request)
+
+
+class NoJitter:
+    """Deterministic zero-delay retry seam."""
+
+    def apply(self, delay: float, *, attempt: int, identity: str) -> float:
+        """Return no delay after validating policy inputs."""
+        assert delay >= 0
+        assert attempt >= 0
+        assert identity
+        return 0.0
+
+
+class FakeCloudQuotasPages:
+    """Scripted one-page client with no network access."""
+
+    def __init__(
+        self,
+        info_pages: Sequence[QuotaInfoPage | BaseException] | None = None,
+        preference_pages: Sequence[QuotaPreferencePage | BaseException] | None = None,
+    ) -> None:
+        """Configure independent scripted read sequences."""
+        self.info_pages = list(info_pages or [])
+        self.preference_pages = list(preference_pages or [])
+        self.calls: list[tuple[str, str, str, float]] = []
+
+    async def quota_infos(
+        self,
+        *,
+        parent: str,
+        page_size: int,
+        page_token: str,
+        timeout_seconds: float,
+    ) -> QuotaInfoPage:
+        """Return the next scripted QuotaInfo page."""
+        self.calls.append(("info", parent, page_token, timeout_seconds))
+        assert page_size == 1
+        result = self.info_pages.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    async def quota_preferences(
+        self,
+        *,
+        parent: str,
+        page_size: int,
+        page_token: str,
+        timeout_seconds: float,
+    ) -> QuotaPreferencePage:
+        """Return the next scripted preference page."""
+        self.calls.append(("preference", parent, page_token, timeout_seconds))
+        assert page_size == 1
+        result = self.preference_pages.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+class FakeMonitoringPages:
+    """Scripted Monitoring page client."""
+
+    def __init__(self, pages: list[TimeSeriesPage | BaseException]) -> None:
+        """Configure one scripted Monitoring sequence."""
+        self.pages = list(pages)
+        self.calls: list[tuple[str, str, str, float]] = []
+
+    async def time_series(  # noqa: PLR0913
+        self,
+        *,
+        name: str,
+        filter_expression: str,
+        interval: monitoring_v3.TimeInterval,
+        page_size: int,
+        page_token: str,
+        timeout_seconds: float,
+    ) -> TimeSeriesPage:
+        """Return the next scripted time-series page."""
+        assert interval.start_time
+        assert interval.end_time
+        assert page_size == 1
+        self.calls.append((name, filter_expression, page_token, timeout_seconds))
+        result = self.pages.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+def _context(*, adc_quota_project: bool = True) -> ProviderReadContext:
+    identity = ADCIdentityEvidence.principal_unverified(
+        credential_kind=CredentialKind.UNKNOWN,
+        adc_quota_project=(
+            ADCQuotaProject("transport-project") if adc_quota_project else None
+        ),
+    )
+    return ProviderReadContext(
+        project=CanonicalProject(
+            ResourceScope(ResourceScopeKind.PROJECT, "projects/415104041262"),
+            "public-schema-project",
+            "Public Schema Project",
+        ),
+        identity=identity,
+        deadline=100.0,
+        cancellation=CancellationToken(),
+    )
+
+
+def _policy(
+    budget: RecordingBudget,
+    *,
+    times: list[float] | None = None,
+) -> GoogleReadPolicy:
+    clock = iter(times or [0.0] * 20)
+    return GoogleReadPolicy(
+        budget,
+        NoJitter(),
+        timeout_seconds=7.0,
+        monotonic=lambda: next(clock),
+    )
+
+
+def _json(name: str) -> Mapping[str, object]:
+    return cast("Mapping[str, object]", json.loads((FIXTURES / name).read_text()))
+
+
+def _quota_info_pages() -> list[QuotaInfoPage]:
+    pages = cast("list[Mapping[str, object]]", _json("quota-info-pages.json")["pages"])
+    results = []
+    for page in pages:
+        infos = []
+        for raw in cast("list[Mapping[str, object]]", page["quotaInfos"]):
+            pb = cloudquotas_v1.QuotaInfo.pb()()
+            json_format.ParseDict(dict(raw), pb, ignore_unknown_fields=True)
+            infos.append(cloudquotas_v1.QuotaInfo(pb))
+        results.append(QuotaInfoPage(tuple(infos), cast("str", page["nextPageToken"])))
+    return results
+
+
+def _preference_page() -> QuotaPreferencePage:
+    raw = _json("quota-preference-page.json")
+    items = []
+    for value in cast("list[Mapping[str, object]]", raw["quotaPreferences"]):
+        pb = cloudquotas_v1.QuotaPreference.pb()()
+        json_format.ParseDict(dict(value), pb, ignore_unknown_fields=True)
+        items.append(cloudquotas_v1.QuotaPreference(pb))
+    return QuotaPreferencePage(tuple(items), cast("str", raw["nextPageToken"]))
+
+
+def _monitoring_page() -> TimeSeriesPage:
+    raw = _json("monitoring-usage-page.json")
+    items = []
+    for value in cast("list[Mapping[str, object]]", raw["timeSeries"]):
+        pb = monitoring_v3.TimeSeries.pb()()
+        json_format.ParseDict(dict(value), pb, ignore_unknown_fields=True)
+        items.append(monitoring_v3.TimeSeries(pb))
+    return TimeSeriesPage(tuple(items), cast("str", raw["nextPageToken"]))
+
+
+def test_effective_quota_reader_preserves_pages_values_and_unknown_scope() -> None:
+    """All public-schema QuotaInfo slices normalize without global-path inference."""
+    budget = RecordingBudget()
+    client = FakeCloudQuotasPages(info_pages=_quota_info_pages())
+    reader = GoogleEffectiveQuotaReader(
+        client, _policy(budget), page_size=1, now=lambda: NOW
+    )
+
+    result = asyncio.run(
+        reader.read(EffectiveQuotaReadRequest(_context(), "compute.googleapis.com"))
+    )
+
+    assert result.complete
+    assert result.coverage.pages_completed == TWO
+    assert [value.identity.quota_scope for value in result.values] == [
+        QuotaScope.REGIONAL,
+        QuotaScope.UNKNOWN,
+    ]
+    assert result.values[0].effective_value.value == 2**63 - 1
+    assert result.values[0].container_type.raw == "CONTAINER_TYPE_UNSPECIFIED"
+    assert result.values[0].ongoing_rollout
+    assert result.values[1].applicable_locations == ("global",)
+    assert client.calls[1][2] == "public-page-2"
+    assert len(budget.requests) == TWO
+    assert budget.requests[0].adc_quota_project is not None
+
+
+def test_official_cloud_quotas_wrapper_uses_one_page_and_disables_retry() -> None:
+    """Generated pagers and retry objects terminate inside the adapter."""
+    client = FakeOfficialCloudQuotasClient()
+    wrapper = OfficialCloudQuotasPageClient(
+        cast("cloudquotas_v1.CloudQuotasAsyncClient", client)
+    )
+
+    info = asyncio.run(
+        wrapper.quota_infos(
+            parent="projects/1/locations/global/services/compute.googleapis.com",
+            page_size=INFO_PAGE_SIZE,
+            page_token="public-page-token",  # noqa: S106
+            timeout_seconds=3.5,
+        )
+    )
+    preference = asyncio.run(
+        wrapper.quota_preferences(
+            parent="projects/1/locations/global",
+            page_size=19,
+            page_token="",
+            timeout_seconds=4.5,
+        )
+    )
+
+    info_request = cast("cloudquotas_v1.ListQuotaInfosRequest", client.calls[0][1])
+    assert info_request.page_size == INFO_PAGE_SIZE
+    assert info_request.page_token == "public-page-token"  # noqa: S105
+    assert client.calls[0][2:] == (None, 3.5)
+    assert info.next_page_token == "public-next-page"  # noqa: S105
+    assert preference.items == ()
+
+
+def test_official_monitoring_wrapper_uses_full_view_and_disables_retry() -> None:
+    """The generated Monitoring request is exact, bounded, and read-only."""
+    client = FakeOfficialMonitoringClient()
+    wrapper = OfficialMonitoringPageClient(
+        cast("monitoring_v3.MetricServiceAsyncClient", client)
+    )
+    interval = monitoring_v3.TimeInterval(
+        start_time=datetime(2026, 7, 22, tzinfo=UTC),
+        end_time=datetime(2026, 7, 23, tzinfo=UTC),
+    )
+
+    page = asyncio.run(
+        wrapper.time_series(
+            name="projects/1",
+            filter_expression="public-filter",
+            interval=interval,
+            page_size=MONITORING_PAGE_SIZE,
+            page_token="public-page-token",  # noqa: S106
+            timeout_seconds=2.5,
+        )
+    )
+
+    request = cast("monitoring_v3.ListTimeSeriesRequest", client.calls[0][0])
+    assert request.name == "projects/1"
+    assert request.filter == "public-filter"
+    assert request.view == monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL
+    assert request.page_size == MONITORING_PAGE_SIZE
+    assert client.calls[0][1:] == (None, 2.5)
+    assert page.items == ()
+
+
+def test_preference_reader_preserves_lifecycle_etag_and_timestamps() -> None:
+    """Existing preferences retain safe reconciliation evidence, never contact."""
+    budget = RecordingBudget()
+    reader = GoogleQuotaPreferenceReader(
+        FakeCloudQuotasPages(preference_pages=[_preference_page()]),
+        _policy(budget),
+        page_size=1,
+        now=lambda: NOW,
+    )
+
+    result = asyncio.run(reader.read(QuotaPreferenceReadRequest(_context())))
+
+    assert result.complete
+    preference = result.values[0]
+    assert preference.preferred_value == 2**63 - 1
+    assert preference.granted_value == GRANTED_VALUE
+    assert preference.etag == "public-etag-example"
+    assert preference.reconciling
+    assert preference.update_time == datetime(2026, 7, 21, 2, 3, 4, tzinfo=UTC)
+    assert "public.fixture@example.com" not in repr(result)
+
+
+def test_page_cap_retains_values_but_marks_effective_read_incomplete() -> None:
+    """A required next page cannot be hidden behind usable first-page evidence."""
+    pages = _quota_info_pages()
+    result = asyncio.run(
+        GoogleEffectiveQuotaReader(
+            FakeCloudQuotasPages(info_pages=pages),
+            _policy(RecordingBudget()),
+            page_size=1,
+            maximum_pages=1,
+            now=lambda: NOW,
+        ).read(EffectiveQuotaReadRequest(_context(), "compute.googleapis.com"))
+    )
+
+    assert result.values
+    assert not result.complete
+    assert result.coverage.page_cap_reached
+    assert result.diagnostics[0].code.value == "provider-page-cap-reached"
+
+
+def test_transient_page_failure_retries_and_charges_every_attempt() -> None:
+    """A documented throttling response retries only inside the shared deadline."""
+    budget = RecordingBudget()
+    pages: list[QuotaInfoPage | BaseException] = [
+        google_exceptions.ResourceExhausted("token=private"),
+        _quota_info_pages()[0],
+    ]
+    result = asyncio.run(
+        GoogleEffectiveQuotaReader(
+            FakeCloudQuotasPages(info_pages=pages),
+            _policy(budget),
+            page_size=1,
+            maximum_pages=1,
+            now=lambda: NOW,
+        ).read(EffectiveQuotaReadRequest(_context(), "compute.googleapis.com"))
+    )
+
+    assert len(budget.requests) == TWO
+    assert not result.complete  # the successful page still advertises another page
+    assert "private" not in repr(result)
+
+
+def test_permanent_and_unknown_transport_failures_are_static_and_incomplete() -> None:
+    """Provider exceptions and their private text never cross the adapter."""
+    for error, code in (
+        (
+            google_exceptions.PermissionDenied("/Users/private/adc.json"),
+            "provider-read-authorization-failed",
+        ),
+        (RuntimeError("ya29.private-token"), "provider-read-failed"),
+    ):
+        budget = RecordingBudget()
+        result = asyncio.run(
+            GoogleEffectiveQuotaReader(
+                FakeCloudQuotasPages(info_pages=[error]),
+                _policy(budget),
+                page_size=1,
+                now=lambda: NOW,
+            ).read(
+                EffectiveQuotaReadRequest(
+                    _context(adc_quota_project=False),
+                    "compute.googleapis.com",
+                )
+            )
+        )
+        assert not result.complete
+        assert result.coverage.pages_completed == 0
+        assert result.diagnostics[0].code.value == code
+        assert "private" not in repr(result)
+        assert budget.requests[0].adc_quota_project is None
+
+
+def test_unavailable_adc_stops_before_budget_or_provider_access() -> None:
+    """Unreadable credentials cannot dispatch a provider call."""
+    budget = RecordingBudget()
+    client = FakeCloudQuotasPages(info_pages=_quota_info_pages())
+    context = _context()
+    unavailable = ADCIdentityEvidence.unavailable(
+        credential_kind=CredentialKind.UNKNOWN,
+        code="adc-unavailable",
+        guidance="Repair ADC outside cqmgr.",
+    )
+    request = EffectiveQuotaReadRequest(
+        ProviderReadContext(
+            context.project,
+            unavailable,
+            context.deadline,
+            context.cancellation,
+        ),
+        "compute.googleapis.com",
+    )
+
+    result = asyncio.run(
+        GoogleEffectiveQuotaReader(
+            client,
+            _policy(budget),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(request)
+    )
+
+    assert not result.complete
+    assert result.diagnostics[0].code.value == "provider-credentials-unavailable"
+    assert budget.requests == []
+    assert client.calls == []
+
+
+def test_unknown_provider_enum_is_preserved_without_known_semantics() -> None:
+    """A future public enum number remains exact schema-skew evidence."""
+    page = _quota_info_pages()[0]
+    pb = cloudquotas_v1.QuotaInfo.pb(page.items[0])
+    pb.quota_increase_eligibility.ineligibility_reason = 99
+    future = QuotaInfoPage((cloudquotas_v1.QuotaInfo(pb),), "")
+
+    result = asyncio.run(
+        GoogleEffectiveQuotaReader(
+            FakeCloudQuotasPages(info_pages=[future]),
+            _policy(RecordingBudget()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(EffectiveQuotaReadRequest(_context(), "compute.googleapis.com"))
+    )
+
+    assert result.values[0].eligibility.reason.raw == "UNRECOGNIZED_99"
+    assert result.values[0].eligibility.reason.known is None
+
+
+def test_schema_skew_keeps_page_evidence_incomplete() -> None:
+    """Malformed required quota fields cannot satisfy a future mutation gate."""
+    item = _quota_info_pages()[1].items[0]
+    item.metric_unit = ""
+    result = asyncio.run(
+        GoogleEffectiveQuotaReader(
+            FakeCloudQuotasPages(info_pages=[QuotaInfoPage((item,), "")]),
+            _policy(RecordingBudget()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(EffectiveQuotaReadRequest(_context(), "compute.googleapis.com"))
+    )
+
+    assert result.values == ()
+    assert not result.complete
+    assert result.diagnostics[0].code.value == "provider-schema-invalid"
+
+
+def test_monitoring_reader_preserves_all_points_intervals_values_and_labels() -> None:
+    """Usage remains separate time-series evidence without invented freshness."""
+    budget = RecordingBudget()
+    client = FakeMonitoringPages([_monitoring_page()])
+    request = UsageReadRequest(
+        _context(),
+        'metric.type="serviceruntime.googleapis.com/quota/allocation/usage"',
+        datetime(2026, 7, 22, tzinfo=UTC),
+        datetime(2026, 7, 23, tzinfo=UTC),
+    )
+
+    result = asyncio.run(
+        GoogleUsageReader(client, _policy(budget), page_size=1, now=lambda: NOW).read(
+            request
+        )
+    )
+
+    assert result.complete
+    observation = result.values[0]
+    assert observation.metric_labels.items[0][0] == "quota_metric"
+    assert len(observation.points) == TWO
+    assert observation.points[0].interval_start == datetime(2026, 7, 22, 1, tzinfo=UTC)
+    assert observation.points[0].value.value == 2**63 - 1
+    assert observation.points[1].interval_start is None
+    assert observation.points[1].value.value == DOUBLE_USAGE
+    assert client.calls[0][1] == request.filter
+
+
+def test_monitoring_schema_skew_and_partial_page_fail_closed() -> None:
+    """Unsupported point shapes and a failed required page remain incomplete."""
+    page = _monitoring_page()
+    bad = page.items[0]
+    bad.metric.type = "future.googleapis.com/not-quota-usage"
+    client = FakeMonitoringPages(
+        [
+            TimeSeriesPage((bad,), "next"),
+            google_exceptions.ServiceUnavailable("private"),
+        ]
+    )
+    result = asyncio.run(
+        GoogleUsageReader(
+            client,
+            GoogleReadPolicy(
+                RecordingBudget(), NoJitter(), maximum_attempts=1, monotonic=lambda: 0.0
+            ),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(
+            UsageReadRequest(
+                _context(),
+                "public-filter",
+                datetime(2026, 7, 22, tzinfo=UTC),
+                datetime(2026, 7, 23, tzinfo=UTC),
+            )
+        )
+    )
+
+    assert not result.complete
+    assert result.coverage.pages_attempted == TWO
+    assert result.coverage.pages_completed == 1
+    assert {item.code.value for item in result.diagnostics} == {
+        "provider-schema-invalid",
+        "provider-read-transient-failure",
+    }
+
+
+@pytest.mark.parametrize("value", [0, -1, True, float("inf")])
+def test_adapter_pagination_policy_is_bounded(value: object) -> None:
+    """Page policy cannot be zero, boolean, negative, or unbounded."""
+    with pytest.raises(ValueError, match="maximum_pages"):
+        GoogleUsageReader(
+            FakeMonitoringPages([]),
+            _policy(RecordingBudget()),
+            maximum_pages=cast("int", value),
+        )

@@ -1,0 +1,23 @@
+{
+  "quotaPreferences": [
+    {
+      "name": "projects/415104041262/locations/global/quotaPreferences/compute-gpu-family-us-central1",
+      "dimensions": {"region": "us-central1", "gpu_family": "NVIDIA_H100"},
+      "quotaConfig": {
+        "preferredValue": "9223372036854775807",
+        "grantedValue": "64",
+        "stateDetail": "PUBLIC_EXAMPLE_STATE",
+        "traceId": "public-trace-example",
+        "requestOrigin": "CLOUD_CONSOLE"
+      },
+      "etag": "public-etag-example",
+      "createTime": "2026-07-20T01:02:03Z",
+      "updateTime": "2026-07-21T02:03:04Z",
+      "service": "compute.googleapis.com",
+      "quotaId": "GPUS-PER-GPU-FAMILY-per-project-region",
+      "reconciling": true,
+      "contactEmail": "public.fixture@example.com"
+    }
+  ],
+  "nextPageToken": ""
+}
