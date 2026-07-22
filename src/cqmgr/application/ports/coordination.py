@@ -147,3 +147,14 @@ class ReadCoalescer(Protocol):
     ) -> RedactedText:
         """Return the leader's safe result to concurrent equivalent callers."""
         ...
+
+    async def run_sync(
+        self,
+        identity: str,
+        work: Callable[[], RedactedText],
+        *,
+        deadline: float,
+        cancellation: CancellationToken,
+    ) -> RedactedText:
+        """Fence real worker completion when adapting a synchronous read."""
+        ...

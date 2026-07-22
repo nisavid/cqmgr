@@ -66,11 +66,12 @@ _SEGMENT_PATTERN: Final = re.compile(r"audit-([0-9]{8})\.jsonl\Z")
 _QUOTA_CONTACT_PATTERN: Final = re.compile(
     r"(?<![\w.+-])[\w.+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![\w.-])"
 )
-_POSIX_MACHINE_PATH_PATTERN: Final = re.compile(
-    r"(?<![\w:])/(?:Users|Volumes|home|private|tmp|var|etc|opt)(?:/[^\s,;]+)+"
+_POSIX_MACHINE_PATH_PATTERN: Final = re.compile(r"(?<![\w:/])/(?!/)[^\s,;]+")
+_WINDOWS_MACHINE_PATH_PATTERN: Final = re.compile(
+    r"(?i)(?<!\w)(?:[A-Z]:[\\/]|\\\\)[^\s,;]+"
 )
-_WINDOWS_MACHINE_PATH_PATTERN: Final = re.compile(r"(?i)(?:[A-Z]:\\|\\\\)[^\s,;]+")
 _RAW_PROVIDER_BODY_PATTERN: Final = re.compile(r"(?s)(?:\{.*\}|\[.*\])")
+_GOOGLE_ACCESS_TOKEN_PATTERN: Final = re.compile(r"(?<!\w)ya29\.[A-Za-z0-9._~-]+")
 
 
 class FilesystemAuditJournal:
@@ -91,8 +92,8 @@ class FilesystemAuditJournal:
         self._root.mkdir(parents=True, exist_ok=True)
         self._max_records_per_segment = max_records_per_segment
         self._failure_hook = failure_hook or (lambda _stage: None)
-        self._lock = InterprocessFileLock(self._root / ".journal.lock")
-        with self._lock:
+        self._lock_path = self._root / ".journal.lock"
+        with self._new_lock():
             if not (self._root / _MANIFEST_NAME).exists() and not tuple(
                 self._root.glob("audit-*.jsonl")
             ):
@@ -106,7 +107,7 @@ class FilesystemAuditJournal:
         machine_paths: tuple[str, ...] = (),
     ) -> AuditRecord:
         """Append and fsync one canonical record before returning it."""
-        with self._lock:
+        with self._new_lock():
             records = self._recover_and_read()
             safe_draft = self._scrub(draft, sensitive_values, machine_paths)
             segment = records[-1].segment if records else 1
@@ -145,7 +146,7 @@ class FilesystemAuditJournal:
 
     def query(self, query: AuditQuery) -> AuditQueryPage:
         """Read one filter-bound page in ascending chain order."""
-        with self._lock:
+        with self._new_lock():
             records = self._read_all(check_manifest=True)
             start = self._decode_cursor(query) if query.cursor is not None else 0
             filtered = tuple(
@@ -162,7 +163,7 @@ class FilesystemAuditJournal:
 
     def inspect(self, record_id: str) -> AuditRecord | None:
         """Read one exact record identity without exposing storage paths."""
-        with self._lock:
+        with self._new_lock():
             return next(
                 (
                     record
@@ -177,7 +178,7 @@ class FilesystemAuditJournal:
     ) -> AuditVerification:
         """Verify exact sequence and hash continuity for a retained range."""
         try:
-            with self._lock:
+            with self._new_lock():
                 records = self._read_all(check_manifest=True)
         except AuditIntegrityError as error:
             return AuditVerification(
@@ -202,6 +203,9 @@ class FilesystemAuditJournal:
 
     def _segment_path(self, segment: int) -> Path:
         return self._root / _SEGMENT_NAME.format(segment=segment)
+
+    def _new_lock(self) -> InterprocessFileLock:
+        return InterprocessFileLock(self._lock_path)
 
     def _append_record(self, record: AuditRecord) -> None:
         path = self._segment_path(record.segment)
@@ -232,6 +236,7 @@ class FilesystemAuditJournal:
             automatic = _POSIX_MACHINE_PATH_PATTERN.sub(REDACTION_MARKER, automatic)
             automatic = _WINDOWS_MACHINE_PATH_PATTERN.sub(REDACTION_MARKER, automatic)
             automatic = _RAW_PROVIDER_BODY_PATTERN.sub(REDACTION_MARKER, automatic)
+            automatic = _GOOGLE_ACCESS_TOKEN_PATTERN.sub(REDACTION_MARKER, automatic)
             return RedactedText(automatic)
 
         return replace(

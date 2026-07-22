@@ -35,10 +35,16 @@ class CriticalUnknownOutcome:
 class CriticalUnknownDispatchError(Exception):
     """A provider write may have happened but its terminal record failed."""
 
-    def __init__(self, outcome: CriticalUnknownOutcome) -> None:
+    def __init__(
+        self,
+        outcome: CriticalUnknownOutcome,
+        *,
+        recovery_failures: tuple[Exception, ...] = (),
+    ) -> None:
         """Retain the exact identities needed for deterministic recovery."""
         super().__init__("provider write has a critical unknown durable outcome")
         self.outcome = outcome
+        self.recovery_failures = recovery_failures
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +79,17 @@ class AuditedWriteCoordinator[Result]:
         try:
             hooks.record_terminal(result)
         except Exception as error:
-            hooks.quarantine(outcome.quarantine_identity)
-            hooks.record_critical_unknown(outcome)
-            raise CriticalUnknownDispatchError(outcome) from error
+            recovery_failures: list[Exception] = []
+            for recovery in (
+                lambda: hooks.quarantine(outcome.quarantine_identity),
+                lambda: hooks.record_critical_unknown(outcome),
+            ):
+                try:
+                    recovery()
+                except Exception as recovery_error:  # noqa: BLE001 - retained evidence
+                    recovery_failures.append(recovery_error)
+            raise CriticalUnknownDispatchError(
+                outcome,
+                recovery_failures=tuple(recovery_failures),
+            ) from error
         return result
