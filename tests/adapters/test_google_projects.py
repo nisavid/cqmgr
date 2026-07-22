@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -141,6 +142,31 @@ def test_resource_manager_rejects_non_active_project_evidence() -> None:
 
     assert not result.succeeded
     assert result.diagnostics[0].code.value == "project-not-active"
+
+
+@pytest.mark.parametrize(
+    "state",
+    [resourcemanager_v3.Project.State.STATE_UNSPECIFIED, 99],
+)
+def test_resource_manager_treats_unknown_state_as_refreshable_evidence(
+    state: int,
+) -> None:
+    """An unknown provider state is invalid evidence, not confirmed inactivity."""
+    response = _project_fixture()
+    response.state = cast("resourcemanager_v3.Project.State", state)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = asyncio.run(
+            ResourceManagerProjectResolver(FakeProjectsClient(response)).resolve(
+                ProjectReference("tokyo-rain-123")
+            )
+        )
+
+    assert caught == []
+    assert not result.succeeded
+    assert result.diagnostics[0].code.value == "invalid-project-evidence"
+    assert result.diagnostics[0].retry.value == "after-refresh"
 
 
 def test_resource_manager_rejects_malformed_or_mismatched_project_evidence() -> None:

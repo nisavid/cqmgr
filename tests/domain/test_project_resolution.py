@@ -35,7 +35,15 @@ def test_project_reference_builds_the_official_get_name(
 
 @pytest.mark.parametrize(
     "value",
-    ["", "projects/", "folders/123", "UPPERCASE", "short", "a/../b"],
+    [
+        "",
+        "projects/",
+        "projects/tokyo-rain-123",
+        "folders/123",
+        "UPPERCASE",
+        "short",
+        "a/../b",
+    ],
 )
 def test_project_reference_rejects_non_project_or_ambiguous_inputs(value: str) -> None:
     """A project resolver never infers from another resource kind or path."""
