@@ -78,7 +78,7 @@ class GoogleReadPolicy:
         self._monotonic = monotonic
         self._sleep = sleep
 
-    async def call[CallT](  # noqa: PLR0911 - each typed gate returns immediately
+    async def call[CallT](  # noqa: C901, PLR0911 - typed gates return immediately
         self,
         context: ProviderReadContext,
         *,
@@ -163,8 +163,20 @@ class GoogleReadPolicy:
                 )
             try:
                 return ProviderCallResult(
-                    await dispatch(min(self._timeout_seconds, remaining)),
+                    await _await_until_stopped(
+                        dispatch(min(self._timeout_seconds, remaining)),
+                        context,
+                        remaining_seconds=remaining,
+                    ),
                     None,
+                )
+            except (
+                CoordinationCancelledError,
+                CoordinationDeadlineExceededError,
+            ) as error:
+                return ProviderCallResult(
+                    None,
+                    _provider_stop_failure(phase, provider, error),
                 )
             except Exception as error:  # noqa: BLE001 - provider text is discarded
                 retryable = _is_transient(error)
@@ -190,9 +202,71 @@ class GoogleReadPolicy:
                             RetryDisposition.AFTER_REFRESH,
                         ),
                     )
-                await self._sleep(delay)
+                try:
+                    await _await_until_stopped(
+                        self._sleep(delay),
+                        context,
+                        remaining_seconds=remaining,
+                    )
+                except (
+                    CoordinationCancelledError,
+                    CoordinationDeadlineExceededError,
+                ) as error:
+                    return ProviderCallResult(
+                        None,
+                        _provider_stop_failure(phase, provider, error),
+                    )
         msg = "unreachable retry loop"
         raise RuntimeError(msg)
+
+
+async def _await_until_stopped[CallT](
+    work: Awaitable[CallT],
+    context: ProviderReadContext,
+    *,
+    remaining_seconds: float,
+) -> CallT:
+    work_task = asyncio.ensure_future(work)
+    cancellation_task = asyncio.create_task(context.cancellation.wait())
+    tasks = (work_task, cancellation_task)
+    try:
+        done, _ = await asyncio.wait(
+            tasks,
+            timeout=remaining_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if cancellation_task in done:
+            raise CoordinationCancelledError
+        if work_task not in done:
+            raise CoordinationDeadlineExceededError
+        return await work_task
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _provider_stop_failure(
+    phase: str,
+    provider: str,
+    error: CoordinationCancelledError | CoordinationDeadlineExceededError,
+) -> Diagnostic:
+    if isinstance(error, CoordinationCancelledError):
+        return _diagnostic(
+            phase,
+            provider,
+            "provider-read-cancelled",
+            "The provider read was cancelled by its caller.",
+            RetryDisposition.AFTER_REFRESH,
+        )
+    return _diagnostic(
+        phase,
+        provider,
+        "provider-read-deadline-exceeded",
+        "The provider read exceeded its caller-controlled deadline.",
+        RetryDisposition.AFTER_REFRESH,
+    )
 
 
 def _is_transient(error: Exception) -> bool:

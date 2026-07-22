@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 _ALLOCATION_USAGE_METRIC = "serviceruntime.googleapis.com/quota/allocation/usage"
+_CONSUMER_QUOTA_RESOURCE = "consumer_quota"
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,7 +150,7 @@ class GoogleUsageReader:
                 identity=f"monitoring-usage:{name}:{token}",
                 dispatch=lambda timeout, page_token=token: self._client.time_series(
                     name=name,
-                    filter_expression=request.filter,
+                    filter_expression=_usage_filter(request.service),
                     interval=interval,
                     page_size=self._page_size,
                     page_token=page_token,
@@ -200,9 +201,9 @@ def _map_time_series(
         or series.value_type != metric_pb2.MetricDescriptor.ValueType.INT64
         or series.unit != "1"
         or not metric_labels.get("quota_metric")
-        or series.resource.type != "consumer_quota"
+        or series.resource.type != _CONSUMER_QUOTA_RESOURCE
         or resource_labels.get("project_id") != request.context.project.project_id
-        or not resource_labels.get("service")
+        or resource_labels.get("service") != request.service
         or not resource_labels.get("location")
     ):
         msg = "Monitoring response contains a non-usage metric"
@@ -250,3 +251,11 @@ def _map_point(
         raise ValueError(msg)
     value = getattr(point_pb.value, actual_value_field)
     return MonitoringPoint(start, end, MonitoringValue(kind, value))
+
+
+def _usage_filter(service: str) -> str:
+    return (
+        f'metric.type = "{_ALLOCATION_USAGE_METRIC}" '
+        f'AND resource.type = "{_CONSUMER_QUOTA_RESOURCE}" '
+        f'AND resource.labels.service = "{service}"'
+    )

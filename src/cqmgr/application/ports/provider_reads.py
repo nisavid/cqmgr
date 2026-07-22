@@ -68,23 +68,43 @@ class QuotaPreferenceReadRequest:
 
 @dataclass(frozen=True, slots=True)
 class UsageReadRequest:
-    """Read allocation usage for one explicit interval and provider filter."""
+    """Read allocation usage for one canonical service and explicit interval."""
 
     context: ProviderReadContext
-    filter: str
+    service: str
     interval_start: datetime
     interval_end: datetime
 
     def __post_init__(self) -> None:
-        """Require one bounded UTC interval and a non-empty exact filter."""
-        if not isinstance(self.filter, str) or not self.filter:
-            msg = "Monitoring filter must be non-empty"
-            raise ValueError(msg)
+        """Require a canonical service and one bounded UTC interval."""
+        _require_service(self.service)
         require_utc(self.interval_start, "interval_start")
         require_utc(self.interval_end, "interval_end")
         if self.interval_start >= self.interval_end:
             msg = "Monitoring interval must have start before end"
             raise ValueError(msg)
+
+
+def _require_service(service: object) -> None:
+    if (
+        not isinstance(service, str)
+        or not service.isascii()
+        or service != service.lower()
+    ):
+        msg = "usage service must be a canonical lowercase DNS name"
+        raise ValueError(msg)
+    labels = service.split(".")
+    allowed = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
+    minimum_labels = 2
+    if len(labels) < minimum_labels or any(
+        not label
+        or label.startswith("-")
+        or label.endswith("-")
+        or any(character not in allowed for character in label)
+        for label in labels
+    ):
+        msg = "usage service must be a canonical lowercase DNS name"
+        raise ValueError(msg)
 
 
 class EffectiveQuotaReader(Protocol):
