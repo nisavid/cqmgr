@@ -17,6 +17,7 @@ from cqmgr.domain.audit import (
     AUDIT_GENESIS_HASH,
     AUDIT_RECORD_SCHEMA,
     AuditFact,
+    AuditFactName,
     AuditFailureCode,
     AuditQuery,
     AuditQueryPage,
@@ -71,7 +72,6 @@ _WINDOWS_MACHINE_PATH_PATTERN: Final = re.compile(
     r"(?i)(?<!\w)(?:[A-Z]:[\\/]|\\\\)[^\s,;]+"
 )
 _RAW_PROVIDER_BODY_PATTERN: Final = re.compile(r"(?s)(?:\{.*\}|\[.*\])")
-_RAW_PROVIDER_BODY_FACT_NAMES: Final = frozenset({"provider-body"})
 _GOOGLE_ACCESS_TOKEN_PATTERN: Final = re.compile(r"(?<!\w)ya29\.[A-Za-z0-9._~-]+")
 
 
@@ -123,7 +123,7 @@ class FilesystemAuditJournal:
                         occurred_at=safe_draft.occurred_at,
                         facts=(
                             AuditFact(
-                                StableSymbol("previous-segment"),
+                                AuditFactName.PREVIOUS_SEGMENT,
                                 RedactedText(str(segment - 1)),
                             ),
                         ),
@@ -249,7 +249,7 @@ class FilesystemAuditJournal:
                 AuditFact(
                     fact.name,
                     RedactedText(REDACTION_MARKER)
-                    if fact.name.value in _RAW_PROVIDER_BODY_FACT_NAMES
+                    if fact.name is AuditFactName.PROVIDER_BODY
                     else scrub(fact.value),
                 )
                 for fact in draft.facts
@@ -359,7 +359,7 @@ class FilesystemAuditJournal:
                 DiagnosticCode(code) for code in data["diagnostic_codes"]
             ),
             facts=tuple(
-                AuditFact(StableSymbol(fact["name"]), RedactedText(fact["value"]))
+                AuditFact(AuditFactName(fact["name"]), RedactedText(fact["value"]))
                 for fact in data["facts"]
             ),
         )
@@ -502,7 +502,7 @@ class FilesystemAuditJournal:
             and draft.correlation_id is None
             and not draft.diagnostic_codes
             and len(draft.facts) == 1
-            and draft.facts[0].name == StableSymbol("previous-segment")
+            and draft.facts[0].name is AuditFactName.PREVIOUS_SEGMENT
             and draft.facts[0].value.value == str(actual_segment - 1)
         )
         if not valid:
