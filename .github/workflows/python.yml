@@ -153,7 +153,7 @@ jobs:
           process_crash_releases_os_lock_without_deleting_shared_state or
           concurrent_different_exports_never_overwrite or
           foreign_key_is_rejected_across_processes_before_provider_dispatch or
-          windows_repository_removes_broad_plan_read_access"
+          windows_repository_replaces_every_explicit_plan_reader"
 
       - name: Smoke-test installed artifacts and native keyring
         if: runner.os != 'Linux'

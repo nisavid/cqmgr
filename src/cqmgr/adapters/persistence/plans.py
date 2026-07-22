@@ -48,6 +48,49 @@ _MINIMUM_AUTHENTICATION_KEY_BYTES = 32
 _CONSUMPTION_MARKER_SCHEMA = b"cqmgr.plan-consumption/v1:"
 _PRIVATE_FILE_MODE = 0o600
 _PRIVATE_DIRECTORY_MODE = 0o700
+_WINDOWS_PRIVATE_ACL_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+$target = $env:CQMGR_ACL_TARGET
+$acl = Get-Acl -LiteralPath $target
+$acl.SetAccessRuleProtection($true, $false)
+foreach ($rule in @($acl.Access)) {
+    [void]$acl.RemoveAccessRuleAll($rule)
+}
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$inheritance = [System.Security.AccessControl.InheritanceFlags]::None
+if (Test-Path -LiteralPath $target -PathType Container) {
+    $inheritance = (
+        [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+        [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    )
+}
+$access = [System.Security.AccessControl.FileSystemAccessRule]::new(
+    $identity,
+    [System.Security.AccessControl.FileSystemRights]::FullControl,
+    $inheritance,
+    [System.Security.AccessControl.PropagationFlags]::None,
+    [System.Security.AccessControl.AccessControlType]::Allow
+)
+$acl.SetAccessRule($access)
+Set-Acl -LiteralPath $target -AclObject $acl
+$verified = @(Get-Acl -LiteralPath $target).Access
+$verifiedIdentity = $null
+if ($verified.Count -eq 1) {
+    $verifiedIdentity = $verified[0].IdentityReference.Translate(
+        [System.Security.Principal.SecurityIdentifier]
+    )
+}
+if (
+    $verified.Count -ne 1 -or
+    $verifiedIdentity.Value -ne $identity.Value -or
+    $verified[0].AccessControlType -ne
+        [System.Security.AccessControl.AccessControlType]::Allow -or
+    $verified[0].FileSystemRights -ne
+        [System.Security.AccessControl.FileSystemRights]::FullControl
+) {
+    throw 'Windows private ACL verification failed'
+}
+"""
 
 
 _LedgerRecord = PlanLedgerRecord
@@ -900,28 +943,21 @@ def _restrict_windows_acl(path: Path) -> None:
     if os.name != "nt":
         return
     system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
-    executable = rf"{system_root}\System32\icacls.exe"
-    username = os.environ.get("USERNAME")
-    if not username:
-        msg = "Windows account identity is unavailable"
-        raise OSError(msg)
-    domain = os.environ.get("USERDOMAIN")
-    principal = f"{domain}\\{username}" if domain else username
-    permission = "(OI)(CI)F" if path.is_dir() else "F"
+    executable = rf"{system_root}\System32\WindowsPowerShell\v1.0\powershell.exe"
+    environment = os.environ.copy()
+    environment["CQMGR_ACL_TARGET"] = str(path)
     completed = subprocess.run(  # noqa: S603
         [
             executable,
-            str(path),
-            "/inheritance:r",
-            "/remove:g",
-            "*S-1-1-0",
-            "*S-1-5-11",
-            "*S-1-5-32-545",
-            "/grant:r",
-            f"{principal}:{permission}",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            _WINDOWS_PRIVATE_ACL_SCRIPT,
         ],
         check=False,
         capture_output=True,
+        env=environment,
         timeout=10,
     )
     if completed.returncode != 0:

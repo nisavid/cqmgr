@@ -268,7 +268,7 @@ fresh Preview in v1.
 
 Local repository directories and records are private to the active account.
 POSIX hosts enforce owner-only directory and file modes. Windows hosts replace
-inherited DACLs with a protected full-control entry for the active account;
+the complete DACL with one protected full-control entry for the active account;
 failure to establish that boundary blocks local plan persistence.
 
 If the selected OS-keyring backend or plan-authentication secret is unavailable,
