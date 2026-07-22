@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -51,6 +53,36 @@ def test_runtime_keyring_backend_is_classified_without_mutation(tmp_path: Path) 
 
     assert probe.backend_identity == ".".join(identity)
     assert probe.mutation_capable is (identity in supported)
+
+
+@pytest.mark.skipif(
+    os.environ.get("CQMGR_REQUIRE_NATIVE_KEYRING_SMOKE") != "1",
+    reason="real native-keyring mutation is restricted to ephemeral CI runners",
+)
+def test_runtime_supported_keyring_round_trip(tmp_path: Path) -> None:
+    """Ephemeral macOS and Windows runners prove one verified native round trip."""
+    backend = keyring.get_keyring()
+    store = NativeSecretStore(
+        backend,
+        NativePlanInterprocessLock(tmp_path / "runtime-keyring-mutation.lock"),
+    )
+    assert store.probe().mutation_capable
+    reference = SecretStoreReference.generate(
+        f"ci-{secrets.token_urlsafe(12)}",
+        SecretPurpose.PLAN_AUTHENTICATION,
+    )
+    value = SecretValue(secrets.token_bytes(32))
+
+    try:
+        assert store.create(reference, value).status is SecretStoreStatus.CREATED
+        loaded = store.get(reference)
+        assert loaded.status is SecretStoreStatus.AVAILABLE
+        assert loaded.secret == value
+        assert store.delete(reference).status is SecretStoreStatus.DELETED
+        assert store.get(reference).status is SecretStoreStatus.MISSING
+    finally:
+        if store.get(reference).status is SecretStoreStatus.AVAILABLE:
+            store.delete(reference)
 
 
 class _FakeKeyring:

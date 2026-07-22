@@ -145,13 +145,23 @@ jobs:
           -k "concurrent_processes_obtain_at_most_one_lease_and_call_no_provider or
           process_crash_releases_os_lock_without_deleting_shared_state or
           concurrent_different_exports_never_overwrite or
-          foreign_key_is_rejected_across_processes_before_provider_dispatch"
+          foreign_key_is_rejected_across_processes_before_provider_dispatch or
+          windows_repository_removes_broad_plan_read_access"
 
       - name: Probe the installed native keyring backend
         run: >-
           uv run --locked --python 3.14 pytest --no-cov -q
           tests/plans/test_secret_store.py
           -k "runtime_keyring_backend_is_classified_without_mutation"
+
+      - name: Verify the native keyring round trip
+        if: runner.os != 'Linux'
+        env:
+          CQMGR_REQUIRE_NATIVE_KEYRING_SMOKE: "1"
+        run: >-
+          uv run --locked --python 3.14 pytest --no-cov -q
+          tests/plans/test_secret_store.py
+          -k "runtime_supported_keyring_round_trip"
 
       - name: Smoke-test isolated tool installations
         run: uv run --python 3.14 python scripts/smoke_tool_install.py dist --python 3.14

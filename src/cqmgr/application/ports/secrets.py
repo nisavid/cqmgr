@@ -41,6 +41,7 @@ class SecretPurpose(StrEnum):
     """Allowlisted cqmgr secret purposes."""
 
     PLAN_AUTHENTICATION = "plan-authentication"
+    PLAN_CONSUMPTION = "plan-consumption"
     QUOTA_CONTACT = "quota-contact"
 
 

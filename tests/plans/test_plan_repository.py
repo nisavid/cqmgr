@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import subprocess
 import tempfile
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -20,7 +21,14 @@ from cqmgr.adapters.persistence.native_plan_lock import NativePlanInterprocessLo
 from cqmgr.adapters.persistence.plans import LocalPlanRepository
 from cqmgr.adapters.serialization.plans import PlanCodec
 from cqmgr.application.ports.plans import EncodedPlan, PlanLease, PlanRepositoryStatus
-from cqmgr.application.ports.secrets import SecretValue
+from cqmgr.application.ports.secrets import (
+    SecretBackendKind,
+    SecretStoreOutcome,
+    SecretStoreProbe,
+    SecretStoreReference,
+    SecretStoreStatus,
+    SecretValue,
+)
 from cqmgr.domain.plan_consumption import PlanLedgerRecord
 from cqmgr.domain.plans import (
     PLAN_LIFETIME,
@@ -47,6 +55,50 @@ PLAN_KEY = SecretValue(KEY)
 PRIVATE_FILE_MODE = 0o600
 PRIVATE_DIRECTORY_MODE = 0o700
 CONTENDING_PROCESS_COUNT = 4
+
+
+class _MemoryConsumptionStore:
+    """Process-local fake for the immutable native consumption-marker seam."""
+
+    def __init__(self) -> None:
+        self.values: dict[SecretStoreReference, SecretValue] = {}
+
+    def probe(self) -> SecretStoreProbe:
+        return SecretStoreProbe(SecretBackendKind.MACOS_KEYCHAIN, "test-memory")
+
+    def get(self, reference: SecretStoreReference) -> SecretStoreOutcome:
+        value = self.values.get(reference)
+        if value is None:
+            return SecretStoreOutcome(SecretStoreStatus.MISSING)
+        return SecretStoreOutcome.available(value)
+
+    def create(
+        self,
+        reference: SecretStoreReference,
+        secret: SecretValue,
+    ) -> SecretStoreOutcome:
+        if reference in self.values:
+            return SecretStoreOutcome(SecretStoreStatus.CONFLICT)
+        self.values[reference] = secret
+        return SecretStoreOutcome(SecretStoreStatus.CREATED)
+
+    def delete(self, reference: SecretStoreReference) -> SecretStoreOutcome:
+        if self.values.pop(reference, None) is None:
+            return SecretStoreOutcome(SecretStoreStatus.MISSING)
+        return SecretStoreOutcome(SecretStoreStatus.DELETED)
+
+
+_CONSUMPTION_STORES: dict[Path, _MemoryConsumptionStore] = {}
+
+
+def _repository(
+    root: Path,
+    *,
+    lock: NativePlanInterprocessLock | None = None,
+) -> LocalPlanRepository:
+    resolved = root.resolve()
+    store = _CONSUMPTION_STORES.setdefault(resolved, _MemoryConsumptionStore())
+    return LocalPlanRepository(root, store, lock=lock)
 
 
 def _encoded():  # noqa: ANN202
@@ -90,7 +142,7 @@ def _lease_worker(
     key: bytes,
     queue: multiprocessing.Queue[str],
 ) -> None:
-    repository = LocalPlanRepository(Path(root))
+    repository = _repository(Path(root))
     outcome = repository.acquire_lease(
         digest,
         SecretValue(key),
@@ -107,7 +159,7 @@ def _export_worker(
     destination: str,
     queue: multiprocessing.Queue[str],
 ) -> None:
-    repository = LocalPlanRepository(Path(root))
+    repository = _repository(Path(root))
     outcome = repository.export(EncodedPlan(plan_bytes, digest), Path(destination))
     queue.put(outcome.status.value)
 
@@ -137,7 +189,7 @@ def test_local_store_is_content_addressed_and_export_is_atomic_owner_only(
 ) -> None:
     """Local and explicit exported copies preserve exact authenticated bytes."""
     encoded = _encoded()
-    repository = LocalPlanRepository(tmp_path / "repository")
+    repository = _repository(tmp_path / "repository")
 
     assert repository.store(encoded, PLAN_KEY).status is PlanRepositoryStatus.STORED
     loaded = repository.load(encoded.digest, PLAN_KEY, NOW)
@@ -162,7 +214,7 @@ def test_first_use_durably_publishes_each_created_directory(
     monkeypatch.setattr(plan_persistence, "_fsync_directory", flushed.append)
     root = tmp_path / "fresh" / "nested" / "repository"
 
-    LocalPlanRepository(root)
+    _repository(root)
 
     assert flushed == [
         tmp_path,
@@ -173,10 +225,38 @@ def test_first_use_durably_publishes_each_created_directory(
     ]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACL contract")
+def test_windows_repository_removes_broad_plan_read_access(tmp_path: Path) -> None:
+    """Plan and ledger paths retain only the active Windows account ACL."""
+    encoded = _encoded()
+    repository = _repository(tmp_path)
+    repository.store(encoded, PLAN_KEY)
+    system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
+    executable = rf"{system_root}\System32\icacls.exe"
+
+    for path in (
+        tmp_path,
+        tmp_path / "plans",
+        tmp_path / "state",
+        _plan_path(tmp_path, encoded.digest),
+        _state_path(tmp_path, encoded.digest),
+    ):
+        completed = subprocess.run(  # noqa: S603
+            [executable, str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        acl = completed.stdout.casefold()
+        assert "everyone:" not in acl
+        assert "builtin\\users:" not in acl
+
+
 def test_lease_dispatch_terminal_consumption_is_single_use(tmp_path: Path) -> None:
     """A plan is durably consumed before dispatch and can never be leased again."""
     encoded = _encoded()
-    repository = LocalPlanRepository(tmp_path)
+    repository = _repository(tmp_path)
     repository.store(encoded, PLAN_KEY)
 
     leased = repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
@@ -208,7 +288,7 @@ def test_stale_pre_dispatch_lease_recovers_but_dispatch_crash_quarantines(
 ) -> None:
     """Recovery distinguishes safe pre-dispatch abandonment from ambiguity."""
     encoded = _encoded()
-    repository = LocalPlanRepository(tmp_path)
+    repository = _repository(tmp_path)
     repository.store(encoded, PLAN_KEY)
     first = repository.acquire_lease(
         encoded.digest, PLAN_KEY, NOW, lease_duration=timedelta(seconds=1)
@@ -225,7 +305,7 @@ def test_stale_pre_dispatch_lease_recovers_but_dispatch_crash_quarantines(
     assert recovered.lease is not None
     repository.mark_dispatched(recovered.lease, PLAN_KEY, NOW + timedelta(seconds=2))
 
-    restarted = LocalPlanRepository(tmp_path)
+    restarted = _repository(tmp_path)
     assert (
         restarted.load(
             encoded.digest,
@@ -251,7 +331,7 @@ def test_dispatch_deadline_quarantines_when_plan_bytes_are_missing(
 ) -> None:
     """Durable dispatch evidence reaches quarantine without readable plan bytes."""
     encoded = _encoded()
-    repository = LocalPlanRepository(tmp_path)
+    repository = _repository(tmp_path)
     repository.store(encoded, PLAN_KEY)
     leased = repository.acquire_lease(
         encoded.digest, PLAN_KEY, NOW, lease_duration=timedelta(seconds=1)
@@ -280,7 +360,7 @@ def test_load_recovers_dispatch_deadline_before_decoding_corrupt_plan(
 ) -> None:
     """Load preserves durable dispatch recovery when plan bytes are corrupt."""
     encoded = _encoded()
-    repository = LocalPlanRepository(tmp_path)
+    repository = _repository(tmp_path)
     repository.store(encoded, PLAN_KEY)
     leased = repository.acquire_lease(
         encoded.digest, PLAN_KEY, NOW, lease_duration=timedelta(seconds=1)
@@ -301,7 +381,7 @@ def test_concurrent_processes_obtain_at_most_one_lease_and_call_no_provider(
 ) -> None:
     """The local ledger serializes separate cqmgr processes before any provider."""
     encoded = _encoded()
-    LocalPlanRepository(tmp_path).store(encoded, PLAN_KEY)
+    _repository(tmp_path).store(encoded, PLAN_KEY)
     context = multiprocessing.get_context("spawn")
     queue: multiprocessing.Queue[str] = context.Queue()
     processes = [
@@ -329,7 +409,7 @@ def test_foreign_key_is_rejected_across_processes_before_provider_dispatch(
 ) -> None:
     """A second installation cannot turn a copied digest into Apply authority."""
     encoded = _encoded()
-    LocalPlanRepository(tmp_path).store(encoded, PLAN_KEY)
+    _repository(tmp_path).store(encoded, PLAN_KEY)
     context = multiprocessing.get_context("spawn")
     queue: multiprocessing.Queue[str] = context.Queue()
     process = context.Process(
@@ -343,7 +423,7 @@ def test_foreign_key_is_rejected_across_processes_before_provider_dispatch(
     assert process.exitcode == 0
     assert queue.get(timeout=1) == PlanRepositoryStatus.CONFLICT.value
     assert (
-        LocalPlanRepository(tmp_path)
+        _repository(tmp_path)
         .acquire_lease(
             encoded.digest,
             PLAN_KEY,
@@ -359,7 +439,7 @@ def test_pre_dispatch_authentication_failure_proves_zero_fake_provider_writes(
 ) -> None:
     """The Apply-shaped guard reaches a fake provider only after durable dispatch."""
     encoded = _encoded()
-    repository = LocalPlanRepository(tmp_path)
+    repository = _repository(tmp_path)
     repository.store(encoded, PLAN_KEY)
     writes: list[str] = []
 
@@ -402,7 +482,7 @@ def test_lock_timeout_is_typed_at_every_plan_repository_operation(
     """OS-lock contention cannot escape any plan repository result boundary."""
     root = tmp_path / "repository"
     lock_path = root / "repository.lock"
-    repository = LocalPlanRepository(
+    repository = _repository(
         root,
         lock=NativePlanInterprocessLock(
             lock_path,
@@ -411,7 +491,7 @@ def test_lock_timeout_is_typed_at_every_plan_repository_operation(
         ),
     )
     encoded = _encoded()
-    setup = LocalPlanRepository(root)
+    setup = _repository(root)
     setup.store(encoded, PLAN_KEY)
     leased = setup.acquire_lease(encoded.digest, PLAN_KEY, NOW)
     assert leased.lease is not None
@@ -476,7 +556,7 @@ def test_repository_rejects_invalid_digest_bytes_and_conflicting_exports(
 ) -> None:
     """Content addressing and explicit export paths never guess or overwrite."""
     encoded = _encoded()
-    repository = LocalPlanRepository(tmp_path / "repository")
+    repository = _repository(tmp_path / "repository")
     assert (
         repository.store(EncodedPlan(b"not-json", encoded.digest), PLAN_KEY).status
         is PlanRepositoryStatus.FAILED
@@ -511,7 +591,7 @@ def test_repository_fail_closed_on_missing_unsafe_or_corrupt_local_state(
 ) -> None:
     """Unsafe permissions and unsupported state never become Apply capability."""
     encoded = _encoded()
-    repository = LocalPlanRepository(tmp_path)
+    repository = _repository(tmp_path)
     assert (
         repository.load(encoded.digest, PLAN_KEY, NOW).status
         is PlanRepositoryStatus.MISSING
@@ -557,7 +637,7 @@ def test_repository_fail_closed_on_missing_unsafe_or_corrupt_local_state(
 def test_repeat_store_preserves_and_reports_terminal_state(tmp_path: Path) -> None:
     """Idempotent storage cannot misreport or reset a consumed plan."""
     encoded = _encoded()
-    repository = LocalPlanRepository(tmp_path)
+    repository = _repository(tmp_path)
     repository.store(encoded, PLAN_KEY)
     leased = repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
     assert leased.lease is not None
@@ -575,7 +655,7 @@ def test_foreign_authentication_key_cannot_issue_apply_authority(
 ) -> None:
     """A digest-valid local plan remains inapplicable to another installation."""
     encoded = _encoded()
-    repository = LocalPlanRepository(tmp_path)
+    repository = _repository(tmp_path)
     repository.store(encoded, PLAN_KEY)
 
     foreign = repository.acquire_lease(
@@ -594,7 +674,7 @@ def test_foreign_authentication_key_cannot_issue_apply_authority(
 def test_authentication_field_tampering_blocks_load_and_lease(tmp_path: Path) -> None:
     """A digest-valid envelope cannot acquire authority with a forged HMAC."""
     encoded = _encoded()
-    repository = LocalPlanRepository(tmp_path)
+    repository = _repository(tmp_path)
     repository.store(encoded, PLAN_KEY)
     envelope = json.loads(encoded.bytes)
     envelope["authentication"] = "hmac-sha256:" + ("0" * 64)
@@ -619,7 +699,7 @@ def test_valid_shape_ledger_rollback_cannot_resurrect_a_consumed_plan(
 ) -> None:
     """Replaying an unsigned available record fails closed after consumption."""
     encoded = _encoded()
-    repository = LocalPlanRepository(tmp_path)
+    repository = _repository(tmp_path)
     repository.store(encoded, PLAN_KEY)
     leased = repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
     assert leased.lease is not None
@@ -645,10 +725,40 @@ def test_valid_shape_ledger_rollback_cannot_resurrect_a_consumed_plan(
     )
 
 
+def test_authentic_ledger_replay_cannot_authorize_a_second_provider_write(
+    tmp_path: Path,
+) -> None:
+    """The immutable native marker closes rollback outside the filesystem."""
+    encoded = _encoded()
+    repository = _repository(tmp_path)
+    repository.store(encoded, PLAN_KEY)
+    state_path = _state_path(tmp_path, encoded.digest)
+    authentic_available_state = state_path.read_bytes()
+    writes: list[str] = []
+
+    first = _attempt_fake_provider_write(
+        repository,
+        encoded.digest,
+        PLAN_KEY,
+        writes,
+    )
+    state_path.write_bytes(authentic_available_state)
+    replay = _attempt_fake_provider_write(
+        repository,
+        encoded.digest,
+        PLAN_KEY,
+        writes,
+    )
+
+    assert first is PlanRepositoryStatus.DISPATCHED
+    assert replay is PlanRepositoryStatus.QUARANTINED
+    assert writes == [encoded.digest]
+
+
 def test_plan_expiry_caps_lease_and_is_revalidated_at_dispatch(tmp_path: Path) -> None:
     """An expired plan cannot acquire or spend dispatch authority."""
     encoded = _encoded()
-    repository = LocalPlanRepository(tmp_path)
+    repository = _repository(tmp_path)
     repository.store(encoded, PLAN_KEY)
 
     leased = repository.acquire_lease(
@@ -711,7 +821,7 @@ def test_lease_validation_conflicts_expiry_and_quarantine_are_durable(
 ) -> None:
     """Wrong, stale and ambiguous lease transitions remain provider-free."""
     encoded = _encoded()
-    repository = LocalPlanRepository(tmp_path)
+    repository = _repository(tmp_path)
     repository.store(encoded, PLAN_KEY)
     with pytest.raises(ValueError, match="positive"):
         repository.acquire_lease(
@@ -788,7 +898,7 @@ def test_dispatch_and_completion_are_idempotent_for_the_exact_lease(
 ) -> None:
     """A retry after a local response loss cannot create a second dispatch."""
     encoded = _encoded()
-    repository = LocalPlanRepository(tmp_path)
+    repository = _repository(tmp_path)
     repository.store(encoded, PLAN_KEY)
     leased = repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
     assert leased.lease is not None
@@ -803,7 +913,7 @@ def test_dispatch_and_completion_are_idempotent_for_the_exact_lease(
     )
     assert (
         repository.mark_dispatched(leased.lease, PLAN_KEY, NOW).status
-        is PlanRepositoryStatus.DISPATCHED
+        is PlanRepositoryStatus.CONFLICT
     )
     assert (
         repository.complete(leased.lease, PLAN_KEY, NOW).status
@@ -896,7 +1006,7 @@ class PlanRepositoryStateMachine(RuleBasedStateMachine):
         """Create one isolated real-filesystem repository model."""
         super().__init__()
         self.temporary = tempfile.TemporaryDirectory()
-        self.repository = LocalPlanRepository(Path(self.temporary.name))
+        self.repository = _repository(Path(self.temporary.name))
         self.encoded = _encoded()
         self.repository.store(self.encoded, PLAN_KEY)
         self.model = PlanLedgerState.AVAILABLE

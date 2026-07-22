@@ -29,6 +29,13 @@ update-in-place or automatic write retry. Rotation creates a new random item,
 verifies it, and atomically switches the non-secret reference before the old
 item is eligible for explicit cleanup.
 
+Each plan also has a non-secret, digest-derived consumption-marker identity in
+that private namespace. Immediately before provider dispatch, cqmgr creates the
+marker once with a keyed digest-bound value and verifies the write. The marker
+is never replaced or deleted. Filesystem ledger recovery checks it before
+issuing authority, so replaying an older authentic ledger snapshot cannot make
+a dispatched plan reusable.
+
 A local interprocess lock serializes cqmgr callers. The portable keyring API
 does not provide compare-and-swap, so arbitrary external writers are not
 participants in this concurrency protocol. An observable verification mismatch
