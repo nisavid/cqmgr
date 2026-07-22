@@ -104,7 +104,7 @@ jobs:
       - name: Enforce critical domain coverage
         run: >-
           uv run --locked --no-sync --python "$PYTHON_VERSION" coverage report
-          --include="src/cqmgr/domain/status.py,src/cqmgr/domain/results.py,src/cqmgr/domain/redaction.py"
+          --include="src/cqmgr/domain/status.py,src/cqmgr/domain/results.py,src/cqmgr/domain/redaction.py,src/cqmgr/domain/plans.py,src/cqmgr/domain/plan_consumption.py,src/cqmgr/adapters/serialization/plans.py"
           --fail-under=100
 
   package-smoke:
