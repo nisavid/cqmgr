@@ -236,17 +236,65 @@ def test_plan_value_types_reject_invalid_and_secret_bearing_shapes() -> None:
             cast("StableSymbol", "profile"), "profile:name", "hmac-sha256:value"
         )
     with pytest.raises(ValueError, match="source_identity"):
-        ContactBinding(StableSymbol("profile"), "", "hmac-sha256:value")
-    with pytest.raises(ValueError, match="value_digest"):
-        ContactBinding(StableSymbol("profile"), "profile:name", "raw@example.invalid")
+        ContactBinding(StableSymbol("selected-profile"), "", HMAC_SHA256_C)
+    with pytest.raises(ValueError, match="source"):
+        ContactBinding(
+            StableSymbol("unknown-source"),
+            "profile:accelerators",
+            HMAC_SHA256_C,
+        )
+    with pytest.raises(ValueError, match="source_identity"):
+        ContactBinding(
+            StableSymbol("per-operation-input"),
+            "person@example.test",
+            HMAC_SHA256_C,
+        )
+    with pytest.raises(ValueError, match="source_identity"):
+        ContactBinding(
+            StableSymbol("direct-user"),
+            "principal://accounts/" + ("a" * 256),
+            HMAC_SHA256_C,
+        )
     with pytest.raises(ValueError, match="value_digest"):
         ContactBinding(
-            StableSymbol("profile"), "profile:name", "hmac-sha256:" + ("A" * 64)
+            StableSymbol("selected-profile"),
+            "profile:name",
+            "raw@example.invalid",
+        )
+    with pytest.raises(ValueError, match="value_digest"):
+        ContactBinding(
+            StableSymbol("selected-profile"),
+            "profile:name",
+            "hmac-sha256:" + ("A" * 64),
         )
     with pytest.raises(TypeError, match="evidence name"):
         EvidenceBinding(cast("StableSymbol", "policy"), "sha256:value", NOW)
     with pytest.raises(ValueError, match="value_digest"):
         EvidenceBinding(StableSymbol("policy"), "value", NOW)
+
+
+@pytest.mark.parametrize(
+    ("source", "source_identity"),
+    [
+        ("named-profile", "profile:accelerators"),
+        ("selected-profile", "profile:accelerators"),
+        ("direct-user", "principal://accounts/123"),
+        ("per-operation-input", "input:hmac-sha256:" + ("d" * 64)),
+    ],
+)
+def test_contact_binding_accepts_only_bounded_non_secret_source_identities(
+    source: str,
+    source_identity: str,
+) -> None:
+    """Canonical contact sources retain identity without retaining the contact."""
+    binding = ContactBinding(
+        StableSymbol(source),
+        source_identity,
+        HMAC_SHA256_C,
+    )
+
+    assert binding.source_identity == source_identity
+    assert "@" not in binding.source_identity
 
 
 def test_plan_rejects_cross_scope_unit_and_binding_inconsistency() -> None:
@@ -266,6 +314,10 @@ def test_plan_rejects_cross_scope_unit_and_binding_inconsistency() -> None:
         replace(plan, slice_identity=cast("EffectiveQuotaSliceIdentity", "slice"))
     with pytest.raises(ValueError, match="plan resource scope"):
         replace(plan, slice_identity=other_slice)
+    with pytest.raises(ValueError, match="constraint resource scope"):
+        replace(plan, constraints=(ConstraintReference(other_slice),))
+    with pytest.raises(ValueError, match="constraints must be unique"):
+        replace(plan, constraints=(plan.constraints[0], plan.constraints[0]))
     with pytest.raises(TypeError, match="target and effective"):
         replace(plan, target=cast("QuotaQuantity", 8))
     with pytest.raises(ValueError, match="same unit"):
