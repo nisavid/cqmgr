@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 from google.cloud import compute_v1, tpu_v2
+from google.cloud.location import locations_pb2
 
 from cqmgr.adapters.google.compute_catalog import (
     ComputeMachineTypesPage,
@@ -48,8 +49,6 @@ from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Sequence
-
-    from google.cloud.location import locations_pb2
 
 NOW = datetime(2026, 7, 22, 9, tzinfo=UTC)
 
@@ -366,6 +365,91 @@ def test_tpu_zone_readers_fail_coverage_for_malformed_items() -> None:
         assert result.values == ()
         assert result.location_coverage[0].state is LocationCoverageState.FAILED
         assert _diagnostic_codes(result) == ["provider-schema-invalid"]
+        assert not result.complete
+
+
+def test_tpu_readers_reject_items_outside_the_requested_parent() -> None:
+    """Provider DTO identity cannot be relabeled as the requested project or zone."""
+    client = TpuPages(
+        locations=(
+            TpuLocationsPage(
+                (
+                    locations_pb2.Location(
+                        name="projects/other/locations/us-east1-b",
+                        location_id="us-east1-b",
+                    ),
+                ),
+                "",
+            ),
+        ),
+        accelerators=(
+            TpuAcceleratorTypesPage(
+                (
+                    tpu_v2.AcceleratorType(
+                        name=(
+                            "projects/other/locations/us-east1-b/acceleratorTypes/v6e-8"
+                        ),
+                        type_="v6e-8",
+                    ),
+                    tpu_v2.AcceleratorType(
+                        name=(
+                            "projects/123456789/locations/us-central1-b/"
+                            "acceleratorTypes/v4-8"
+                        ),
+                        type_="v6e-8",
+                    ),
+                ),
+                "",
+            ),
+        ),
+        runtimes=(
+            TpuRuntimeVersionsPage(
+                (
+                    tpu_v2.RuntimeVersion(
+                        name=(
+                            "projects/other/locations/us-east1-b/"
+                            "runtimeVersions/tpu-vm-base"
+                        ),
+                        version="tpu-vm-base",
+                    ),
+                    tpu_v2.RuntimeVersion(
+                        name=(
+                            "projects/123456789/locations/us-central1-b/"
+                            "runtimeVersions/tpu-vm-v4-base"
+                        ),
+                        version="tpu-vm-base",
+                    ),
+                ),
+                "",
+            ),
+        ),
+    )
+    context = _context()
+
+    results = (
+        asyncio.run(
+            GoogleTpuLocationReader(client, _policy()).read(
+                TpuLocationReadRequest(context)
+            )
+        ),
+        asyncio.run(
+            GoogleTpuAcceleratorTypeReader(client, _policy()).read(
+                TpuAcceleratorTypeReadRequest(context, "us-central1-b")
+            )
+        ),
+        asyncio.run(
+            GoogleTpuRuntimeVersionReader(client, _policy()).read(
+                TpuRuntimeVersionReadRequest(context, "us-central1-b")
+            )
+        ),
+    )
+
+    for index, result in enumerate(results):
+        assert result.values == ()
+        assert result.location_coverage[0].state is LocationCoverageState.FAILED
+        assert _diagnostic_codes(result) == ["provider-schema-invalid"] * (
+            1 if index == 0 else 2
+        )
         assert not result.complete
 
 
