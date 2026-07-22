@@ -1,5 +1,6 @@
 """Installation-local persistence and opaque quota-query cursors."""
 
+import base64
 import json
 import os
 import stat
@@ -188,6 +189,37 @@ def test_windows_acl_timeout_is_typed_and_leaves_no_state(
 
     assert list(root.rglob("*.json")) == []
     assert list(root.rglob("*.tmp")) == []
+
+
+def test_windows_acl_command_sets_and_verifies_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The native Windows command applies and verifies owner with the private DACL."""
+    commands: list[list[str]] = []
+
+    def succeed(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del kwargs
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(
+        windows_acl,
+        "os",
+        SimpleNamespace(name="nt", environ=os.environ),
+    )
+    monkeypatch.setattr(windows_acl.subprocess, "run", succeed)
+
+    windows_acl.restrict_windows_acl(tmp_path)
+
+    encoded_command = commands[0][-1]
+    script = base64.b64decode(encoded_command).decode("utf-16le")
+    assert '$sddl = "O:$($identity.Value)D:P' in script
+    assert "AccessControlSections]::Owner" in script
+    assert "$verifiedAcl.GetOwner(" in script
 
 
 def test_repository_hardens_existing_state_before_read(
