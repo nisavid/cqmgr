@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import multiprocessing
+import tempfile
 import time
 from pathlib import Path
 
@@ -30,6 +32,7 @@ from cqmgr.application.ports.coordination import (
 from cqmgr.domain.redaction import REDACTION_MARKER, RedactedText
 
 _DEADLINE_ASSERTION_BOUND = 0.5
+_EXPECTED_EVENT_LOOP_TICKS = 4
 _REFILLED_AT = 110.0
 
 
@@ -114,6 +117,24 @@ def _hold_lock(path: str, ready: object) -> None:
     lock.acquire()
     ready.put("locked")  # type: ignore[attr-defined]
     time.sleep(30)
+
+
+def _hold_coalesced_leadership(root: str, ready: object) -> None:
+    coalescer = SharedReadCoalescer(root)
+
+    async def work() -> RedactedText:
+        ready.put("leading")  # type: ignore[attr-defined]
+        await asyncio.sleep(30)
+        return RedactedText("never-published")
+
+    asyncio.run(
+        coalescer.run(
+            "crashed-read",
+            work,
+            deadline=time.monotonic() + 60,
+            cancellation=CancellationToken(),
+        )
+    )
 
 
 @given(
@@ -282,14 +303,118 @@ def test_budget_configuration_and_request_types_fail_closed(tmp_path: Path) -> N
                 cancellation=CancellationToken(),
             )
         )
-    with pytest.raises(CoordinationDeadlineExceededError):
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"schema": "cqmgr.local-budget-state/v1", "entries": [], "extra": 1},
+        {
+            "schema": "cqmgr.local-budget-state/v1",
+            "entries": {"provider:not-a-digest": {}},
+        },
+        {
+            "schema": "cqmgr.local-budget-state/v1",
+            "entries": {
+                "provider:" + ("0" * 64): {
+                    "window_started_at": 1.0,
+                    "last_seen_at": 1.0,
+                    "used": True,
+                }
+            },
+        },
+        {
+            "schema": "cqmgr.local-budget-state/v1",
+            "entries": {
+                "provider:" + ("0" * 64): {
+                    "window_started_at": math.inf,
+                    "last_seen_at": math.inf,
+                    "used": 0,
+                }
+            },
+        },
+        {
+            "schema": "cqmgr.local-budget-state/v1",
+            "entries": {
+                "provider:" + ("0" * 64): {
+                    "window_started_at": 2.0,
+                    "last_seen_at": 1.0,
+                    "used": 0,
+                }
+            },
+        },
+        {
+            "schema": "cqmgr.local-budget-state/v1",
+            "entries": {
+                "provider:" + ("0" * 64): {
+                    "window_started_at": 1.0,
+                    "last_seen_at": 1.0,
+                    "used": 2,
+                }
+            },
+        },
+    ],
+)
+def test_every_corrupt_budget_entry_fails_closed(
+    tmp_path: Path,
+    state: dict[str, object],
+) -> None:
+    """Malformed keys, shapes, clocks, booleans, and overuse never reset budgets."""
+    (tmp_path / "budgets.json").write_text(json.dumps(state))
+    coordinator = SharedBudgetCoordinator(tmp_path, _limits())
+
+    with pytest.raises((TypeError, RuntimeError), match="budget state"):
         asyncio.run(
             coordinator.acquire(
-                BudgetRequest("provider", "project", "billing", units=2),
+                _request(),
                 deadline=time.monotonic() + 1,
                 cancellation=CancellationToken(),
             )
         )
+
+
+@given(
+    capacity=st.integers(min_value=1, max_value=8),
+    attempts=st.integers(min_value=1, max_value=12),
+)
+def test_budget_property_never_grants_more_than_capacity(
+    capacity: int,
+    attempts: int,
+) -> None:
+    """Any sequential acquisition trace conservatively caps durable grants."""
+    with tempfile.TemporaryDirectory() as root:
+        coordinator = SharedBudgetCoordinator(
+            root,
+            _limits(capacity=capacity, period_seconds=60),
+        )
+        grants = 0
+        for _ in range(attempts):
+            try:
+                asyncio.run(
+                    coordinator.acquire(
+                        _request(),
+                        deadline=time.monotonic() + 1,
+                        cancellation=CancellationToken(),
+                    )
+                )
+            except CoordinationDeadlineExceededError:
+                continue
+            grants += 1
+
+        assert grants == min(capacity, attempts)
+        with pytest.raises(CoordinationDeadlineExceededError):
+            asyncio.run(
+                coordinator.acquire(
+                    BudgetRequest(
+                        "provider",
+                        "project",
+                        "billing",
+                        units=capacity + 1,
+                    ),
+                    deadline=time.monotonic() + 1,
+                    cancellation=CancellationToken(),
+                )
+            )
 
 
 def test_clock_rollback_does_not_refill_a_budget_window(tmp_path: Path) -> None:
@@ -429,6 +554,149 @@ def test_coalesced_read_failure_releases_the_identity_for_retry(tmp_path: Path) 
     assert result.value == "safe"
 
 
+def test_coalesced_leader_work_is_bounded_by_caller_deadline(tmp_path: Path) -> None:
+    """Leader work is cancelled and unpublished when its caller deadline expires."""
+    coalescer = SharedReadCoalescer(tmp_path)
+
+    async def slow() -> RedactedText:
+        await asyncio.sleep(10)
+        return RedactedText("late")
+
+    with pytest.raises(CoordinationDeadlineExceededError):
+        asyncio.run(
+            coalescer.run(
+                "slow-read",
+                slow,
+                deadline=time.monotonic() + 0.05,
+                cancellation=CancellationToken(),
+            )
+        )
+
+    assert list(tmp_path.glob("*.json")) == []
+
+
+def test_coalesced_leader_work_is_bounded_by_cancellation(tmp_path: Path) -> None:
+    """Cancelling a leader cancels its work and releases the identity for retry."""
+    coalescer = SharedReadCoalescer(tmp_path)
+
+    async def cancel_during_work() -> None:
+        token = CancellationToken()
+
+        async def slow() -> RedactedText:
+            await asyncio.sleep(10)
+            return RedactedText("late")
+
+        task = asyncio.create_task(
+            coalescer.run(
+                "cancelled-leader",
+                slow,
+                deadline=time.monotonic() + 5,
+                cancellation=token,
+            )
+        )
+        await asyncio.sleep(0.02)
+        token.cancel()
+        with pytest.raises(CoordinationCancelledError):
+            await asyncio.wait_for(task, timeout=0.5)
+
+    asyncio.run(cancel_during_work())
+    assert list(tmp_path.glob("*.json")) == []
+
+
+def test_coalescing_never_duplicates_work_when_a_waiter_deadline_expires(
+    tmp_path: Path,
+) -> None:
+    """A waiting caller times out without becoming an overlapping successor leader."""
+    first = SharedReadCoalescer(tmp_path)
+    second = SharedReadCoalescer(tmp_path)
+    calls = 0
+
+    async def exercise() -> None:
+        nonlocal calls
+        started = asyncio.Event()
+
+        async def leader_work() -> RedactedText:
+            nonlocal calls
+            calls += 1
+            started.set()
+            await asyncio.sleep(0.15)
+            return RedactedText("leader")
+
+        async def forbidden_duplicate() -> RedactedText:
+            nonlocal calls
+            calls += 1
+            return RedactedText("duplicate")
+
+        leader = asyncio.create_task(
+            first.run(
+                "one-read",
+                leader_work,
+                deadline=time.monotonic() + 1,
+                cancellation=CancellationToken(),
+            )
+        )
+        await started.wait()
+        with pytest.raises(CoordinationDeadlineExceededError):
+            await second.run(
+                "one-read",
+                forbidden_duplicate,
+                deadline=time.monotonic() + 0.05,
+                cancellation=CancellationToken(),
+            )
+        assert (await leader).value == "leader"
+
+    asyncio.run(exercise())
+    assert calls == 1
+
+
+def test_coalescing_waiter_cancellation_does_not_block_event_loop(
+    tmp_path: Path,
+) -> None:
+    """A follower remains cancellable while another leader holds the process lock."""
+    first = SharedReadCoalescer(tmp_path)
+    second = SharedReadCoalescer(tmp_path)
+
+    async def exercise() -> int:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def leader_work() -> RedactedText:
+            started.set()
+            await release.wait()
+            return RedactedText("leader")
+
+        leader = asyncio.create_task(
+            first.run(
+                "shared-read",
+                leader_work,
+                deadline=time.monotonic() + 1,
+                cancellation=CancellationToken(),
+            )
+        )
+        await started.wait()
+        token = CancellationToken()
+        follower = asyncio.create_task(
+            second.run(
+                "shared-read",
+                _safe_read,
+                deadline=time.monotonic() + 1,
+                cancellation=token,
+            )
+        )
+        ticks = 0
+        for _ in range(4):
+            await asyncio.sleep(0.01)
+            ticks += 1
+        token.cancel()
+        with pytest.raises(CoordinationCancelledError):
+            await asyncio.wait_for(follower, timeout=0.5)
+        release.set()
+        await leader
+        return ticks
+
+    assert asyncio.run(exercise()) == _EXPECTED_EVENT_LOOP_TICKS
+
+
 def test_coalesced_read_rejects_raw_results_and_corrupt_state(tmp_path: Path) -> None:
     """Only safe normalized results and valid local coordination state are reusable."""
     coalescer = SharedReadCoalescer(tmp_path)
@@ -536,6 +804,32 @@ def test_process_death_releases_interprocess_lock(tmp_path: Path) -> None:
     assert process.exitcode is not None
 
 
+def test_process_death_releases_coalesced_leadership_for_retry(tmp_path: Path) -> None:
+    """A crashed leader cannot fence out or publish over its healthy successor."""
+    context = multiprocessing.get_context("spawn")
+    ready = context.Queue()
+    process = context.Process(
+        target=_hold_coalesced_leadership,
+        args=(str(tmp_path), ready),
+    )
+    process.start()
+    assert ready.get(timeout=10) == "leading"
+    process.terminate()
+    process.join(timeout=10)
+
+    result = asyncio.run(
+        SharedReadCoalescer(tmp_path).run(
+            "crashed-read",
+            _safe_read,
+            deadline=time.monotonic() + 1,
+            cancellation=CancellationToken(),
+        )
+    )
+
+    assert result.value == "safe"
+    assert process.exitcode is not None
+
+
 def test_lock_validates_polling_and_instance_ownership(tmp_path: Path) -> None:
     """A lock instance cannot recursively overwrite its held file descriptor."""
     with pytest.raises(ValueError, match="polling"):
@@ -546,3 +840,54 @@ def test_lock_validates_polling_and_instance_ownership(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="already held"):
         lock.acquire()
     lock.release()
+
+
+def test_async_lock_checks_free_lock_deadline_and_cancellation_first(
+    tmp_path: Path,
+) -> None:
+    """An available lock still cannot widen an elapsed or cancelled caller."""
+    lock = InterprocessFileLock(tmp_path / "async.lock")
+    with pytest.raises(CoordinationDeadlineExceededError):
+        asyncio.run(
+            lock.acquire_async(
+                deadline=time.monotonic() - 1,
+                cancellation=CancellationToken(),
+            )
+        )
+    token = CancellationToken()
+    token.cancel()
+    with pytest.raises(CoordinationCancelledError):
+        asyncio.run(
+            lock.acquire_async(
+                deadline=time.monotonic() + 1,
+                cancellation=token,
+            )
+        )
+    lock.acquire()
+    lock.release()
+
+
+def test_async_lock_contention_does_not_block_event_loop(tmp_path: Path) -> None:
+    """A contended file lock polls asynchronously until the holder releases."""
+    path = tmp_path / "contended.lock"
+    held = InterprocessFileLock(path)
+    waiting = InterprocessFileLock(path)
+    held.acquire()
+
+    async def exercise() -> int:
+        task = asyncio.create_task(
+            waiting.acquire_async(
+                deadline=time.monotonic() + 1,
+                cancellation=CancellationToken(),
+            )
+        )
+        ticks = 0
+        for _ in range(4):
+            await asyncio.sleep(0.01)
+            ticks += 1
+        held.release()
+        await task
+        waiting.release()
+        return ticks
+
+    assert asyncio.run(exercise()) == _EXPECTED_EVENT_LOOP_TICKS

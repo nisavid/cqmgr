@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +38,31 @@ if TYPE_CHECKING:
 _SEGMENT_NAME: Final = "audit-{segment:08d}.jsonl"
 _MANIFEST_NAME: Final = "manifest.json"
 _MIN_RECORDS_PER_SEGMENT: Final = 2
+_RECORD_FIELDS: Final = frozenset(
+    {
+        "schema",
+        "record_id",
+        "sequence",
+        "segment",
+        "kind",
+        "operation",
+        "resource_scope",
+        "occurred_at",
+        "outcome",
+        "correlation_id",
+        "diagnostic_codes",
+        "facts",
+        "previous_hash",
+        "record_hash",
+    }
+)
+_RESOURCE_SCOPE_FIELDS: Final = frozenset({"type", "name"})
+_FACT_FIELDS: Final = frozenset({"name", "value"})
+_MANIFEST_FIELDS: Final = frozenset(
+    {"schema", "last_sequence", "last_segment", "last_hash"}
+)
+_SHA256_PATTERN: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_SEGMENT_PATTERN: Final = re.compile(r"audit-([0-9]{8})\.jsonl\Z")
 
 
 class FilesystemAuditJournal:
@@ -171,10 +197,13 @@ class FilesystemAuditJournal:
 
     def _append_record(self, record: AuditRecord) -> None:
         path = self._segment_path(record.segment)
+        is_new_segment = not path.exists()
         with path.open("ab") as stream:
             stream.write(self._encode(record) + b"\n")
             stream.flush()
             os.fsync(stream.fileno())
+        if is_new_segment:
+            _fsync_directory(self._root)
         self._failure_hook("after-record-fsync")
         self._write_manifest(record)
         self._failure_hook("after-manifest-fsync")
@@ -273,8 +302,13 @@ class FilesystemAuditJournal:
     @classmethod
     def _decode(cls, raw: bytes) -> AuditRecord:
         data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise _MalformedAuditRecordError
         if data.get("schema") != AUDIT_RECORD_SCHEMA:
             raise _UnsupportedAuditSchemaError
+        if set(data) != _RECORD_FIELDS:
+            raise _NoncanonicalAuditRecordError
+        cls._validate_record_field_shapes(data)
         scope_data = data["resource_scope"]
         scope = (
             ResourceScope(
@@ -304,7 +338,7 @@ class FilesystemAuditJournal:
                 for fact in data["facts"]
             ),
         )
-        return AuditRecord(
+        record = AuditRecord(
             record_id=data["record_id"],
             sequence=data["sequence"],
             segment=data["segment"],
@@ -312,24 +346,90 @@ class FilesystemAuditJournal:
             previous_hash=data["previous_hash"],
             record_hash=data["record_hash"],
         )
+        if raw != cls._encode(record):
+            raise _NoncanonicalAuditRecordError
+        return record
+
+    @staticmethod
+    def _validate_record_field_shapes(data: dict[str, Any]) -> None:
+        required_strings = (
+            "record_id",
+            "kind",
+            "operation",
+            "occurred_at",
+            "previous_hash",
+            "record_hash",
+        )
+        if any(not isinstance(data[name], str) for name in required_strings):
+            raise _MalformedAuditRecordError
+        if type(data["sequence"]) is not int or type(data["segment"]) is not int:
+            raise _MalformedAuditRecordError
+        if data["sequence"] < 1 or data["segment"] < 1:
+            raise _MalformedAuditRecordError
+        if _SHA256_PATTERN.fullmatch(data["previous_hash"]) is None or (
+            _SHA256_PATTERN.fullmatch(data["record_hash"]) is None
+        ):
+            raise _MalformedAuditRecordError
+        FilesystemAuditJournal._validate_record_scope(data["resource_scope"])
+        FilesystemAuditJournal._validate_record_collections(data)
+
+    @staticmethod
+    def _validate_record_scope(scope: object) -> None:
+        if scope is not None and (
+            not isinstance(scope, dict)
+            or set(scope) != _RESOURCE_SCOPE_FIELDS
+            or any(not isinstance(scope[name], str) for name in _RESOURCE_SCOPE_FIELDS)
+        ):
+            raise _NoncanonicalAuditRecordError
+
+    @staticmethod
+    def _validate_record_collections(data: dict[str, Any]) -> None:
+        if data["outcome"] is not None and not isinstance(data["outcome"], str):
+            raise _MalformedAuditRecordError
+        if data["correlation_id"] is not None and not isinstance(
+            data["correlation_id"], str
+        ):
+            raise _MalformedAuditRecordError
+        diagnostic_codes = data["diagnostic_codes"]
+        if not isinstance(diagnostic_codes, list) or any(
+            not isinstance(code, str) for code in diagnostic_codes
+        ):
+            raise _MalformedAuditRecordError
+        facts = data["facts"]
+        if not isinstance(facts, list):
+            raise _MalformedAuditRecordError
+        if any(
+            not isinstance(fact, dict)
+            or set(fact) != _FACT_FIELDS
+            or any(not isinstance(fact[name], str) for name in _FACT_FIELDS)
+            for fact in facts
+        ):
+            raise _NoncanonicalAuditRecordError
 
     def _read_all(self, *, check_manifest: bool = False) -> tuple[AuditRecord, ...]:
         records: list[AuditRecord] = []
-        paths = sorted(self._root.glob("audit-*.jsonl"))
+        paths = self._ordered_segment_paths()
         expected_hash = AUDIT_GENESIS_HASH
         expected_sequence = 1
-        for expected_segment, path in enumerate(paths, start=1):
-            actual_segment = int(path.stem.removeprefix("audit-"))
+        for expected_segment, (actual_segment, path) in enumerate(paths, start=1):
             if actual_segment != expected_segment:
                 self._fail(
                     AuditFailureCode.MISSING_SEGMENT, expected_segment, None, None
                 )
-            decoded = self._read_segment(
-                path,
-                actual_segment=actual_segment,
-                expected_sequence=expected_sequence,
-            )
-            for record in decoded:
+            for raw_line in path.read_bytes().splitlines(keepends=True):
+                if not raw_line.endswith(b"\n"):
+                    self._fail(
+                        AuditFailureCode.MALFORMED_RECORD,
+                        actual_segment,
+                        expected_sequence,
+                        None,
+                    )
+                raw = raw_line[:-1]
+                record = self._decode_record_or_fail(
+                    raw,
+                    actual_segment=actual_segment,
+                    expected_sequence=expected_sequence,
+                )
                 self._verify_record(
                     record,
                     actual_segment=actual_segment,
@@ -343,40 +443,51 @@ class FilesystemAuditJournal:
             self._verify_manifest(tuple(records))
         return tuple(records)
 
-    def _read_segment(
+    def _ordered_segment_paths(self) -> tuple[tuple[int, Path], ...]:
+        parsed: list[tuple[int, Path]] = []
+        for path in self._root.glob("audit-*.jsonl"):
+            match = _SEGMENT_PATTERN.fullmatch(path.name)
+            if match is None:
+                self._fail(AuditFailureCode.INVALID_SEGMENT_NAME, 0, None, None)
+            parsed.append((int(match.group(1)), path))
+        return tuple(sorted(parsed))
+
+    def _decode_record_or_fail(
         self,
-        path: Path,
+        raw: bytes,
         *,
         actual_segment: int,
         expected_sequence: int,
-    ) -> tuple[AuditRecord, ...]:
-        content = path.read_bytes()
-        if content and not content.endswith(b"\n"):
+    ) -> AuditRecord:
+        try:
+            return self._decode(raw)
+        except _UnsupportedAuditSchemaError:
+            self._fail(
+                AuditFailureCode.UNSUPPORTED_SCHEMA,
+                actual_segment,
+                expected_sequence,
+                None,
+            )
+        except _NoncanonicalAuditRecordError:
+            self._fail(
+                AuditFailureCode.NONCANONICAL_RECORD,
+                actual_segment,
+                expected_sequence,
+                None,
+            )
+        except (
+            _MalformedAuditRecordError,
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
             self._fail(
                 AuditFailureCode.MALFORMED_RECORD,
                 actual_segment,
-                expected_sequence + content.count(b"\n"),
+                expected_sequence,
                 None,
             )
-        records: list[AuditRecord] = []
-        for index, raw in enumerate(content.splitlines()):
-            try:
-                records.append(self._decode(raw))
-            except _UnsupportedAuditSchemaError:
-                self._fail(
-                    AuditFailureCode.UNSUPPORTED_SCHEMA,
-                    actual_segment,
-                    expected_sequence + index,
-                    None,
-                )
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                self._fail(
-                    AuditFailureCode.MALFORMED_RECORD,
-                    actual_segment,
-                    expected_sequence + index,
-                    None,
-                )
-        return tuple(records)
 
     def _verify_record(
         self,
@@ -393,6 +504,14 @@ class FilesystemAuditJournal:
                 record.sequence,
                 record.record_id,
             )
+        expected_record_id = f"audit-{record.sequence:020d}"
+        if record.record_id != expected_record_id:
+            self._fail(
+                AuditFailureCode.RECORD_ID_MISMATCH,
+                actual_segment,
+                record.sequence,
+                record.record_id,
+            )
         if record.previous_hash != expected_hash:
             self._fail(
                 AuditFailureCode.PREVIOUS_HASH_MISMATCH,
@@ -400,13 +519,8 @@ class FilesystemAuditJournal:
                 record.sequence,
                 record.record_id,
             )
-        expected_record = self._build_record(
-            record.draft,
-            sequence=record.sequence,
-            segment=record.segment,
-            previous_hash=record.previous_hash,
-        )
-        if record.record_hash != expected_record.record_hash:
+        expected_digest = hashlib.sha256(self._canonical_mapping(record)).hexdigest()
+        if record.record_hash != f"sha256:{expected_digest}":
             self._fail(
                 AuditFailureCode.RECORD_HASH_MISMATCH,
                 actual_segment,
@@ -418,13 +532,14 @@ class FilesystemAuditJournal:
         records = self._read_all()
         manifest = self._read_manifest()
         if not records:
-            if manifest is not None and manifest.get("last_sequence") != 0:
-                self._fail(AuditFailureCode.MANIFEST_MISMATCH, 0, None, None)
+            self._require_empty_manifest(manifest)
             return ()
         last = records[-1]
         if manifest is None:
             self._fail(AuditFailureCode.MANIFEST_MISMATCH, 0, None, None)
-        if manifest.get("last_sequence", -1) < last.sequence:
+        manifest_sequence = manifest["last_sequence"]
+        if manifest_sequence < last.sequence:
+            self._require_manifest_prefix(manifest, records)
             self._write_manifest(last)
             return records
         self._verify_manifest(records)
@@ -438,7 +553,45 @@ class FilesystemAuditJournal:
             data = json.loads(path.read_bytes())
         except (OSError, json.JSONDecodeError):
             self._fail(AuditFailureCode.MANIFEST_MISMATCH, 0, None, None)
+        if (
+            not isinstance(data, dict)
+            or set(data) != _MANIFEST_FIELDS
+            or data.get("schema") != "cqmgr.audit-manifest/v1"
+            or type(data.get("last_sequence")) is not int
+            or type(data.get("last_segment")) is not int
+            or data["last_sequence"] < 0
+            or data["last_segment"] < 0
+            or not isinstance(data.get("last_hash"), str)
+            or _SHA256_PATTERN.fullmatch(data["last_hash"]) is None
+        ):
+            self._fail(AuditFailureCode.MANIFEST_MISMATCH, 0, None, None)
         return data
+
+    def _require_empty_manifest(self, manifest: dict[str, Any] | None) -> None:
+        expected = {
+            "schema": "cqmgr.audit-manifest/v1",
+            "last_sequence": 0,
+            "last_segment": 0,
+            "last_hash": AUDIT_GENESIS_HASH,
+        }
+        if manifest != expected:
+            self._fail(AuditFailureCode.MANIFEST_MISMATCH, 0, None, None)
+
+    def _require_manifest_prefix(
+        self,
+        manifest: dict[str, Any],
+        records: tuple[AuditRecord, ...],
+    ) -> None:
+        sequence = manifest["last_sequence"]
+        if sequence == 0:
+            self._require_empty_manifest(manifest)
+            return
+        prefix = records[sequence - 1]
+        if (
+            manifest["last_segment"] != prefix.segment
+            or manifest["last_hash"] != prefix.record_hash
+        ):
+            self._fail(AuditFailureCode.MANIFEST_MISMATCH, 0, None, None)
 
     def _verify_manifest(self, records: tuple[AuditRecord, ...]) -> None:
         manifest = self._read_manifest()
@@ -618,6 +771,14 @@ class _UnsupportedAuditSchemaError(Exception):
 
 class _InvalidCursorError(Exception):
     """A cursor failed integrity or query-binding validation."""
+
+
+class _MalformedAuditRecordError(Exception):
+    """A retained JSON value cannot form a typed audit record."""
+
+
+class _NoncanonicalAuditRecordError(Exception):
+    """A retained record has valid meaning but noncanonical bytes or fields."""
 
 
 def _fsync_directory(path: Path) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 from threading import Event
@@ -70,6 +71,7 @@ class BudgetLimit:
         if (
             isinstance(self.period_seconds, bool)
             or not isinstance(self.period_seconds, (int, float))
+            or not math.isfinite(self.period_seconds)
             or self.period_seconds <= 0
         ):
             msg = "budget period must be positive seconds"
