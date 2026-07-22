@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
@@ -36,7 +36,7 @@ class PlanLedgerRecord:
     """Pure durable state for one locally authenticated plan digest."""
 
     state: PlanLedgerState
-    lease_token: str | None = None
+    lease_token: str | None = field(default=None, repr=False)
     lease_expires_at: datetime | None = None
     reason: StableSymbol | None = None
 

@@ -375,3 +375,35 @@ def test_native_plan_lock_rejects_invalid_configuration_and_reentrancy(
         with pytest.raises(RuntimeError, match="not reentrant"):
             lock.__enter__()
     lock.__exit__()
+
+
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    [True, float("nan"), float("inf"), float("-inf")],
+)
+def test_native_plan_lock_rejects_nonfinite_or_boolean_timeout(
+    tmp_path: Path,
+    timeout_seconds: float,
+) -> None:
+    """A caller cannot turn bounded lock acquisition into an endless wait."""
+    with pytest.raises(ValueError, match="timeout"):
+        NativePlanInterprocessLock(
+            tmp_path / "lock",
+            timeout_seconds=timeout_seconds,
+        )
+
+
+@pytest.mark.parametrize(
+    "poll_seconds",
+    [True, float("nan"), float("inf"), float("-inf")],
+)
+def test_native_plan_lock_rejects_nonfinite_or_boolean_poll_interval(
+    tmp_path: Path,
+    poll_seconds: float,
+) -> None:
+    """Lock polling always uses a finite positive scheduling interval."""
+    with pytest.raises(ValueError, match="poll"):
+        NativePlanInterprocessLock(
+            tmp_path / "lock",
+            poll_seconds=poll_seconds,
+        )

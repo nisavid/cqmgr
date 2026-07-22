@@ -24,6 +24,23 @@ if TYPE_CHECKING:
 PLAN_SCHEMA = QUOTA_REQUEST_PLAN_SCHEMA
 PLAN_LIFETIME = timedelta(minutes=15)
 _LOWER_HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_MAXIMUM_CONTACT_SOURCE_IDENTITY_LENGTH = 256
+_PROFILE_CONTACT_SOURCE_IDENTITY = re.compile(
+    r"profile:[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z"
+)
+_DIRECT_USER_CONTACT_SOURCE_IDENTITY = re.compile(
+    r"principal://[A-Za-z0-9][A-Za-z0-9._~-]*"
+    r"(?:/[A-Za-z0-9][A-Za-z0-9._~-]*)*\Z"
+)
+_PROTECTED_INPUT_CONTACT_SOURCE_IDENTITY = re.compile(
+    r"input:hmac-sha256:[0-9a-f]{64}\Z"
+)
+_CONTACT_SOURCE_IDENTITIES = {
+    "direct-user": _DIRECT_USER_CONTACT_SOURCE_IDENTITY,
+    "named-profile": _PROFILE_CONTACT_SOURCE_IDENTITY,
+    "per-operation-input": _PROTECTED_INPUT_CONTACT_SOURCE_IDENTITY,
+    "selected-profile": _PROFILE_CONTACT_SOURCE_IDENTITY,
+}
 
 
 class PlanLedgerState(StrEnum):
@@ -81,8 +98,16 @@ class ContactBinding:
         if not isinstance(self.source, StableSymbol):
             msg = "contact source must be a StableSymbol"
             raise TypeError(msg)
-        if not isinstance(self.source_identity, str) or not self.source_identity:
-            msg = "contact source_identity must be a non-empty string"
+        identity_pattern = _CONTACT_SOURCE_IDENTITIES.get(self.source.value)
+        if identity_pattern is None:
+            msg = "contact source is unsupported"
+            raise ValueError(msg)
+        if (
+            not isinstance(self.source_identity, str)
+            or len(self.source_identity) > _MAXIMUM_CONTACT_SOURCE_IDENTITY_LENGTH
+            or identity_pattern.fullmatch(self.source_identity) is None
+        ):
+            msg = "contact source_identity must match its bounded non-secret source"
             raise ValueError(msg)
         if not _is_exact_digest(self.value_digest, "hmac-sha256"):
             msg = "contact value_digest must be an exact lowercase hmac-sha256 digest"
@@ -168,6 +193,7 @@ class QuotaRequestPlan:
         _require_tuple_of(self.acknowledgements, StableSymbol, "acknowledgements")
         _require_tuple_of(self.constraints, ConstraintReference, "constraints")
         _require_tuple_of(self.evidence, EvidenceBinding, "evidence")
+        _require_plan_constraints(self.resource_scope, self.constraints)
         if len({item.name for item in self.evidence}) != len(self.evidence):
             msg = "evidence names must be unique"
             raise ValueError(msg)
@@ -273,6 +299,19 @@ def _require_tuple_of(value: object, item_type: type[object], name: str) -> None
     ):
         msg = f"{name} must be a tuple of {item_type.__name__} values"
         raise TypeError(msg)
+
+
+def _require_plan_constraints(
+    resource_scope: ResourceScope,
+    constraints: tuple[ConstraintReference, ...],
+) -> None:
+    identities = tuple(item.slice_identity for item in constraints)
+    if any(identity.resource_scope != resource_scope for identity in identities):
+        msg = "constraint resource scope must match the plan resource scope"
+        raise ValueError(msg)
+    if len(set(identities)) != len(identities):
+        msg = "plan constraints must be unique"
+        raise ValueError(msg)
 
 
 def _is_exact_digest(value: object, algorithm: str) -> bool:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import math
 import os
 import sys
 import time
@@ -32,7 +33,19 @@ class NativePlanInterprocessLock:
         poll_seconds: float = 0.01,
     ) -> None:
         """Configure a bounded lock acquisition."""
-        if timeout_seconds < 0 or poll_seconds <= 0:
+        invalid_timeout = (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds < 0
+        )
+        invalid_poll = (
+            isinstance(poll_seconds, bool)
+            or not isinstance(poll_seconds, (int, float))
+            or not math.isfinite(poll_seconds)
+            or poll_seconds <= 0
+        )
+        if invalid_timeout or invalid_poll:
             msg = "lock timeout must be non-negative and poll interval positive"
             raise ValueError(msg)
         self._path = path
