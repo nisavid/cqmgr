@@ -439,9 +439,10 @@ def test_snapshot_sorting_covers_equal_missing_text_and_identity_ties() -> None:
     query = QuotaQuery(
         _scope(),
         ServiceSource("compute.googleapis.com"),
-        sort=(QuotaSort(QuotaSortField.SERVICE), QuotaSort(QuotaSortField.QUOTA_ID)),
+        sort=(QuotaSort(QuotaSortField.DISPLAY_NAME),),
     )
-    left = _item(identity=_identity("A"))
-    right = _item(identity=_identity("B"), display_name=None)
-    snapshot = QuotaQuerySnapshot(_metadata(query), (right, left))
-    assert snapshot.sorted_items() == (left, right)
+    left = _item(identity=_identity("A"), display_name="Same")
+    right = _item(identity=_identity("B"), display_name="Same")
+    missing = _item(identity=_identity("0"), display_name=None)
+    snapshot = QuotaQuerySnapshot(_metadata(query), (missing, right, left))
+    assert snapshot.sorted_items() == (left, right, missing)
