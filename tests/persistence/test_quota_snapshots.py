@@ -112,7 +112,7 @@ def test_repository_atomically_round_trips_private_canonical_snapshot(
         "cqmgr.quota-query-snapshot/v2"
     )
     assert list(root.rglob("*.tmp")) == []
-    if stat.S_IMODE(root.stat().st_mode):
+    if os.name != "nt":
         assert stat.S_IMODE(root.stat().st_mode) == PRIVATE_DIRECTORY_MODE
         assert (
             stat.S_IMODE((root / "snapshots").stat().st_mode) == PRIVATE_DIRECTORY_MODE
@@ -161,7 +161,8 @@ def test_cursor_is_random_opaque_and_resolves_bound_query_and_offset(
     assert resolved.offset == 1
     cursor_file = next((tmp_path / "snapshots" / "cursors").glob("*.json"))
     assert TOKEN not in cursor_file.read_text()
-    assert stat.S_IMODE(cursor_file.stat().st_mode) == PRIVATE_FILE_MODE
+    if os.name != "nt":
+        assert stat.S_IMODE(cursor_file.stat().st_mode) == PRIVATE_FILE_MODE
 
 
 def test_cursor_collision_retries_without_overwriting_existing_binding(
@@ -530,6 +531,25 @@ def test_repository_rejects_nonregular_state_and_unusable_root(tmp_path: Path) -
     unusable.write_text("occupied")
     with pytest.raises(QuotaSnapshotOperationalError, match="FileExistsError"):
         FilesystemQuotaQuerySnapshots(unusable).save(snapshot)
+
+
+def test_fallback_rejects_directory_before_platform_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fallback reads classify nonregular state before platform-specific open errors."""
+    directory = tmp_path / "state.json"
+    directory.mkdir()
+
+    def unexpected_open(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        msg = "nonregular state must be rejected before os.open"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(persistence.os, "open", unexpected_open)
+
+    with pytest.raises(QuotaSnapshotOperationalError, match="regular file"):
+        persistence._read_trusted_file(directory)  # noqa: SLF001
 
 
 def test_resolved_cursor_requires_a_snapshot_and_nonnegative_offset() -> None:

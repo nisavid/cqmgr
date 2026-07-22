@@ -273,6 +273,9 @@ def _read_trusted_file(path: Path) -> bytes:
     if path.is_symlink():
         msg = "quota snapshot state file must not be a symlink"
         raise QuotaSnapshotOperationalError(msg)
+    if not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode):
+        msg = "quota snapshot state must be a regular file"
+        raise QuotaSnapshotOperationalError(msg)
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
