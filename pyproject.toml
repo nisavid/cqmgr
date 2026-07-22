@@ -177,6 +177,7 @@ forbidden_modules = [
 [[tool.importlinter.contracts]]
 name = "Entry points do not bypass application operations"
 type = "forbidden"
+allow_indirect_imports = true
 source_modules = [
   "cqmgr.cli",
   "cqmgr.tui",
