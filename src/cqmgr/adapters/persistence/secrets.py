@@ -142,7 +142,10 @@ class NativeSecretStore:
             return SecretStoreOutcome(SecretStoreStatus.UNSUPPORTED)
         if not self._lock.owned_by_current_thread:
             return SecretStoreOutcome(SecretStoreStatus.FAILED)
-        return self._create_unlocked(reference, secret)
+        try:
+            return self._create_unlocked(reference, secret)
+        except Exception as error:  # noqa: BLE001
+            return _failure(error)
 
     def _get_unlocked(self, reference: SecretStoreReference) -> SecretStoreOutcome:
         raw = self._get_raw(reference)
