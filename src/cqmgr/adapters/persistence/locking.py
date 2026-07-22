@@ -59,7 +59,12 @@ class InterprocessFileLock:
                 try:
                     _try_lock(stream)
                 except BlockingIOError:
-                    time.sleep(self._poll_seconds)
+                    remaining = (
+                        self._poll_seconds
+                        if deadline is None
+                        else max(deadline - time.monotonic(), 0)
+                    )
+                    time.sleep(min(self._poll_seconds, remaining))
                 else:
                     try:
                         _raise_if_stopped(

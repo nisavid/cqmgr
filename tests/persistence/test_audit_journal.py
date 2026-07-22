@@ -263,11 +263,20 @@ def test_append_scrubs_explicit_secrets_and_machine_paths(tmp_path: Path) -> Non
     assert machine_path.encode() not in persisted
 
 
-def test_append_unconditionally_excludes_audit_forbidden_text(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        '{"quotaPreferences":[{"name":"unsafe"}]}',
+        "status=PERMISSION_DENIED; principal=user@example.invalid; debug=opaque",
+    ],
+)
+def test_append_unconditionally_excludes_audit_forbidden_text(
+    tmp_path: Path,
+    raw_body: str,
+) -> None:
     """Audit persistence removes contacts, local paths, and raw provider bodies."""
     quota_contact = "person@example.test"
     machine_path = "/Users/example/private/adc.json"
-    raw_body = '{"quotaPreferences":[{"name":"unsafe"}]}'
     safe_identity = "quotaPreferences/safe-identity"
     journal = FilesystemAuditJournal(tmp_path)
 
@@ -292,7 +301,7 @@ def test_append_unconditionally_excludes_audit_forbidden_text(tmp_path: Path) ->
     assert record.draft.facts[1].value.value == safe_identity
     assert record.draft.correlation_id is not None
     assert REDACTION_MARKER in record.draft.correlation_id.value
-    assert REDACTION_MARKER in record.draft.facts[0].value.value
+    assert record.draft.facts[0].value.value == REDACTION_MARKER
 
 
 @pytest.mark.parametrize(

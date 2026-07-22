@@ -1172,6 +1172,32 @@ def test_lock_validates_polling_and_instance_ownership(tmp_path: Path) -> None:
     lock.release()
 
 
+def test_sync_lock_contention_clamps_poll_to_remaining_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Synchronous polling never widens the caller's monotonic deadline."""
+    path = tmp_path / "sync-deadline.lock"
+    held = InterprocessFileLock(path)
+    waiting = InterprocessFileLock(path, poll_seconds=0.2)
+    held.acquire()
+    now = [100.0]
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(locking_adapter.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(locking_adapter.time, "sleep", sleep)
+
+    with pytest.raises(CoordinationDeadlineExceededError):
+        waiting.acquire(deadline=100.01)
+
+    held.release()
+    assert sleeps == pytest.approx([0.01])
+
+
 def test_async_lock_checks_free_lock_deadline_and_cancellation_first(
     tmp_path: Path,
 ) -> None:
