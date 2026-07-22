@@ -437,10 +437,11 @@ def test_capped_tpu_zone_source_is_not_scanned() -> None:
     assert not result.complete
 
 
-def test_invalid_compute_scope_is_explicit_failed_coverage() -> None:
+@pytest.mark.parametrize("scope", ["zones/us central1-a", "zones/us-central1"])
+def test_invalid_compute_scope_is_explicit_failed_coverage(scope: str) -> None:
     """A malformed Compute scope cannot escape as authoritative empty evidence."""
     page = ComputeMachineTypesPage(
-        scopes=(ComputeMachineTypesScope("zones/us central1-a", ()),),
+        scopes=(ComputeMachineTypesScope(scope, ()),),
         next_page_token="",
     )
     result = asyncio.run(
