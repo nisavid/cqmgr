@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from typing import TYPE_CHECKING, Protocol
 
 from google.api_core import exceptions as google_exceptions
@@ -76,7 +77,29 @@ class ResourceManagerProjectResolver:
         except Exception as error:  # noqa: BLE001  # provider text is discarded
             return _provider_failure(reference, error)
 
-        if response.state != resourcemanager_v3.Project.State.ACTIVE:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Unrecognized State enum value: [0-9]+\Z",
+                category=UserWarning,
+                module=r"proto\.marshal\.rules\.enums",
+            )
+            state = response.state
+
+        if state not in (
+            resourcemanager_v3.Project.State.ACTIVE,
+            resourcemanager_v3.Project.State.DELETE_REQUESTED,
+        ):
+            return _failure(
+                reference,
+                code="invalid-project-evidence",
+                guidance=(
+                    "Resource Manager returned project evidence without a state; "
+                    "refresh and retry."
+                ),
+                retry=RetryDisposition.AFTER_REFRESH,
+            )
+        if state == resourcemanager_v3.Project.State.DELETE_REQUESTED:
             return _failure(
                 reference,
                 code="project-not-active",
