@@ -268,7 +268,7 @@ def test_first_use_durably_publishes_each_created_directory(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows ACL contract")
-def test_windows_repository_removes_broad_plan_read_access(tmp_path: Path) -> None:
+def test_windows_repository_replaces_every_explicit_plan_reader(tmp_path: Path) -> None:
     """Plan and ledger paths retain only the active Windows account ACL."""
     system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
     executable = rf"{system_root}\System32\icacls.exe"
@@ -278,6 +278,7 @@ def test_windows_repository_removes_broad_plan_read_access(tmp_path: Path) -> No
             str(tmp_path),
             "/grant",
             "*S-1-1-0:(OI)(CI)R",
+            "*S-1-5-32-544:(OI)(CI)R",
         ],
         check=True,
         capture_output=True,
@@ -305,6 +306,8 @@ def test_windows_repository_removes_broad_plan_read_access(tmp_path: Path) -> No
         assert "everyone:" not in acl
         assert "s-1-1-0:" not in acl
         assert "builtin\\users:" not in acl
+        assert "builtin\\administrators:" not in acl
+        assert "s-1-5-32-544:" not in acl
 
 
 def test_lease_dispatch_terminal_consumption_is_single_use(tmp_path: Path) -> None:
