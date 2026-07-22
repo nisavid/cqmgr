@@ -6,6 +6,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING, cast, override
 from unittest.mock import patch
 
+import keyring
 import pytest
 from keyring.errors import InitError, KeyringError, KeyringLocked
 
@@ -29,6 +30,24 @@ if TYPE_CHECKING:
 
 GENERATED_REFERENCE_COUNT = 32
 MAXIMUM_REFERENCE_LENGTH = 128
+
+
+def test_runtime_keyring_backend_is_classified_without_mutation(tmp_path: Path) -> None:
+    """The installed platform backend is probed through its real concrete class."""
+    backend = keyring.get_keyring()
+    probe = NativeSecretStore(
+        backend,
+        NativePlanInterprocessLock(tmp_path / "runtime-keyring.lock"),
+    ).probe()
+    identity = (type(backend).__module__, type(backend).__name__)
+    supported = {
+        ("keyring.backends.macOS", "Keyring"),
+        ("keyring.backends.Windows", "WinVaultKeyring"),
+        ("keyring.backends.SecretService", "Keyring"),
+    }
+
+    assert probe.backend_identity == ".".join(identity)
+    assert probe.mutation_capable is (identity in supported)
 
 
 class _FakeKeyring:
