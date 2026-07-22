@@ -547,6 +547,12 @@ def test_constraint_sufficiency_rejects_ambiguous_or_incoherent_evidence() -> No
         replace(global_assessment, usage=object())  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="one native unit"):
         replace(global_assessment, usage=QuotaQuantity(1, QuotaUnit("core")))
+    with pytest.raises(ValueError, match="usage must be non-negative"):
+        replace(
+            global_assessment,
+            usage=QuotaQuantity(-1, QuotaUnit("1")),
+            permits=True,
+        )
     with pytest.raises(TypeError, match="permits must be boolean"):
         replace(global_assessment, permits=1)  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="assessments must contain"):

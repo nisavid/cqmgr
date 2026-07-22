@@ -720,7 +720,9 @@ def test_resolve_gpu_retains_unrelated_catalog_failures() -> None:
     assert tpu_runtimes.calls == []
 
 
-@pytest.mark.parametrize("usage_case", ["missing", "ambiguous", "incompatible"])
+@pytest.mark.parametrize(
+    "usage_case", ["missing", "ambiguous", "incompatible", "negative"]
+)
 def test_resolve_stops_on_untrustworthy_constraint_usage(usage_case: str) -> None:
     """Every exact limiting slice requires one compatible authoritative series."""
     regional, global_ = _gpu_quota_evidence()
@@ -733,6 +735,7 @@ def test_resolve_stops_on_untrustworthy_constraint_usage(usage_case: str) -> Non
             regional_usage,
             replace(global_usage, unit=OTHER_UNIT.symbol),
         ),
+        "negative": (regional_usage, _usage(global_, -1)),
     }[usage_case]
     operations = WorkloadResolutionOperations(
         ScriptedReader((_complete(regional, global_),)),
