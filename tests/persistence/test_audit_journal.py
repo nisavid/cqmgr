@@ -449,7 +449,7 @@ def test_verification_rejects_noncanonical_record_bytes(
             sort_keys=True,
             separators=(",", ":"),
         )
-    path.write_text(raw + "\n")
+    path.write_text(raw + "\n", encoding="utf-8", newline="\n")
 
     result = journal.verify()
 
