@@ -337,6 +337,12 @@ across other hosts or tools. Every adapter still handles provider throttling
 within the remaining operation deadline, and the configured local budgets stay
 conservative relative to documented provider limits.
 
+A durable budget replacement is the acquisition commit point. Cancellation or
+deadline expiry before that point leaves no charge; after it, the matching grant
+is returned. A failure after replacement but before durability confirmation
+returns a typed commit-unknown error with the possible grant details and must
+not be retried automatically.
+
 Read adapters may use bounded exponential backoff with jitter for documented
 transient failures and rate limits within the supplied budget. Provider writes
 never use blind generic retries. Deterministic preference identity, etag, and

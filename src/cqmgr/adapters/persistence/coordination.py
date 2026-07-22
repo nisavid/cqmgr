@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 from cqmgr.adapters.persistence.locking import InterprocessFileLock
 from cqmgr.application.ports.coordination import (
+    BudgetCommitUnknownError,
     BudgetGrant,
     BudgetLimit,
     BudgetRequest,
@@ -41,6 +42,10 @@ _BUDGET_KEY_PATTERN: Final = re.compile(
 _BUDGET_STATE_FIELDS: Final = frozenset({"schema", "entries"})
 _BUDGET_ENTRY_FIELDS: Final = frozenset({"window_started_at", "last_seen_at", "used"})
 _BACKGROUND_LEADERS: set[asyncio.Task[None]] = set()
+
+
+class _AtomicWriteCommitUnknownError(OSError):
+    """A replacement is visible but its directory entry may not be durable."""
 
 
 class DeterministicJitter:
@@ -134,10 +139,14 @@ class SharedBudgetCoordinator:
                     cancellation.raise_if_cancelled()
                     if self._monotonic() >= deadline:
                         raise CoordinationDeadlineExceededError
-                    self._write_state(entries)
+                    grant = BudgetGrant(charged_at=now, request=request)
+                    try:
+                        self._write_state(entries)
+                    except _AtomicWriteCommitUnknownError as error:
+                        raise BudgetCommitUnknownError(grant) from error
                     # Once the charge commits, reporting cancellation or timeout
                     # would make a retry charge the same acquisition again.
-                    return BudgetGrant(charged_at=now, request=request)
+                    return grant
             finally:
                 lock.release()
             remaining = deadline - self._monotonic()
@@ -622,6 +631,15 @@ def _atomic_write_json(root: Path, name: str, data: dict[str, Any]) -> None:
         stream.flush()
         os.fsync(stream.fileno())
     temporary.replace(destination)
+    try:
+        _sync_directory(root)
+    except OSError as error:
+        msg = "atomic JSON replacement durability is unknown"
+        raise _AtomicWriteCommitUnknownError(msg) from error
+
+
+def _sync_directory(root: Path) -> None:
+    """Make a completed replacement durable where the platform exposes fsync."""
     if os.name == "nt":
         return
     directory = os.open(root, os.O_RDONLY)

@@ -26,6 +26,7 @@ from cqmgr.adapters.persistence.coordination import (
 )
 from cqmgr.adapters.persistence.locking import InterprocessFileLock
 from cqmgr.application.ports.coordination import (
+    BudgetCommitUnknownError,
     BudgetLimit,
     BudgetRequest,
     BudgetScope,
@@ -337,6 +338,73 @@ def test_budget_controls_are_rechecked_immediately_before_commit(
             )
         )
 
+    assert not (tmp_path / "budgets.json").exists()
+
+
+def test_post_replace_sync_failure_reports_unknown_budget_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A visible charge with unconfirmed durability cannot invite a blind retry."""
+    request = _request()
+
+    def fail_directory_sync(_root: Path) -> None:
+        raise OSError(errno.EIO, "directory sync failed")
+
+    monkeypatch.setattr(
+        coordination_adapter,
+        "_sync_directory",
+        fail_directory_sync,
+    )
+    coordinator = SharedBudgetCoordinator(tmp_path, _limits(capacity=2))
+
+    with pytest.raises(BudgetCommitUnknownError) as caught:
+        asyncio.run(
+            coordinator.acquire(
+                request,
+                deadline=time.monotonic() + 1,
+                cancellation=CancellationToken(),
+            )
+        )
+
+    error = caught.value
+    assert str(error) == "local budget charge durability is unknown"
+    assert error.possible_grant.request == request
+    assert error.possible_grant.charged_at > 0
+    assert isinstance(error.__cause__, OSError)
+    storage_error = error.__cause__.__cause__
+    assert isinstance(storage_error, OSError)
+    assert storage_error.errno == errno.EIO
+    assert storage_error.strerror == "directory sync failed"
+    state = json.loads((tmp_path / "budgets.json").read_text())
+    assert {entry["used"] for entry in state["entries"].values()} == {1}
+
+
+def test_pre_replace_sync_failure_remains_a_definite_storage_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed temporary-file sync leaves no charge and permits a later retry."""
+    (tmp_path / ".budgets.lock").write_bytes(b"0")
+    failure = OSError(errno.EIO, "temporary sync failed")
+
+    def fail_file_sync(_descriptor: int) -> None:
+        raise failure
+
+    monkeypatch.setattr(coordination_adapter.os, "fsync", fail_file_sync)
+    coordinator = SharedBudgetCoordinator(tmp_path, _limits(capacity=2))
+
+    with pytest.raises(OSError, match="temporary sync failed") as caught:
+        asyncio.run(
+            coordinator.acquire(
+                _request(),
+                deadline=time.monotonic() + 1,
+                cancellation=CancellationToken(),
+            )
+        )
+
+    assert caught.value is failure
+    assert not isinstance(caught.value, BudgetCommitUnknownError)
     assert not (tmp_path / "budgets.json").exists()
 
 
