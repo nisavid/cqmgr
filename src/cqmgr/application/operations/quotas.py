@@ -1324,6 +1324,9 @@ def _usage_quantity(
     if point.value.kind is not MonitoringValueKind.INT64:
         msg = "quota usage requires an authoritative INT64 point"
         raise _AmbiguousEvidenceError(msg)
+    if point.value.value < 0:  # type: ignore[operator]
+        msg = "quota usage requires a non-negative authoritative point"
+        raise _AmbiguousEvidenceError(msg)
     return QuotaQuantity(point.value.value, evidence.effective_value.unit)  # type: ignore[arg-type]
 
 

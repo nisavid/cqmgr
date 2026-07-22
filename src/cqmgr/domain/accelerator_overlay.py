@@ -332,6 +332,9 @@ class QuotaConstraintAssessment:
         if len({quantity.unit for quantity in quantities}) != 1:
             msg = "quota constraint assessment values must use one native unit"
             raise ValueError(msg)
+        if self.usage.value < 0:
+            msg = "quota constraint assessment usage must be non-negative"
+            raise ValueError(msg)
         if not isinstance(self.permits, bool):
             msg = "quota constraint assessment permits must be boolean"
             raise TypeError(msg)
