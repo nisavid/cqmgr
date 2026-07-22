@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 
 from cqmgr.application.configuration import (
     ConfigSnapshot,
+    InterfaceSettingKey,
+    InterfaceSettings,
     Profile,
+    ProfileResourceScopeError,
     ScopeResolutionSource,
     SelectionState,
     UnsupportedResourceScopeError,
@@ -54,7 +59,7 @@ def test_explicit_profile_without_scope_does_not_fall_through() -> None:
         direct_resource_scope=project("3"),
     )
 
-    with pytest.raises(LookupError, match="has no resource scope"):
+    with pytest.raises(ProfileResourceScopeError, match="has no resource scope"):
         resolve_resource_scope(
             configuration,
             selection,
@@ -113,3 +118,14 @@ def test_v1_rejects_non_project_scopes_without_inference(
             SelectionState(direct_resource_scope=project("3")),
             explicit_resource_scope=unsupported_scope,
         )
+
+
+def test_interface_settings_reject_non_enum_keys() -> None:
+    """Public config access fails closed instead of defaulting or leaking KeyError."""
+    settings = InterfaceSettings()
+    invalid = cast("InterfaceSettingKey", "interface.unknown")
+
+    with pytest.raises(TypeError, match="InterfaceSettingKey"):
+        settings.get(invalid)
+    with pytest.raises(TypeError, match="InterfaceSettingKey"):
+        settings.replace(invalid, value=True)
