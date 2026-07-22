@@ -52,11 +52,6 @@ _WINDOWS_PRIVATE_ACL_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
 $target = $env:CQMGR_ACL_TARGET
 try {
-    $acl = Get-Acl -LiteralPath $target
-} catch {
-    exit 11
-}
-try {
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 } catch {
     exit 12
@@ -72,6 +67,11 @@ if ($isDirectory) {
 }
 $sddl = "D:P(A;${inheritance};FA;;;$($identity.Value))"
 try {
+    if ($isDirectory) {
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    } else {
+        $acl = New-Object System.Security.AccessControl.FileSecurity
+    }
     $acl.SetSecurityDescriptorSddlForm(
         $sddl,
         [System.Security.AccessControl.AccessControlSections]::Access
@@ -80,12 +80,26 @@ try {
     exit 13
 }
 try {
-    Set-Acl -LiteralPath $target -AclObject $acl
+    if ($isDirectory) {
+        [System.IO.Directory]::SetAccessControl($target, $acl)
+    } else {
+        [System.IO.File]::SetAccessControl($target, $acl)
+    }
 } catch {
     exit 14
 }
 try {
-    $verifiedAcl = Get-Acl -LiteralPath $target
+    if ($isDirectory) {
+        $verifiedAcl = [System.IO.Directory]::GetAccessControl(
+            $target,
+            [System.Security.AccessControl.AccessControlSections]::Access
+        )
+    } else {
+        $verifiedAcl = [System.IO.File]::GetAccessControl(
+            $target,
+            [System.Security.AccessControl.AccessControlSections]::Access
+        )
+    }
 } catch {
     exit 15
 }
