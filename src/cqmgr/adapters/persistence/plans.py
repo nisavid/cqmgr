@@ -52,28 +52,19 @@ _WINDOWS_PRIVATE_ACL_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
 $target = $env:CQMGR_ACL_TARGET
 $acl = Get-Acl -LiteralPath $target
-$acl.SetAccessRuleProtection($true, $false)
-foreach ($rule in @($acl.Access)) {
-    [void]$acl.RemoveAccessRuleAll($rule)
-}
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-$inheritance = [System.Security.AccessControl.InheritanceFlags]::None
+$inheritance = ''
 if (Test-Path -LiteralPath $target -PathType Container) {
-    $inheritance = (
-        [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
-        [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
-    )
+    $inheritance = 'OICI'
 }
-$access = [System.Security.AccessControl.FileSystemAccessRule]::new(
-    $identity,
-    [System.Security.AccessControl.FileSystemRights]::FullControl,
-    $inheritance,
-    [System.Security.AccessControl.PropagationFlags]::None,
-    [System.Security.AccessControl.AccessControlType]::Allow
+$sddl = "D:P(A;${inheritance};FA;;;$($identity.Value))"
+$acl.SetSecurityDescriptorSddlForm(
+    $sddl,
+    [System.Security.AccessControl.AccessControlSections]::Access
 )
-$acl.SetAccessRule($access)
 Set-Acl -LiteralPath $target -AclObject $acl
-$verified = @(Get-Acl -LiteralPath $target).Access
+$verifiedAcl = Get-Acl -LiteralPath $target
+$verified = @($verifiedAcl.Access)
 $verifiedIdentity = $null
 if ($verified.Count -eq 1) {
     $verifiedIdentity = $verified[0].IdentityReference.Translate(
@@ -81,6 +72,7 @@ if ($verified.Count -eq 1) {
     )
 }
 if (
+    -not $verifiedAcl.AreAccessRulesProtected -or
     $verified.Count -ne 1 -or
     $verifiedIdentity.Value -ne $identity.Value -or
     $verified[0].AccessControlType -ne
