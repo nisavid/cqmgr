@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol
 
+from google.api import metric_pb2
 from google.cloud import monitoring_v3
 
 from cqmgr.adapters.google.read_policy import (
@@ -191,7 +192,19 @@ def _map_time_series(
     series: monitoring_v3.TimeSeries,
     request: UsageReadRequest,
 ) -> UsageObservation:
-    if series.metric.type != _ALLOCATION_USAGE_METRIC:
+    metric_labels = series.metric.labels
+    resource_labels = series.resource.labels
+    if (
+        series.metric.type != _ALLOCATION_USAGE_METRIC
+        or series.metric_kind != metric_pb2.MetricDescriptor.MetricKind.GAUGE
+        or series.value_type != metric_pb2.MetricDescriptor.ValueType.INT64
+        or series.unit != "1"
+        or not metric_labels.get("quota_metric")
+        or series.resource.type != "consumer_quota"
+        or resource_labels.get("project_id") != request.context.project.project_id
+        or not resource_labels.get("service")
+        or not resource_labels.get("location")
+    ):
         msg = "Monitoring response contains a non-usage metric"
         raise ValueError(msg)
     return UsageObservation(
@@ -200,33 +213,40 @@ def _map_time_series(
         metric_labels=NormalizedDimensions(series.metric.labels.items()),
         resource_type=series.resource.type,
         resource_labels=NormalizedDimensions(series.resource.labels.items()),
-        points=tuple(_map_point(point) for point in series.points),
+        points=tuple(
+            _map_point(point, value_field="int64_value") for point in series.points
+        ),
         unit=series.unit or None,
     )
 
 
-def _map_point(point: monitoring_v3.Point) -> MonitoringPoint:
+def _map_point(
+    point: monitoring_v3.Point,
+    *,
+    value_field: str,
+) -> MonitoringPoint:
     point_pb = monitoring_v3.Point.pb(point)
     interval_pb = point_pb.interval
     if not interval_pb.HasField("end_time"):
         msg = "Monitoring point requires end_time"
         raise ValueError(msg)
-    start = (
-        interval_pb.start_time.ToDatetime(tzinfo=UTC)
-        if interval_pb.HasField("start_time")
-        else None
-    )
     end = interval_pb.end_time.ToDatetime(tzinfo=UTC)
-    value_field = point_pb.value.WhichOneof("value")
+    start = None
+    if interval_pb.HasField("start_time"):
+        start = interval_pb.start_time.ToDatetime(tzinfo=UTC)
+        if start != end:
+            msg = "GAUGE Monitoring point interval must be instantaneous"
+            raise ValueError(msg)
+    actual_value_field = point_pb.value.WhichOneof("value")
     kinds = {
         "bool_value": MonitoringValueKind.BOOL,
         "int64_value": MonitoringValueKind.INT64,
         "double_value": MonitoringValueKind.DOUBLE,
         "string_value": MonitoringValueKind.STRING,
     }
-    kind = kinds.get(value_field)
-    if kind is None:
+    kind = kinds.get(actual_value_field)
+    if kind is None or actual_value_field != value_field:
         msg = "Monitoring point has unsupported value type"
         raise ValueError(msg)
-    value = getattr(point_pb.value, value_field)
+    value = getattr(point_pb.value, actual_value_field)
     return MonitoringPoint(start, end, MonitoringValue(kind, value))
