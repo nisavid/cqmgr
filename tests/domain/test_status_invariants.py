@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import cast
 
 import pytest
 
@@ -111,7 +111,7 @@ def test_status_rejects_raw_strings_for_closed_types() -> None:
     """Serialized strings must be parsed before entering the typed domain."""
     with pytest.raises(TypeError, match="reconciliation"):
         QuotaRequestStatus.derive(
-            reconciliation=cast("Any", "settled"),
+            reconciliation=cast("Reconciliation", "settled"),
             baseline=None,
             desired=quantity(8),
             granted=None,
@@ -122,7 +122,7 @@ def test_status_rejects_raw_strings_for_closed_types() -> None:
     with pytest.raises(TypeError, match="grant_satisfaction"):
         QuotaRequestStatus(
             reconciliation=Reconciliation.SETTLED,
-            grant_satisfaction=cast("Any", "full"),
+            grant_satisfaction=cast("GrantSatisfaction", "full"),
             effective_confirmation=EffectiveConfirmation.UNOBSERVED,
             baseline=quantity(4),
             desired=quantity(8),
@@ -141,11 +141,14 @@ def test_status_rejects_raw_strings_for_closed_types() -> None:
         effective_observed_at=None,
     )
     with pytest.raises(TypeError, match="reconciliation"):
-        replace(status, reconciliation=cast("Any", "settled"))
+        replace(status, reconciliation=cast("Reconciliation", "settled"))
     with pytest.raises(TypeError, match="effective_confirmation"):
-        replace(status, effective_confirmation=cast("Any", "unobserved"))
+        replace(
+            status,
+            effective_confirmation=cast("EffectiveConfirmation", "unobserved"),
+        )
     with pytest.raises(TypeError, match="condition"):
-        status.watch(cast("Any", "granted"))
+        status.watch(cast("WatchCondition", "granted"))
 
 
 def test_status_rejects_invalid_quantities_units_and_times() -> None:
@@ -154,7 +157,7 @@ def test_status_rejects_invalid_quantities_units_and_times() -> None:
         QuotaRequestStatus.derive(
             reconciliation=Reconciliation.SETTLED,
             baseline=None,
-            desired=cast("Any", 8),
+            desired=cast("QuotaQuantity", 8),
             granted=None,
             effective=None,
             status_observed_at=NOW,
@@ -167,7 +170,7 @@ def test_status_rejects_invalid_quantities_units_and_times() -> None:
             desired=quantity(8),
             granted=None,
             effective=None,
-            status_observed_at=cast("Any", "2026-07-21T00:00:00Z"),
+            status_observed_at=cast("datetime", "2026-07-21T00:00:00Z"),
             effective_observed_at=None,
         )
     with pytest.raises(ValueError, match="one explicit unit"):
@@ -242,17 +245,24 @@ def test_status_rejects_invalid_provider_projections() -> None:
         effective_observed_at=None,
     )
     with pytest.raises(TypeError, match="provider_reconciliation"):
-        replace(unknown, provider_reconciliation=cast("Any", "FUTURE_STATE"))
+        replace(
+            unknown,
+            provider_reconciliation=cast(
+                "ProviderSymbol[Reconciliation]", "FUTURE_STATE"
+            ),
+        )
 
     wrong_projection = ProviderSymbol("full", GrantSatisfaction)
     with pytest.raises(TypeError, match="Reconciliation enum type"):
         replace(
             unknown,
-            provider_reconciliation=cast("Any", wrong_projection),
+            provider_reconciliation=cast(
+                "ProviderSymbol[Reconciliation]", wrong_projection
+            ),
         )
     with pytest.raises(TypeError, match="Reconciliation enum type"):
         QuotaRequestStatus.derive(
-            reconciliation=cast("Any", wrong_projection),
+            reconciliation=cast("ProviderSymbol[Reconciliation]", wrong_projection),
             baseline=None,
             desired=quantity(8),
             granted=None,
@@ -265,11 +275,13 @@ def test_status_rejects_invalid_provider_projections() -> None:
     with pytest.raises(TypeError, match="Reconciliation enum type"):
         replace(
             unknown,
-            provider_reconciliation=cast("Any", wrong_unknown_domain),
+            provider_reconciliation=cast(
+                "ProviderSymbol[Reconciliation]", wrong_unknown_domain
+            ),
         )
     with pytest.raises(TypeError, match="Reconciliation enum type"):
         QuotaRequestStatus.derive(
-            reconciliation=cast("Any", wrong_unknown_domain),
+            reconciliation=cast("ProviderSymbol[Reconciliation]", wrong_unknown_domain),
             baseline=None,
             desired=quantity(8),
             granted=None,
