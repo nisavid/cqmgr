@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
@@ -19,6 +20,7 @@ from cqmgr.application.ports.plans import (
     PlanRepositoryOutcome,
     PlanRepositoryStatus,
 )
+from cqmgr.application.ports.secrets import SecretValue
 from cqmgr.domain.plan_consumption import (
     PlanLedgerDecision,
     PlanLedgerRecord,
@@ -31,10 +33,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
-    from cqmgr.application.ports.secrets import SecretValue
-
 _STATE_SCHEMA = "cqmgr.plan-state/v1"
 _DIGEST = re.compile(r"sha256:([0-9a-f]{64})\Z")
+_AUTHENTICATION = re.compile(r"hmac-sha256:[0-9a-f]{64}\Z")
+_MINIMUM_AUTHENTICATION_KEY_BYTES = 32
 _PRIVATE_FILE_MODE = 0o600
 _PRIVATE_DIRECTORY_MODE = 0o700
 
@@ -56,8 +58,7 @@ class LocalPlanRepository:
         self._plans = root / "plans"
         self._states = root / "state"
         for directory in (self._root, self._plans, self._states):
-            directory.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_DIRECTORY_MODE)
-            directory.chmod(_PRIVATE_DIRECTORY_MODE)
+            _ensure_private_directory(directory)
         self._lock = lock or NativePlanInterprocessLock(root / ".plan-repository.lock")
 
     def store(
@@ -65,25 +66,35 @@ class LocalPlanRepository:
     ) -> PlanRepositoryOutcome:
         """Store exact canonical bytes by their verified digest."""
         try:
+            key = _key_bytes(authentication_key)
             decoded = PlanCodec.decode(plan.bytes)
             digest_hex = _digest_hex(plan.digest)
-            authenticated = decoded.authenticate(authentication_key.reveal())
+            authenticated = decoded.authenticate(key)
         except (PlanDecodeError, TypeError, ValueError):
             return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
         if decoded.digest != plan.digest:
             return PlanRepositoryOutcome(PlanRepositoryStatus.CONFLICT)
         if not authenticated:
             return PlanRepositoryOutcome(PlanRepositoryStatus.CONFLICT)
-        return self._with_lock(lambda: self._store_locked(plan, digest_hex))
+        return self._with_lock(lambda: self._store_locked(plan, digest_hex, key))
 
-    def load(self, digest: str, now: datetime) -> PlanRepositoryOutcome:
+    def load(
+        self,
+        digest: str,
+        authentication_key: SecretValue,
+        now: datetime,
+    ) -> PlanRepositoryOutcome:
         """Load trustworthy local bytes and recover an abandoned state window."""
         require_utc(now, "now")
         try:
+            key = _key_bytes(authentication_key)
+        except (TypeError, ValueError):
+            return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
+        try:
             digest_hex = _digest_hex(digest)
-        except ValueError:
+        except (TypeError, ValueError):
             return PlanRepositoryOutcome(PlanRepositoryStatus.MISSING)
-        return self._with_lock(lambda: self._load_locked(digest, digest_hex, now))
+        return self._with_lock(lambda: self._load_locked(digest, digest_hex, key, now))
 
     def export(self, plan: EncodedPlan, path: Path) -> PlanRepositoryOutcome:
         """Atomically write exact portable bytes to one explicit private path."""
@@ -102,25 +113,36 @@ class LocalPlanRepository:
     def acquire_lease(
         self,
         digest: str,
+        authentication_key: SecretValue,
         now: datetime,
         *,
         lease_duration: timedelta = timedelta(minutes=1),
     ) -> PlanRepositoryOutcome:
-        """Acquire the one exclusive pre-dispatch lease for an available plan."""
+        """Authenticate and exclusively lease one available local plan."""
         require_utc(now, "now")
         if not isinstance(lease_duration, timedelta) or lease_duration <= timedelta():
             msg = "lease_duration must be a positive timedelta"
             raise ValueError(msg)
         try:
+            key = _key_bytes(authentication_key)
+        except (TypeError, ValueError):
+            return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
+        try:
             digest_hex = _digest_hex(digest)
-        except ValueError:
+        except (TypeError, ValueError):
             return PlanRepositoryOutcome(PlanRepositoryStatus.MISSING)
         return self._with_lock(
-            lambda: self._acquire_lease_locked(digest, digest_hex, now, lease_duration)
+            lambda: self._acquire_lease_locked(
+                digest,
+                digest_hex,
+                key,
+                now,
+                lease_duration,
+            )
         )
 
     def _store_locked(
-        self, plan: EncodedPlan, digest_hex: str
+        self, plan: EncodedPlan, digest_hex: str, key: bytes
     ) -> PlanRepositoryOutcome:
         plan_path = self._plans / f"{digest_hex}.plan"
         state_path = self._states / f"{digest_hex}.json"
@@ -131,13 +153,13 @@ class LocalPlanRepository:
                 record = _LedgerRecord.quarantined(
                     StableSymbol("missing-consumption-ledger")
                 )
-                self._write_record(digest_hex, record)
+                self._write_record(digest_hex, record, key)
                 return _outcome_for_record(record)
             if state_path.exists():
-                record = self._read_record(digest_hex)
+                record = self._read_record(digest_hex, key)
             else:
                 record = _LedgerRecord.available()
-                self._write_record(digest_hex, record)
+                self._write_record(digest_hex, record, key)
             if not plan_path.exists():
                 _atomic_write(plan_path, plan.bytes, _PRIVATE_FILE_MODE)
         except (OSError, ValueError):
@@ -149,31 +171,51 @@ class LocalPlanRepository:
             )
         return _outcome_for_record(record)
 
-    def _load_locked(
-        self, digest: str, digest_hex: str, now: datetime
+    def _load_locked(  # noqa: PLR0911
+        self, digest: str, digest_hex: str, key: bytes, now: datetime
     ) -> PlanRepositoryOutcome:
         plan_path = self._plans / f"{digest_hex}.plan"
         state_path = self._states / f"{digest_hex}.json"
         if not plan_path.is_file() and not state_path.is_file():
             return PlanRepositoryOutcome(PlanRepositoryStatus.MISSING)
         try:
-            record = self._recover_record(digest_hex, now)
+            record = self._recover_record(digest_hex, key, now)
             if record.state in {
                 PlanLedgerState.DISPATCHED,
                 PlanLedgerState.CONSUMED,
                 PlanLedgerState.QUARANTINED,
             }:
                 try:
-                    plan_bytes, _decoded = self._read_local_plan(digest, digest_hex)
+                    plan_bytes, decoded = self._read_local_plan(digest, digest_hex)
                 except (OSError, PlanDecodeError, ValueError):
                     return _outcome_for_record(record)
-                return _outcome_for_record(record, plan_bytes=plan_bytes)
+                if not decoded.authenticate(key):
+                    return PlanRepositoryOutcome(
+                        PlanRepositoryStatus.CONFLICT,
+                        state=record.state,
+                        authenticated=False,
+                    )
+                return _outcome_for_record(
+                    record,
+                    plan_bytes=plan_bytes,
+                    authenticated=True,
+                )
             if not plan_path.is_file():
                 return PlanRepositoryOutcome(PlanRepositoryStatus.MISSING)
-            plan_bytes, _decoded = self._read_local_plan(digest, digest_hex)
-        except (OSError, PlanDecodeError, ValueError):
+            plan_bytes, decoded = self._read_local_plan(digest, digest_hex)
+            if not decoded.authenticate(key):
+                return PlanRepositoryOutcome(
+                    PlanRepositoryStatus.CONFLICT,
+                    state=record.state,
+                    authenticated=False,
+                )
+        except (OSError, PlanDecodeError, TypeError, ValueError):
             return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
-        return _outcome_for_record(record, plan_bytes=plan_bytes)
+        return _outcome_for_record(
+            record,
+            plan_bytes=plan_bytes,
+            authenticated=True,
+        )
 
     def _export_locked(self, plan: EncodedPlan, path: Path) -> PlanRepositoryOutcome:
         try:
@@ -209,6 +251,7 @@ class LocalPlanRepository:
         self,
         digest: str,
         digest_hex: str,
+        key: bytes,
         now: datetime,
         lease_duration: timedelta,
     ) -> PlanRepositoryOutcome:
@@ -216,8 +259,13 @@ class LocalPlanRepository:
             return PlanRepositoryOutcome(PlanRepositoryStatus.MISSING)
         try:
             _plan_bytes, decoded = self._read_local_plan(digest, digest_hex)
-            record = self._recover_record(digest_hex, now)
-        except (OSError, PlanDecodeError, ValueError):
+            if not decoded.authenticate(key):
+                return PlanRepositoryOutcome(
+                    PlanRepositoryStatus.CONFLICT,
+                    authenticated=False,
+                )
+            record = self._recover_record(digest_hex, key, now)
+        except (OSError, PlanDecodeError, TypeError, ValueError):
             return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
         if decoded.plan.is_expired(now):
             return PlanRepositoryOutcome(
@@ -246,31 +294,44 @@ class LocalPlanRepository:
                 )
             return _unavailable_for_record(record)
         try:
-            self._write_record(digest_hex, transition.record)
+            self._write_record(digest_hex, transition.record, key)
         except OSError:
             return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
         return PlanRepositoryOutcome(
             PlanRepositoryStatus.LEASED,
             state=PlanLedgerState.LEASED,
             lease=lease,
+            authenticated=True,
         )
 
-    def mark_dispatched(self, lease: PlanLease, now: datetime) -> PlanRepositoryOutcome:
+    def mark_dispatched(
+        self,
+        lease: PlanLease,
+        authentication_key: SecretValue,
+        now: datetime,
+    ) -> PlanRepositoryOutcome:
         """Durably consume a valid lease immediately before provider dispatch."""
         require_utc(now, "now")
         return self._transition_with_lease(
             lease,
+            authentication_key,
             now,
             required=PlanLedgerState.LEASED,
             target=PlanLedgerState.DISPATCHED,
             status=PlanRepositoryStatus.DISPATCHED,
         )
 
-    def complete(self, lease: PlanLease, now: datetime) -> PlanRepositoryOutcome:
+    def complete(
+        self,
+        lease: PlanLease,
+        authentication_key: SecretValue,
+        now: datetime,
+    ) -> PlanRepositoryOutcome:
         """Record that the dispatched plan has one durable terminal outcome."""
         require_utc(now, "now")
         return self._transition_with_lease(
             lease,
+            authentication_key,
             now,
             required=PlanLedgerState.DISPATCHED,
             target=PlanLedgerState.CONSUMED,
@@ -278,7 +339,11 @@ class LocalPlanRepository:
         )
 
     def quarantine(
-        self, lease: PlanLease, reason: StableSymbol, now: datetime
+        self,
+        lease: PlanLease,
+        reason: StableSymbol,
+        authentication_key: SecretValue,
+        now: datetime,
     ) -> PlanRepositoryOutcome:
         """Make an interrupted or ambiguous dispatch permanently inapplicable."""
         require_utc(now, "now")
@@ -286,32 +351,41 @@ class LocalPlanRepository:
             msg = "quarantine reason must be a StableSymbol"
             raise TypeError(msg)
         try:
+            key = _key_bytes(authentication_key)
+        except (TypeError, ValueError):
+            return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
+        try:
             digest_hex = _digest_hex(lease.digest)
-        except ValueError:
+        except (TypeError, ValueError):
             return PlanRepositoryOutcome(PlanRepositoryStatus.MISSING)
         return self._with_lock(
-            lambda: self._quarantine_locked(digest_hex, lease, reason)
+            lambda: self._quarantine_locked(digest_hex, key, lease, reason)
         )
 
     def _quarantine_locked(
-        self, digest_hex: str, lease: PlanLease, reason: StableSymbol
+        self,
+        digest_hex: str,
+        key: bytes,
+        lease: PlanLease,
+        reason: StableSymbol,
     ) -> PlanRepositoryOutcome:
         try:
-            record = self._read_record(digest_hex)
+            record = self._read_record(digest_hex, key)
         except (OSError, ValueError):
             return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
         transition = record.quarantine(token=lease.token, reason=reason)
         if transition.decision is PlanLedgerDecision.CONFLICT:
             return PlanRepositoryOutcome(PlanRepositoryStatus.CONFLICT)
         try:
-            self._write_record(digest_hex, transition.record)
+            self._write_record(digest_hex, transition.record, key)
         except OSError:
             return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
         return _outcome_for_record(transition.record)
 
-    def _transition_with_lease(
+    def _transition_with_lease(  # noqa: PLR0913
         self,
         lease: PlanLease,
+        authentication_key: SecretValue,
         now: datetime,
         *,
         required: PlanLedgerState,
@@ -319,13 +393,18 @@ class LocalPlanRepository:
         status: PlanRepositoryStatus,
     ) -> PlanRepositoryOutcome:
         try:
+            key = _key_bytes(authentication_key)
+        except (TypeError, ValueError):
+            return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
+        try:
             digest_hex = _digest_hex(lease.digest)
-        except ValueError:
+        except (TypeError, ValueError):
             return PlanRepositoryOutcome(PlanRepositoryStatus.MISSING)
         return self._with_lock(
             lambda: self._transition_with_lease_locked(
                 lease,
                 digest_hex,
+                key,
                 now,
                 required=required,
                 target=target,
@@ -333,10 +412,11 @@ class LocalPlanRepository:
             )
         )
 
-    def _transition_with_lease_locked(  # noqa: PLR0911, PLR0913
+    def _transition_with_lease_locked(  # noqa: C901, PLR0911, PLR0913
         self,
         lease: PlanLease,
         digest_hex: str,
+        key: bytes,
         now: datetime,
         *,
         required: PlanLedgerState,
@@ -344,20 +424,26 @@ class LocalPlanRepository:
         status: PlanRepositoryStatus,
     ) -> PlanRepositoryOutcome:
         try:
-            record = self._read_record(digest_hex)
+            record = self._read_record(digest_hex, key)
             if required is PlanLedgerState.LEASED:
                 recovered = record.recover(now)
                 if recovered.record.state is PlanLedgerState.QUARANTINED:
-                    self._write_record(digest_hex, recovered.record)
+                    self._write_record(digest_hex, recovered.record, key)
                     return _outcome_for_record(recovered.record)
                 _plan_bytes, decoded = self._read_local_plan(lease.digest, digest_hex)
+                if not decoded.authenticate(key):
+                    return PlanRepositoryOutcome(
+                        PlanRepositoryStatus.CONFLICT,
+                        state=record.state,
+                        authenticated=False,
+                    )
                 if (
                     record.state is PlanLedgerState.LEASED
                     and record.lease_token == lease.token
                     and decoded.plan.is_expired(now)
                 ):
                     expired_record = _LedgerRecord.available()
-                    self._write_record(digest_hex, expired_record)
+                    self._write_record(digest_hex, expired_record, key)
                     return PlanRepositoryOutcome(
                         PlanRepositoryStatus.EXPIRED,
                         state=PlanLedgerState.AVAILABLE,
@@ -375,7 +461,7 @@ class LocalPlanRepository:
             PlanLedgerDecision.EXPIRED,
         }:
             try:
-                self._write_record(digest_hex, transition.record)
+                self._write_record(digest_hex, transition.record, key)
             except OSError:
                 return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
         if transition.decision is PlanLedgerDecision.EXPIRED:
@@ -397,26 +483,32 @@ class LocalPlanRepository:
             )
         return _unavailable_for_record(record)
 
-    def _recover_record(self, digest_hex: str, now: datetime) -> _LedgerRecord:
+    def _recover_record(
+        self,
+        digest_hex: str,
+        key: bytes,
+        now: datetime,
+    ) -> _LedgerRecord:
         state_path = self._states / f"{digest_hex}.json"
         if not state_path.exists():
             record = _LedgerRecord.quarantined(
                 StableSymbol("missing-consumption-ledger")
             )
-            self._write_record(digest_hex, record)
+            self._write_record(digest_hex, record, key)
             return record
-        record = self._read_record(digest_hex)
+        record = self._read_record(digest_hex, key)
         transition = record.recover(now)
         if transition.decision in {
             PlanLedgerDecision.ACCEPTED,
             PlanLedgerDecision.EXPIRED,
         }:
-            self._write_record(digest_hex, transition.record)
+            self._write_record(digest_hex, transition.record, key)
         return transition.record
 
-    def _read_record(self, digest_hex: str) -> _LedgerRecord:
+    def _read_record(self, digest_hex: str, key: bytes) -> _LedgerRecord:
         raw = json.loads((self._states / f"{digest_hex}.json").read_text())
         expected = {
+            "authentication",
             "lease_expires_at",
             "lease_token",
             "reason",
@@ -429,6 +521,18 @@ class LocalPlanRepository:
         if raw["schema"] != _STATE_SCHEMA:
             msg = "plan ledger record has unsupported schema"
             raise ValueError(msg)
+        authentication = raw["authentication"]
+        record_mapping = {name: raw[name] for name in expected - {"authentication"}}
+        if (
+            not isinstance(authentication, str)
+            or _AUTHENTICATION.fullmatch(authentication) is None
+            or not hmac.compare_digest(
+                authentication,
+                _record_authentication(digest_hex, record_mapping, key),
+            )
+        ):
+            msg = "plan ledger record authentication failed"
+            raise ValueError(msg)
         token = raw["lease_token"]
         if token is not None and not isinstance(token, str):
             msg = "plan ledger lease token must be a string"
@@ -440,8 +544,8 @@ class LocalPlanRepository:
             reason=(StableSymbol(raw["reason"]) if raw["reason"] is not None else None),
         )
 
-    def _write_record(self, digest_hex: str, record: _LedgerRecord) -> None:
-        raw = {
+    def _write_record(self, digest_hex: str, record: _LedgerRecord, key: bytes) -> None:
+        record_mapping: dict[str, object] = {
             "lease_expires_at": (
                 _format_time(record.lease_expires_at)
                 if record.lease_expires_at is not None
@@ -452,6 +556,14 @@ class LocalPlanRepository:
             "schema": _STATE_SCHEMA,
             "state": record.state.value,
         }
+        raw = {
+            **record_mapping,
+            "authentication": _record_authentication(
+                digest_hex,
+                record_mapping,
+                key,
+            ),
+        }
         data = (
             json.dumps(raw, separators=(",", ":"), sort_keys=True).encode("utf-8")
             + b"\n"
@@ -460,7 +572,10 @@ class LocalPlanRepository:
 
     def _read_local_plan(self, digest: str, digest_hex: str):  # noqa: ANN202
         plan_path = self._plans / f"{digest_hex}.plan"
-        if stat.S_IMODE(plan_path.stat().st_mode) != _PRIVATE_FILE_MODE:
+        if (
+            os.name != "nt"
+            and stat.S_IMODE(plan_path.stat().st_mode) != _PRIVATE_FILE_MODE
+        ):
             msg = "local plan permissions are not private"
             raise ValueError(msg)
         plan_bytes = plan_path.read_bytes()
@@ -489,6 +604,51 @@ def _digest_hex(digest: str) -> str:
         msg = "plan digest must be canonical sha256"
         raise ValueError(msg)
     return match.group(1)
+
+
+def _key_bytes(authentication_key: SecretValue) -> bytes:
+    if not isinstance(authentication_key, SecretValue):
+        msg = "authentication_key must be a SecretValue"
+        raise TypeError(msg)
+    key = authentication_key.reveal()
+    if len(key) < _MINIMUM_AUTHENTICATION_KEY_BYTES:
+        msg = "plan authentication key must contain at least 32 bytes"
+        raise ValueError(msg)
+    return key
+
+
+def _record_authentication(
+    digest_hex: str,
+    record_mapping: dict[str, object],
+    key: bytes,
+) -> str:
+    bound_record = {
+        "digest": f"sha256:{digest_hex}",
+        "record": record_mapping,
+    }
+    data = json.dumps(
+        bound_record,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"hmac-sha256:{hmac.digest(key, data, 'sha256').hex()}"
+
+
+def _ensure_private_directory(path: Path) -> None:
+    missing: list[Path] = []
+    candidate = path
+    while not candidate.exists():
+        missing.append(candidate)
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+    path.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_DIRECTORY_MODE)
+    for directory in reversed(missing):
+        directory.chmod(_PRIVATE_DIRECTORY_MODE)
+        _fsync_directory(directory.parent)
+    path.chmod(_PRIVATE_DIRECTORY_MODE)
 
 
 def _atomic_write(path: Path, data: bytes, mode: int) -> None:
@@ -556,13 +716,17 @@ def _status_for_state(state: PlanLedgerState) -> PlanRepositoryStatus:
 
 
 def _outcome_for_record(
-    record: _LedgerRecord, *, plan_bytes: bytes | None = None
+    record: _LedgerRecord,
+    *,
+    plan_bytes: bytes | None = None,
+    authenticated: bool | None = None,
 ) -> PlanRepositoryOutcome:
     return PlanRepositoryOutcome(
         _status_for_state(record.state),
         plan_bytes=plan_bytes,
         state=record.state,
         reason=record.reason,
+        authenticated=authenticated,
     )
 
 

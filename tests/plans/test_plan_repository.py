@@ -13,8 +13,9 @@ from stat import S_IMODE
 from typing import cast, override
 
 import pytest
-from hypothesis.stateful import RuleBasedStateMachine, invariant, precondition, rule
+from hypothesis.stateful import RuleBasedStateMachine, precondition, rule
 
+import cqmgr.adapters.persistence.plans as plan_persistence
 from cqmgr.adapters.persistence.native_plan_lock import NativePlanInterprocessLock
 from cqmgr.adapters.persistence.plans import LocalPlanRepository
 from cqmgr.adapters.serialization.plans import PlanCodec
@@ -83,9 +84,19 @@ def _encoded():  # noqa: ANN202
     return PlanCodec.encode(plan, KEY)
 
 
-def _lease_worker(root: str, digest: str, queue: multiprocessing.Queue[str]) -> None:
+def _lease_worker(
+    root: str,
+    digest: str,
+    key: bytes,
+    queue: multiprocessing.Queue[str],
+) -> None:
     repository = LocalPlanRepository(Path(root))
-    outcome = repository.acquire_lease(digest, NOW, lease_duration=timedelta(seconds=2))
+    outcome = repository.acquire_lease(
+        digest,
+        SecretValue(key),
+        NOW,
+        lease_duration=timedelta(seconds=2),
+    )
     queue.put(outcome.status.value)
 
 
@@ -106,6 +117,21 @@ def _crash_holding_lock(path: str) -> None:
         os._exit(0)
 
 
+def _attempt_fake_provider_write(
+    repository: LocalPlanRepository,
+    digest: str,
+    key: SecretValue,
+    writes: list[str],
+) -> PlanRepositoryStatus:
+    leased = repository.acquire_lease(digest, key, NOW)
+    if leased.lease is None:
+        return leased.status
+    dispatched = repository.mark_dispatched(leased.lease, key, NOW)
+    if dispatched.status is PlanRepositoryStatus.DISPATCHED:
+        writes.append(digest)
+    return dispatched.status
+
+
 def test_local_store_is_content_addressed_and_export_is_atomic_owner_only(
     tmp_path: Path,
 ) -> None:
@@ -114,10 +140,11 @@ def test_local_store_is_content_addressed_and_export_is_atomic_owner_only(
     repository = LocalPlanRepository(tmp_path / "repository")
 
     assert repository.store(encoded, PLAN_KEY).status is PlanRepositoryStatus.STORED
-    loaded = repository.load(encoded.digest, NOW)
+    loaded = repository.load(encoded.digest, PLAN_KEY, NOW)
     assert loaded.status is PlanRepositoryStatus.AVAILABLE
     assert loaded.plan_bytes == encoded.bytes
     assert loaded.state is PlanLedgerState.AVAILABLE
+    assert loaded.authenticated is True
 
     exported = tmp_path / "review" / "request.plan"
     assert repository.export(encoded, exported).status is PlanRepositoryStatus.EXPORTED
@@ -126,31 +153,52 @@ def test_local_store_is_content_addressed_and_export_is_atomic_owner_only(
     assert S_IMODE((tmp_path / "repository").stat().st_mode) == PRIVATE_DIRECTORY_MODE
 
 
+def test_first_use_durably_publishes_each_created_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh nested repository entries are flushed from parent to leaf."""
+    flushed: list[Path] = []
+    monkeypatch.setattr(plan_persistence, "_fsync_directory", flushed.append)
+    root = tmp_path / "fresh" / "nested" / "repository"
+
+    LocalPlanRepository(root)
+
+    assert flushed == [
+        tmp_path,
+        tmp_path / "fresh",
+        tmp_path / "fresh" / "nested",
+        root,
+        root,
+    ]
+
+
 def test_lease_dispatch_terminal_consumption_is_single_use(tmp_path: Path) -> None:
     """A plan is durably consumed before dispatch and can never be leased again."""
     encoded = _encoded()
     repository = LocalPlanRepository(tmp_path)
     repository.store(encoded, PLAN_KEY)
 
-    leased = repository.acquire_lease(encoded.digest, NOW)
+    leased = repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
     assert leased.status is PlanRepositoryStatus.LEASED
     assert leased.lease is not None
     assert (
-        repository.acquire_lease(encoded.digest, NOW).status
+        repository.acquire_lease(encoded.digest, PLAN_KEY, NOW).status
         is PlanRepositoryStatus.CONFLICT
     )
     assert (
-        repository.mark_dispatched(leased.lease, NOW).status
+        repository.mark_dispatched(leased.lease, PLAN_KEY, NOW).status
         is PlanRepositoryStatus.DISPATCHED
     )
     assert (
-        repository.complete(leased.lease, NOW).status is PlanRepositoryStatus.CONSUMED
+        repository.complete(leased.lease, PLAN_KEY, NOW).status
+        is PlanRepositoryStatus.CONSUMED
     )
-    consumed = repository.load(encoded.digest, NOW)
+    consumed = repository.load(encoded.digest, PLAN_KEY, NOW)
     assert consumed.status is PlanRepositoryStatus.CONSUMED
     assert consumed.plan_bytes == encoded.bytes
     assert (
-        repository.acquire_lease(encoded.digest, NOW).status
+        repository.acquire_lease(encoded.digest, PLAN_KEY, NOW).status
         is PlanRepositoryStatus.CONSUMED
     )
 
@@ -163,31 +211,36 @@ def test_stale_pre_dispatch_lease_recovers_but_dispatch_crash_quarantines(
     repository = LocalPlanRepository(tmp_path)
     repository.store(encoded, PLAN_KEY)
     first = repository.acquire_lease(
-        encoded.digest, NOW, lease_duration=timedelta(seconds=1)
+        encoded.digest, PLAN_KEY, NOW, lease_duration=timedelta(seconds=1)
     )
     assert first.lease is not None
 
     recovered = repository.acquire_lease(
         encoded.digest,
+        PLAN_KEY,
         NOW + timedelta(seconds=2),
         lease_duration=timedelta(seconds=1),
     )
     assert recovered.status is PlanRepositoryStatus.LEASED
     assert recovered.lease is not None
-    repository.mark_dispatched(recovered.lease, NOW + timedelta(seconds=2))
+    repository.mark_dispatched(recovered.lease, PLAN_KEY, NOW + timedelta(seconds=2))
 
     restarted = LocalPlanRepository(tmp_path)
     assert (
         restarted.load(
-            encoded.digest, NOW + timedelta(seconds=2, milliseconds=500)
+            encoded.digest,
+            PLAN_KEY,
+            NOW + timedelta(seconds=2, milliseconds=500),
         ).status
         is PlanRepositoryStatus.DISPATCHED
     )
     assert (
-        restarted.mark_dispatched(recovered.lease, NOW + timedelta(seconds=3)).status
+        restarted.mark_dispatched(
+            recovered.lease, PLAN_KEY, NOW + timedelta(seconds=3)
+        ).status
         is PlanRepositoryStatus.QUARANTINED
     )
-    loaded = restarted.load(encoded.digest, NOW + timedelta(seconds=3))
+    loaded = restarted.load(encoded.digest, PLAN_KEY, NOW + timedelta(seconds=3))
     assert loaded.status is PlanRepositoryStatus.QUARANTINED
     assert loaded.state is PlanLedgerState.QUARANTINED
     assert loaded.reason == StableSymbol("ambiguous-dispatch")
@@ -201,22 +254,22 @@ def test_dispatch_deadline_quarantines_when_plan_bytes_are_missing(
     repository = LocalPlanRepository(tmp_path)
     repository.store(encoded, PLAN_KEY)
     leased = repository.acquire_lease(
-        encoded.digest, NOW, lease_duration=timedelta(seconds=1)
+        encoded.digest, PLAN_KEY, NOW, lease_duration=timedelta(seconds=1)
     )
     assert leased.lease is not None
     assert (
-        repository.mark_dispatched(leased.lease, NOW).status
+        repository.mark_dispatched(leased.lease, PLAN_KEY, NOW).status
         is PlanRepositoryStatus.DISPATCHED
     )
     _plan_path(tmp_path, encoded.digest).unlink()
 
     deadline = NOW + timedelta(seconds=1)
-    recovered = repository.mark_dispatched(leased.lease, deadline)
+    recovered = repository.mark_dispatched(leased.lease, PLAN_KEY, deadline)
 
     assert recovered.status is PlanRepositoryStatus.QUARANTINED
     assert recovered.state is PlanLedgerState.QUARANTINED
     assert recovered.reason == StableSymbol("ambiguous-dispatch")
-    loaded = repository.load(encoded.digest, deadline)
+    loaded = repository.load(encoded.digest, PLAN_KEY, deadline)
     assert loaded.status is PlanRepositoryStatus.QUARANTINED
     assert loaded.state is PlanLedgerState.QUARANTINED
     assert loaded.reason == StableSymbol("ambiguous-dispatch")
@@ -230,13 +283,13 @@ def test_load_recovers_dispatch_deadline_before_decoding_corrupt_plan(
     repository = LocalPlanRepository(tmp_path)
     repository.store(encoded, PLAN_KEY)
     leased = repository.acquire_lease(
-        encoded.digest, NOW, lease_duration=timedelta(seconds=1)
+        encoded.digest, PLAN_KEY, NOW, lease_duration=timedelta(seconds=1)
     )
     assert leased.lease is not None
-    repository.mark_dispatched(leased.lease, NOW)
+    repository.mark_dispatched(leased.lease, PLAN_KEY, NOW)
     _plan_path(tmp_path, encoded.digest).write_bytes(b"corrupt")
 
-    loaded = repository.load(encoded.digest, NOW + timedelta(seconds=1))
+    loaded = repository.load(encoded.digest, PLAN_KEY, NOW + timedelta(seconds=1))
 
     assert loaded.status is PlanRepositoryStatus.QUARANTINED
     assert loaded.state is PlanLedgerState.QUARANTINED
@@ -254,12 +307,10 @@ def test_concurrent_processes_obtain_at_most_one_lease_and_call_no_provider(
     processes = [
         context.Process(
             target=_lease_worker,
-            args=(str(tmp_path), encoded.digest, queue),
+            args=(str(tmp_path), encoded.digest, KEY, queue),
         )
         for _ in range(CONTENDING_PROCESS_COUNT)
     ]
-    provider_calls = 0
-
     for process in processes:
         process.start()
     for process in processes:
@@ -271,7 +322,63 @@ def test_concurrent_processes_obtain_at_most_one_lease_and_call_no_provider(
     assert statuses.count(PlanRepositoryStatus.CONFLICT.value) == (
         CONTENDING_PROCESS_COUNT - 1
     )
-    assert provider_calls == 0
+
+
+def test_foreign_key_is_rejected_across_processes_before_provider_dispatch(
+    tmp_path: Path,
+) -> None:
+    """A second installation cannot turn a copied digest into Apply authority."""
+    encoded = _encoded()
+    LocalPlanRepository(tmp_path).store(encoded, PLAN_KEY)
+    context = multiprocessing.get_context("spawn")
+    queue: multiprocessing.Queue[str] = context.Queue()
+    process = context.Process(
+        target=_lease_worker,
+        args=(str(tmp_path), encoded.digest, b"f" * 32, queue),
+    )
+
+    process.start()
+    process.join(timeout=10)
+
+    assert process.exitcode == 0
+    assert queue.get(timeout=1) == PlanRepositoryStatus.CONFLICT.value
+    assert (
+        LocalPlanRepository(tmp_path)
+        .acquire_lease(
+            encoded.digest,
+            PLAN_KEY,
+            NOW,
+        )
+        .status
+        is PlanRepositoryStatus.LEASED
+    )
+
+
+def test_pre_dispatch_authentication_failure_proves_zero_fake_provider_writes(
+    tmp_path: Path,
+) -> None:
+    """The Apply-shaped guard reaches a fake provider only after durable dispatch."""
+    encoded = _encoded()
+    repository = LocalPlanRepository(tmp_path)
+    repository.store(encoded, PLAN_KEY)
+    writes: list[str] = []
+
+    rejected = _attempt_fake_provider_write(
+        repository,
+        encoded.digest,
+        SecretValue(b"f" * 32),
+        writes,
+    )
+    dispatched = _attempt_fake_provider_write(
+        repository,
+        encoded.digest,
+        PLAN_KEY,
+        writes,
+    )
+
+    assert rejected is PlanRepositoryStatus.CONFLICT
+    assert dispatched is PlanRepositoryStatus.DISPATCHED
+    assert writes == [encoded.digest]
 
 
 def test_process_crash_releases_os_lock_without_deleting_shared_state(
@@ -306,18 +413,20 @@ def test_lock_timeout_is_typed_at_every_plan_repository_operation(
     encoded = _encoded()
     setup = LocalPlanRepository(root)
     setup.store(encoded, PLAN_KEY)
-    leased = setup.acquire_lease(encoded.digest, NOW)
+    leased = setup.acquire_lease(encoded.digest, PLAN_KEY, NOW)
     assert leased.lease is not None
     with NativePlanInterprocessLock(lock_path):
         outcomes = (
             repository.store(encoded, PLAN_KEY),
-            repository.load(encoded.digest, NOW),
+            repository.load(encoded.digest, PLAN_KEY, NOW),
             repository.export(encoded, tmp_path / "export.plan"),
             repository.read_export(tmp_path / "export.plan"),
-            repository.acquire_lease(encoded.digest, NOW),
-            repository.mark_dispatched(leased.lease, NOW),
-            repository.complete(leased.lease, NOW),
-            repository.quarantine(leased.lease, StableSymbol("lock-failure"), NOW),
+            repository.acquire_lease(encoded.digest, PLAN_KEY, NOW),
+            repository.mark_dispatched(leased.lease, PLAN_KEY, NOW),
+            repository.complete(leased.lease, PLAN_KEY, NOW),
+            repository.quarantine(
+                leased.lease, StableSymbol("lock-failure"), PLAN_KEY, NOW
+            ),
         )
 
     assert {outcome.status for outcome in outcomes} == {PlanRepositoryStatus.FAILED}
@@ -403,33 +512,46 @@ def test_repository_fail_closed_on_missing_unsafe_or_corrupt_local_state(
     """Unsafe permissions and unsupported state never become Apply capability."""
     encoded = _encoded()
     repository = LocalPlanRepository(tmp_path)
-    assert repository.load(encoded.digest, NOW).status is PlanRepositoryStatus.MISSING
-    assert repository.load("not-a-digest", NOW).status is PlanRepositoryStatus.MISSING
+    assert (
+        repository.load(encoded.digest, PLAN_KEY, NOW).status
+        is PlanRepositoryStatus.MISSING
+    )
+    assert (
+        repository.load("not-a-digest", PLAN_KEY, NOW).status
+        is PlanRepositoryStatus.MISSING
+    )
     repository.store(encoded, PLAN_KEY)
 
     plan_path = _plan_path(tmp_path, encoded.digest)
     plan_path.chmod(0o644)
-    assert repository.load(encoded.digest, NOW).status is PlanRepositoryStatus.FAILED
+    assert (
+        repository.load(encoded.digest, PLAN_KEY, NOW).status
+        is PlanRepositoryStatus.FAILED
+    )
     plan_path.chmod(PRIVATE_FILE_MODE)
 
-    leased = repository.acquire_lease(encoded.digest, NOW)
+    leased = repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
     assert leased.lease is not None
-    repository.mark_dispatched(leased.lease, NOW)
-    repository.complete(leased.lease, NOW)
+    repository.mark_dispatched(leased.lease, PLAN_KEY, NOW)
+    repository.complete(leased.lease, PLAN_KEY, NOW)
 
     state_path = _state_path(tmp_path, encoded.digest)
     state_path.unlink()
     assert (
-        repository.load(encoded.digest, NOW).status is PlanRepositoryStatus.QUARANTINED
+        repository.load(encoded.digest, PLAN_KEY, NOW).status
+        is PlanRepositoryStatus.QUARANTINED
     )
     assert (
-        repository.acquire_lease(encoded.digest, NOW).status
+        repository.acquire_lease(encoded.digest, PLAN_KEY, NOW).status
         is PlanRepositoryStatus.QUARANTINED
     )
     state = json.loads(state_path.read_text())
     state["schema"] = "cqmgr.plan-state/v2"
     state_path.write_text(json.dumps(state))
-    assert repository.load(encoded.digest, NOW).status is PlanRepositoryStatus.FAILED
+    assert (
+        repository.load(encoded.digest, PLAN_KEY, NOW).status
+        is PlanRepositoryStatus.FAILED
+    )
 
 
 def test_repeat_store_preserves_and_reports_terminal_state(tmp_path: Path) -> None:
@@ -437,15 +559,90 @@ def test_repeat_store_preserves_and_reports_terminal_state(tmp_path: Path) -> No
     encoded = _encoded()
     repository = LocalPlanRepository(tmp_path)
     repository.store(encoded, PLAN_KEY)
-    leased = repository.acquire_lease(encoded.digest, NOW)
+    leased = repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
     assert leased.lease is not None
-    repository.mark_dispatched(leased.lease, NOW)
-    repository.complete(leased.lease, NOW)
+    repository.mark_dispatched(leased.lease, PLAN_KEY, NOW)
+    repository.complete(leased.lease, PLAN_KEY, NOW)
 
     repeated = repository.store(encoded, PLAN_KEY)
 
     assert repeated.status is PlanRepositoryStatus.CONSUMED
     assert repeated.state is PlanLedgerState.CONSUMED
+
+
+def test_foreign_authentication_key_cannot_issue_apply_authority(
+    tmp_path: Path,
+) -> None:
+    """A digest-valid local plan remains inapplicable to another installation."""
+    encoded = _encoded()
+    repository = LocalPlanRepository(tmp_path)
+    repository.store(encoded, PLAN_KEY)
+
+    foreign = repository.acquire_lease(
+        encoded.digest,
+        SecretValue(b"f" * 32),
+        NOW,
+    )
+
+    assert foreign.status is PlanRepositoryStatus.CONFLICT
+    assert foreign.lease is None
+    assert repository.acquire_lease(encoded.digest, PLAN_KEY, NOW).status is (
+        PlanRepositoryStatus.LEASED
+    )
+
+
+def test_authentication_field_tampering_blocks_load_and_lease(tmp_path: Path) -> None:
+    """A digest-valid envelope cannot acquire authority with a forged HMAC."""
+    encoded = _encoded()
+    repository = LocalPlanRepository(tmp_path)
+    repository.store(encoded, PLAN_KEY)
+    envelope = json.loads(encoded.bytes)
+    envelope["authentication"] = "hmac-sha256:" + ("0" * 64)
+    plan_path = _plan_path(tmp_path, encoded.digest)
+    plan_path.write_text(
+        json.dumps(envelope, separators=(",", ":"), sort_keys=True) + "\n"
+    )
+    plan_path.chmod(PRIVATE_FILE_MODE)
+
+    loaded = repository.load(encoded.digest, PLAN_KEY, NOW)
+    leased = repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
+
+    assert loaded.status is PlanRepositoryStatus.CONFLICT
+    assert loaded.authenticated is False
+    assert leased.status is PlanRepositoryStatus.CONFLICT
+    assert leased.authenticated is False
+    assert leased.lease is None
+
+
+def test_valid_shape_ledger_rollback_cannot_resurrect_a_consumed_plan(
+    tmp_path: Path,
+) -> None:
+    """Replaying an unsigned available record fails closed after consumption."""
+    encoded = _encoded()
+    repository = LocalPlanRepository(tmp_path)
+    repository.store(encoded, PLAN_KEY)
+    leased = repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
+    assert leased.lease is not None
+    repository.mark_dispatched(leased.lease, PLAN_KEY, NOW)
+    repository.complete(leased.lease, PLAN_KEY, NOW)
+    _state_path(tmp_path, encoded.digest).write_text(
+        json.dumps(
+            {
+                "lease_expires_at": None,
+                "lease_token": None,
+                "reason": None,
+                "schema": "cqmgr.plan-state/v1",
+                "state": "available",
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+    assert repository.acquire_lease(encoded.digest, PLAN_KEY, NOW).status is (
+        PlanRepositoryStatus.FAILED
+    )
 
 
 def test_plan_expiry_caps_lease_and_is_revalidated_at_dispatch(tmp_path: Path) -> None:
@@ -456,6 +653,7 @@ def test_plan_expiry_caps_lease_and_is_revalidated_at_dispatch(tmp_path: Path) -
 
     leased = repository.acquire_lease(
         encoded.digest,
+        PLAN_KEY,
         NOW + timedelta(minutes=14),
         lease_duration=timedelta(minutes=10),
     )
@@ -463,11 +661,11 @@ def test_plan_expiry_caps_lease_and_is_revalidated_at_dispatch(tmp_path: Path) -
     assert leased.lease is not None
     assert leased.lease.expires_at == NOW + PLAN_LIFETIME
     assert (
-        repository.mark_dispatched(leased.lease, NOW + PLAN_LIFETIME).status
+        repository.mark_dispatched(leased.lease, PLAN_KEY, NOW + PLAN_LIFETIME).status
         is PlanRepositoryStatus.EXPIRED
     )
     assert (
-        repository.acquire_lease(encoded.digest, NOW + PLAN_LIFETIME).status
+        repository.acquire_lease(encoded.digest, PLAN_KEY, NOW + PLAN_LIFETIME).status
         is PlanRepositoryStatus.EXPIRED
     )
 
@@ -516,39 +714,71 @@ def test_lease_validation_conflicts_expiry_and_quarantine_are_durable(
     repository = LocalPlanRepository(tmp_path)
     repository.store(encoded, PLAN_KEY)
     with pytest.raises(ValueError, match="positive"):
-        repository.acquire_lease(encoded.digest, NOW, lease_duration=timedelta())
-    assert repository.acquire_lease("bad", NOW).status is PlanRepositoryStatus.MISSING
+        repository.acquire_lease(
+            encoded.digest, PLAN_KEY, NOW, lease_duration=timedelta()
+        )
+    assert repository.load(encoded.digest, SecretValue(b"short"), NOW).status is (
+        PlanRepositoryStatus.FAILED
+    )
+    assert (
+        repository.acquire_lease(
+            encoded.digest,
+            SecretValue(b"short"),
+            NOW,
+        ).status
+        is PlanRepositoryStatus.FAILED
+    )
+    assert (
+        repository.acquire_lease("bad", PLAN_KEY, NOW).status
+        is PlanRepositoryStatus.MISSING
+    )
 
     leased = repository.acquire_lease(
-        encoded.digest, NOW, lease_duration=timedelta(seconds=1)
+        encoded.digest, PLAN_KEY, NOW, lease_duration=timedelta(seconds=1)
     )
     assert leased.lease is not None
     wrong = replace(leased.lease, token="wrong-token")  # noqa: S106
     assert (
-        repository.mark_dispatched(wrong, NOW).status is PlanRepositoryStatus.CONFLICT
+        repository.mark_dispatched(wrong, PLAN_KEY, NOW).status
+        is PlanRepositoryStatus.CONFLICT
     )
-    assert repository.complete(wrong, NOW).status is PlanRepositoryStatus.CONFLICT
     assert (
-        repository.quarantine(wrong, StableSymbol("ambiguous"), NOW).status
+        repository.complete(wrong, PLAN_KEY, NOW).status
+        is PlanRepositoryStatus.CONFLICT
+    )
+    assert (
+        repository.quarantine(wrong, StableSymbol("ambiguous"), PLAN_KEY, NOW).status
         is PlanRepositoryStatus.CONFLICT
     )
     with pytest.raises(TypeError, match="StableSymbol"):
-        repository.quarantine(leased.lease, cast("StableSymbol", "ambiguous"), NOW)
+        repository.quarantine(
+            leased.lease,
+            cast("StableSymbol", "ambiguous"),
+            PLAN_KEY,
+            NOW,
+        )
     assert (
-        repository.mark_dispatched(leased.lease, NOW + timedelta(seconds=1)).status
+        repository.mark_dispatched(
+            leased.lease, PLAN_KEY, NOW + timedelta(seconds=1)
+        ).status
         is PlanRepositoryStatus.EXPIRED
     )
 
-    second = repository.acquire_lease(encoded.digest, NOW + timedelta(seconds=2))
+    second = repository.acquire_lease(
+        encoded.digest, PLAN_KEY, NOW + timedelta(seconds=2)
+    )
     assert second.lease is not None
     assert (
         repository.quarantine(
-            second.lease, StableSymbol("operator-interrupted"), NOW
+            second.lease,
+            StableSymbol("operator-interrupted"),
+            PLAN_KEY,
+            NOW,
         ).status
         is PlanRepositoryStatus.QUARANTINED
     )
     assert (
-        repository.acquire_lease(encoded.digest, NOW).status
+        repository.acquire_lease(encoded.digest, PLAN_KEY, NOW).status
         is PlanRepositoryStatus.QUARANTINED
     )
 
@@ -560,23 +790,28 @@ def test_dispatch_and_completion_are_idempotent_for_the_exact_lease(
     encoded = _encoded()
     repository = LocalPlanRepository(tmp_path)
     repository.store(encoded, PLAN_KEY)
-    leased = repository.acquire_lease(encoded.digest, NOW)
+    leased = repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
     assert leased.lease is not None
     assert (
-        repository.mark_dispatched(leased.lease, NOW).status
+        repository.mark_dispatched(leased.lease, PLAN_KEY, NOW).status
         is PlanRepositoryStatus.DISPATCHED
     )
     wrong = replace(leased.lease, token="wrong-token")  # noqa: S106
-    assert repository.complete(wrong, NOW).status is PlanRepositoryStatus.CONFLICT
     assert (
-        repository.mark_dispatched(leased.lease, NOW).status
+        repository.complete(wrong, PLAN_KEY, NOW).status
+        is PlanRepositoryStatus.CONFLICT
+    )
+    assert (
+        repository.mark_dispatched(leased.lease, PLAN_KEY, NOW).status
         is PlanRepositoryStatus.DISPATCHED
     )
     assert (
-        repository.complete(leased.lease, NOW).status is PlanRepositoryStatus.CONSUMED
+        repository.complete(leased.lease, PLAN_KEY, NOW).status
+        is PlanRepositoryStatus.CONSUMED
     )
     assert (
-        repository.complete(leased.lease, NOW).status is PlanRepositoryStatus.CONSUMED
+        repository.complete(leased.lease, PLAN_KEY, NOW).status
+        is PlanRepositoryStatus.CONSUMED
     )
 
 
@@ -667,7 +902,6 @@ class PlanRepositoryStateMachine(RuleBasedStateMachine):
         self.model = PlanLedgerState.AVAILABLE
         self.lease: PlanLease | None = None
         self.now = NOW
-        self.provider_calls = 0
 
     @precondition(
         lambda self: (
@@ -677,7 +911,7 @@ class PlanRepositoryStateMachine(RuleBasedStateMachine):
     @rule()
     def lease_available_plan(self) -> None:
         """Acquire the only lease from available state."""
-        outcome = self.repository.acquire_lease(self.encoded.digest, self.now)
+        outcome = self.repository.acquire_lease(self.encoded.digest, PLAN_KEY, self.now)
         assert outcome.status is PlanRepositoryStatus.LEASED
         assert outcome.lease is not None
         self.lease = outcome.lease
@@ -691,7 +925,7 @@ class PlanRepositoryStateMachine(RuleBasedStateMachine):
     @rule()
     def expired_plan_stays_unleased(self) -> None:
         """Once plan evidence expires, generated transitions cannot revive it."""
-        outcome = self.repository.acquire_lease(self.encoded.digest, self.now)
+        outcome = self.repository.acquire_lease(self.encoded.digest, PLAN_KEY, self.now)
         assert outcome.status is PlanRepositoryStatus.EXPIRED
 
     @precondition(lambda self: self.model is PlanLedgerState.LEASED)
@@ -700,7 +934,7 @@ class PlanRepositoryStateMachine(RuleBasedStateMachine):
         """Recover an expired lease without consuming the plan."""
         assert self.lease is not None
         self.now = self.lease.expires_at
-        outcome = self.repository.load(self.encoded.digest, self.now)
+        outcome = self.repository.load(self.encoded.digest, PLAN_KEY, self.now)
         assert outcome.state is PlanLedgerState.AVAILABLE
         self.model = PlanLedgerState.AVAILABLE
         self.lease = None
@@ -710,7 +944,7 @@ class PlanRepositoryStateMachine(RuleBasedStateMachine):
     def dispatch(self) -> None:
         """Durably consume the plan before the simulated provider boundary."""
         assert self.lease is not None
-        outcome = self.repository.mark_dispatched(self.lease, self.now)
+        outcome = self.repository.mark_dispatched(self.lease, PLAN_KEY, self.now)
         assert outcome.state is PlanLedgerState.DISPATCHED
         self.model = PlanLedgerState.DISPATCHED
 
@@ -719,7 +953,7 @@ class PlanRepositoryStateMachine(RuleBasedStateMachine):
     def finish(self) -> None:
         """Record one terminal result for a dispatched plan."""
         assert self.lease is not None
-        outcome = self.repository.complete(self.lease, self.now)
+        outcome = self.repository.complete(self.lease, PLAN_KEY, self.now)
         assert outcome.state is PlanLedgerState.CONSUMED
         self.model = PlanLedgerState.CONSUMED
 
@@ -731,7 +965,10 @@ class PlanRepositoryStateMachine(RuleBasedStateMachine):
         """Make an ambiguous in-flight state permanently inapplicable."""
         assert self.lease is not None
         outcome = self.repository.quarantine(
-            self.lease, StableSymbol("state-machine-ambiguity"), self.now
+            self.lease,
+            StableSymbol("state-machine-ambiguity"),
+            PLAN_KEY,
+            self.now,
         )
         assert outcome.state is PlanLedgerState.QUARANTINED
         self.model = PlanLedgerState.QUARANTINED
@@ -744,13 +981,8 @@ class PlanRepositoryStateMachine(RuleBasedStateMachine):
     @rule()
     def observe_terminal_state(self) -> None:
         """Prove a terminal plan cannot regain a lease."""
-        outcome = self.repository.acquire_lease(self.encoded.digest, self.now)
+        outcome = self.repository.acquire_lease(self.encoded.digest, PLAN_KEY, self.now)
         assert outcome.state is self.model
-
-    @invariant()
-    def provider_is_never_called(self) -> None:
-        """Prove every generated repository transition remains provider-free."""
-        assert self.provider_calls == 0
 
     @override
     def teardown(self) -> None:
