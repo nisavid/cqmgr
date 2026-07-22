@@ -200,7 +200,19 @@ def test_resource_manager_omits_empty_optional_display_name() -> None:
     assert result.project.display_name is None
 
 
-@pytest.mark.parametrize("timeout", [0, -1, "20"])
+@pytest.mark.parametrize(
+    "timeout",
+    [
+        0,
+        -1,
+        "20",
+        True,
+        10**309,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+    ],
+)
 def test_resource_manager_requires_a_positive_numeric_timeout(timeout: object) -> None:
     """The adapter refuses unbounded or mistyped transport timeout policy."""
     with pytest.raises(ValueError, match="timeout_seconds"):

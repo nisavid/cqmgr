@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Protocol
 
 from google.api_core import exceptions as google_exceptions
@@ -46,11 +47,21 @@ class ResourceManagerProjectResolver:
         timeout_seconds: float = 20.0,
     ) -> None:
         """Bind the shared-credential official client and bounded call timeout."""
-        if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
+        if isinstance(timeout_seconds, bool) or not isinstance(
+            timeout_seconds, (int, float)
+        ):
+            msg = "project resolution timeout_seconds must be positive"
+            raise ValueError(msg)  # noqa: TRY004  # one invalid-policy contract
+        try:
+            timeout = float(timeout_seconds)
+        except OverflowError:
+            msg = "project resolution timeout_seconds must be positive"
+            raise ValueError(msg) from None
+        if not math.isfinite(timeout) or timeout <= 0:
             msg = "project resolution timeout_seconds must be positive"
             raise ValueError(msg)
         self._client = client
-        self._timeout_seconds = float(timeout_seconds)
+        self._timeout_seconds = timeout
 
     async def resolve(self, reference: ProjectReference) -> ProjectResolution:
         """Return canonical active project evidence without retaining raw DTOs."""
