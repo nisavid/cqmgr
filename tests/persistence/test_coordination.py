@@ -76,7 +76,7 @@ def _budget_worker(
         try:
             await coordinator.acquire(
                 _request(),
-                deadline=time.monotonic() + 0.25,
+                deadline=time.monotonic() + 5,
                 cancellation=CancellationToken(),
             )
         except CoordinationDeadlineExceededError:
