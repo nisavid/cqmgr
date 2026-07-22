@@ -709,6 +709,15 @@ def test_gpu_resolver_requires_exact_fixed_shape_count_and_coherent_location() -
 
     with pytest.raises(ValueError, match="zone must belong to its explicit region"):
         replace(_gpu_requirement(), zone="us-east1-b")
+    for non_zone in ("us-central1", "us-central1-ab"):
+        with pytest.raises(ValueError, match="exact canonical zone"):
+            replace(_gpu_requirement(), zone=non_zone)
+    for region, zone in (
+        ("us$-central1", "us$-central1-a"),
+        ("u_-central1", "u_-central1-a"),
+    ):
+        with pytest.raises(ValueError, match="exact canonical zone"):
+            replace(_gpu_requirement(), region=region, zone=zone)
 
     with pytest.raises(WorkloadResolutionError) as flex_start:
         MAINTAINED_ACCELERATOR_OVERLAY.resolve(

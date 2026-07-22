@@ -39,6 +39,7 @@ _REVIEW_DATE = date(2026, 7, 14)
 _COMPUTE_QUOTA_SOURCE = "https://docs.cloud.google.com/compute/resource-usage"
 _TPU_QUOTA_SOURCE = "https://docs.cloud.google.com/tpu/docs/quota"
 _MIN_DNS_LABELS = 2
+_LOCATION_CHARACTERS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
 
 
 class AmbiguousOverlayMatchError(ValueError):
@@ -205,7 +206,7 @@ class GpuWorkloadRequirement:
             msg = "GPU provisioning_model must be a ProvisioningModel"
             raise TypeError(msg)
         _require_location(self.region, "GPU region")
-        _require_location(self.zone, "GPU zone")
+        _require_canonical_zone(self.zone, "GPU zone")
         _require_zone_in_region(self.zone, self.region, "GPU")
 
 
@@ -1194,6 +1195,7 @@ def _is_canonical_zone(value: object) -> bool:
         separator == "-"
         and "-" in region
         and all(region.split("-"))
+        and all(character in _LOCATION_CHARACTERS for character in value)
         and region[-1:].isdigit()
         and len(suffix) == 1
         and suffix.isalpha()
