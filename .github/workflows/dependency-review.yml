@@ -39,6 +39,7 @@ jobs:
             BSD-3-Clause,
             HPND-Markus-Kuhn,
             MIT,
+            MIT-0,
             MPL-2.0,
             PSF-2.0
           retry-on-snapshot-warnings: true
