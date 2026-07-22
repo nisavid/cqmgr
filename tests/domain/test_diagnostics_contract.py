@@ -145,11 +145,11 @@ def test_provider_metadata_is_a_closed_positive_allowlist() -> None:
         ProviderMetadata(reason="unsafe raw string")  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("http_status", [99, 600, True])
-def test_provider_metadata_rejects_invalid_http_status(http_status: int) -> None:
+@pytest.mark.parametrize("http_status", [99, 600, True, 429.5])
+def test_provider_metadata_rejects_invalid_http_status(http_status: object) -> None:
     """HTTP metadata is a status code, not an arbitrary provider integer."""
     with pytest.raises(ValueError, match="HTTP status"):
-        ProviderMetadata(http_status=http_status)
+        ProviderMetadata(http_status=cast("int", http_status))
 
 
 def test_diagnostic_requires_redacted_text_for_human_and_provider_text() -> None:

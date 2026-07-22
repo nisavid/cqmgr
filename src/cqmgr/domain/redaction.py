@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
@@ -26,33 +27,36 @@ class RedactedText:
     ) -> None:
         """Redact explicit terms longest-first using one stable marker."""
         terms = tuple(sensitive_values) + tuple(machine_paths)
+        if not isinstance(value, str) or any(
+            not isinstance(term, str) for term in terms
+        ):
+            msg = "redacted text and redaction terms must be strings"
+            raise TypeError(msg)
         if any(not term for term in terms):
             msg = "redaction terms must not be empty"
             raise ValueError(msg)
 
         ordered_terms = sorted(set(terms), key=lambda item: (-len(item), item))
+        ranges = [
+            (match.start(), match.start() + len(term))
+            for term in (*ordered_terms, REDACTION_MARKER)
+            for match in re.finditer(f"(?={re.escape(term)})", value)
+        ]
+        merged_ranges: list[tuple[int, int]] = []
+        for start, end in sorted(ranges):
+            if merged_ranges and start <= merged_ranges[-1][1]:
+                previous_start, previous_end = merged_ranges[-1]
+                merged_ranges[-1] = (previous_start, max(previous_end, end))
+            else:
+                merged_ranges.append((start, end))
+
         parts: list[str] = []
-        index = 0
-        while index < len(value):
-            matched = next(
-                (term for term in ordered_terms if value.startswith(term, index)),
-                None,
-            )
-            marker_starts_here = value.startswith(REDACTION_MARKER, index)
-            if marker_starts_here and (
-                matched is None or len(matched) < len(REDACTION_MARKER)
-            ):
-                parts.append(REDACTION_MARKER)
-                index += len(REDACTION_MARKER)
-                continue
-
-            if matched is None:
-                parts.append(value[index])
-                index += 1
-                continue
-
+        cursor = 0
+        for start, end in merged_ranges:
+            parts.append(value[cursor:start])
             parts.append(REDACTION_MARKER)
-            index += len(matched)
+            cursor = end
+        parts.append(value[cursor:])
 
         object.__setattr__(self, "_value", "".join(parts))
 

@@ -36,6 +36,14 @@ def test_redacted_text_rejects_empty_redaction_terms(argument: str) -> None:
         RedactedText("safe", **kwargs)
 
 
+def test_redacted_text_rejects_non_string_inputs() -> None:
+    """Untyped values cannot bypass the explicit safe-text boundary."""
+    with pytest.raises(TypeError, match="must be strings"):
+        RedactedText(7)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="must be strings"):
+        RedactedText("safe", sensitive_values=(7,))  # type: ignore[arg-type]
+
+
 @given(
     prefix=st.text(),
     secret=st.text(min_size=1),
@@ -93,6 +101,21 @@ def test_redacted_text_never_redacts_inside_its_stable_marker() -> None:
 
     assert str(first) == REDACTION_MARKER
     assert second == first
+
+
+@pytest.mark.parametrize(
+    ("text", "terms"),
+    [
+        ("abcde", ("ab", "bcde")),
+        ("abcd", ("ab", "cd")),
+    ],
+)
+def test_redacted_text_merges_overlapping_or_adjacent_sensitive_ranges(
+    text: str,
+    terms: tuple[str, ...],
+) -> None:
+    """Every character covered by connected sensitive terms is redacted once."""
+    assert str(RedactedText(text, sensitive_values=terms)) == REDACTION_MARKER
 
 
 @pytest.mark.parametrize(

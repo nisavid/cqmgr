@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from enum import IntEnum
+from typing import TYPE_CHECKING
 
 from cqmgr.domain.diagnostics import Diagnostic
 from cqmgr.domain.quotas import EffectiveQuotaSliceIdentity, QuotaQuantity
@@ -13,6 +13,10 @@ from cqmgr.domain.redaction import RedactedText
 from cqmgr.domain.schemas import OPERATION_RESULT_SCHEMA, WATCH_EVENT_SCHEMA
 from cqmgr.domain.scopes import ResourceScope
 from cqmgr.domain.status import QuotaRequestStatus, WatchCondition, WatchDisposition
+from cqmgr.domain.time import require_utc
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 _KEBAB_SYMBOL_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
 _OPERATION_NAME_PATTERN = re.compile(
@@ -164,15 +168,6 @@ class Completeness:
         return cls(is_complete=False, gaps=tuple(gaps), has_partial_data=False)
 
 
-def _require_utc(value: datetime, field_name: str) -> None:
-    if not isinstance(value, datetime):
-        msg = f"{field_name} must be a datetime"
-        raise TypeError(msg)
-    if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
-        msg = f"{field_name} must be an aware UTC timestamp"
-        raise ValueError(msg)
-
-
 @dataclass(frozen=True, slots=True)
 class Provenance:
     """Safe authoritative source, time, coverage, status, and identity evidence."""
@@ -192,13 +187,13 @@ class Provenance:
         ):
             msg = "provenance source and coverage must be StableSymbol values"
             raise TypeError(msg)
-        _require_utc(self.observed_at, "observed_at")
+        require_utc(self.observed_at, "observed_at")
         for field_name, value in (
             ("interval_started_at", self.interval_started_at),
             ("interval_finished_at", self.interval_finished_at),
         ):
             if value is not None:
-                _require_utc(value, field_name)
+                require_utc(value, field_name)
         if (
             self.interval_started_at is not None
             and self.interval_finished_at is not None
@@ -267,8 +262,8 @@ class OperationResult[DataT]:
     def __post_init__(self) -> None:
         """Enforce types, timestamps, boundary, completeness, and exit invariants."""
         self._validate_types()
-        _require_utc(self.started_at, "started_at")
-        _require_utc(self.finished_at, "finished_at")
+        require_utc(self.started_at, "started_at")
+        require_utc(self.finished_at, "finished_at")
         if self.finished_at < self.started_at:
             msg = "finished_at cannot precede started_at"
             raise ValueError(msg)
@@ -393,7 +388,7 @@ class WatchEvent[DataT]:
         if not isinstance(self.resume, str) or not self.resume:
             msg = "resume must be a non-empty string"
             raise ValueError(msg)
-        _require_utc(self.observed_at, "observed_at")
+        require_utc(self.observed_at, "observed_at")
         if not isinstance(self.request, WatchRequestIdentity):
             msg = "request must be a WatchRequestIdentity"
             raise TypeError(msg)
