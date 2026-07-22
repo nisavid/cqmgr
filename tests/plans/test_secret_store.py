@@ -74,12 +74,15 @@ def test_runtime_supported_keyring_round_trip(tmp_path: Path) -> None:
     value = SecretValue(secrets.token_bytes(32))
 
     try:
-        assert store.create(reference, value).status is SecretStoreStatus.CREATED
+        created = store.create(reference, value)
+        assert created.status is SecretStoreStatus.CREATED
         loaded = store.get(reference)
         assert loaded.status is SecretStoreStatus.AVAILABLE
         assert loaded.secret == value
-        assert store.delete(reference).status is SecretStoreStatus.DELETED
-        assert store.get(reference).status is SecretStoreStatus.MISSING
+        deleted = store.delete(reference)
+        assert deleted.status is SecretStoreStatus.DELETED
+        missing = store.get(reference)
+        assert missing.status is SecretStoreStatus.MISSING
     finally:
         if store.get(reference).status is SecretStoreStatus.AVAILABLE:
             store.delete(reference)
@@ -314,21 +317,20 @@ def test_plan_consumption_marker_is_not_delete_capable(tmp_path: Path) -> None:
     reference = _marker_reference()
     marker = SecretValue(b"m" * 32)
 
-    assert store.create(reference, marker).status is SecretStoreStatus.UNSUPPORTED
-    assert store.get(reference).status is SecretStoreStatus.UNSUPPORTED
-    assert store.delete(reference).status is SecretStoreStatus.UNSUPPORTED
-    assert (
-        store.create_consumption_marker(reference, marker).status
-        is SecretStoreStatus.FAILED
-    )
+    ordinary_create = store.create(reference, marker)
+    ordinary_get = store.get(reference)
+    ordinary_delete = store.delete(reference)
+    unlocked_create = store.create_consumption_marker(reference, marker)
+    assert ordinary_create.status is SecretStoreStatus.UNSUPPORTED
+    assert ordinary_get.status is SecretStoreStatus.UNSUPPORTED
+    assert ordinary_delete.status is SecretStoreStatus.UNSUPPORTED
+    assert unlocked_create.status is SecretStoreStatus.FAILED
 
     with lock:
-        assert (
-            store.create_consumption_marker(reference, marker).status
-            is SecretStoreStatus.CREATED
-        )
+        created = store.create_consumption_marker(reference, marker)
         loaded = store.get_consumption_marker(reference)
 
+    assert created.status is SecretStoreStatus.CREATED
     assert loaded.status is SecretStoreStatus.AVAILABLE
     assert loaded.secret == marker
 
