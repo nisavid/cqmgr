@@ -554,6 +554,9 @@ def test_tpu_requirement_makes_management_plane_specific_shape_explicit() -> Non
 
     with pytest.raises(ValueError, match="does not match"):
         replace(legacy, workload_consumer=WorkloadConsumer.GKE)
+    for non_zone in ("us-central1", "a"):
+        with pytest.raises(ValueError, match="exact canonical zone"):
+            replace(legacy, zone=non_zone)
 
 
 def _compute_tpu_requirement(

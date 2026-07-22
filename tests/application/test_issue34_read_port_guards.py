@@ -120,6 +120,13 @@ def test_catalog_requests_require_context_and_canonical_zone() -> None:
     for request_type in (TpuAcceleratorTypeReadRequest, TpuRuntimeVersionReadRequest):
         with pytest.raises(TypeError, match="ProviderReadContext"):
             request_type(cast("ProviderReadContext", object()), "us-central1-a")
-        for zone in ("", "US-CENTRAL1-A", "-us-central1-a", "zones/us-central1-a"):
+        for zone in (
+            "",
+            "US-CENTRAL1-A",
+            "-us-central1-a",
+            "zones/us-central1-a",
+            "us-central1",
+            "a",
+        ):
             with pytest.raises(ValueError, match="canonical location ID"):
                 request_type(context, zone)

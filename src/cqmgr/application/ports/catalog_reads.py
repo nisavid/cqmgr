@@ -108,21 +108,32 @@ def _require_context_and_zone(
     if not isinstance(context, ProviderReadContext):
         msg = f"{request_name} request requires ProviderReadContext"
         raise TypeError(msg)
-    if (
-        not isinstance(zone, str)
-        or not zone
-        or not zone.isascii()
-        or zone != zone.lower()
-        or "/" in zone
-        or zone.startswith("-")
-        or zone.endswith("-")
-        or any(
-            character not in "abcdefghijklmnopqrstuvwxyz0123456789-"
-            for character in zone
-        )
-    ):
+    if not _is_canonical_zone(zone):
         msg = f"{request_name} zone must be a lowercase canonical location ID"
         raise ValueError(msg)
+
+
+def _is_canonical_zone(value: object) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value
+        or not value.isascii()
+        or value != value.lower()
+        or any(
+            character not in "abcdefghijklmnopqrstuvwxyz0123456789-"
+            for character in value
+        )
+    ):
+        return False
+    region, separator, suffix = value.rpartition("-")
+    return (
+        separator == "-"
+        and "-" in region
+        and all(region.split("-"))
+        and region[-1:].isdigit()
+        and len(suffix) == 1
+        and suffix.isalpha()
+    )
 
 
 class ComputeMachineTypeReader(Protocol):
