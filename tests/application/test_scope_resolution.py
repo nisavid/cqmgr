@@ -8,7 +8,6 @@ import pytest
 
 from cqmgr.application.configuration import (
     ConfigSnapshot,
-    InterfaceSettingKey,
     InterfaceSettings,
     Profile,
     ProfileResourceScopeError,
@@ -124,12 +123,12 @@ def test_v1_rejects_non_project_scopes_without_inference(
 def test_interface_settings_reject_non_enum_keys() -> None:
     """Public config access fails closed instead of defaulting or leaking KeyError."""
     settings = InterfaceSettings()
-    invalid = cast("InterfaceSettingKey", "interface.unknown")
+    invalid = "interface.unknown"
 
     with pytest.raises(TypeError, match="InterfaceSettingKey"):
-        settings.get(invalid)
+        settings.get(invalid)  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="InterfaceSettingKey"):
-        settings.replace(invalid, value=True)
+        settings.replace(invalid, value=True)  # type: ignore[arg-type]
 
 
 def test_quota_contact_uses_a_closed_profile_bound_os_keyring_reference() -> None:
