@@ -275,6 +275,46 @@ def test_repository_rejects_symlinked_snapshot_and_cursor_files(
         repository.resolve(cursor.value, now=NOW)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="symlink semantics differ on Windows")
+@pytest.mark.parametrize("directory", ["snapshots", "cursors"])
+def test_repository_rejects_symlinked_state_directories(
+    tmp_path: Path,
+    directory: str,
+) -> None:
+    """Descriptor-relative reads never follow replaced parent directories."""
+    root = tmp_path / "state"
+    repository = FilesystemQuotaQuerySnapshots(root, token_factory=lambda: TOKEN)
+    snapshot = _snapshot()
+    repository.save(snapshot)
+    cursor = repository.issue(snapshot.metadata.snapshot_id, 0, now=NOW)
+    state_directory = root / directory
+    target = root / f"{directory}-target"
+    state_directory.rename(target)
+    state_directory.symlink_to(target, target_is_directory=True)
+
+    if directory == "snapshots":
+        with pytest.raises(QuotaSnapshotOperationalError):
+            repository.load(snapshot.metadata.snapshot_id, now=NOW)
+    else:
+        with pytest.raises(QuotaSnapshotOperationalError):
+            repository.resolve(cursor.value, now=NOW)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink semantics differ on Windows")
+def test_repository_rejects_symlinked_root_during_reads(tmp_path: Path) -> None:
+    """The bound storage root itself cannot be replaced by a directory symlink."""
+    root = tmp_path / "state"
+    repository = FilesystemQuotaQuerySnapshots(root)
+    snapshot = _snapshot()
+    repository.save(snapshot)
+    target = tmp_path / "state-target"
+    root.rename(target)
+    root.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(QuotaSnapshotOperationalError):
+        repository.load(snapshot.metadata.snapshot_id, now=NOW)
+
+
 def test_repository_rejects_newer_and_corrupt_snapshot_state(tmp_path: Path) -> None:
     """Schema-newer and malformed persisted bytes never become partial evidence."""
     root = tmp_path / "snapshots"
@@ -449,14 +489,16 @@ def test_repository_translates_read_and_cursor_publication_failures(
     snapshot = _snapshot()
     repository.save(snapshot)
 
-    def deny_read(_path: Path) -> bytes:
+    def deny_read(_root: Path, _directory: str, _filename: str) -> bytes:
         raise PermissionError
 
-    monkeypatch.setattr(persistence, "_read_trusted_file", deny_read)
+    monkeypatch.setattr(persistence, "_read_repository_file", deny_read)
     with pytest.raises(QuotaSnapshotOperationalError, match="PermissionError"):
         repository.load(snapshot.metadata.snapshot_id, now=NOW)
     with pytest.raises(QuotaSnapshotOperationalError, match="PermissionError"):
         repository.resolve(TOKEN, now=NOW)
+    with pytest.raises(QuotaSnapshotOperationalError, match="PermissionError"):
+        repository.save(snapshot)
 
     monkeypatch.undo()
 
