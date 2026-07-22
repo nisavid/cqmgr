@@ -204,10 +204,20 @@ def test_compute_reader_keeps_valid_items_when_a_scope_item_is_malformed() -> No
     """Malformed machine evidence fails its scope without hiding valid siblings."""
     valid = compute_v1.MachineType(
         name="a3-highgpu-8g",
+        zone="us-central1-a",
+        self_link=(
+            "https://www.googleapis.com/compute/v1/projects/123456789/"
+            "zones/us-central1-a/machineTypes/a3-highgpu-8g"
+        ),
         deprecated=compute_v1.DeprecationStatus(state="PROVIDER_NEW_STATE"),
     )
     invalid = compute_v1.MachineType(
         name="bad-shape",
+        zone="us-central1-a",
+        self_link=(
+            "https://www.googleapis.com/compute/v1/projects/123456789/"
+            "zones/us-central1-a/machineTypes/bad-shape"
+        ),
         accelerators=[
             compute_v1.Accelerators(
                 guest_accelerator_type="nvidia-h100-80gb",
@@ -235,6 +245,62 @@ def test_compute_reader_keeps_valid_items_when_a_scope_item_is_malformed() -> No
         "provider-schema-invalid",
         "compute-catalog-scope-invalid",
     ]
+
+
+def test_compute_reader_rejects_items_outside_the_requested_project_and_zone() -> None:
+    """Provider DTO identity cannot be relabeled as the requested project or zone."""
+    page = ComputeMachineTypesPage(
+        scopes=(
+            ComputeMachineTypesScope(
+                "zones/us-central1-a",
+                (
+                    compute_v1.MachineType(
+                        name="a3-highgpu-8g",
+                        zone="us-central1-a",
+                        self_link=(
+                            "https://www.googleapis.com/compute/v1/projects/other/"
+                            "zones/us-central1-a/machineTypes/a3-highgpu-8g"
+                        ),
+                    ),
+                    compute_v1.MachineType(
+                        name="ct6e-standard-4t",
+                        zone="us-east1-b",
+                        self_link=(
+                            "https://www.googleapis.com/compute/v1/projects/123456789/"
+                            "zones/us-east1-b/machineTypes/ct6e-standard-4t"
+                        ),
+                    ),
+                    compute_v1.MachineType(
+                        name="a3-highgpu-8g",
+                        zone="us-central1-a",
+                        self_link=(
+                            "https://www.googleapis.com/compute/v1/projects/123456789/"
+                            "zones/us-central1-a/machineTypes/another-machine"
+                        ),
+                    ),
+                    compute_v1.MachineType(name="identity-missing"),
+                ),
+            ),
+        ),
+        next_page_token="",
+    )
+
+    result = asyncio.run(
+        GoogleComputeMachineTypeReader(ComputePages((page,)), _policy()).read(
+            ComputeMachineTypeReadRequest(_context())
+        )
+    )
+
+    assert result.values == ()
+    assert result.location_coverage[0].state is LocationCoverageState.FAILED
+    assert _diagnostic_codes(result) == [
+        "provider-schema-invalid",
+        "provider-schema-invalid",
+        "provider-schema-invalid",
+        "provider-schema-invalid",
+        "compute-catalog-scope-invalid",
+    ]
+    assert not result.complete
 
 
 @pytest.mark.parametrize(

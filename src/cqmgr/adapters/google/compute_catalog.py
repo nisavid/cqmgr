@@ -236,7 +236,13 @@ class GoogleComputeMachineTypeReader:
                 raise RuntimeError(msg)
             completed += 1
             for scoped in page.scopes:
-                _consume_scope(scoped, values, diagnostics, location_coverage)
+                _consume_scope(
+                    scoped,
+                    project,
+                    values,
+                    diagnostics,
+                    location_coverage,
+                )
             for unreachable in page.unreachable_scopes:
                 diagnostic = _coverage_diagnostic(
                     "compute-catalog-location-unreachable"
@@ -288,6 +294,7 @@ class GoogleComputeMachineTypeReader:
 
 def _consume_scope(
     scoped: ComputeMachineTypesScope,
+    project: str,
     values: list[ComputeMachineType],
     diagnostics: list[Diagnostic],
     coverage: list[CatalogLocationCoverage],
@@ -302,7 +309,7 @@ def _consume_scope(
     scope_failed = False
     for item in scoped.machine_types:
         try:
-            values.append(_map_machine_type(item, location))
+            values.append(_map_machine_type(item, project, location))
         except (TypeError, ValueError, OverflowError):
             diagnostic = schema_diagnostic("compute-machine-types-read", "compute")
             diagnostics.append(diagnostic)
@@ -330,8 +337,10 @@ def _consume_scope(
 
 def _map_machine_type(
     item: compute_v1.MachineType,
+    project: str,
     zone: str,
 ) -> ComputeMachineType:
+    _verify_machine_type_identity(item, project, zone)
     lifecycle = (
         ProviderSymbol(item.deprecated.state, CatalogLifecycle)
         if item.deprecated.state
@@ -349,6 +358,23 @@ def _map_machine_type(
         ),
         lifecycle=lifecycle,
     )
+
+
+def _verify_machine_type_identity(
+    item: compute_v1.MachineType,
+    project: str,
+    zone: str,
+) -> None:
+    expected_zone_link = (
+        f"https://www.googleapis.com/compute/v1/projects/{project}/zones/{zone}"
+    )
+    expected_self_link = f"{expected_zone_link}/machineTypes/{item.name}"
+    if item.zone != zone:
+        msg = "Compute machine type zone must match its requested project and scope"
+        raise ValueError(msg)
+    if item.self_link != expected_self_link:
+        msg = "Compute machine type self link must match its name, project, and scope"
+        raise ValueError(msg)
 
 
 def _scope_location(scope: str) -> str:
