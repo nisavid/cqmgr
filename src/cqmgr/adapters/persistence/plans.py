@@ -62,7 +62,12 @@ try {
     exit 12
 }
 $inheritance = ''
-if (Test-Path -LiteralPath $target -PathType Container) {
+try {
+    $isDirectory = Test-Path -LiteralPath $target -PathType Container
+} catch {
+    exit 16
+}
+if ($isDirectory) {
     $inheritance = 'OICI'
 }
 $sddl = "D:P(A;${inheritance};FA;;;$($identity.Value))"
