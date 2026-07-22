@@ -151,7 +151,8 @@ def test_blocked_backends_never_receive_secret_operations(
         store.create(_reference(), SecretValue(b"a" * 32)).status
         is SecretStoreStatus.UNSUPPORTED
     )
-    assert store.delete(_reference()).status is SecretStoreStatus.UNSUPPORTED
+    delete_outcome = store.delete(_reference())
+    assert delete_outcome.status is SecretStoreStatus.UNSUPPORTED
     assert backend.calls == []
 
 
@@ -180,8 +181,10 @@ def test_create_is_once_verified_and_never_replaces_an_existing_secret(
     )
     assert store.get(reference).secret == secret
     assert backend.calls.count("set") == 1
-    assert store.delete(reference).status is SecretStoreStatus.DELETED
-    assert store.delete(reference).status is SecretStoreStatus.MISSING
+    deleted = store.delete(reference)
+    missing = store.delete(reference)
+    assert deleted.status is SecretStoreStatus.DELETED
+    assert missing.status is SecretStoreStatus.MISSING
 
 
 @pytest.mark.parametrize(
@@ -306,7 +309,8 @@ def test_create_read_after_write_mismatch_and_keyring_error_are_conflicts(
         store.create(_reference(), SecretValue(b"a" * 32)).status
         is SecretStoreStatus.FAILED
     )
-    assert store.delete(_reference()).status is SecretStoreStatus.FAILED
+    delete_outcome = store.delete(_reference())
+    assert delete_outcome.status is SecretStoreStatus.FAILED
 
 
 def test_spoofed_native_module_and_name_are_not_allowlisted(tmp_path: Path) -> None:
