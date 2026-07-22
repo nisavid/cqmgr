@@ -156,8 +156,17 @@ def smoke_artifact(
         assert "--version" in help_output
         assert version_output == f"cqmgr, version {PROJECT_VERSION}\n"
         assert list(runtime_home.rglob("*")) == []
+        perform_native_round_trip = (
+            native_keyring_round_trip and artifact.name.endswith(".whl")
+        )
         persistence_environment = runtime_environment.copy()
         persistence_environment.pop("PYTHONPATH")
+        if perform_native_round_trip:
+            for key in ("APPDATA", "HOME", "LOCALAPPDATA"):
+                if key in os.environ:
+                    persistence_environment[key] = os.environ[key]
+                else:
+                    persistence_environment.pop(key, None)
         tool_environment = temporary / "uv-tools" / "cqmgr"
         interpreter = tool_environment / (
             "Scripts/python.exe" if os.name == "nt" else "bin/python"
@@ -168,7 +177,7 @@ def smoke_artifact(
             str(runtime_home / "persistence-smoke"),
             str(CHECKOUT_ROOT),
         ]
-        if native_keyring_round_trip:
+        if perform_native_round_trip:
             command.append("--native-keyring-round-trip")
         _run(command, cwd=temporary, environment=persistence_environment)
 
