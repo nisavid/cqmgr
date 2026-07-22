@@ -287,6 +287,23 @@ def test_windows_repository_replaces_every_explicit_plan_reader(tmp_path: Path) 
     encoded = _encoded()
     repository = _repository(tmp_path)
     repository.store(encoded, PLAN_KEY)
+    existing_export = tmp_path / "existing.plan"
+    existing_export.write_bytes(encoded.bytes)
+    subprocess.run(  # noqa: S603
+        [
+            executable,
+            str(existing_export),
+            "/grant",
+            "*S-1-1-0:R",
+            "*S-1-5-32-544:R",
+        ],
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert repository.export(encoded, existing_export).status is (
+        PlanRepositoryStatus.EXPORTED
+    )
 
     for path in (
         tmp_path,
@@ -294,6 +311,7 @@ def test_windows_repository_replaces_every_explicit_plan_reader(tmp_path: Path) 
         tmp_path / "state",
         _plan_path(tmp_path, encoded.digest),
         _state_path(tmp_path, encoded.digest),
+        existing_export,
     ):
         completed = subprocess.run(  # noqa: S603
             [executable, str(path)],
@@ -633,7 +651,10 @@ def test_repository_rejects_invalid_digest_bytes_and_conflicting_exports(
 
     exported = tmp_path / "export.plan"
     assert repository.export(encoded, exported).status is PlanRepositoryStatus.EXPORTED
+    if os.name != "nt":
+        exported.chmod(0o644)
     assert repository.export(encoded, exported).status is PlanRepositoryStatus.EXPORTED
+    assert S_IMODE(exported.stat().st_mode) == PRIVATE_FILE_MODE
     exported.write_bytes(b"different")
     assert repository.export(encoded, exported).status is PlanRepositoryStatus.CONFLICT
     assert repository.read_export(exported).status is PlanRepositoryStatus.FAILED
@@ -894,6 +915,29 @@ def test_export_acl_failure_leaves_no_published_destination(
 
     assert repository.export(encoded, destination).status is PlanRepositoryStatus.FAILED
     assert not destination.exists()
+
+
+def test_export_race_winner_is_hardened_before_idempotent_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An identical external race winner must satisfy the private boundary."""
+    encoded = _encoded()
+    repository = _repository(tmp_path / "repository")
+    destination = tmp_path / "review" / "request.plan"
+
+    def publish_external_winner(_source: Path, path: Path) -> None:
+        path.write_bytes(encoded.bytes)
+        path.chmod(0o644)
+        raise FileExistsError
+
+    monkeypatch.setattr(plan_persistence.os, "link", publish_external_winner)
+
+    assert repository.export(encoded, destination).status is (
+        PlanRepositoryStatus.EXPORTED
+    )
+    if os.name != "nt":
+        assert S_IMODE(destination.stat().st_mode) == PRIVATE_FILE_MODE
 
 
 def test_lease_validation_conflicts_expiry_and_quarantine_are_durable(

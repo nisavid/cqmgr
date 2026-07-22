@@ -327,16 +327,11 @@ class LocalPlanRepository:
         try:
             path.parent.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_DIRECTORY_MODE)
             if path.exists():
-                if path.is_file() and path.read_bytes() == plan.bytes:
-                    path.chmod(_PRIVATE_FILE_MODE)
-                    return PlanRepositoryOutcome(PlanRepositoryStatus.EXPORTED)
-                return PlanRepositoryOutcome(PlanRepositoryStatus.CONFLICT)
+                return _harden_existing_export(path, plan.bytes)
             try:
                 _atomic_publish_no_replace(path, plan.bytes, _PRIVATE_FILE_MODE)
             except FileExistsError:
-                if path.is_file() and path.read_bytes() == plan.bytes:
-                    return PlanRepositoryOutcome(PlanRepositoryStatus.EXPORTED)
-                return PlanRepositoryOutcome(PlanRepositoryStatus.CONFLICT)
+                return _harden_existing_export(path, plan.bytes)
         except OSError:
             return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
         return PlanRepositoryOutcome(PlanRepositoryStatus.EXPORTED)
@@ -927,6 +922,19 @@ def _atomic_publish_no_replace(path: Path, data: bytes, mode: int) -> None:
     finally:
         with suppress(OSError):
             temporary.unlink(missing_ok=True)
+
+
+def _harden_existing_export(path: Path, data: bytes) -> PlanRepositoryOutcome:
+    try:
+        if path.is_symlink() or not path.is_file() or path.read_bytes() != data:
+            return PlanRepositoryOutcome(PlanRepositoryStatus.CONFLICT)
+        path.chmod(_PRIVATE_FILE_MODE)
+        _restrict_windows_acl(path)
+        if os.name != "nt" and stat.S_IMODE(path.stat().st_mode) != _PRIVATE_FILE_MODE:
+            return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
+    except OSError:
+        return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
+    return PlanRepositoryOutcome(PlanRepositoryStatus.EXPORTED)
 
 
 def _fsync_directory(path: Path) -> None:
