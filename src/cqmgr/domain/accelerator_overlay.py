@@ -247,7 +247,7 @@ class TpuWorkloadRequirement:
         if not isinstance(self.provisioning_model, ProvisioningModel):
             msg = "TPU provisioning_model must be a ProvisioningModel"
             raise TypeError(msg)
-        _require_location(self.zone, "TPU zone")
+        _require_canonical_zone(self.zone, "TPU zone")
         if self.management_plane is ManagementPlane.COMPUTE:
             if self.region is None or self.machine_type is None:
                 msg = "Compute TPU requires exact region and machine_type"
@@ -1020,6 +1020,13 @@ def _require_location(value: object, field_name: str) -> None:
         raise ValueError(msg)
 
 
+def _require_canonical_zone(value: object, field_name: str) -> None:
+    _require_location(value, field_name)
+    if not _is_canonical_zone(value):
+        msg = f"{field_name} must be an exact canonical zone"
+        raise ValueError(msg)
+
+
 def _require_zone_in_region(zone: str, region: str, workload: str) -> None:
     if zone.rsplit("-", maxsplit=1)[0] != region:
         msg = f"{workload} zone must belong to its explicit region"
@@ -1057,6 +1064,20 @@ def _is_canonical_service_dns(service: object) -> bool:
         and not label.endswith("-")
         and all(character in allowed for character in label)
         for label in labels
+    )
+
+
+def _is_canonical_zone(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    region, separator, suffix = value.rpartition("-")
+    return (
+        separator == "-"
+        and "-" in region
+        and all(region.split("-"))
+        and region[-1:].isdigit()
+        and len(suffix) == 1
+        and suffix.isalpha()
     )
 
 
