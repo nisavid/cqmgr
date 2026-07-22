@@ -391,10 +391,24 @@ def _scope_location(scope: str) -> str:
         or not location[0].isalnum()
         or not location[-1].isalnum()
         or any(character not in allowed for character in location)
+        or not _is_canonical_zone(location)
     ):
         msg = "Compute machine-type scope must identify one zone"
         raise ValueError(msg)
     return location
+
+
+def _is_canonical_zone(value: str) -> bool:
+    """Distinguish one exact zone from a region-shaped location."""
+    region, separator, suffix = value.rpartition("-")
+    return (
+        separator == "-"
+        and "-" in region
+        and all(region.split("-"))
+        and region[-1:].isdigit()
+        and len(suffix) == 1
+        and suffix.isalpha()
+    )
 
 
 def _coverage(
