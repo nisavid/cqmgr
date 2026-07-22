@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
+from inspect import iscoroutinefunction
 from typing import TYPE_CHECKING
 
 from cqmgr.application.configuration import (
@@ -20,7 +22,7 @@ from cqmgr.domain.results import ExitClass
 from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Coroutine
 
 
 class MemoryRepository[SnapshotT]:
@@ -31,11 +33,11 @@ class MemoryRepository[SnapshotT]:
         self.snapshot = snapshot
         self.update_count = 0
 
-    def read(self) -> SnapshotT:
+    async def read(self) -> SnapshotT:
         """Return the current snapshot."""
         return self.snapshot
 
-    def update(self, transform: Callable[[SnapshotT], SnapshotT]) -> SnapshotT:
+    async def update(self, transform: Callable[[SnapshotT], SnapshotT]) -> SnapshotT:
         """Apply one transformation and retain the result."""
         self.snapshot = transform(self.snapshot)
         self.update_count += 1
@@ -48,6 +50,11 @@ class FixedClock:
     def now(self) -> datetime:
         """Return one UTC observation time."""
         return datetime(2026, 7, 21, 12, tzinfo=UTC)
+
+
+def run[ResultT](awaitable: Coroutine[object, object, ResultT]) -> ResultT:
+    """Run one application coroutine at the test's public boundary."""
+    return asyncio.run(awaitable)
 
 
 def scope(kind: ResourceScopeKind, identifier: str) -> ResourceScope:
@@ -73,11 +80,19 @@ def operations(
     )
 
 
+def test_public_local_operations_are_async_first() -> None:
+    """CLI and Textual share coroutine application entry points."""
+    assert iscoroutinefunction(LocalOperations.scope_show)
+    assert iscoroutinefunction(LocalOperations.scope_select)
+    assert iscoroutinefunction(LocalOperations.profile_select)
+    assert iscoroutinefunction(LocalOperations.config_set)
+
+
 def test_scope_select_reports_canonical_project_and_direct_source() -> None:
     """A local project selection is visible in the surface-neutral result."""
     service, _, state = operations()
 
-    result = service.scope_select(scope(ResourceScopeKind.PROJECT, "123"))
+    result = run(service.scope_select(scope(ResourceScopeKind.PROJECT, "123")))
 
     assert result.outcome.exit_class is ExitClass.SUCCESS
     assert result.resource_scope == scope(ResourceScopeKind.PROJECT, "123")
@@ -93,7 +108,7 @@ def test_scope_select_rejects_folder_before_updating_state() -> None:
         )
     )
 
-    result = service.scope_select(scope(ResourceScopeKind.FOLDER, "456"))
+    result = run(service.scope_select(scope(ResourceScopeKind.FOLDER, "456")))
 
     assert result.outcome.exit_class is ExitClass.REJECTED_PRECONDITION
     assert result.resource_scope == scope(ResourceScopeKind.FOLDER, "456")
@@ -114,7 +129,7 @@ def test_scope_clear_reveals_selected_profile_project() -> None:
         ),
     )
 
-    result = service.scope_clear()
+    result = run(service.scope_clear())
 
     assert result.resource_scope == profile_project
     assert result.data.resolution_source == "selected-profile"
@@ -125,10 +140,35 @@ def test_unknown_profile_selection_is_rejected_without_state_write() -> None:
     """An explicit profile lookup miss is not reclassified as ambient fallback."""
     service, _, state = operations()
 
-    result = service.profile_select("missing")
+    result = run(service.profile_select("missing"))
 
     assert result.outcome.exit_class is ExitClass.REJECTED_PRECONDITION
     assert state.update_count == 0
+
+
+def test_profile_selection_reports_the_effective_higher_precedence_direct_scope() -> (
+    None
+):
+    """Selecting a profile preserves and reports the active direct project."""
+    direct_project = scope(ResourceScopeKind.PROJECT, "123")
+    profile_project = scope(ResourceScopeKind.PROJECT, "789")
+    service, _, state = operations(
+        configuration=ConfigSnapshot(
+            profiles=(Profile(name="secondary", resource_scope=profile_project),)
+        ),
+        selection=SelectionState(direct_resource_scope=direct_project),
+    )
+
+    result = run(service.profile_select("secondary"))
+
+    assert result.resource_scope == direct_project
+    assert result.data.resolution_source == "direct-selection"
+    assert result.data.profile is not None
+    assert result.data.profile.resource_scope == profile_project
+    assert state.snapshot == SelectionState(
+        selected_profile="secondary",
+        direct_resource_scope=direct_project,
+    )
 
 
 def test_config_set_changes_only_validated_interface_key() -> None:
@@ -138,7 +178,7 @@ def test_config_set_changes_only_validated_interface_key() -> None:
         configuration=ConfigSnapshot(profiles=(configured_profile,))
     )
 
-    result = service.config_set(InterfaceSettingKey.NERD_FONT, value=True)
+    result = run(service.config_set(InterfaceSettingKey.NERD_FONT, value=True))
 
     assert result.outcome.exit_class is ExitClass.SUCCESS
     assert result.data.key == "interface.nerd-font"
@@ -151,16 +191,32 @@ def test_repository_failures_have_closed_exit_classification() -> None:
     """Newer schema is a precondition; corrupt local state is operational failure."""
     service, _, _ = operations()
 
-    newer = service.repository_failure(
-        "config.get",
-        UnsupportedConfigurationSchemaError("cqmgr.config/v2"),
+    newer = run(
+        service.repository_failure(
+            "config.get",
+            UnsupportedConfigurationSchemaError("cqmgr.config/v2"),
+        )
     )
-    invalid = service.repository_failure(
-        "scope.show",
-        ConfigurationRepositoryError("invalid TOML"),
+    invalid = run(
+        service.repository_failure(
+            "scope.show",
+            ConfigurationRepositoryError("invalid TOML"),
+        )
     )
 
     assert newer.outcome.exit_class is ExitClass.REJECTED_PRECONDITION
     assert newer.outcome.code.value == "unsupported-configuration-schema"
     assert invalid.outcome.exit_class is ExitClass.OPERATIONAL_FAILURE
     assert invalid.outcome.code.value == "invalid-local-state"
+    assert not newer.completeness.is_complete
+    assert not newer.completeness.has_partial_data
+    assert [
+        (gap.source.value, gap.reason.value) for gap in newer.completeness.gaps
+    ] == [("local-state", "unsupported-configuration-schema")]
+    assert [diagnostic.code.value for diagnostic in newer.diagnostics] == [
+        "unsupported-configuration-schema"
+    ]
+    assert newer.diagnostics[0].source.value == "local-state"
+    assert "Upgrade cqmgr" in str(newer.diagnostics[0].message)
+    assert "Repair or restore" in str(invalid.diagnostics[0].message)
+    assert newer.data.guidance == str(newer.diagnostics[0].message)

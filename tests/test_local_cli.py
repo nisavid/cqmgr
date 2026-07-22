@@ -11,6 +11,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
+import cqmgr.cli as cli_module
 from cqmgr.bootstrap import InvocationKind, classify_invocation
 from cqmgr.cli import main
 
@@ -51,6 +52,43 @@ def test_invocation_is_classified_before_optional_runtime_imports(
     )
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("scope", "--help"),
+        ("sco", "show", "--help"),
+        ("tui", "--help"),
+    ],
+)
+def test_click_root_classifies_the_complete_raw_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: tuple[str, ...],
+) -> None:
+    """Actual nested help reaches bootstrap classification with its raw argv."""
+    observed: list[tuple[str, ...]] = []
+    classify = cli_module.classify_invocation
+
+    def recording_classifier(
+        raw_arguments: tuple[str, ...],
+        *,
+        stdin_is_tty: bool,
+        stdout_is_tty: bool,
+    ) -> InvocationKind:
+        observed.append(tuple(raw_arguments))
+        return classify(
+            raw_arguments,
+            stdin_is_tty=stdin_is_tty,
+            stdout_is_tty=stdout_is_tty,
+        )
+
+    monkeypatch.setattr(cli_module, "classify_invocation", recording_classifier)
+
+    result = CliRunner().invoke(main, list(arguments))
+
+    assert result.exit_code == 0, result.output
+    assert observed == [arguments]
+
+
 def local_environment(tmp_path: Path) -> dict[str, str]:
     """Provide explicit cqmgr-only paths for hermetic CLI state."""
     return {
@@ -66,7 +104,14 @@ def test_scope_commands_and_aliases_preserve_resolution_source(tmp_path: Path) -
 
     selected = runner.invoke(
         main,
-        ["sco", "sel", "projects/123", "--output", "json"],
+        [
+            "sco",
+            "sel",
+            "--resource-scope",
+            "projects/123",
+            "--output",
+            "json",
+        ],
         env=environment,
     )
     shown = runner.invoke(
@@ -92,7 +137,7 @@ def test_folder_selection_is_rejected_without_replacing_project(tmp_path: Path) 
     assert (
         runner.invoke(
             main,
-            ["scope", "select", "projects/123"],
+            ["scope", "select", "--resource-scope", "projects/123"],
             env=environment,
         ).exit_code
         == 0
@@ -100,7 +145,14 @@ def test_folder_selection_is_rejected_without_replacing_project(tmp_path: Path) 
 
     rejected = runner.invoke(
         main,
-        ["scope", "select", "folders/456", "--output", "json"],
+        [
+            "scope",
+            "select",
+            "--resource-scope",
+            "folders/456",
+            "--output",
+            "json",
+        ],
         env=environment,
     )
     shown = runner.invoke(
@@ -149,6 +201,132 @@ def test_profile_and_config_commands_use_separate_files(tmp_path: Path) -> None:
     assert Path(environment["CQMGR_SELECTION_STATE_PATH"]).exists()
 
 
+def test_profile_json_exposes_only_safe_os_keyring_reference_metadata(
+    tmp_path: Path,
+) -> None:
+    """Structured profile output never emits contact or credential-shaped text."""
+    environment = local_environment(tmp_path)
+    Path(environment["CQMGR_CONFIG_PATH"]).write_text(
+        'schema = "cqmgr.config/v1"\n\n'
+        "[profiles.primary]\n"
+        'quota_contact_keyring_reference = "cqmgr:quota-contact:primary"\n'
+    )
+
+    result = CliRunner().invoke(
+        main,
+        ["profile", "get", "primary", "--output", "json"],
+        env=environment,
+    )
+
+    assert result.exit_code == 0, result.output
+    reference = json.loads(result.stdout)["data"]["profile"][
+        "quota_contact_keyring_reference"
+    ]
+    assert reference == {
+        "account": "quota-contact:primary",
+        "backend": "os-keyring",
+        "service": "cqmgr",
+    }
+
+
+def test_profile_select_human_output_reports_the_effective_scope_and_source(
+    tmp_path: Path,
+) -> None:
+    """The selected profile remains distinct from the winning direct project."""
+    environment = local_environment(tmp_path)
+    Path(environment["CQMGR_CONFIG_PATH"]).write_text(
+        'schema = "cqmgr.config/v1"\n\n'
+        "[profiles.secondary]\n"
+        'resource_scope = "projects/789"\n'
+    )
+    runner = CliRunner()
+    assert (
+        runner.invoke(
+            main,
+            ["scope", "select", "--resource-scope", "projects/123"],
+            env=environment,
+        ).exit_code
+        == 0
+    )
+
+    result = runner.invoke(
+        main,
+        ["profile", "select", "secondary"],
+        env=environment,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Profile resource scope: projects/789" in result.stdout
+    assert "Effective resource scope: projects/123" in result.stdout
+    assert "Resolution source: direct-selection" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("scope", "show"),
+        ("scope", "select"),
+        ("scope", "clear"),
+        ("profile", "list"),
+        ("profile", "get"),
+        ("profile", "select"),
+        ("config", "get"),
+        ("config", "set"),
+    ],
+)
+def test_every_local_leaf_exposes_shared_presentation_options(
+    command: tuple[str, ...],
+) -> None:
+    """No-color and quiet remain leaf-scoped public compatibility options."""
+    result = CliRunner().invoke(main, [*command, "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--no-color" in result.stdout
+    assert "--quiet" in result.stdout
+
+
+def test_no_color_and_quiet_preserve_required_human_result_facts(
+    tmp_path: Path,
+) -> None:
+    """Presentation controls suppress neither result identity nor safety facts."""
+    environment = local_environment(tmp_path)
+    selected = CliRunner().invoke(
+        main,
+        [
+            "scope",
+            "select",
+            "--resource-scope",
+            "projects/123",
+            "--no-color",
+            "--quiet",
+        ],
+        env=environment,
+    )
+
+    assert selected.exit_code == 0, selected.output
+    assert selected.stdout == (
+        "Resource scope: projects/123\nResolution source: direct-selection\n"
+    )
+
+    rejected = CliRunner().invoke(
+        main,
+        [
+            "scope",
+            "select",
+            "--resource-scope",
+            "folders/456",
+            "--no-color",
+            "--quiet",
+        ],
+        env=environment,
+    )
+
+    assert rejected.exit_code == REJECTED_PRECONDITION_EXIT
+    assert "Outcome: unsupported-resource-scope (exit 3)" in rejected.stderr
+    assert "Boundary: local-selection-updated (not reached)" in rejected.stderr
+    assert "folder resource scopes are reserved but unsupported" in rejected.stderr
+
+
 def test_local_commands_do_not_import_or_initialize_optional_integrations(
     tmp_path: Path,
 ) -> None:
@@ -179,7 +357,7 @@ os.environ["GOOGLE_CLOUD_PROJECT"] = "ambient-must-not-be-read"
 from cqmgr.cli import main
 
 for arguments in (
-    ["scope", "select", "projects/123"],
+    ["scope", "select", "--resource-scope", "projects/123"],
     ["scope", "show"],
     ["profile", "list"],
     ["config", "get", "interface.no-color"],
@@ -239,6 +417,35 @@ def test_invalid_configuration_returns_a_typed_result(
     payload = json.loads(result.stdout)
     assert payload["outcome"]["code"] == expected_outcome
     assert payload["boundary"] == {"condition": "local-state-valid", "reached": False}
+    assert payload["complete"] is False
+    assert [item["code"]["value"] for item in payload["diagnostics"]] == [
+        expected_outcome
+    ]
+    assert payload["diagnostics"][0]["source"]["value"] == "local-state"
+    assert payload["data"]["guidance"] == payload["diagnostics"][0]["message"]
+
+
+def test_human_repository_failure_has_common_envelope_and_safe_guidance(
+    tmp_path: Path,
+) -> None:
+    """A local-state failure stays actionable without exposing stored contents."""
+    environment = local_environment(tmp_path)
+    Path(environment["CQMGR_CONFIG_PATH"]).write_text("not valid TOML = [")
+
+    result = CliRunner().invoke(
+        main,
+        ["config", "get", "interface.no-color"],
+        env=environment,
+    )
+
+    assert result.exit_code == OPERATIONAL_FAILURE_EXIT
+    assert result.stdout == ""
+    assert "Operation: config.get" in result.stderr
+    assert "Outcome: invalid-local-state (exit 9)" in result.stderr
+    assert "Boundary: local-state-valid (not reached)" in result.stderr
+    assert "Complete: false" in result.stderr
+    assert "Repair or restore the cqmgr local-state file, then retry." in result.stderr
+    assert "not valid TOML" not in result.stderr
 
 
 def test_noninteractive_entry_points_fail_before_textual_import() -> None:

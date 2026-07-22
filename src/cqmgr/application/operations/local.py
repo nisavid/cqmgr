@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -20,8 +21,18 @@ from cqmgr.application.ports.configuration import (
     ConfigurationRepositoryError,
     UnsupportedConfigurationSchemaError,
 )
+from cqmgr.domain.diagnostics import (
+    Diagnostic,
+    DiagnosticCode,
+    DiagnosticPhase,
+    DiagnosticSource,
+    RetryDisposition,
+    Severity,
+)
+from cqmgr.domain.redaction import RedactedText
 from cqmgr.domain.results import (
     Completeness,
+    EvidenceGap,
     ExitClass,
     OperationBoundary,
     OperationName,
@@ -56,6 +67,7 @@ class ProfileOperationData:
     profile: Profile | None
     profiles: tuple[Profile, ...]
     selected_profile: str | None
+    resolution_source: str | None = None
     reason: str | None = None
 
 
@@ -71,7 +83,7 @@ class ConfigOperationData:
 class RepositoryFailureData:
     """Safe local repository failure detail."""
 
-    reason: str
+    guidance: str
 
 
 class LocalOperations:
@@ -88,6 +100,14 @@ class LocalOperations:
         self._selection = selection
         self._clock = clock
 
+    async def _read_local_state(self) -> tuple[ConfigSnapshot, SelectionState]:
+        """Read independent configuration and selection snapshots concurrently."""
+        configuration, selection = await asyncio.gather(
+            self._configuration.read(),
+            self._selection.read(),
+        )
+        return configuration, selection
+
     def _result[DataT](  # noqa: PLR0913
         self,
         *,
@@ -98,6 +118,8 @@ class LocalOperations:
         outcome: str,
         exit_class: ExitClass,
         data: DataT,
+        completeness: Completeness | None = None,
+        diagnostics: tuple[Diagnostic, ...] = (),
     ) -> OperationResult[DataT]:
         started_at = self._clock.now()
         finished_at = self._clock.now()
@@ -106,10 +128,11 @@ class LocalOperations:
             resource_scope=resource_scope,
             boundary=OperationBoundary(StableSymbol(boundary), reached),
             outcome=Outcome(StableSymbol(outcome), exit_class),
-            completeness=Completeness.complete(),
+            completeness=completeness or Completeness.complete(),
             started_at=started_at,
             finished_at=finished_at,
             data=data,
+            diagnostics=diagnostics,
         )
 
     def _scope_data(
@@ -133,35 +156,55 @@ class LocalOperations:
             reason=reason,
         )
 
-    def repository_failure(
+    async def repository_failure(
         self,
         operation: str,
         error: ConfigurationRepositoryError,
     ) -> OperationResult[RepositoryFailureData]:
         """Classify unsupported newer state separately from corrupt local state."""
         unsupported = isinstance(error, UnsupportedConfigurationSchemaError)
+        outcome = (
+            "unsupported-configuration-schema" if unsupported else "invalid-local-state"
+        )
+        guidance = (
+            "Upgrade cqmgr to a version that supports this local-state schema, "
+            "then retry."
+            if unsupported
+            else "Repair or restore the cqmgr local-state file, then retry."
+        )
+        diagnostic = Diagnostic(
+            code=DiagnosticCode(outcome),
+            severity=Severity.ERROR,
+            phase=DiagnosticPhase("local-state-read"),
+            source=DiagnosticSource("local-state"),
+            retry=(
+                RetryDisposition.NEVER
+                if unsupported
+                else RetryDisposition.AFTER_REFRESH
+            ),
+            message=RedactedText(guidance),
+        )
         return self._result(
             operation=operation,
             resource_scope=None,
             boundary="local-state-valid",
             reached=False,
-            outcome=(
-                "unsupported-configuration-schema"
-                if unsupported
-                else "invalid-local-state"
-            ),
+            outcome=outcome,
             exit_class=(
                 ExitClass.REJECTED_PRECONDITION
                 if unsupported
                 else ExitClass.OPERATIONAL_FAILURE
             ),
-            data=RepositoryFailureData(reason=str(error)),
+            data=RepositoryFailureData(guidance=guidance),
+            completeness=Completeness.unavailable(
+                EvidenceGap(StableSymbol("local-state"), StableSymbol(outcome))
+            ),
+            diagnostics=(diagnostic,),
         )
 
-    def scope_show(self) -> OperationResult[ScopeOperationData]:
+    async def scope_show(self) -> OperationResult[ScopeOperationData]:
         """Inspect the resolved project and exact local resolution source."""
-        configuration = self._configuration.read()
-        selection = self._selection.read()
+        configuration, selection = await self._read_local_state()
         try:
             resolution = resolve_resource_scope(configuration, selection)
         except ConfigurationError as error:
@@ -184,13 +227,12 @@ class LocalOperations:
             data=self._scope_data(selection, resolution),
         )
 
-    def scope_select(
+    async def scope_select(
         self,
         resource_scope: ResourceScope,
     ) -> OperationResult[ScopeOperationData]:
         """Select one explicit V1 project without ambient inference."""
-        configuration = self._configuration.read()
-        selection = self._selection.read()
+        configuration, selection = await self._read_local_state()
         try:
             resolution = resolve_resource_scope(
                 configuration,
@@ -212,7 +254,7 @@ class LocalOperations:
                     source=ScopeResolutionSource.EXPLICIT_INPUT,
                 ),
             )
-        updated = self._selection.update(
+        updated = await self._selection.update(
             lambda state: SelectionState(
                 selected_profile=state.selected_profile,
                 direct_resource_scope=resolution.resource_scope,
@@ -232,10 +274,10 @@ class LocalOperations:
             data=self._scope_data(updated, selected_resolution),
         )
 
-    def scope_clear(self) -> OperationResult[ScopeOperationData]:
+    async def scope_clear(self) -> OperationResult[ScopeOperationData]:
         """Clear only direct scope state and reveal selected-profile scope."""
-        configuration = self._configuration.read()
-        updated = self._selection.update(
+        configuration = await self._configuration.read()
+        updated = await self._selection.update(
             lambda state: SelectionState(selected_profile=state.selected_profile)
         )
         try:
@@ -260,10 +302,9 @@ class LocalOperations:
             data=self._scope_data(updated, resolution),
         )
 
-    def profile_list(self) -> OperationResult[ProfileOperationData]:
+    async def profile_list(self) -> OperationResult[ProfileOperationData]:
         """List validated profiles in stable name order."""
-        configuration = self._configuration.read()
-        selection = self._selection.read()
+        configuration, selection = await self._read_local_state()
         data = ProfileOperationData(
             profile=None,
             profiles=tuple(sorted(configuration.profiles, key=lambda item: item.name)),
@@ -279,10 +320,9 @@ class LocalOperations:
             data=data,
         )
 
-    def profile_get(self, name: str) -> OperationResult[ProfileOperationData]:
+    async def profile_get(self, name: str) -> OperationResult[ProfileOperationData]:
         """Inspect one explicitly named validated profile."""
-        configuration = self._configuration.read()
-        selection = self._selection.read()
+        configuration, selection = await self._read_local_state()
         try:
             profile = configuration.profile(name)
         except ConfigurationError as error:
@@ -314,10 +354,9 @@ class LocalOperations:
             ),
         )
 
-    def profile_select(self, name: str) -> OperationResult[ProfileOperationData]:
+    async def profile_select(self, name: str) -> OperationResult[ProfileOperationData]:
         """Select one existing profile without changing direct scope state."""
-        configuration = self._configuration.read()
-        selection = self._selection.read()
+        configuration, selection = await self._read_local_state()
         try:
             profile = configuration.profile(name)
         except ConfigurationError as error:
@@ -357,15 +396,23 @@ class LocalOperations:
                     reason=reason,
                 ),
             )
-        updated = self._selection.update(
+        updated = await self._selection.update(
             lambda state: SelectionState(
                 selected_profile=name,
                 direct_resource_scope=state.direct_resource_scope,
             )
         )
+        try:
+            effective_resolution = resolve_resource_scope(configuration, updated)
+        except ConfigurationError:
+            effective_resolution = None
         return self._result(
             operation="profile.select",
-            resource_scope=profile.resource_scope,
+            resource_scope=(
+                effective_resolution.resource_scope
+                if effective_resolution is not None
+                else None
+            ),
             boundary="local-selection-updated",
             reached=True,
             outcome="succeeded",
@@ -374,15 +421,20 @@ class LocalOperations:
                 profile=profile,
                 profiles=(),
                 selected_profile=updated.selected_profile,
+                resolution_source=(
+                    effective_resolution.source.value
+                    if effective_resolution is not None
+                    else None
+                ),
             ),
         )
 
-    def config_get(
+    async def config_get(
         self,
         key: InterfaceSettingKey,
     ) -> OperationResult[ConfigOperationData]:
         """Inspect one validated interface configuration key."""
-        value = self._configuration.read().interface.get(key)
+        value = (await self._configuration.read()).interface.get(key)
         return self._result(
             operation="config.get",
             resource_scope=None,
@@ -393,14 +445,14 @@ class LocalOperations:
             data=ConfigOperationData(key.value, value),
         )
 
-    def config_set(
+    async def config_set(
         self,
         key: InterfaceSettingKey,
         *,
         value: bool,
     ) -> OperationResult[ConfigOperationData]:
         """Atomically change one validated interface setting."""
-        updated = self._configuration.update(
+        updated = await self._configuration.update(
             lambda snapshot: ConfigSnapshot(
                 profiles=snapshot.profiles,
                 interface=snapshot.interface.replace(key, value=value),

@@ -8,6 +8,8 @@ from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
+from cqmgr.application.configuration import QuotaContactKeyringReference
+from cqmgr.domain.redaction import RedactedText
 from cqmgr.domain.scopes import ResourceScope
 
 if TYPE_CHECKING:
@@ -17,6 +19,14 @@ if TYPE_CHECKING:
 def _value(value: object) -> object:  # noqa: PLR0911
     if isinstance(value, ResourceScope):
         return {"type": value.kind.value, "name": value.canonical_name}
+    if isinstance(value, QuotaContactKeyringReference):
+        return {
+            "backend": value.backend,
+            "service": value.service,
+            "account": value.account,
+        }
+    if isinstance(value, RedactedText):
+        return value.value
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, datetime):
