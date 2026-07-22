@@ -219,9 +219,9 @@ These requirements are hard gates rather than interface guidance:
    per-installation plan-authentication secret. Apply requires local
    authentication, an unused consumption record, an absent immutable
    native-keyring consumption marker, an exclusive lease, and durable marker
-   creation and consumption before provider dispatch. Ambiguous dispatch
-   quarantines the plan; replaying an older authentic filesystem record does
-   not restore Apply capability.
+   creation plus the ledger-owned consumption transition before provider
+   dispatch. Ambiguous dispatch quarantines the plan; replaying an older
+   authentic filesystem record does not restore Apply capability.
 5. **Fresh revalidation.** Identity, eligibility, effective value, preference,
    etag, rollout, policy, material usage, or companion evidence drift
    invalidates the plan. Apply never silently rebuilds or refreshes a different
