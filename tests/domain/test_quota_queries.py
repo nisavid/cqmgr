@@ -1,5 +1,6 @@
 """Bounded logical quota-query and product-snapshot contracts."""
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
@@ -7,6 +8,7 @@ import pytest
 
 from cqmgr.domain.catalog import (
     ACCELERATOR_CATALOG_SCHEMA,
+    AcceleratorConstraintSet,
     AcceleratorId,
     CatalogGroupId,
     CatalogMetadata,
@@ -28,6 +30,7 @@ from cqmgr.domain.quota_queries import (
     SortDirection,
 )
 from cqmgr.domain.quotas import (
+    ConstraintReference,
     EffectiveQuotaSliceIdentity,
     NormalizedDimensions,
     QuotaQuantity,
@@ -395,3 +398,29 @@ def test_opaque_cursor_metadata_binds_snapshot_and_offset_without_provider_token
     assert cursor.value == "cqmgr-cursor-opaque-value"
     assert cursor.snapshot_id == "snapshot-opaque-1"
     assert cursor.offset == CURSOR_OFFSET
+
+
+def test_query_item_retains_its_anchored_constraint_set() -> None:
+    """Snapshot rows preserve related exact identities for cursor continuation."""
+    item = _item(
+        "H100",
+        display_name="NVIDIA H100",
+        accelerator="nvidia-h100",
+        location="us-central1",
+    )
+    constraint_set = AcceleratorConstraintSet(
+        AcceleratorId("nvidia-h100"),
+        (ConstraintReference(item.identity),),
+    )
+
+    retained = replace(item, constraint_set=constraint_set)
+
+    assert retained.constraint_set == constraint_set
+    with pytest.raises(ValueError, match="accelerator"):
+        replace(
+            item,
+            constraint_set=AcceleratorConstraintSet(
+                AcceleratorId("nvidia-l4"),
+                (ConstraintReference(item.identity),),
+            ),
+        )

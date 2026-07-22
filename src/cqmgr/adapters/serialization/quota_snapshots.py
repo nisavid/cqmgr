@@ -12,6 +12,7 @@ from cqmgr.application.ports.quota_snapshots import (
     UnsupportedQuotaSnapshotSchemaError,
 )
 from cqmgr.domain.catalog import (
+    AcceleratorConstraintSet,
     AcceleratorId,
     CatalogGroupId,
     CatalogMetadata,
@@ -30,6 +31,7 @@ from cqmgr.domain.quota_queries import (
     SortDirection,
 )
 from cqmgr.domain.quotas import (
+    ConstraintReference,
     EffectiveQuotaSliceIdentity,
     NormalizedDimensions,
     QuotaQuantity,
@@ -260,6 +262,17 @@ def _item(item: QuotaQueryItem) -> dict[str, object]:
             if item.evidence_observed_at is None
             else _timestamp(item.evidence_observed_at)
         ),
+        "constraint_set": (
+            None
+            if item.constraint_set is None
+            else {
+                "accelerator_id": item.constraint_set.accelerator_id.value,
+                "references": [
+                    _identity(reference.slice_identity)
+                    for reference in item.constraint_set.references
+                ],
+            }
+        ),
     }
 
 
@@ -417,6 +430,7 @@ def _decode_item(value: object) -> QuotaQueryItem:
             "grant_satisfaction",
             "effective_confirmation",
             "evidence_observed_at",
+            "constraint_set",
         },
         "item",
     )
@@ -456,6 +470,24 @@ def _decode_item(value: object) -> QuotaQueryItem:
             None
             if table["evidence_observed_at"] is None
             else _datetime(table["evidence_observed_at"], "evidence_observed_at")
+        ),
+        constraint_set=_decode_constraint_set(table["constraint_set"]),
+    )
+
+
+def _decode_constraint_set(value: object) -> AcceleratorConstraintSet | None:
+    if value is None:
+        return None
+    table = _exact_object(
+        value,
+        {"accelerator_id", "references"},
+        "constraint_set",
+    )
+    return AcceleratorConstraintSet(
+        AcceleratorId(_string(table["accelerator_id"], "constraint accelerator_id")),
+        tuple(
+            ConstraintReference(_decode_identity(item))
+            for item in _list(table["references"], "constraint references")
         ),
     )
 
