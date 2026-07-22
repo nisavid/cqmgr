@@ -1247,6 +1247,78 @@ def test_inspect_joins_only_exact_authoritative_evidence() -> None:
     assert unrelated_region.identity not in references
 
 
+def test_inspect_does_not_join_usage_from_another_applicable_location() -> None:
+    """A dimensioned slice joins usage only at its exact location."""
+    evidence = replace(
+        _evidence("known-guided"),
+        applicable_locations=("us-central1", "us-east1"),
+    )
+    east_usage = replace(
+        _usage(evidence),
+        resource_labels=NormalizedDimensions(
+            (
+                ("location", "us-east1"),
+                ("project_id", "public-schema-project"),
+                ("service", evidence.identity.service),
+            )
+        ),
+    )
+    fixture = _fixture(
+        (_complete(evidence),),
+        usage=_complete(east_usage),
+    )
+
+    result = asyncio.run(
+        fixture.operations.inspect(QuotaInspectRequest(_context(), evidence.identity))
+    )
+
+    assert result.succeeded
+    assert result.data.usage is None
+    assert result.data.item is not None
+    assert result.data.item.usage_value is None
+
+
+def test_inspect_zonal_slice_does_not_join_parent_region_usage() -> None:
+    """A zonal slice requires usage at its exact zone."""
+    evidence = replace(
+        _evidence("known-zonal"),
+        identity=EffectiveQuotaSliceIdentity(
+            PROJECT,
+            "compute.googleapis.com",
+            "known-zonal",
+            NormalizedDimensions(
+                (("region", "us-central1"), ("zone", "us-central1-a"))
+            ),
+            QuotaScope.ZONAL,
+        ),
+        applicable_locations=("us-central1", "us-central1-a"),
+        declared_dimensions=("region", "zone"),
+    )
+    regional_usage = replace(
+        _usage(evidence),
+        resource_labels=NormalizedDimensions(
+            (
+                ("location", "us-central1"),
+                ("project_id", "public-schema-project"),
+                ("service", evidence.identity.service),
+            )
+        ),
+    )
+    fixture = _fixture(
+        (_complete(evidence),),
+        usage=_complete(regional_usage),
+    )
+
+    result = asyncio.run(
+        fixture.operations.inspect(QuotaInspectRequest(_context(), evidence.identity))
+    )
+
+    assert result.succeeded
+    assert result.data.usage is None
+    assert result.data.item is not None
+    assert result.data.item.usage_value is None
+
+
 def test_inspect_global_companion_exposes_each_anchored_region_set() -> None:
     """Inspect preserves alternative regional sets sharing one global slice."""
     central, global_ = _gpu_quota_evidence()
