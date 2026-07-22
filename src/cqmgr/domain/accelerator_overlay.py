@@ -62,6 +62,7 @@ class ResolutionFailureReason(StrEnum):
     UNSUPPORTED_COMPATIBILITY = "unsupported-compatibility"
     PROVIDER_IDENTITY = "provider-identity"
     MISSING_LOCATION_EVIDENCE = "missing-location-evidence"
+    INELIGIBLE = "ineligible"
 
 
 class WorkloadResolutionError(ValueError):
@@ -669,6 +670,7 @@ class SemanticAcceleratorOverlay:
         constraint_set = self._constraint_set_for_resolution(
             requirement.accelerator_id, primary[0], quota_evidences
         )
+        _require_eligible_constraints(constraint_set, quota_evidences)
         return ResolvedQuotaRequirement(
             requirement=requirement,
             owning_service=mapping.selector.service,
@@ -808,6 +810,22 @@ def _require_complete_location(
         raise WorkloadResolutionError(
             ResolutionFailureReason.MISSING_LOCATION_EVIDENCE,
             "Required selected-location catalog evidence is incomplete.",
+        )
+
+
+def _require_eligible_constraints(
+    constraint_set: AcceleratorConstraintSet,
+    evidences: tuple[EffectiveQuotaEvidence, ...],
+) -> None:
+    """Require every exact limiting slice to be provider-eligible for guidance."""
+    by_identity = {evidence.identity: evidence for evidence in evidences}
+    if any(
+        not by_identity[reference.slice_identity].eligibility.eligible
+        for reference in constraint_set.references
+    ):
+        raise WorkloadResolutionError(
+            ResolutionFailureReason.INELIGIBLE,
+            "At least one exact quota constraint is not eligible for an increase.",
         )
 
 

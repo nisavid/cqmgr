@@ -457,6 +457,36 @@ def test_gpu_resolver_fails_when_a_required_companion_slice_is_missing() -> None
     assert ambiguous.value.reason is ResolutionFailureReason.AMBIGUOUS
 
 
+def test_gpu_resolver_fails_when_an_exact_constraint_is_ineligible() -> None:
+    """Guidance stops when any independent limiting slice is ineligible."""
+    regional = _evidence(
+        "GPUS-PER-GPU-FAMILY-per-project-region",
+        service="compute.googleapis.com",
+        dimensions=(("gpu_family", "NVIDIA_H100"), ("region", "us-central1")),
+        scope=QuotaScope.REGIONAL,
+        unit="1",
+        locations=("us-central1",),
+        display_name="GPUs per family per region",
+        fixed=True,
+    )
+    global_ = _evidence(
+        "GPUS-ALL-REGIONS-per-project",
+        service="compute.googleapis.com",
+        dimensions=(),
+        scope=QuotaScope.GLOBAL,
+        unit="1",
+        locations=("global",),
+        display_name="GPUs (all regions)",
+    )
+
+    with pytest.raises(WorkloadResolutionError) as rejected:
+        MAINTAINED_ACCELERATOR_OVERLAY.resolve(
+            _gpu_requirement(), (regional, global_), _gpu_catalog_evidence()
+        )
+
+    assert rejected.value.reason is ResolutionFailureReason.INELIGIBLE
+
+
 def test_gpu_resolver_requires_exact_fixed_shape_count_and_coherent_location() -> None:
     """A fixed machine shape cannot be resized or paired with another region."""
     regional = _evidence(
