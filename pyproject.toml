@@ -26,6 +26,8 @@ classifiers = [
 ]
 dependencies = [
   "click>=8.1,<9",
+  "google-auth>=2.38,<3",
+  "google-cloud-resource-manager>=1.18,<2",
   "keyring>=25.7,<26",
   "textual>=8,<9",
 ]
