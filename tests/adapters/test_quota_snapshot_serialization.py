@@ -3,6 +3,7 @@
 import json
 from dataclasses import replace
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 
@@ -20,11 +21,13 @@ from cqmgr.domain.catalog import (
     ACCELERATOR_CATALOG_SCHEMA,
     AcceleratorConstraintSet,
     AcceleratorId,
+    CatalogGroupId,
     CatalogMetadata,
     CatalogPredicates,
 )
 from cqmgr.domain.quota_queries import (
     QUOTA_QUERY_EVIDENCE_CONTRACT,
+    CatalogGroupSource,
     QuerySnapshotMetadata,
     QuotaQuery,
     QuotaQueryFilters,
@@ -152,6 +155,7 @@ def test_snapshot_record_round_trips_as_canonical_safe_json(
     "document",
     [
         b'{"schema":"cqmgr.quota-query-snapshot/v2"}\n',
+        b'{"schema":"cqmgr.quota-query-snapshot/v0","snapshot":{}}\n',
         b'{"schema":"cqmgr.quota-query-snapshot/v1","unknown":true}\n',
         b"not-json\n",
     ],
@@ -186,6 +190,118 @@ def test_cursor_binding_decoder_rejects_noncanonical_bytes() -> None:
     noncanonical = canonical.removesuffix(b"\n")
     with pytest.raises(QuotaSnapshotStoredDataError, match="not canonical"):
         decode_cursor_binding(noncanonical)
+
+
+def test_snapshot_codec_round_trips_catalog_group_and_constraint_references() -> None:
+    """Retained rows preserve guided group selection and exact related slices."""
+    snapshot = quota_snapshot()
+    item = snapshot.items[0]
+    constrained = replace(
+        item,
+        constraint_set=AcceleratorConstraintSet(
+            cast("AcceleratorId", item.accelerator_id),
+            (ConstraintReference(item.identity),),
+        ),
+    )
+    grouped = replace(
+        snapshot,
+        metadata=replace(
+            snapshot.metadata,
+            query=replace(
+                snapshot.metadata.query,
+                source=CatalogGroupSource(CatalogGroupId.COMPUTE_ACCELERATORS),
+            ),
+        ),
+        items=(constrained,),
+    )
+
+    assert decode_snapshot_record(encode_snapshot_record(grouped)) == grouped
+
+
+def test_codec_entrypoints_reject_wrong_types_and_invalid_cursor_values() -> None:
+    """Codec boundaries never coerce application objects or cursor positions."""
+    with pytest.raises(TypeError, match="QuotaQuerySnapshot"):
+        encode_snapshot_record(cast("QuotaQuerySnapshot", object()))
+    with pytest.raises(TypeError, match="must be bytes"):
+        decode_snapshot_record(cast("bytes", "json"))
+    with pytest.raises(TypeError, match="must be bytes"):
+        decode_cursor_binding(cast("bytes", "json"))
+    for snapshot_id, offset in (("", 0), ("snapshot-1", -1), ("snapshot-1", True)):
+        with pytest.raises(ValueError, match="cursor"):
+            encode_cursor_binding(snapshot_id, cast("int", offset))
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"schema": "cqmgr.quota-query-cursor/v2", "snapshot_id": "s", "offset": 0},
+        {"schema": "cqmgr.quota-query-cursor/v0", "snapshot_id": "s", "offset": 0},
+        {"schema": "cqmgr.quota-query-cursor/v1", "snapshot_id": "s", "offset": -1},
+        {"schema": "cqmgr.quota-query-cursor/v1", "snapshot_id": 1, "offset": 0},
+        {"schema": "cqmgr.quota-query-cursor/v1", "snapshot_id": "s"},
+    ],
+)
+def test_cursor_binding_decoder_rejects_untrusted_state(
+    document: dict[str, object],
+) -> None:
+    """Unknown schemas and malformed local bindings fail closed."""
+    encoded = (
+        json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode()
+    expected = (
+        UnsupportedQuotaSnapshotSchemaError
+        if document["schema"] == "cqmgr.quota-query-cursor/v2"
+        else QuotaSnapshotStoredDataError
+    )
+    with pytest.raises(expected):
+        decode_cursor_binding(encoded)
+
+    with pytest.raises(QuotaSnapshotStoredDataError, match="malformed"):
+        decode_cursor_binding(b"not-json\n")
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("snapshot", "metadata", "query", "source", "kind"), "unknown"),
+        (("snapshot", "metadata", "observed_at"), "2026-07-22T08:00:00+01:00"),
+        (("snapshot", "items", 0, "identity", "dimensions"), [["region"]]),
+        (("snapshot", "items", 0, "effective_value", "value"), "01"),
+        (("snapshot", "items", 0, "predicates", "guided"), 1),
+        (("snapshot", "items"), {}),
+    ],
+)
+def test_snapshot_decoder_rejects_semantically_invalid_canonical_state(
+    path: tuple[str | int, ...],
+    value: object,
+) -> None:
+    """Canonical JSON syntax cannot legitimize invalid retained evidence."""
+    document = json.loads(encode_snapshot_record(quota_snapshot()))
+    target: object = document
+    for component in path[:-1]:
+        target = target[component]  # type: ignore[index]
+    target[path[-1]] = value  # type: ignore[index]
+    encoded = (
+        json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode()
+
+    with pytest.raises(QuotaSnapshotStoredDataError):
+        decode_snapshot_record(encoded)
+
+
+def test_snapshot_decoder_rejects_unsafe_retained_text() -> None:
+    """Unsafe path material is rejected even when injected directly on disk."""
+    document = json.loads(encode_snapshot_record(quota_snapshot()))
+    document["snapshot"]["items"][0]["display_name"] = "/Users/private/quota.json"
+    encoded = (
+        json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode()
+
+    with pytest.raises(QuotaSnapshotStoredDataError, match="unsafe evidence"):
+        decode_snapshot_record(encoded)
 
 
 @pytest.mark.parametrize(
