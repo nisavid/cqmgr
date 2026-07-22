@@ -39,6 +39,7 @@ EXPECTED_PACKAGE_FILES = {
     PurePosixPath("adapters/persistence/plans.py"),
     PurePosixPath("adapters/persistence/quota_snapshots.py"),
     PurePosixPath("adapters/persistence/secrets.py"),
+    PurePosixPath("adapters/persistence/windows_acl.py"),
     PurePosixPath("adapters/serialization/__init__.py"),
     PurePosixPath("adapters/serialization/plans.py"),
     PurePosixPath("adapters/serialization/quota_snapshots.py"),

@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from cqmgr.adapters.persistence.windows_acl import restrict_windows_acl
 from cqmgr.adapters.serialization.quota_snapshots import (
     decode_cursor_binding,
     decode_snapshot_record,
@@ -236,9 +237,21 @@ def _ensure_private_directory(path: Path) -> None:
     if path.is_symlink():
         msg = "quota snapshot directory must not be a symlink"
         raise QuotaSnapshotOperationalError(msg)
+    missing: list[Path] = []
+    candidate = path
+    while not candidate.exists():
+        missing.append(candidate)
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
     try:
         path.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_DIRECTORY_MODE)
+        for directory in reversed(missing):
+            directory.chmod(_PRIVATE_DIRECTORY_MODE)
+            restrict_windows_acl(directory)
         path.chmod(_PRIVATE_DIRECTORY_MODE)
+        restrict_windows_acl(path)
     except OSError as error:
         raise _operational_error(error) from error
 
@@ -250,14 +263,18 @@ def _publish_exclusive(path: Path, data: bytes) -> None:
         os.O_WRONLY | os.O_CREAT | os.O_EXCL,
         _PRIVATE_FILE_MODE,
     )
+    linked = False
     try:
         temporary.chmod(_PRIVATE_FILE_MODE)
+        restrict_windows_acl(temporary)
         with os.fdopen(descriptor, "wb") as stream:
             descriptor = -1
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
         os.link(temporary, path, follow_symlinks=False)
+        linked = True
+        restrict_windows_acl(path)
         temporary.unlink()
         _fsync_directory(path.parent)
     except BaseException:
@@ -266,6 +283,9 @@ def _publish_exclusive(path: Path, data: bytes) -> None:
                 os.close(descriptor)
         with suppress(OSError):
             temporary.unlink(missing_ok=True)
+        if linked:
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
         raise
 
 
@@ -295,12 +315,24 @@ def _read_trusted_file(path: Path) -> bytes:
 
 def _read_repository_file(root: Path, directory: str, filename: str) -> bytes:
     """Read through no-follow directory descriptors on supported platforms."""
+    directory_paths = (root, root / directory)
+    for path in directory_paths:
+        if path.is_symlink():
+            msg = "quota snapshot directory must not be a symlink"
+            raise QuotaSnapshotOperationalError(msg)
+        if path.exists():
+            restrict_windows_acl(path)
+    state_path = root / directory / filename
+    if state_path.is_symlink():
+        msg = "quota snapshot state file must not be a symlink"
+        raise QuotaSnapshotOperationalError(msg)
+    if state_path.exists() and stat.S_ISREG(
+        state_path.stat(follow_symlinks=False).st_mode
+    ):
+        restrict_windows_acl(state_path)
+
     if os.name == "nt" or not hasattr(os, "O_DIRECTORY"):  # pragma: win32 cover
-        for path in (root, root / directory):
-            if path.is_symlink():
-                msg = "quota snapshot directory must not be a symlink"
-                raise QuotaSnapshotOperationalError(msg)
-        return _read_trusted_file(root / directory / filename)
+        return _read_trusted_file(state_path)
 
     root_descriptor = _open_trusted_directory(root)
     try:

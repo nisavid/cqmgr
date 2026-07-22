@@ -3,14 +3,17 @@
 import json
 import os
 import stat
+import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
-import cqmgr.adapters.persistence.quota_snapshots as persistence
+from cqmgr.adapters.persistence import quota_snapshots as persistence
+from cqmgr.adapters.persistence import windows_acl
 from cqmgr.adapters.persistence.quota_snapshots import FilesystemQuotaQuerySnapshots
 from cqmgr.application.ports.quota_snapshots import (
     ExpiredQuotaCursorError,
@@ -118,6 +121,137 @@ def test_repository_atomically_round_trips_private_canonical_snapshot(
             stat.S_IMODE((root / "snapshots").stat().st_mode) == PRIVATE_DIRECTORY_MODE
         )
         assert stat.S_IMODE(snapshot_files[0].stat().st_mode) == PRIVATE_FILE_MODE
+
+
+def test_repository_restricts_acl_on_directories_temporary_and_final_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every created state path crosses the shared private ACL boundary."""
+    restricted: list[Path] = []
+    monkeypatch.setattr(persistence, "restrict_windows_acl", restricted.append)
+    root = tmp_path / "quota-query-snapshots"
+    repository = FilesystemQuotaQuerySnapshots(root)
+
+    repository.save(_snapshot())
+
+    snapshot_file = next((root / "snapshots").glob("*.json"))
+    assert {root, root / "snapshots", root / "cursors", snapshot_file}.issubset(
+        restricted
+    )
+    assert any(path.name.endswith(".tmp") for path in restricted)
+
+
+def test_snapshot_acl_failure_leaves_no_published_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed final ACL boundary removes the linked state file and temporary."""
+    root = tmp_path / "quota-query-snapshots"
+    repository = FilesystemQuotaQuerySnapshots(root)
+
+    def fail_final_path(path: Path) -> None:
+        if path.suffix == ".json":
+            msg = "injected ACL failure"
+            raise OSError(msg)
+
+    monkeypatch.setattr(persistence, "restrict_windows_acl", fail_final_path)
+
+    with pytest.raises(QuotaSnapshotOperationalError, match="OSError"):
+        repository.save(_snapshot())
+
+    assert list(root.rglob("*.json")) == []
+    assert list(root.rglob("*.tmp")) == []
+
+
+def test_windows_acl_timeout_is_typed_and_leaves_no_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hung ACL subprocess remains a typed repository failure."""
+    root = tmp_path / "quota-query-snapshots"
+
+    def timeout(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        del args, kwargs
+        command = "powershell"
+        raise subprocess.TimeoutExpired(command, 10)
+
+    monkeypatch.setattr(
+        windows_acl,
+        "os",
+        SimpleNamespace(name="nt", environ=os.environ),
+    )
+    monkeypatch.setattr(windows_acl.subprocess, "run", timeout)
+
+    with pytest.raises(QuotaSnapshotOperationalError, match="OSError"):
+        FilesystemQuotaQuerySnapshots(root).save(_snapshot())
+
+    assert list(root.rglob("*.json")) == []
+    assert list(root.rglob("*.tmp")) == []
+
+
+def test_repository_hardens_existing_state_before_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy state is hardened before its retained evidence is trusted."""
+    root = tmp_path / "quota-query-snapshots"
+    repository = FilesystemQuotaQuerySnapshots(root)
+    snapshot = _snapshot()
+    repository.save(snapshot)
+    snapshot_file = next((root / "snapshots").glob("*.json"))
+    restricted: list[Path] = []
+    monkeypatch.setattr(persistence, "restrict_windows_acl", restricted.append)
+
+    assert repository.load(snapshot.metadata.snapshot_id, now=NOW) == snapshot
+
+    assert restricted == [root, root / "snapshots", snapshot_file]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACL contract")
+def test_windows_snapshot_and_cursor_state_replaces_inherited_readers(
+    tmp_path: Path,
+) -> None:
+    """Snapshot and cursor paths retain only the active Windows account ACL."""
+    system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
+    executable = rf"{system_root}\System32\icacls.exe"
+    subprocess.run(  # noqa: S603
+        [
+            executable,
+            str(tmp_path),
+            "/grant",
+            "*S-1-1-0:(OI)(CI)R",
+            "*S-1-5-32-544:(OI)(CI)R",
+        ],
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+    repository = FilesystemQuotaQuerySnapshots(tmp_path, token_factory=lambda: TOKEN)
+    snapshot = _snapshot()
+    repository.save(snapshot)
+    repository.issue(snapshot.metadata.snapshot_id, 0, now=NOW)
+
+    for path in (
+        tmp_path,
+        tmp_path / "snapshots",
+        tmp_path / "cursors",
+        next((tmp_path / "snapshots").glob("*.json")),
+        next((tmp_path / "cursors").glob("*.json")),
+    ):
+        completed = subprocess.run(  # noqa: S603
+            [executable, str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        acl = completed.stdout.casefold()
+        assert "everyone:" not in acl
+        assert "s-1-1-0:" not in acl
+        assert "builtin\\users:" not in acl
+        assert "builtin\\administrators:" not in acl
+        assert "s-1-5-32-544:" not in acl
 
 
 def test_repository_snapshot_id_is_immutable_and_idempotent(tmp_path: Path) -> None:
