@@ -13,4 +13,4 @@ class Clock(Protocol):
 
     def now(self) -> datetime:
         """Return the current aware UTC time."""
-        ...  # pragma: no cover
+        raise NotImplementedError

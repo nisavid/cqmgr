@@ -13,7 +13,8 @@ from click.testing import CliRunner
 
 import cqmgr.cli as cli_module
 from cqmgr.bootstrap import InvocationKind, classify_invocation
-from cqmgr.cli import main
+
+main = cli_module.main
 
 REJECTED_PRECONDITION_EXIT = 3
 OPERATIONAL_FAILURE_EXIT = 9

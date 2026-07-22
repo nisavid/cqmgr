@@ -25,11 +25,11 @@ class ConfigRepository(Protocol):
 
     async def read(self) -> ConfigSnapshot:
         """Read one validated, migrated snapshot."""
-        ...  # pragma: no cover
+        raise NotImplementedError
 
     async def update(self, transform: ConfigTransform) -> ConfigSnapshot:
         """Atomically apply one read-modify-write transformation."""
-        ...  # pragma: no cover
+        raise NotImplementedError
 
 
 class SelectionStateRepository(Protocol):
@@ -37,11 +37,11 @@ class SelectionStateRepository(Protocol):
 
     async def read(self) -> SelectionState:
         """Read one validated, migrated state snapshot."""
-        ...  # pragma: no cover
+        raise NotImplementedError
 
     async def update(self, transform: SelectionTransform) -> SelectionState:
         """Atomically apply one read-modify-write transformation."""
-        ...  # pragma: no cover
+        raise NotImplementedError
 
 
 type ConfigTransform = Callable[[ConfigSnapshot], ConfigSnapshot]
