@@ -155,6 +155,11 @@ jobs:
           foreign_key_is_rejected_across_processes_before_provider_dispatch or
           windows_repository_replaces_every_explicit_plan_reader"
 
+      - name: Exercise local persistence and lock contracts
+        run: >-
+          uv run --locked --python 3.14 pytest --no-cov -q
+          tests/persistence
+
       - name: Smoke-test installed artifacts and native keyring
         if: runner.os != 'Linux'
         run: >-

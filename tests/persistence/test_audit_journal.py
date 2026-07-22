@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import cqmgr.adapters.persistence.audit as audit_adapter
 from cqmgr.adapters.persistence.audit import AuditIntegrityError, FilesystemAuditJournal
 from cqmgr.domain.audit import (
     AUDIT_GENESIS_HASH,
@@ -37,6 +38,10 @@ def _rewrite_record(path: Path, index: int, **changes: object) -> None:
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() + b"\n"
     )
     path.write_bytes(b"".join(lines))
+
+
+def _record_payload(path: Path, index: int = 0) -> dict[str, object]:
+    return json.loads(path.read_bytes().splitlines()[index])
 
 
 def _draft(
@@ -251,6 +256,191 @@ def test_verification_distinguishes_previous_hash_tampering(tmp_path: Path) -> N
     assert result.failure.sequence == _SECOND_RECORD
 
 
+def test_verification_rejects_record_identity_tampering(tmp_path: Path) -> None:
+    """A stored record identity is derived from and bound to its exact sequence."""
+    journal = FilesystemAuditJournal(tmp_path)
+    journal.append(_draft())
+    _rewrite_record(
+        tmp_path / "audit-00000001.jsonl",
+        0,
+        record_id="audit-00000000000000000999",
+    )
+
+    result = journal.verify()
+
+    assert result.failure is not None
+    assert result.failure.code is AuditFailureCode.RECORD_ID_MISMATCH
+    assert result.failure.sequence == 1
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["unknown-field", "whitespace", "key-order", "unicode-escape", "timestamp"],
+)
+def test_verification_rejects_noncanonical_record_bytes(
+    tmp_path: Path,
+    variant: str,
+) -> None:
+    """Semantically similar JSON is invalid unless every retained byte is canonical."""
+    journal = FilesystemAuditJournal(tmp_path)
+    journal.append(
+        _draft(facts=(AuditFact(StableSymbol("label"), RedactedText("café")),))
+    )
+    path = tmp_path / "audit-00000001.jsonl"
+    payload = _record_payload(path)
+    if variant == "unknown-field":
+        payload["extra"] = "not-allowed"
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    elif variant == "whitespace":
+        raw = json.dumps(payload, sort_keys=True)
+    elif variant == "key-order":
+        reversed_payload = {name: payload[name] for name in reversed(payload)}
+        raw = json.dumps(
+            reversed_payload,
+            ensure_ascii=False,
+            sort_keys=False,
+            separators=(",", ":"),
+        )
+    elif variant == "unicode-escape":
+        raw = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    else:
+        payload["occurred_at"] = "2026-07-21T00:00:00+00:00"
+        raw = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    path.write_text(raw + "\n")
+
+    result = journal.verify()
+
+    assert result.failure is not None
+    assert result.failure.code is AuditFailureCode.NONCANONICAL_RECORD
+
+
+@pytest.mark.parametrize("payload", [[], "text", 7, None])
+def test_verification_returns_typed_failure_for_nonobject_json(
+    tmp_path: Path,
+    payload: object,
+) -> None:
+    """A valid JSON value that is not a record never escapes as a Python error."""
+    journal = FilesystemAuditJournal(tmp_path)
+    (tmp_path / "audit-00000001.jsonl").write_text(json.dumps(payload) + "\n")
+
+    result = journal.verify()
+
+    assert result.failure is not None
+    assert result.failure.code is AuditFailureCode.MALFORMED_RECORD
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("kind", True, AuditFailureCode.MALFORMED_RECORD),
+        ("sequence", True, AuditFailureCode.MALFORMED_RECORD),
+        ("segment", True, AuditFailureCode.MALFORMED_RECORD),
+        ("sequence", 0, AuditFailureCode.MALFORMED_RECORD),
+        ("segment", 0, AuditFailureCode.MALFORMED_RECORD),
+        ("previous_hash", "invalid", AuditFailureCode.MALFORMED_RECORD),
+        ("record_hash", "invalid", AuditFailureCode.MALFORMED_RECORD),
+        ("resource_scope", [], AuditFailureCode.NONCANONICAL_RECORD),
+        (
+            "resource_scope",
+            {"type": "project", "name": "projects/123", "extra": "field"},
+            AuditFailureCode.NONCANONICAL_RECORD,
+        ),
+        (
+            "resource_scope",
+            {"type": "project", "name": True},
+            AuditFailureCode.NONCANONICAL_RECORD,
+        ),
+        ("outcome", True, AuditFailureCode.MALFORMED_RECORD),
+        ("correlation_id", True, AuditFailureCode.MALFORMED_RECORD),
+        ("diagnostic_codes", {}, AuditFailureCode.MALFORMED_RECORD),
+        ("diagnostic_codes", [True], AuditFailureCode.MALFORMED_RECORD),
+        ("facts", {}, AuditFailureCode.MALFORMED_RECORD),
+        ("facts", ["fact"], AuditFailureCode.NONCANONICAL_RECORD),
+        (
+            "facts",
+            [{"name": "label"}],
+            AuditFailureCode.NONCANONICAL_RECORD,
+        ),
+        (
+            "facts",
+            [{"name": "label", "value": True}],
+            AuditFailureCode.NONCANONICAL_RECORD,
+        ),
+    ],
+)
+def test_verification_rejects_every_noncanonical_record_field_shape(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    expected: AuditFailureCode,
+) -> None:
+    """Closed record fields reject wrong scalar, collection, and nested shapes."""
+    journal = FilesystemAuditJournal(tmp_path)
+    journal.append(_draft())
+    path = tmp_path / "audit-00000001.jsonl"
+    payload = _record_payload(path)
+    payload[field] = value
+    path.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+    result = journal.verify()
+
+    assert result.failure is not None
+    assert result.failure.code is expected
+
+
+def test_verification_returns_typed_failure_for_invalid_segment_filename(
+    tmp_path: Path,
+) -> None:
+    """Unexpected segment names are integrity failures rather than parse exceptions."""
+    journal = FilesystemAuditJournal(tmp_path)
+    (tmp_path / "audit-invalid.jsonl").write_text("{}\n")
+
+    result = journal.verify()
+
+    assert result.failure is not None
+    assert result.failure.code is AuditFailureCode.INVALID_SEGMENT_NAME
+
+
+def test_verification_reports_earliest_record_failure_before_later_truncation(
+    tmp_path: Path,
+) -> None:
+    """Chronological verification does not let a later parse failure mask tampering."""
+    journal = FilesystemAuditJournal(tmp_path)
+    journal.append(_draft(correlation_id="first"))
+    journal.append(_draft(correlation_id="second"))
+    path = tmp_path / "audit-00000001.jsonl"
+    lines = path.read_bytes().splitlines(keepends=True)
+    first = json.loads(lines[0])
+    first["outcome"] = "altered"
+    lines[0] = json.dumps(first, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    lines[1] = lines[1][:-5]
+    path.write_bytes(b"".join(lines))
+
+    result = journal.verify()
+
+    assert result.failure is not None
+    assert result.failure.code is AuditFailureCode.RECORD_HASH_MISMATCH
+    assert result.failure.sequence == 1
+
+
 def test_verification_reports_unsupported_record_schema(tmp_path: Path) -> None:
     """A newer audit record schema is rejected without guessing its meaning."""
     journal = FilesystemAuditJournal(tmp_path)
@@ -335,6 +525,126 @@ def test_verification_rejects_malformed_manifest(tmp_path: Path) -> None:
 
     assert result.failure is not None
     assert result.failure.code is AuditFailureCode.MANIFEST_MISMATCH
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {"schema": "cqmgr.audit-manifest/v2", "last_sequence": 0},
+        {
+            "schema": "cqmgr.audit-manifest/v1",
+            "last_sequence": True,
+            "last_segment": 0,
+            "last_hash": AUDIT_GENESIS_HASH,
+        },
+        {
+            "schema": "cqmgr.audit-manifest/v1",
+            "last_sequence": 0,
+            "last_segment": 0,
+            "last_hash": AUDIT_GENESIS_HASH,
+            "extra": "field",
+        },
+    ],
+)
+def test_verification_rejects_newer_or_noncanonical_manifest_shape(
+    tmp_path: Path,
+    manifest: dict[str, object],
+) -> None:
+    """Manifest schema and closed field types fail closed before recovery."""
+    journal = FilesystemAuditJournal(tmp_path)
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+
+    result = journal.verify()
+
+    assert result.failure is not None
+    assert result.failure.code is AuditFailureCode.MANIFEST_MISMATCH
+
+
+def test_append_recovery_requires_manifest_to_match_an_exact_chain_prefix(
+    tmp_path: Path,
+) -> None:
+    """An arbitrary lower manifest is not mistaken for a post-fsync crash window."""
+    journal = FilesystemAuditJournal(tmp_path)
+    journal.append(_draft(correlation_id="first"))
+    journal.append(_draft(correlation_id="second"))
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    manifest["last_sequence"] = 1
+    manifest["last_segment"] = 1
+    manifest["last_hash"] = "sha256:" + ("9" * 64)
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+
+    with pytest.raises(AuditIntegrityError, match="manifest-mismatch"):
+        journal.append(_draft(correlation_id="third"))
+
+
+def test_append_recovery_rejects_newer_manifest_before_writing(tmp_path: Path) -> None:
+    """A newer manifest schema cannot be downgraded by a subsequent append."""
+    journal = FilesystemAuditJournal(tmp_path)
+    journal.append(_draft())
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    manifest["schema"] = "cqmgr.audit-manifest/v2"
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+
+    with pytest.raises(AuditIntegrityError, match="manifest-mismatch"):
+        journal.append(_draft())
+
+
+def test_new_segment_directory_entry_is_synced_before_durability_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash hook observes a new segment only after its directory entry is durable."""
+    stages: list[str] = []
+    original_sync = audit_adapter._fsync_directory  # noqa: SLF001
+
+    def record_directory_sync(path: Path) -> None:
+        stages.append("directory-fsync")
+        original_sync(path)
+
+    def record_hook(stage: str) -> None:
+        stages.append(stage)
+
+    monkeypatch.setattr(audit_adapter, "_fsync_directory", record_directory_sync)
+    journal = FilesystemAuditJournal(tmp_path, failure_hook=record_hook)
+    stages.clear()
+
+    journal.append(_draft())
+
+    assert stages[:2] == ["directory-fsync", "after-record-fsync"]
+
+
+def test_rotation_checkpoint_crash_recovers_new_segment_without_lost_intent(
+    tmp_path: Path,
+) -> None:
+    """A crash after a durable rotation checkpoint resumes in the new segment."""
+    journal = FilesystemAuditJournal(tmp_path, max_records_per_segment=2)
+    journal.append(_draft(correlation_id="one"))
+    journal.append(_draft(correlation_id="two"))
+    crashed = False
+
+    def fail_after_checkpoint(stage: str) -> None:
+        nonlocal crashed
+        if stage == "after-record-fsync" and not crashed:
+            crashed = True
+            raise _InjectedCrashError
+
+    crashing = FilesystemAuditJournal(
+        tmp_path,
+        max_records_per_segment=2,
+        failure_hook=fail_after_checkpoint,
+    )
+    with pytest.raises(_InjectedCrashError):
+        crashing.append(_draft(correlation_id="three"))
+
+    recovered = FilesystemAuditJournal(tmp_path, max_records_per_segment=2)
+    record = recovered.append(_draft(correlation_id="three"))
+    records = recovered.query(AuditQuery(limit=10)).records
+
+    assert record.segment == _SECOND_RECORD
+    assert [item.draft.kind for item in records].count(
+        AuditRecordKind.ROTATION_CHECKPOINT
+    ) == 1
+    assert recovered.verify().valid
 
 
 def test_append_rejects_manifest_that_claims_deleted_records(tmp_path: Path) -> None:

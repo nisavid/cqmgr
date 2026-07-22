@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from pathlib import Path
@@ -43,6 +44,7 @@ class InterprocessFileLock:
         if self._stream is not None:
             msg = "interprocess lock is already held by this instance"
             raise RuntimeError(msg)
+        _raise_if_stopped(deadline=deadline, cancellation=cancellation)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         stream = self._path.open("a+b")
         stream.seek(0)
@@ -52,15 +54,61 @@ class InterprocessFileLock:
             os.fsync(stream.fileno())
         try:
             while True:
-                if cancellation is not None:
-                    cancellation.raise_if_cancelled()
+                _raise_if_stopped(deadline=deadline, cancellation=cancellation)
                 try:
                     _try_lock(stream)
                 except BlockingIOError:
-                    if deadline is not None and time.monotonic() >= deadline:
-                        raise CoordinationDeadlineExceededError from None
                     time.sleep(self._poll_seconds)
                 else:
+                    try:
+                        _raise_if_stopped(
+                            deadline=deadline,
+                            cancellation=cancellation,
+                        )
+                    except BaseException:
+                        _unlock(stream)
+                        raise
+                    self._stream = stream
+                    return
+        except BaseException:
+            stream.close()
+            raise
+
+    async def acquire_async(
+        self,
+        *,
+        deadline: float,
+        cancellation: CancellationToken,
+    ) -> None:
+        """Acquire without blocking the event loop or widening caller controls."""
+        if self._stream is not None:
+            msg = "interprocess lock is already held by this instance"
+            raise RuntimeError(msg)
+        _raise_if_stopped(deadline=deadline, cancellation=cancellation)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        stream = self._path.open("a+b")
+        stream.seek(0)
+        if stream.read(1) == b"":
+            stream.write(b"0")
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            while True:
+                _raise_if_stopped(deadline=deadline, cancellation=cancellation)
+                try:
+                    _try_lock(stream)
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    await asyncio.sleep(min(self._poll_seconds, max(remaining, 0)))
+                else:
+                    try:
+                        _raise_if_stopped(
+                            deadline=deadline,
+                            cancellation=cancellation,
+                        )
+                    except BaseException:
+                        _unlock(stream)
+                        raise
                     self._stream = stream
                     return
         except BaseException:
@@ -91,6 +139,17 @@ class InterprocessFileLock:
     ) -> None:
         """Release after the protected transaction."""
         self.release()
+
+
+def _raise_if_stopped(
+    *,
+    deadline: float | None,
+    cancellation: CancellationToken | None,
+) -> None:
+    if cancellation is not None:
+        cancellation.raise_if_cancelled()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise CoordinationDeadlineExceededError
 
 
 if os.name == "nt":

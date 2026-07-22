@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import json
+import math
 import os
+import re
+import secrets
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
@@ -29,6 +34,11 @@ if TYPE_CHECKING:
 _STATE_SCHEMA: Final = "cqmgr.local-budget-state/v1"
 _COALESCE_SCHEMA: Final = "cqmgr.coalesced-read/v1"
 _CANCELLATION_POLL_SECONDS: Final = 0.05
+_BUDGET_KEY_PATTERN: Final = re.compile(
+    r"(provider|project|adc-quota-project):[0-9a-f]{64}"
+)
+_BUDGET_STATE_FIELDS: Final = frozenset({"schema", "entries"})
+_BUDGET_ENTRY_FIELDS: Final = frozenset({"window_started_at", "last_seen_at", "used"})
 
 
 class DeterministicJitter:
@@ -81,7 +91,7 @@ class SharedBudgetCoordinator:
         self._wall_clock = wall_clock
         self._monotonic = monotonic
         self._sleep = sleep
-        self._lock = InterprocessFileLock(self._root / ".budgets.lock")
+        self._lock_path = self._root / ".budgets.lock"
 
     async def acquire(
         self,
@@ -100,16 +110,26 @@ class SharedBudgetCoordinator:
             if remaining <= 0:
                 raise CoordinationDeadlineExceededError
             actual_deadline = time.monotonic() + remaining
-            self._lock.acquire(deadline=actual_deadline, cancellation=cancellation)
+            lock = InterprocessFileLock(self._lock_path)
+            await lock.acquire_async(
+                deadline=actual_deadline,
+                cancellation=cancellation,
+            )
             try:
+                cancellation.raise_if_cancelled()
+                if self._monotonic() >= deadline:
+                    raise CoordinationDeadlineExceededError
                 state = self._read_state()
                 now = self._wall_clock()
                 entries, wait = self._prospective_entries(state, request, now)
                 if wait is None:
                     self._write_state(entries)
+                    cancellation.raise_if_cancelled()
+                    if self._monotonic() >= deadline:
+                        raise CoordinationDeadlineExceededError
                     return BudgetGrant(charged_at=now, request=request)
             finally:
-                self._lock.release()
+                lock.release()
             remaining = deadline - self._monotonic()
             if wait is None or wait >= remaining:
                 raise CoordinationDeadlineExceededError
@@ -184,12 +204,46 @@ class SharedBudgetCoordinator:
         except (OSError, json.JSONDecodeError) as error:
             msg = "local budget state is unreadable"
             raise RuntimeError(msg) from error
-        if state.get("schema") != _STATE_SCHEMA or not isinstance(
-            state.get("entries"), dict
-        ):
+        if not isinstance(state, dict):
+            msg = "local budget state is malformed"
+            raise TypeError(msg)
+        if state.get("schema") != _STATE_SCHEMA:
             msg = "local budget state has an unsupported schema"
             raise RuntimeError(msg)
+        if set(state) != _BUDGET_STATE_FIELDS or not isinstance(state["entries"], dict):
+            msg = "local budget state is malformed"
+            raise RuntimeError(msg)
+        for key, entry in state["entries"].items():
+            self._validate_budget_entry(key, entry)
         return state
+
+    def _validate_budget_entry(self, key: object, entry: object) -> None:
+        if not isinstance(key, str) or _BUDGET_KEY_PATTERN.fullmatch(key) is None:
+            msg = "local budget state contains an invalid entry key"
+            raise RuntimeError(msg)
+        if not isinstance(entry, dict) or set(entry) != _BUDGET_ENTRY_FIELDS:
+            msg = "local budget state contains a malformed entry"
+            raise RuntimeError(msg)
+        window_started = entry["window_started_at"]
+        last_seen = entry["last_seen_at"]
+        used = entry["used"]
+        if not _is_finite_nonnegative_number(window_started) or not (
+            _is_finite_nonnegative_number(last_seen)
+        ):
+            msg = "local budget state contains an invalid clock"
+            raise RuntimeError(msg)
+        if last_seen < window_started:
+            msg = "local budget state contains a reversed clock"
+            raise RuntimeError(msg)
+        scope = BudgetScope(key.partition(":")[0])
+        if (
+            isinstance(used, bool)
+            or not isinstance(used, int)
+            or used < 0
+            or used > self._limits[scope].capacity
+        ):
+            msg = "local budget state contains invalid usage"
+            raise RuntimeError(msg)
 
     def _write_state(self, entries: dict[str, Any]) -> None:
         _atomic_write_json(
@@ -202,24 +256,23 @@ class SharedBudgetCoordinator:
 class SharedReadCoalescer:
     """Share one normalized safe read result with concurrent local callers."""
 
-    def __init__(  # noqa: PLR0913 - each injected clock is an explicit test seam
+    def __init__(
         self,
         root: str | PathLike[str],
         *,
         result_ttl_seconds: float = 0.25,
-        leader_lease_seconds: float = 30.0,
         wall_clock: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         """Open an installation-local coordination directory."""
+        if not _is_finite_nonnegative_number(result_ttl_seconds):
+            msg = "coalesced result TTL must be non-negative seconds"
+            raise ValueError(msg)
         self._root = Path(root)
         self._root.mkdir(parents=True, exist_ok=True)
         self._result_ttl = result_ttl_seconds
-        self._leader_lease = leader_lease_seconds
         self._wall_clock = wall_clock
         self._monotonic = monotonic
-        self._sleep = sleep
 
     async def run(
         self,
@@ -233,71 +286,153 @@ class SharedReadCoalescer:
         digest = hashlib.sha256(identity.encode()).hexdigest()
         lock = InterprocessFileLock(self._root / f".{digest}.lock")
         state_path = self._root / f"{digest}.json"
-        while True:
+        cancellation.raise_if_cancelled()
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise CoordinationDeadlineExceededError
+        await lock.acquire_async(
+            deadline=time.monotonic() + remaining,
+            cancellation=cancellation,
+        )
+        try:
             cancellation.raise_if_cancelled()
-            remaining = deadline - self._monotonic()
+            if self._monotonic() >= deadline:
+                raise CoordinationDeadlineExceededError
+            now = self._wall_clock()
+            state = _read_optional_json(state_path)
+            cached = _read_cached_result(state, now=now)
+            if cached is not None:
+                return cached
+            owner = secrets.token_hex(16)
+            _atomic_write_json(
+                self._root,
+                state_path.name,
+                {
+                    "schema": _COALESCE_SCHEMA,
+                    "status": "in-flight",
+                    "owner": owner,
+                },
+            )
+            try:
+                value = await _run_bounded_work(
+                    work,
+                    deadline=deadline,
+                    cancellation=cancellation,
+                    monotonic=self._monotonic,
+                )
+                _require_redacted_text(value)
+                cancellation.raise_if_cancelled()
+                _raise_deadline_if_elapsed(deadline, self._monotonic)
+            except BaseException:
+                state_path.unlink(missing_ok=True)
+                raise
+            _atomic_write_json(
+                self._root,
+                state_path.name,
+                {
+                    "schema": _COALESCE_SCHEMA,
+                    "status": "done",
+                    "owner": owner,
+                    "expires_at": self._wall_clock() + self._result_ttl,
+                    "value": base64.b64encode(value.value.encode()).decode(),
+                },
+            )
+            return value
+        finally:
+            lock.release()
+
+
+async def _run_bounded_work(
+    work: Callable[[], Awaitable[RedactedText]],
+    *,
+    deadline: float,
+    cancellation: CancellationToken,
+    monotonic: Callable[[], float],
+) -> RedactedText:
+    task = asyncio.ensure_future(work())
+    try:
+        while not task.done():
+            cancellation.raise_if_cancelled()
+            remaining = deadline - monotonic()
             if remaining <= 0:
                 raise CoordinationDeadlineExceededError
-            lock.acquire(
-                deadline=time.monotonic() + remaining, cancellation=cancellation
+            await asyncio.wait(
+                {task},
+                timeout=min(_CANCELLATION_POLL_SECONDS, remaining),
             )
-            leader = False
-            try:
-                now = self._wall_clock()
-                state = _read_optional_json(state_path)
-                if (
-                    state is not None
-                    and state.get("schema") == _COALESCE_SCHEMA
-                    and state.get("status") == "done"
-                    and float(state["expires_at"]) >= now
-                ):
-                    value = base64.b64decode(state["value"]).decode()
-                    return RedactedText(value)
-                if (
-                    state is None
-                    or state.get("schema") != _COALESCE_SCHEMA
-                    or state.get("status") != "in-flight"
-                    or float(state.get("lease_expires_at", 0)) < now
-                ):
-                    _atomic_write_json(
-                        self._root,
-                        state_path.name,
-                        {
-                            "schema": _COALESCE_SCHEMA,
-                            "status": "in-flight",
-                            "lease_expires_at": now + self._leader_lease,
-                        },
-                    )
-                    leader = True
-            finally:
-                lock.release()
-            if leader:
-                try:
-                    value = await work()
-                    _require_redacted_text(value)
-                except BaseException:
-                    lock.acquire()
-                    try:
-                        state_path.unlink(missing_ok=True)
-                    finally:
-                        lock.release()
-                    raise
-                lock.acquire()
-                try:
-                    _atomic_write_json(
-                        self._root,
-                        state_path.name,
-                        {
-                            "schema": _COALESCE_SCHEMA,
-                            "status": "done",
-                            "expires_at": self._wall_clock() + self._result_ttl,
-                            "value": base64.b64encode(value.value.encode()).decode(),
-                        },
-                    )
-                finally:
-                    lock.release()
-                return value
-            await self._sleep(min(0.01, remaining))
+        return await task
+    finally:
+        if not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+def _read_cached_result(
+    state: dict[str, Any] | None,
+    *,
+    now: float,
+) -> RedactedText | None:
+    if state is None:
+        return None
+    if state.get("schema") != _COALESCE_SCHEMA:
+        msg = "local coalescing state has an unsupported schema"
+        raise RuntimeError(msg)
+    status = state.get("status")
+    if status == "in-flight":
+        if (
+            set(state) != {"schema", "status", "owner"}
+            or not isinstance(state.get("owner"), str)
+            or not state["owner"]
+        ):
+            msg = "local coalescing state is malformed"
+            raise RuntimeError(msg)
+        return None
+    if status != "done" or set(state) != {
+        "schema",
+        "status",
+        "owner",
+        "expires_at",
+        "value",
+    }:
+        msg = "local coalescing state is malformed"
+        raise RuntimeError(msg)
+    expires_at = state["expires_at"]
+    owner = state["owner"]
+    value = state["value"]
+    if (
+        not _is_finite_nonnegative_number(expires_at)
+        or not isinstance(owner, str)
+        or not owner
+        or not isinstance(value, str)
+    ):
+        msg = "local coalescing state is malformed"
+        raise RuntimeError(msg)
+    if expires_at < now:
+        return None
+    try:
+        decoded = base64.b64decode(value, validate=True).decode()
+    except (binascii.Error, UnicodeDecodeError) as error:
+        msg = "local coalescing state is malformed"
+        raise RuntimeError(msg) from error
+    return RedactedText(decoded)
+
+
+def _is_finite_nonnegative_number(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
+def _raise_deadline_if_elapsed(
+    deadline: float,
+    monotonic: Callable[[], float],
+) -> None:
+    if monotonic() >= deadline:
+        raise CoordinationDeadlineExceededError
 
 
 def _read_optional_json(path: Path) -> dict[str, Any] | None:
