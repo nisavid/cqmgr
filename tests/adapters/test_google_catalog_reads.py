@@ -221,6 +221,8 @@ def _compute_pages() -> list[ComputeMachineTypesPage]:
                 machines.append(
                     compute_v1.MachineType(
                         name=raw["name"],
+                        zone=raw.get("zone"),
+                        self_link=raw.get("selfLink"),
                         accelerators=accelerators,
                         deprecated=(
                             compute_v1.DeprecationStatus(
