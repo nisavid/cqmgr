@@ -1,5 +1,6 @@
 """Bounded logical quota-query and product-snapshot contracts."""
 
+from datetime import UTC, datetime, timedelta
 from typing import cast
 
 import pytest
@@ -34,8 +35,14 @@ from cqmgr.domain.quotas import (
     QuotaUnit,
 )
 from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
+from cqmgr.domain.status import (
+    EffectiveConfirmation,
+    GrantSatisfaction,
+    Reconciliation,
+)
 
 CURSOR_OFFSET = 25
+OBSERVED_AT = datetime(2026, 7, 22, 8, tzinfo=UTC)
 
 
 def _scope() -> ResourceScope:
@@ -58,6 +65,8 @@ def test_query_has_exactly_one_typed_service_or_catalog_group_source() -> None:
     assert generic.source == ServiceSource("compute.googleapis.com")
     assert grouped.source == CatalogGroupSource(CatalogGroupId.COMPUTE_ACCELERATORS)
     assert grouped.filters.services == ("compute.googleapis.com",)
+    assert generic.services == ("compute.googleapis.com",)
+    assert grouped.services == ("compute.googleapis.com",)
 
 
 def test_query_rejects_untyped_or_noncanonical_source() -> None:
@@ -102,7 +111,15 @@ def _item(  # noqa: PLR0913
     unit: str = "count",
     effective: int | None = 1,
     cataloged: bool = True,
+    usage: int | None = None,
+    desired: int | None = None,
+    granted: int | None = None,
+    reconciliation: Reconciliation = Reconciliation.UNKNOWN,
+    grant_satisfaction: GrantSatisfaction = GrantSatisfaction.UNKNOWN,
+    effective_confirmation: EffectiveConfirmation = EffectiveConfirmation.UNOBSERVED,
+    evidence_observed_at: datetime = OBSERVED_AT,
 ) -> QuotaQueryItem:
+    quota_unit = QuotaUnit(unit)
     return QuotaQueryItem(
         identity=EffectiveQuotaSliceIdentity(
             resource_scope=_scope(),
@@ -122,8 +139,15 @@ def _item(  # noqa: PLR0913
             mutable=False,
         ),
         effective_value=(
-            None if effective is None else QuotaQuantity(effective, QuotaUnit(unit))
+            None if effective is None else QuotaQuantity(effective, quota_unit)
         ),
+        usage_value=None if usage is None else QuotaQuantity(usage, quota_unit),
+        desired_value=None if desired is None else QuotaQuantity(desired, quota_unit),
+        granted_value=None if granted is None else QuotaQuantity(granted, quota_unit),
+        reconciliation=reconciliation,
+        grant_satisfaction=grant_satisfaction,
+        effective_confirmation=effective_confirmation,
+        evidence_observed_at=evidence_observed_at,
     )
 
 
@@ -170,8 +194,30 @@ def _metadata(query: QuotaQuery, *, complete: bool = True) -> QuerySnapshotMetad
             "2026-07-22",
             "sha256:" + "b" * 64,
         ),
+        evidence_contract="cqmgr.quota-query-evidence/v1",
+        observed_at=OBSERVED_AT,
+        expires_at=OBSERVED_AT + timedelta(minutes=15),
         complete=complete,
     )
+
+
+def test_snapshot_metadata_binds_evidence_contract_and_bounded_lifetime() -> None:
+    """A product cursor cannot outlive or silently change its evidence contract."""
+    query = QuotaQuery(_scope(), ServiceSource("compute.googleapis.com"))
+    metadata = _metadata(query)
+
+    assert metadata.evidence_contract == "cqmgr.quota-query-evidence/v1"
+    assert metadata.expires_at > metadata.observed_at
+    with pytest.raises(ValueError, match="expires_at"):
+        QuerySnapshotMetadata(
+            snapshot_id=metadata.snapshot_id,
+            query=query,
+            catalog=metadata.catalog,
+            evidence_contract=metadata.evidence_contract,
+            observed_at=metadata.observed_at,
+            expires_at=metadata.observed_at,
+            complete=True,
+        )
 
 
 def test_sort_requires_complete_snapshot_and_uses_deterministic_text_ties() -> None:
@@ -260,6 +306,80 @@ def test_numeric_sort_rejects_comparison_across_native_units() -> None:
 
     with pytest.raises(IncompatibleSortUnitsError, match="native unit"):
         snapshot.sorted_items()
+
+
+def test_status_filters_and_all_public_sort_fields_share_the_query_contract() -> None:
+    """Request axes and quantities remain filterable and deterministically sortable."""
+    filters = QuotaQueryFilters(
+        reconciliations=(Reconciliation.SETTLED,),
+        grant_satisfactions=(GrantSatisfaction.FULL,),
+        effective_confirmations=(EffectiveConfirmation.CONFIRMED,),
+    )
+    query = QuotaQuery(
+        resource_scope=_scope(),
+        source=ServiceSource("compute.googleapis.com"),
+        filters=filters,
+        sort=(
+            QuotaSort(QuotaSortField.USAGE, SortDirection.DESC),
+            QuotaSort(QuotaSortField.DESIRED),
+            QuotaSort(QuotaSortField.GRANTED),
+            QuotaSort(QuotaSortField.RECONCILIATION),
+            QuotaSort(QuotaSortField.GRANT_SATISFACTION),
+            QuotaSort(QuotaSortField.EFFECTIVE_CONFIRMATION),
+            QuotaSort(QuotaSortField.EVIDENCE_AGE),
+        ),
+    )
+    matching = _item(
+        "matching",
+        display_name="Matching",
+        accelerator=None,
+        location="us-central1",
+        usage=8,
+        desired=16,
+        granted=16,
+        reconciliation=Reconciliation.SETTLED,
+        grant_satisfaction=GrantSatisfaction.FULL,
+        effective_confirmation=EffectiveConfirmation.CONFIRMED,
+    )
+    unobserved = _item(
+        "unobserved",
+        display_name="Unobserved",
+        accelerator=None,
+        location="us-central1",
+    )
+
+    assert filters.matches(matching)
+    assert not filters.matches(unobserved)
+    snapshot = QuotaQuerySnapshot(_metadata(query), (unobserved, matching))
+    assert snapshot.sorted_items() == (matching,)
+
+
+def test_evidence_age_sorts_older_evidence_after_fresher_evidence() -> None:
+    """Evidence age uses the snapshot observation time and keeps unknown age last."""
+    query = QuotaQuery(
+        resource_scope=_scope(),
+        source=ServiceSource("compute.googleapis.com"),
+        sort=(QuotaSort(QuotaSortField.EVIDENCE_AGE),),
+    )
+    fresh = _item(
+        "fresh",
+        display_name="Fresh",
+        accelerator=None,
+        location="us-central1",
+        evidence_observed_at=OBSERVED_AT,
+    )
+    old = _item(
+        "old",
+        display_name="Old",
+        accelerator=None,
+        location="us-central1",
+        evidence_observed_at=OBSERVED_AT - timedelta(hours=2),
+    )
+
+    assert [
+        item.identity.quota_id
+        for item in QuotaQuerySnapshot(_metadata(query), (old, fresh)).sorted_items()
+    ] == ["fresh", "old"]
 
 
 def test_opaque_cursor_metadata_binds_snapshot_and_offset_without_provider_token() -> (

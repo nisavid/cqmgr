@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from functools import cmp_to_key
 from unicodedata import normalize
@@ -19,8 +20,15 @@ from cqmgr.domain.quotas import (
     QuotaScope,
 )
 from cqmgr.domain.scopes import ResourceScope
+from cqmgr.domain.status import (
+    EffectiveConfirmation,
+    GrantSatisfaction,
+    Reconciliation,
+)
+from cqmgr.domain.time import require_utc
 
 _MINIMUM_DNS_LABELS = 2
+QUOTA_QUERY_EVIDENCE_CONTRACT = "cqmgr.quota-query-evidence/v1"
 _CATALOG_GROUP_SERVICES = {
     CatalogGroupId.COMPUTE_ACCELERATORS: frozenset({"compute.googleapis.com"}),
     CatalogGroupId.CLOUD_TPU_LEGACY: frozenset({"tpu.googleapis.com"}),
@@ -53,6 +61,13 @@ class QuotaSortField(StrEnum):
     QUOTA_SCOPE = "quota-scope"
     QUOTA_POOL = "quota-pool"
     EFFECTIVE = "effective"
+    USAGE = "usage"
+    DESIRED = "desired"
+    GRANTED = "granted"
+    RECONCILIATION = "reconciliation"
+    GRANT_SATISFACTION = "grant-satisfaction"
+    EFFECTIVE_CONFIRMATION = "effective-confirmation"
+    EVIDENCE_AGE = "evidence-age"
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +125,9 @@ class QuotaQueryFilters:
     cataloged: bool | None = None
     guided: bool | None = None
     mutable: bool | None = None
+    reconciliations: tuple[Reconciliation, ...] = ()
+    grant_satisfactions: tuple[GrantSatisfaction, ...] = ()
+    effective_confirmations: tuple[EffectiveConfirmation, ...] = ()
     text: str | None = None
 
     def __post_init__(self) -> None:
@@ -148,6 +166,17 @@ class QuotaQueryFilters:
             if value is not None and not isinstance(value, bool):
                 msg = f"{name} filter must be bool or None"
                 raise TypeError(msg)
+        _require_status_filter_types(
+            (
+                ("reconciliations", self.reconciliations, Reconciliation),
+                ("grant_satisfactions", self.grant_satisfactions, GrantSatisfaction),
+                (
+                    "effective_confirmations",
+                    self.effective_confirmations,
+                    EffectiveConfirmation,
+                ),
+            )
+        )
         if self.text is not None and (
             not isinstance(self.text, str) or not normalize("NFC", self.text)
         ):
@@ -168,6 +197,11 @@ class QuotaQueryFilters:
             self.cataloged is None or item.predicates.cataloged is self.cataloged,
             self.guided is None or item.predicates.guided is self.guided,
             self.mutable is None or item.predicates.mutable is self.mutable,
+            not self.reconciliations or item.reconciliation in self.reconciliations,
+            not self.grant_satisfactions
+            or item.grant_satisfaction in self.grant_satisfactions,
+            not self.effective_confirmations
+            or item.effective_confirmation in self.effective_confirmations,
             self.text is None or _matches_text(item, self.text),
         )
         return all(checks)
@@ -184,6 +218,13 @@ class QuotaQueryItem:
     quota_pool: str | None
     predicates: CatalogPredicates
     effective_value: QuotaQuantity | None
+    usage_value: QuotaQuantity | None = None
+    desired_value: QuotaQuantity | None = None
+    granted_value: QuotaQuantity | None = None
+    reconciliation: Reconciliation = Reconciliation.UNKNOWN
+    grant_satisfaction: GrantSatisfaction = GrantSatisfaction.UNKNOWN
+    effective_confirmation: EffectiveConfirmation = EffectiveConfirmation.UNOBSERVED
+    evidence_observed_at: datetime | None = None
 
     def __post_init__(self) -> None:
         """Keep optional product metadata separate from canonical slice identity."""
@@ -208,10 +249,58 @@ class QuotaQueryItem:
         if not isinstance(self.predicates, CatalogPredicates):
             msg = "predicates must be CatalogPredicates"
             raise TypeError(msg)
-        if self.effective_value is not None and not isinstance(
-            self.effective_value, QuotaQuantity
+        _require_query_item_quantities(
+            (
+                ("effective_value", self.effective_value),
+                ("usage_value", self.usage_value),
+                ("desired_value", self.desired_value),
+                ("granted_value", self.granted_value),
+            )
+        )
+        _require_query_item_status_types(
+            (
+                ("reconciliation", self.reconciliation, Reconciliation),
+                ("grant_satisfaction", self.grant_satisfaction, GrantSatisfaction),
+                (
+                    "effective_confirmation",
+                    self.effective_confirmation,
+                    EffectiveConfirmation,
+                ),
+            )
+        )
+        if self.evidence_observed_at is not None:
+            require_utc(self.evidence_observed_at, "evidence_observed_at")
+
+
+def _require_status_filter_types(
+    filters: tuple[tuple[str, object, type[StrEnum]], ...],
+) -> None:
+    for name, values, enum_type in filters:
+        if not isinstance(values, tuple) or any(
+            not isinstance(value, enum_type) for value in values
         ):
-            msg = "effective_value must be QuotaQuantity or None"
+            msg = f"{name} must contain typed status values"
+            raise TypeError(msg)
+
+
+def _require_query_item_quantities(
+    quantities: tuple[tuple[str, QuotaQuantity | None], ...],
+) -> None:
+    for name, value in quantities:
+        if value is not None and not isinstance(value, QuotaQuantity):
+            msg = f"{name} must be QuotaQuantity or None"
+            raise TypeError(msg)
+    if len({value.unit for _, value in quantities if value is not None}) > 1:
+        msg = "query item quantities must use one native quota unit"
+        raise ValueError(msg)
+
+
+def _require_query_item_status_types(
+    statuses: tuple[tuple[str, object, type[StrEnum]], ...],
+) -> None:
+    for name, value, enum_type in statuses:
+        if not isinstance(value, enum_type):
+            msg = f"{name} must use {enum_type.__name__}"
             raise TypeError(msg)
 
 
@@ -257,6 +346,13 @@ class QuotaQuery:
             msg = f"service filters must remain within the selected {source_kind}"
             raise ValueError(msg)
 
+    @property
+    def services(self) -> tuple[str, ...]:
+        """Return the stable provider services required by the selected source."""
+        if isinstance(self.source, ServiceSource):
+            return (self.source.service,)
+        return tuple(sorted(_CATALOG_GROUP_SERVICES[self.source.group_id]))
+
 
 @dataclass(frozen=True, slots=True)
 class QuerySnapshotMetadata:
@@ -265,6 +361,9 @@ class QuerySnapshotMetadata:
     snapshot_id: str
     query: QuotaQuery
     catalog: CatalogMetadata
+    evidence_contract: str
+    observed_at: datetime
+    expires_at: datetime
     complete: bool
 
     def __post_init__(self) -> None:
@@ -278,6 +377,14 @@ class QuerySnapshotMetadata:
         if not isinstance(self.catalog, CatalogMetadata):
             msg = "snapshot catalog must be CatalogMetadata"
             raise TypeError(msg)
+        if self.evidence_contract != QUOTA_QUERY_EVIDENCE_CONTRACT:
+            msg = f"unsupported evidence contract: {self.evidence_contract!r}"
+            raise ValueError(msg)
+        require_utc(self.observed_at, "observed_at")
+        require_utc(self.expires_at, "expires_at")
+        if self.expires_at <= self.observed_at:
+            msg = "snapshot expires_at must follow observed_at"
+            raise ValueError(msg)
         if not isinstance(self.complete, bool):
             msg = "snapshot complete must be bool"
             raise TypeError(msg)
@@ -349,11 +456,19 @@ def _validate_sort_units(
     items: tuple[QuotaQueryItem, ...],
     sorts: tuple[QuotaSort, ...],
 ) -> None:
-    if any(sort.field is QuotaSortField.EFFECTIVE for sort in sorts):
+    numeric_fields = {
+        QuotaSortField.EFFECTIVE,
+        QuotaSortField.USAGE,
+        QuotaSortField.DESIRED,
+        QuotaSortField.GRANTED,
+    }
+    for sort in sorts:
+        if sort.field not in numeric_fields:
+            continue
         units = {
-            item.effective_value.unit
+            value.unit
             for item in items
-            if item.effective_value is not None
+            if isinstance((value := _field_value(item, sort.field)), QuotaQuantity)
         }
         if len(units) > 1:
             msg = "numeric sorting cannot compare more than one native unit"
@@ -376,6 +491,9 @@ def _compare_field(
         result = _compare_values(left_value.value, right_value.value)
     elif isinstance(left_value, str) and isinstance(right_value, str):
         result = _compare_values(_text_key(left_value), _text_key(right_value))
+    elif isinstance(left_value, datetime) and isinstance(right_value, datetime):
+        # A smaller evidence age means a later observation timestamp.
+        result = -_compare_values(left_value, right_value)
     else:
         msg = "sort values must have one coherent domain type"
         raise TypeError(msg)
@@ -384,8 +502,8 @@ def _compare_field(
 
 def _field_value(
     item: QuotaQueryItem, sort_field: QuotaSortField
-) -> str | QuotaQuantity | None:
-    values: dict[QuotaSortField, str | QuotaQuantity | None] = {
+) -> str | QuotaQuantity | datetime | None:
+    values: dict[QuotaSortField, str | QuotaQuantity | datetime | None] = {
         QuotaSortField.QUOTA_ID: item.identity.quota_id,
         QuotaSortField.DISPLAY_NAME: item.display_name,
         QuotaSortField.SERVICE: item.identity.service,
@@ -396,6 +514,13 @@ def _field_value(
         QuotaSortField.QUOTA_SCOPE: item.identity.quota_scope.value,
         QuotaSortField.QUOTA_POOL: item.quota_pool,
         QuotaSortField.EFFECTIVE: item.effective_value,
+        QuotaSortField.USAGE: item.usage_value,
+        QuotaSortField.DESIRED: item.desired_value,
+        QuotaSortField.GRANTED: item.granted_value,
+        QuotaSortField.RECONCILIATION: item.reconciliation.value,
+        QuotaSortField.GRANT_SATISFACTION: item.grant_satisfaction.value,
+        QuotaSortField.EFFECTIVE_CONFIRMATION: item.effective_confirmation.value,
+        QuotaSortField.EVIDENCE_AGE: item.evidence_observed_at,
     }
     return values[sort_field]
 
