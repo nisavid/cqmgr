@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
 from typing import TYPE_CHECKING, cast, override
 from unittest.mock import patch
@@ -77,6 +80,35 @@ class _FakeKeyring:
         if self.error is not None:
             raise self.error
         del self.values[(service, username)]
+
+
+class _SlowFakeKeyring(_FakeKeyring):
+    """Backend seam that exposes overlapping calls from one shared adapter."""
+
+    active_calls: int
+    maximum_active_calls: int
+    counter_lock: threading.Lock
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.active_calls = 0
+        self.maximum_active_calls = 0
+        self.counter_lock = threading.Lock()
+
+    @override
+    def get_password(self, service: str, username: str) -> str | None:
+        with self.counter_lock:
+            self.active_calls += 1
+            self.maximum_active_calls = max(
+                self.maximum_active_calls,
+                self.active_calls,
+            )
+        try:
+            time.sleep(0.02)
+            return super().get_password(service, username)
+        finally:
+            with self.counter_lock:
+                self.active_calls -= 1
 
 
 def _backend(module: str, name: str = "Keyring") -> _FakeKeyring:
@@ -204,6 +236,25 @@ def test_create_is_once_verified_and_never_replaces_an_existing_secret(
     missing = store.delete(reference)
     assert deleted.status is SecretStoreStatus.DELETED
     assert missing.status is SecretStoreStatus.MISSING
+    assert backend.calls.count("delete") == 1
+    assert backend.calls.count("set") == 1
+
+
+def test_shared_store_serializes_concurrent_threads(tmp_path: Path) -> None:
+    """One injected store serializes local threads instead of failing contention."""
+    backend = _SlowFakeKeyring()
+    store = _trusted_store(
+        backend,
+        NativePlanInterprocessLock(tmp_path / "keyring.lock"),
+    )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        outcomes = tuple(
+            executor.map(lambda _index: store.get(_reference()), range(16))
+        )
+
+    assert {outcome.status for outcome in outcomes} == {SecretStoreStatus.MISSING}
+    assert backend.maximum_active_calls == 1
 
 
 @pytest.mark.parametrize(
@@ -301,6 +352,14 @@ class _MismatchingKeyring(_FakeKeyring):
         self.values[(service, username)] = "cqmgr-secret/v1:bWlzbWF0Y2g="
 
 
+class _IgnoringDeleteKeyring(_FakeKeyring):
+    @override
+    def delete_password(self, service: str, username: str) -> None:
+        """Acknowledge deletion without removing the stored value."""
+        del service, username
+        self.calls.append("delete")
+
+
 def test_create_read_after_write_mismatch_and_keyring_error_are_conflicts(
     tmp_path: Path,
 ) -> None:
@@ -330,6 +389,25 @@ def test_create_read_after_write_mismatch_and_keyring_error_are_conflicts(
     )
     delete_outcome = store.delete(_reference())
     assert delete_outcome.status is SecretStoreStatus.FAILED
+
+
+def test_delete_verifies_absence_without_retry(tmp_path: Path) -> None:
+    """An ignored native deletion cannot be reported as durable cleanup."""
+    backend = _IgnoringDeleteKeyring()
+    store = _trusted_store(
+        backend,
+        NativePlanInterprocessLock(tmp_path / "ignored-delete.lock"),
+    )
+    reference = _reference()
+    secret = SecretValue(b"a" * 32)
+    assert store.create(reference, secret).status is SecretStoreStatus.CREATED
+
+    outcome = store.delete(reference)
+
+    assert outcome.status is SecretStoreStatus.CONFLICT
+    assert store.get(reference).status is SecretStoreStatus.AVAILABLE
+    assert backend.calls.count("delete") == 1
+    assert backend.calls.count("set") == 1
 
 
 def test_spoofed_native_module_and_name_are_not_allowlisted(tmp_path: Path) -> None:
@@ -394,6 +472,39 @@ def test_native_plan_lock_rejects_invalid_configuration_and_reentrancy(
         with pytest.raises(RuntimeError, match="not reentrant"):
             lock.__enter__()
     lock.__exit__()
+
+
+def test_native_plan_lock_serializes_threads_and_rejects_true_recursion(
+    tmp_path: Path,
+) -> None:
+    """A shared lock waits for another thread but rejects its owner's recursion."""
+    lock = NativePlanInterprocessLock(tmp_path / "lock")
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+
+    def first() -> None:
+        with lock:
+            first_entered.set()
+            assert release_first.wait(timeout=1)
+
+    def second() -> None:
+        assert first_entered.wait(timeout=1)
+        with lock:
+            second_entered.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(first)
+        second_future = executor.submit(second)
+        assert first_entered.wait(timeout=1)
+        assert not second_entered.wait(timeout=0.05)
+        release_first.set()
+        first_future.result(timeout=1)
+        second_future.result(timeout=1)
+
+    assert second_entered.is_set()
+    with lock, pytest.raises(RuntimeError, match="not reentrant"):
+        lock.__enter__()
 
 
 @pytest.mark.parametrize(

@@ -115,7 +115,12 @@ class NativeSecretStore:
                 if isinstance(existing, SecretStoreOutcome):
                     return existing
                 self._backend.delete_password(reference.service, reference.username)
-                return SecretStoreOutcome(SecretStoreStatus.DELETED)
+                verified = self._get_raw(reference)
+                if isinstance(verified, SecretStoreOutcome):
+                    if verified.status is SecretStoreStatus.MISSING:
+                        return SecretStoreOutcome(SecretStoreStatus.DELETED)
+                    return verified
+                return SecretStoreOutcome(SecretStoreStatus.CONFLICT)
         except Exception as error:  # noqa: BLE001
             return _failure(error)
 
