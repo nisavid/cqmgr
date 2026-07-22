@@ -1,0 +1,1 @@
+"""Persistence adapter contract tests."""
