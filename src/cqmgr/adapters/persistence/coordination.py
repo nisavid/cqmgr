@@ -39,6 +39,7 @@ _BUDGET_KEY_PATTERN: Final = re.compile(
 )
 _BUDGET_STATE_FIELDS: Final = frozenset({"schema", "entries"})
 _BUDGET_ENTRY_FIELDS: Final = frozenset({"window_started_at", "last_seen_at", "used"})
+_BACKGROUND_LEADERS: set[asyncio.Task[None]] = set()
 
 
 class DeterministicJitter:
@@ -53,7 +54,12 @@ class DeterministicJitter:
 
     def apply(self, delay: float, *, attempt: int, identity: str) -> float:
         """Return a stable value in the inclusive half-to-full-delay interval."""
-        if isinstance(delay, bool) or not isinstance(delay, (int, float)) or delay < 0:
+        if (
+            isinstance(delay, bool)
+            or not isinstance(delay, (int, float))
+            or not math.isfinite(delay)
+            or delay < 0
+        ):
             msg = "jitter delay must be non-negative seconds"
             raise ValueError(msg)
         if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
@@ -262,7 +268,6 @@ class SharedReadCoalescer:
         root: str | PathLike[str],
         *,
         result_ttl_seconds: float = 0.25,
-        wall_clock: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         """Open an installation-local coordination directory."""
@@ -272,7 +277,6 @@ class SharedReadCoalescer:
         self._root = Path(root)
         self._root.mkdir(parents=True, exist_ok=True)
         self._result_ttl = result_ttl_seconds
-        self._wall_clock = wall_clock
         self._monotonic = monotonic
 
     async def run(
@@ -295,14 +299,20 @@ class SharedReadCoalescer:
             deadline=time.monotonic() + remaining,
             cancellation=cancellation,
         )
+        release_lock = True
         try:
             cancellation.raise_if_cancelled()
             if self._monotonic() >= deadline:
                 raise CoordinationDeadlineExceededError
-            now = self._wall_clock()
             state = _read_optional_json(state_path)
-            cached = _read_cached_result(state, now=now)
+            cached = _read_cached_result(
+                state,
+                now=self._monotonic(),
+                ttl=self._result_ttl,
+            )
             if cached is not None:
+                cancellation.raise_if_cancelled()
+                _raise_deadline_if_elapsed(deadline, self._monotonic)
                 return cached
             owner = secrets.token_hex(16)
             _atomic_write_json(
@@ -324,6 +334,18 @@ class SharedReadCoalescer:
                 _require_redacted_text(value)
                 cancellation.raise_if_cancelled()
                 _raise_deadline_if_elapsed(deadline, self._monotonic)
+            except _DetachedLeaderError as detached:
+                cleanup = asyncio.create_task(
+                    _finish_detached_leader(
+                        detached.task,
+                        state_path=state_path,
+                        lock=lock,
+                    )
+                )
+                _BACKGROUND_LEADERS.add(cleanup)
+                cleanup.add_done_callback(_BACKGROUND_LEADERS.discard)
+                release_lock = False
+                raise detached.cause from detached
             except BaseException:
                 state_path.unlink(missing_ok=True)
                 raise
@@ -334,13 +356,16 @@ class SharedReadCoalescer:
                     "schema": _COALESCE_SCHEMA,
                     "status": "done",
                     "owner": owner,
-                    "expires_at": self._wall_clock() + self._result_ttl,
+                    "published_at": self._monotonic(),
                     "value": base64.b64encode(value.value.encode()).decode(),
                 },
             )
+            cancellation.raise_if_cancelled()
+            _raise_deadline_if_elapsed(deadline, self._monotonic)
             return value
         finally:
-            lock.release()
+            if release_lock:
+                lock.release()
 
 
 async def _run_bounded_work(
@@ -354,25 +379,52 @@ async def _run_bounded_work(
     try:
         while not task.done():
             cancellation.raise_if_cancelled()
+            _raise_deadline_if_elapsed(deadline, monotonic)
             remaining = deadline - monotonic()
-            if remaining <= 0:
-                raise CoordinationDeadlineExceededError
             await asyncio.wait(
                 {task},
                 timeout=min(_CANCELLATION_POLL_SECONDS, remaining),
             )
         return await task
-    finally:
-        if not task.done():
-            task.cancel()
+    except BaseException as error:
+        if task.done():
+            raise
+        raise _DetachedLeaderError(task, error) from error
+
+
+class _DetachedLeaderError(Exception):
+    def __init__(
+        self,
+        task: asyncio.Future[RedactedText],
+        cause: BaseException,
+    ) -> None:
+        super().__init__("coalesced leader ownership moved to background cleanup")
+        self.task = task
+        self.cause = cause
+
+
+async def _finish_detached_leader(
+    task: asyncio.Future[RedactedText],
+    *,
+    state_path: Path,
+    lock: InterprocessFileLock,
+) -> None:
+    try:
+        while not task.done():
             with suppress(asyncio.CancelledError):
-                await task
+                await asyncio.shield(task)
+        with suppress(BaseException):
+            task.result()
+    finally:
+        state_path.unlink(missing_ok=True)  # noqa: ASYNC240 - short local cleanup
+        lock.release()
 
 
 def _read_cached_result(
     state: dict[str, Any] | None,
     *,
     now: float,
+    ttl: float,
 ) -> RedactedText | None:
     if state is None:
         return None
@@ -393,23 +445,24 @@ def _read_cached_result(
         "schema",
         "status",
         "owner",
-        "expires_at",
+        "published_at",
         "value",
     }:
         msg = "local coalescing state is malformed"
         raise RuntimeError(msg)
-    expires_at = state["expires_at"]
+    published_at = state["published_at"]
     owner = state["owner"]
     value = state["value"]
     if (
-        not _is_finite_nonnegative_number(expires_at)
+        not _is_finite_nonnegative_number(published_at)
         or not isinstance(owner, str)
         or not owner
         or not isinstance(value, str)
     ):
         msg = "local coalescing state is malformed"
         raise RuntimeError(msg)
-    if expires_at < now:
+    age = now - published_at
+    if age < 0 or age >= ttl:
         return None
     try:
         decoded = base64.b64decode(value, validate=True).decode()

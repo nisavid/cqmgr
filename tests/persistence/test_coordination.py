@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import math
 import multiprocessing
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -15,6 +17,8 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+import cqmgr.adapters.persistence.coordination as coordination_adapter
+import cqmgr.adapters.persistence.locking as locking_adapter
 from cqmgr.adapters.persistence.coordination import (
     DeterministicJitter,
     SharedBudgetCoordinator,
@@ -33,6 +37,7 @@ from cqmgr.domain.redaction import REDACTION_MARKER, RedactedText
 
 _DEADLINE_ASSERTION_BOUND = 0.5
 _EXPECTED_EVENT_LOOP_TICKS = 4
+_EXPECTED_TWO_CALLS = 2
 _REFILLED_AT = 110.0
 
 
@@ -162,6 +167,8 @@ def test_deterministic_jitter_is_stable_and_bounded(
     [
         (-1, 0, "read", "delay"),
         (True, 0, "read", "delay"),
+        (math.nan, 0, "read", "delay"),
+        (math.inf, 0, "read", "delay"),
         (1, -1, "read", "attempt"),
         (1, True, "read", "attempt"),
         (1, 0, "", "identity"),
@@ -695,6 +702,206 @@ def test_coalescing_waiter_cancellation_does_not_block_event_loop(
         return ticks
 
     assert asyncio.run(exercise()) == _EXPECTED_EVENT_LOOP_TICKS
+
+
+def test_windows_lock_error_mapping_propagates_fatal_os_errors() -> None:
+    """Only actual Windows lock contention is normalized to BlockingIOError."""
+    contention = OSError(errno.EACCES, "lock violation")
+    fatal = OSError(errno.EIO, "device failure")
+
+    with pytest.raises(BlockingIOError):
+        locking_adapter._raise_windows_lock_error(contention)  # noqa: SLF001
+    with pytest.raises(OSError, match="device failure") as caught:
+        locking_adapter._raise_windows_lock_error(fatal)  # noqa: SLF001
+
+    assert caught.value is fatal
+
+
+def test_noncooperative_leader_timeout_returns_without_duplicate_work(
+    tmp_path: Path,
+) -> None:
+    """A timed-out caller transfers ownership until stubborn read work really ends."""
+    coalescer = SharedReadCoalescer(tmp_path)
+    calls = 0
+
+    async def exercise() -> None:
+        nonlocal calls
+        release = asyncio.Event()
+
+        async def stubborn() -> RedactedText:
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return RedactedText("late")
+
+        with pytest.raises(CoordinationDeadlineExceededError):
+            await asyncio.wait_for(
+                coalescer.run(
+                    "stubborn-read",
+                    stubborn,
+                    deadline=time.monotonic() + 0.05,
+                    cancellation=CancellationToken(),
+                ),
+                timeout=0.5,
+            )
+        with pytest.raises(CoordinationDeadlineExceededError):
+            await coalescer.run(
+                "stubborn-read",
+                stubborn,
+                deadline=time.monotonic() + 0.05,
+                cancellation=CancellationToken(),
+            )
+        assert calls == 1
+        release.set()
+        await asyncio.sleep(0.05)
+
+    asyncio.run(exercise())
+
+
+def test_to_thread_leader_retains_ownership_until_sync_work_really_ends(
+    tmp_path: Path,
+) -> None:
+    """Task cancellation cannot permit duplicate sync provider work in its thread."""
+    coalescer = SharedReadCoalescer(tmp_path)
+    release = threading.Event()
+    started = threading.Event()
+    calls = 0
+
+    def sync_read() -> RedactedText:
+        nonlocal calls
+        calls += 1
+        started.set()
+        release.wait(timeout=5)
+        return RedactedText("thread-result")
+
+    async def threaded() -> RedactedText:
+        return await asyncio.to_thread(sync_read)
+
+    async def exercise() -> None:
+        with pytest.raises(CoordinationDeadlineExceededError):
+            await asyncio.wait_for(
+                coalescer.run(
+                    "threaded-read",
+                    threaded,
+                    deadline=time.monotonic() + 0.05,
+                    cancellation=CancellationToken(),
+                ),
+                timeout=0.5,
+            )
+        assert started.is_set()
+        with pytest.raises(CoordinationDeadlineExceededError):
+            await coalescer.run(
+                "threaded-read",
+                threaded,
+                deadline=time.monotonic() + 0.05,
+                cancellation=CancellationToken(),
+            )
+        assert calls == 1
+        release.set()
+        await asyncio.sleep(0.05)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("result_ttl", [0.0, 1.0])
+def test_coalesced_cache_uses_strict_monotonic_age(
+    tmp_path: Path,
+    result_ttl: float,
+) -> None:
+    """Zero TTL and backward clock motion never reuse a stale shared result."""
+    now = 100.0
+    calls = 0
+
+    def monotonic() -> float:
+        return now
+
+    coalescer = SharedReadCoalescer(
+        tmp_path,
+        result_ttl_seconds=result_ttl,
+        monotonic=monotonic,
+    )
+
+    async def work() -> RedactedText:
+        nonlocal calls
+        calls += 1
+        return RedactedText(f"result-{calls}")
+
+    first = asyncio.run(
+        coalescer.run(
+            "monotonic-read",
+            work,
+            deadline=101,
+            cancellation=CancellationToken(),
+        )
+    )
+    if result_ttl > 0:
+        now = 99.0
+    second = asyncio.run(
+        coalescer.run(
+            "monotonic-read",
+            work,
+            deadline=101,
+            cancellation=CancellationToken(),
+        )
+    )
+
+    assert first.value == "result-1"
+    assert second.value == "result-2"
+    assert calls == _EXPECTED_TWO_CALLS
+
+
+@pytest.mark.parametrize("control", ["cancellation", "deadline"])
+def test_publication_rechecks_caller_controls_but_retains_safe_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control: str,
+) -> None:
+    """A durable safe result remains reusable when its leader expires during publish."""
+    token = CancellationToken()
+    now = 100.0
+    original_write = coordination_adapter._atomic_write_json  # noqa: SLF001
+
+    def monotonic() -> float:
+        return now
+
+    def write_then_stop(root: Path, name: str, data: dict[str, object]) -> None:
+        nonlocal now
+        original_write(root, name, data)
+        if data.get("status") == "done":
+            if control == "cancellation":
+                token.cancel()
+            else:
+                now = 101.0
+
+    monkeypatch.setattr(coordination_adapter, "_atomic_write_json", write_then_stop)
+    coalescer = SharedReadCoalescer(tmp_path, monotonic=monotonic)
+    expected = (
+        CoordinationCancelledError
+        if control == "cancellation"
+        else CoordinationDeadlineExceededError
+    )
+
+    with pytest.raises(expected):
+        asyncio.run(
+            coalescer.run(
+                "published-read",
+                _safe_read,
+                deadline=101,
+                cancellation=token,
+            )
+        )
+    monkeypatch.setattr(coordination_adapter, "_atomic_write_json", original_write)
+    now = 100.1
+    result = asyncio.run(
+        coalescer.run(
+            "published-read",
+            _safe_read,
+            deadline=101,
+            cancellation=CancellationToken(),
+        )
+    )
+
+    assert result.value == "safe"
 
 
 def test_coalesced_read_rejects_raw_results_and_corrupt_state(tmp_path: Path) -> None:

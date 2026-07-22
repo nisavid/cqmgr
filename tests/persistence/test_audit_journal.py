@@ -129,6 +129,46 @@ def test_rotation_checkpoint_continues_the_hash_chain(tmp_path: Path) -> None:
     assert journal.verify().valid
 
 
+@pytest.mark.parametrize("mutation", ["missing", "wrong-binding"])
+def test_verification_enforces_structural_rotation_checkpoints(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """Every later segment begins with one exactly bound rotation checkpoint."""
+    journal = FilesystemAuditJournal(tmp_path, max_records_per_segment=2)
+    journal.append(_draft(correlation_id="one"))
+    journal.append(_draft(correlation_id="two"))
+    journal.append(_draft(correlation_id="three"))
+    segment = tmp_path / "audit-00000002.jsonl"
+    if mutation == "missing":
+        _rewrite_record(segment, 0, kind=AuditRecordKind.PREVIEW_EVIDENCE.value)
+    else:
+        _rewrite_record(
+            segment,
+            0,
+            facts=[{"name": "previous-segment", "value": "99"}],
+        )
+
+    result = journal.verify()
+
+    assert result.failure is not None
+    assert result.failure.code is AuditFailureCode.INVALID_ROTATION_CHECKPOINT
+    assert result.failure.segment == _SECOND_RECORD
+
+
+def test_verification_rejects_rotation_checkpoint_outside_segment_boundary(
+    tmp_path: Path,
+) -> None:
+    """Caller evidence cannot masquerade as a journal-owned checkpoint."""
+    journal = FilesystemAuditJournal(tmp_path)
+    journal.append(replace(_draft(), kind=AuditRecordKind.ROTATION_CHECKPOINT))
+
+    result = journal.verify()
+
+    assert result.failure is not None
+    assert result.failure.code is AuditFailureCode.INVALID_ROTATION_CHECKPOINT
+
+
 def test_query_cursor_is_bounded_and_bound_to_filters(tmp_path: Path) -> None:
     """Continuation cannot silently resume a different audit query."""
     journal = FilesystemAuditJournal(tmp_path)
@@ -202,7 +242,7 @@ def test_append_scrubs_explicit_secrets_and_machine_paths(tmp_path: Path) -> Non
     machine_path = "/Users/example/private/adc.json"
     journal = FilesystemAuditJournal(tmp_path)
 
-    record = journal.append(
+    journal.append(
         _draft(
             correlation_id=f"contact={quota_contact}",
             facts=(
@@ -219,6 +259,35 @@ def test_append_scrubs_explicit_secrets_and_machine_paths(tmp_path: Path) -> Non
 
     assert quota_contact.encode() not in persisted
     assert machine_path.encode() not in persisted
+
+
+def test_append_unconditionally_excludes_audit_forbidden_text(tmp_path: Path) -> None:
+    """Audit persistence removes contacts, local paths, and raw provider bodies."""
+    quota_contact = "person@example.test"
+    machine_path = "/Users/example/private/adc.json"
+    raw_body = '{"quotaPreferences":[{"name":"unsafe"}]}'
+    safe_identity = "quotaPreferences/safe-identity"
+    journal = FilesystemAuditJournal(tmp_path)
+
+    record = journal.append(
+        _draft(
+            correlation_id=f"contact={quota_contact};path={machine_path}",
+            facts=(
+                AuditFact(StableSymbol("provider-body"), RedactedText(raw_body)),
+                AuditFact(
+                    StableSymbol("preference-identity"),
+                    RedactedText(safe_identity),
+                ),
+            ),
+        )
+    )
+    persisted = b"".join(path.read_bytes() for path in tmp_path.glob("*.json*"))
+
+    assert quota_contact.encode() not in persisted
+    assert machine_path.encode() not in persisted
+    assert raw_body.encode() not in persisted
+    assert safe_identity.encode() in persisted
+    assert record.draft.facts[1].value.value == safe_identity
     assert record.draft.correlation_id is not None
     assert REDACTION_MARKER in record.draft.correlation_id.value
     assert REDACTION_MARKER in record.draft.facts[0].value.value

@@ -190,6 +190,7 @@ class AuditFailureCode(StrEnum):
     RECORD_ID_MISMATCH = "record-id-mismatch"
     NONCANONICAL_RECORD = "noncanonical-record"
     INVALID_SEGMENT_NAME = "invalid-segment-name"
+    INVALID_ROTATION_CHECKPOINT = "invalid-rotation-checkpoint"
     MISSING_SEGMENT = "missing-segment"
     MANIFEST_MISMATCH = "manifest-mismatch"
     RECORD_NOT_FOUND = "record-not-found"
