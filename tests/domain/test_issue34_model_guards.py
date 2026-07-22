@@ -343,6 +343,8 @@ def test_query_item_rejects_untrusted_product_evidence() -> None:
             _item(**{field_name: value})
     with pytest.raises(ValueError, match="one native quota unit"):
         _item(usage_value=QuotaQuantity(4, QuotaUnit("chip")))
+    with pytest.raises(ValueError, match="usage_value must be non-negative"):
+        _item(usage_value=QuotaQuantity(-1, QuotaUnit("card")))
     mismatched = AcceleratorConstraintSet(
         AcceleratorId("nvidia-l4"),
         (ConstraintReference(_identity()),),
