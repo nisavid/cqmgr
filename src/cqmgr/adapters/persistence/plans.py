@@ -952,14 +952,17 @@ def _restrict_windows_acl(path: Path) -> None:
     executable = rf"{system_root}\System32\WindowsPowerShell\v1.0\powershell.exe"
     environment = os.environ.copy()
     environment["CQMGR_ACL_TARGET"] = str(path)
+    encoded_command = base64.b64encode(
+        _WINDOWS_PRIVATE_ACL_SCRIPT.encode("utf-16le")
+    ).decode("ascii")
     completed = subprocess.run(  # noqa: S603
         [
             executable,
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
-            "-Command",
-            _WINDOWS_PRIVATE_ACL_SCRIPT,
+            "-EncodedCommand",
+            encoded_command,
         ],
         check=False,
         capture_output=True,
