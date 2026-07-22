@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import StrEnum
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
 
 PLAN_SCHEMA = QUOTA_REQUEST_PLAN_SCHEMA
 PLAN_LIFETIME = timedelta(minutes=15)
+_LOWER_HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class PlanLedgerState(StrEnum):
@@ -82,8 +84,8 @@ class ContactBinding:
         if not isinstance(self.source_identity, str) or not self.source_identity:
             msg = "contact source_identity must be a non-empty string"
             raise ValueError(msg)
-        if not _is_tagged_hex_or_opaque_digest(self.value_digest, "hmac-sha256"):
-            msg = "contact value_digest must be a non-empty hmac-sha256 digest"
+        if not _is_exact_digest(self.value_digest, "hmac-sha256"):
+            msg = "contact value_digest must be an exact lowercase hmac-sha256 digest"
             raise ValueError(msg)
 
 
@@ -100,8 +102,8 @@ class EvidenceBinding:
         if not isinstance(self.name, StableSymbol):
             msg = "evidence name must be a StableSymbol"
             raise TypeError(msg)
-        if not _is_tagged_hex_or_opaque_digest(self.value_digest, "sha256"):
-            msg = "evidence value_digest must be a non-empty sha256 digest"
+        if not _is_exact_digest(self.value_digest, "sha256"):
+            msg = "evidence value_digest must be an exact lowercase sha256 digest"
             raise ValueError(msg)
         require_utc(self.observed_at, "observed_at")
 
@@ -220,8 +222,8 @@ def review_plan(  # noqa: C901, PLR0913
     if not isinstance(plan, QuotaRequestPlan):
         msg = "plan must be a QuotaRequestPlan"
         raise TypeError(msg)
-    if not _is_tagged_hex_or_opaque_digest(digest, "sha256"):
-        msg = "plan digest must be a non-empty sha256 digest"
+    if not _is_exact_digest(digest, "sha256"):
+        msg = "plan digest must be an exact lowercase sha256 digest"
         raise ValueError(msg)
     if not isinstance(authenticated, bool):
         msg = "authenticated must be bool"
@@ -273,8 +275,11 @@ def _require_tuple_of(value: object, item_type: type[object], name: str) -> None
         raise TypeError(msg)
 
 
-def _is_tagged_hex_or_opaque_digest(value: object, algorithm: str) -> bool:
+def _is_exact_digest(value: object, algorithm: str) -> bool:
     if not isinstance(value, str):
         return False
     prefix = f"{algorithm}:"
-    return value.startswith(prefix) and bool(value.removeprefix(prefix))
+    return (
+        value.startswith(prefix)
+        and _LOWER_HEX_DIGEST.fullmatch(value.removeprefix(prefix)) is not None
+    )

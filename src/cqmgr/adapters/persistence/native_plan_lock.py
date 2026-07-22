@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 import time
@@ -57,7 +58,10 @@ class NativePlanInterprocessLock:
             try:
                 _try_lock(handle)
                 break
-            except BlockingIOError as error:
+            except OSError as error:
+                if not _is_contention(error):
+                    handle.close()
+                    raise
                 if time.monotonic() >= deadline:
                     handle.close()
                     msg = "timed out acquiring interprocess lock"
@@ -96,3 +100,11 @@ def _unlock(handle: IO[bytes]) -> None:
         msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
     else:  # pragma: win32 no cover
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _is_contention(error: OSError) -> bool:
+    return isinstance(error, BlockingIOError) or error.errno in {
+        errno.EACCES,
+        errno.EAGAIN,
+        errno.EDEADLK,
+    }

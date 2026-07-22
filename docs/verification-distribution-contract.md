@@ -51,6 +51,8 @@ installation prerequisite.
 allowlisted native keyrings only. The supported mutation-capable backends are
 macOS Keychain, Windows Credential Locker, and Freedesktop Secret Service.
 KWallet is a non-blocking canary until a real integration spike passes.
+Classification uses the concrete classes exported by those trusted backend
+modules rather than caller-controlled class-name or module-name strings.
 
 The application-facing secret-store port contains only:
 
@@ -61,14 +63,18 @@ The application-facing secret-store port contains only:
 
 Outcomes distinguish missing, locked or cancelled, unavailable, unsupported,
 and failed. References contain a stable cqmgr service namespace, installation
-identity, purpose, and opaque item identity; they never contain a secret.
+identity, purpose, and collision-resistant bounded random item identity; they
+never contain a secret.
 
 The adapter uses no shell, secret-bearing argument, environment value,
 clipboard, inherited standard stream, or plaintext temporary file. A local
 interprocess lock serializes cqmgr callers because the portable keyring API has
-no compare-and-swap contract. Creation uses read-before-write and
-read-after-write verification. Another client changing the same native item is
-reported as a conflict rather than hidden with last-write-wins semantics.
+no compare-and-swap contract. Creation performs exactly one write to a new
+immutable random reference, followed by read-after-write verification, with no
+automatic write retry or update-in-place. Rotation creates and verifies a new
+item before atomically switching the non-secret reference. Observable mismatch
+fails closed. Out-of-band writes to cqmgr's private namespace are unsupported
+tampering rather than participants in the cqmgr concurrency contract.
 
 A missing, locked, null, plaintext, file-backed, third-party, or unknown
 backend cannot issue a mutation-capable plan or Apply one. Read-only provider

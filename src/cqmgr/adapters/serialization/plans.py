@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -29,6 +30,7 @@ from cqmgr.domain.results import StableSymbol
 from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 
 _MINIMUM_AUTHENTICATION_KEY_BYTES = 32
+_AUTHENTICATION = re.compile(r"hmac-sha256:[0-9a-f]{64}\Z")
 
 
 class PlanDecodeError(ValueError):
@@ -71,7 +73,7 @@ class PlanCodec:
         return EncodedPlan(bytes=_canonical(envelope) + b"\n", digest=digest)
 
     @staticmethod
-    def decode(data: bytes) -> DecodedPlan:
+    def decode(data: bytes) -> DecodedPlan:  # noqa: C901
         """Validate exact encoding and digest before exposing plan contents."""
         if not isinstance(data, bytes):
             msg = "plan data must be bytes"
@@ -104,7 +106,7 @@ class PlanCodec:
         if not hmac.compare_digest(digest, expected_digest):
             msg = "plan content digest does not match canonical bytes"
             raise PlanDecodeError(msg)
-        if not authentication.startswith("hmac-sha256:"):
+        if _AUTHENTICATION.fullmatch(authentication) is None:
             msg = "plan authentication algorithm is unsupported"
             raise PlanDecodeError(msg)
         try:
@@ -112,6 +114,9 @@ class PlanCodec:
         except (KeyError, TypeError, ValueError) as error:
             msg = "plan content is invalid"
             raise PlanDecodeError(msg) from error
+        if _canonical(plan_value) != _canonical(_plan_mapping(plan)):
+            msg = "plan content is not semantically canonical"
+            raise PlanDecodeError(msg)
         return DecodedPlan(plan, digest, authentication, data)
 
 

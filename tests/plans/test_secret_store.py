@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from importlib import import_module
 from typing import TYPE_CHECKING, cast, override
+from unittest.mock import patch
 
 import pytest
 from keyring.errors import InitError, KeyringError, KeyringLocked
 
+from cqmgr.adapters.persistence import secrets as secret_adapter
 from cqmgr.adapters.persistence.native_plan_lock import (
     NativePlanInterprocessLock,
 )
@@ -23,6 +26,9 @@ from cqmgr.application.ports.secrets import (
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+GENERATED_REFERENCE_COUNT = 32
+MAXIMUM_REFERENCE_LENGTH = 128
 
 
 class _FakeKeyring:
@@ -63,8 +69,21 @@ def _reference() -> SecretStoreReference:
     return SecretStoreReference(
         installation_id="installation-123",
         purpose=SecretPurpose.PLAN_AUTHENTICATION,
-        item_id="root-key",
+        item_id="item-" + ("a" * 32),
     )
+
+
+def _trusted_store(
+    backend: _FakeKeyring,
+    lock: NativePlanInterprocessLock,
+    kind: SecretBackendKind = SecretBackendKind.MACOS_KEYCHAIN,
+) -> NativeSecretStore:
+    with patch.object(
+        secret_adapter,
+        "_trusted_native_backend_types",
+        return_value={type(backend): kind},
+    ):
+        return NativeSecretStore(backend, lock)
 
 
 @pytest.mark.parametrize(
@@ -90,8 +109,11 @@ def test_supported_native_backends_are_exactly_allowlisted(
     kind: SecretBackendKind,
 ) -> None:
     """Only the three accepted native backend identities permit mutation."""
-    store = NativeSecretStore(
-        _backend(module, name), NativePlanInterprocessLock(tmp_path / "keyring.lock")
+    backend = _backend(module, name)
+    store = _trusted_store(
+        backend,
+        NativePlanInterprocessLock(tmp_path / "keyring.lock"),
+        kind,
     )
 
     probe = store.probe()
@@ -138,7 +160,7 @@ def test_create_is_once_verified_and_never_replaces_an_existing_secret(
 ) -> None:
     """The native API's replacement behavior is hidden behind create-once."""
     backend = _backend("keyring.backends.macOS")
-    store = NativeSecretStore(
+    store = _trusted_store(
         backend, NativePlanInterprocessLock(tmp_path / "keyring.lock")
     )
     reference = _reference()
@@ -178,7 +200,7 @@ def test_backend_failures_are_typed_and_never_expose_exception_text(
     """Operational native-store failures cross the port as closed outcomes."""
     backend = _backend("keyring.backends.SecretService")
     backend.error = error
-    outcome = NativeSecretStore(
+    outcome = _trusted_store(
         backend, NativePlanInterprocessLock(tmp_path / "keyring.lock")
     ).get(_reference())
 
@@ -193,13 +215,28 @@ def test_secret_port_values_are_non_secret_bounded_and_fail_closed() -> None:
     assert reference.service == (
         "io.nisavid.cqmgr/installation-123/plan-authentication"
     )
-    assert reference.username == "root-key"
+    assert reference.username == "item-" + ("a" * 32)
+    generated = {
+        SecretStoreReference.generate(
+            "installation-123", SecretPurpose.PLAN_AUTHENTICATION
+        ).item_id
+        for _ in range(GENERATED_REFERENCE_COUNT)
+    }
+    assert len(generated) == GENERATED_REFERENCE_COUNT
+    assert all(
+        item.startswith("item-") and len(item) <= MAXIMUM_REFERENCE_LENGTH
+        for item in generated
+    )
     with pytest.raises(TypeError, match="purpose"):
         SecretStoreReference("installation", cast("SecretPurpose", "purpose"), "item")
     with pytest.raises(ValueError, match="installation_id"):
         SecretStoreReference("bad/value", SecretPurpose.QUOTA_CONTACT, "item")
     with pytest.raises(ValueError, match="item_id"):
         SecretStoreReference("installation", SecretPurpose.QUOTA_CONTACT, "")
+    with pytest.raises(ValueError, match="generated immutable"):
+        SecretStoreReference(
+            "installation", SecretPurpose.QUOTA_CONTACT, "deterministic-item"
+        )
     with pytest.raises(TypeError, match="bytes"):
         SecretValue(cast("bytes", "secret"))
     with pytest.raises(ValueError, match="empty"):
@@ -223,7 +260,7 @@ def test_corrupt_or_non_string_native_values_fail_without_exposure(
     backend = _backend("keyring.backends.macOS")
     reference = _reference()
     backend.values[(reference.service, reference.username)] = "raw-plaintext"
-    store = NativeSecretStore(
+    store = _trusted_store(
         backend, NativePlanInterprocessLock(tmp_path / "keyring.lock")
     )
     assert store.get(reference).status is SecretStoreStatus.FAILED
@@ -251,7 +288,7 @@ def test_create_read_after_write_mismatch_and_keyring_error_are_conflicts(
         (_MismatchingKeyring,),
         {"__module__": "keyring.backends.macOS"},
     )
-    mismatch = NativeSecretStore(
+    mismatch = _trusted_store(
         backend_type(),
         NativePlanInterprocessLock(tmp_path / "mismatch.lock"),
     )
@@ -262,7 +299,7 @@ def test_create_read_after_write_mismatch_and_keyring_error_are_conflicts(
 
     backend = _backend("keyring.backends.macOS")
     backend.error = KeyringError("sensitive-detail")
-    store = NativeSecretStore(
+    store = _trusted_store(
         backend, NativePlanInterprocessLock(tmp_path / "failed.lock")
     )
     assert (
@@ -270,6 +307,56 @@ def test_create_read_after_write_mismatch_and_keyring_error_are_conflicts(
         is SecretStoreStatus.FAILED
     )
     assert store.delete(_reference()).status is SecretStoreStatus.FAILED
+
+
+def test_spoofed_native_module_and_name_are_not_allowlisted(tmp_path: Path) -> None:
+    """Mutable Python class metadata cannot grant native-store capability."""
+    backend = _backend("keyring.backends.macOS", "Keyring")
+
+    probe = NativeSecretStore(
+        backend, NativePlanInterprocessLock(tmp_path / "spoof.lock")
+    ).probe()
+
+    assert probe.kind is SecretBackendKind.THIRD_PARTY
+    assert not probe.mutation_capable
+
+
+def test_default_allowlist_is_bound_to_exported_concrete_classes() -> None:
+    """Production trust entries are the exact classes exported by keyring."""
+    trusted = secret_adapter._trusted_native_backend_types()  # noqa: SLF001
+
+    assert trusted
+    for backend_type, kind in trusted.items():
+        module = import_module(backend_type.__module__)
+        assert getattr(module, backend_type.__name__) is backend_type
+        assert kind in {
+            SecretBackendKind.MACOS_KEYCHAIN,
+            SecretBackendKind.WINDOWS_CREDENTIAL_LOCKER,
+            SecretBackendKind.SECRET_SERVICE,
+        }
+
+
+def test_lock_timeout_is_a_typed_secret_store_failure(tmp_path: Path) -> None:
+    """OS-lock contention cannot escape the secret-store outcome boundary."""
+    path = tmp_path / "keyring.lock"
+    backend = _backend("keyring.backends.macOS", "Keyring")
+    store = _trusted_store(
+        backend,
+        NativePlanInterprocessLock(
+            path,
+            timeout_seconds=0.01,
+            poll_seconds=0.001,
+        ),
+    )
+
+    with NativePlanInterprocessLock(path):
+        outcomes = (
+            store.get(_reference()),
+            store.create(_reference(), SecretValue(b"a" * 32)),
+            store.delete(_reference()),
+        )
+
+    assert {outcome.status for outcome in outcomes} == {SecretStoreStatus.FAILED}
 
 
 def test_native_plan_lock_rejects_invalid_configuration_and_reentrancy(
