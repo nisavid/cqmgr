@@ -84,14 +84,20 @@ class BudgetRequest:
 
     provider: str
     project: str
-    adc_quota_project: str
+    adc_quota_project: str | None
     units: int = 1
 
     def __post_init__(self) -> None:
         """Reject absent identities and non-conservative request units."""
         if any(
             not isinstance(value, str) or not value
-            for value in (self.provider, self.project, self.adc_quota_project)
+            for value in (self.provider, self.project)
+        ) or (
+            self.adc_quota_project is not None
+            and (
+                not isinstance(self.adc_quota_project, str)
+                or not self.adc_quota_project
+            )
         ):
             msg = "budget identities must be non-empty strings"
             raise ValueError(msg)

@@ -242,6 +242,8 @@ source = { editable = "." }
 dependencies = [
     { name = "click" },
     { name = "google-auth" },
+    { name = "google-cloud-monitoring" },
+    { name = "google-cloud-quotas" },
     { name = "google-cloud-resource-manager" },
     { name = "keyring" },
     { name = "textual" },
@@ -263,6 +265,8 @@ dev = [
 requires-dist = [
     { name = "click", specifier = ">=8.1,<9" },
     { name = "google-auth", specifier = ">=2.38,<3" },
+    { name = "google-cloud-monitoring", specifier = ">=2.28,<3" },
+    { name = "google-cloud-quotas", specifier = ">=0.1,<1" },
     { name = "google-cloud-resource-manager", specifier = ">=1.18,<2" },
     { name = "keyring", specifier = ">=25.7,<26" },
     { name = "textual", specifier = ">=8,<9" },
@@ -363,6 +367,38 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c7/33/dbc946a407401b975f0719658f18e664ece2109f79ffd1ff3bf226c205f4/google_auth-2.56.2.tar.gz", hash = "sha256:e28f103ca8091fb7012b99c44243d7366c29863713b8e34a220c3322b7a07051", size = 365820, upload-time = "2026-07-21T21:53:28.188Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/88/63/50636aae68c9bf17c891c7eb18b49baa9bd6b31d2a97b8de4813a9fc8d1c/google_auth-2.56.2-py3-none-any.whl", hash = "sha256:c8270ea95b2697b74e3d8438ae9c5b898e38b623b915c7b5c5635921e7de68a6", size = 258588, upload-time = "2026-07-21T21:53:26.399Z" },
+]
+
+[[package]]
+name = "google-cloud-monitoring"
+version = "2.31.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "google-api-core", extra = ["grpc"] },
+    { name = "google-auth" },
+    { name = "grpcio" },
+    { name = "proto-plus" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/84/9d/9522e169db3887e7f354bb9aa544a6e26c435ce19337e32432598db18c6f/google_cloud_monitoring-2.31.0.tar.gz", hash = "sha256:b4c9d3528c8643d4eb4b9d688cbb3c5914bc5f69b314ff7c5e1b47bdc073a9ae", size = 404747, upload-time = "2026-06-03T15:28:24.938Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/55/30/aa6635296da9c1c14d2e64f64e1cacd4f4debf8ab7e646c0559545f0f70d/google_cloud_monitoring-2.31.0-py3-none-any.whl", hash = "sha256:64f3d56ead48f0a0674f650cb2828c47b936582a02a27c55f2836681a86281c3", size = 391010, upload-time = "2026-06-03T15:27:39.536Z" },
+]
+
+[[package]]
+name = "google-cloud-quotas"
+version = "0.6.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "google-api-core", extra = ["grpc"] },
+    { name = "google-auth" },
+    { name = "grpcio" },
+    { name = "proto-plus" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1e/27/f45fc5d84f1018d845c651619d02904be200fc47aa8603609e5202018ddc/google_cloud_quotas-0.6.1.tar.gz", hash = "sha256:308957cb216e00a495236d2c5f39fd3017da18f39955768c576930917eba5a8e", size = 175365, upload-time = "2026-06-22T23:22:18.745Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/af/58/fc1f3ae5088137ec2bd97ec3b4483e0b4ba07a03e3a1d8c621762bbac7ce/google_cloud_quotas-0.6.1-py3-none-any.whl", hash = "sha256:9f87d4d17b35e6336c4b465c71832d32564103791ae73cbefcbc7919ee448fb5", size = 164539, upload-time = "2026-06-22T23:20:14.728Z" },
 ]
 
 [[package]]

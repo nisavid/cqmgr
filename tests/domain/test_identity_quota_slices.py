@@ -155,6 +155,19 @@ def test_constraint_reference_points_to_exact_slice() -> None:
     assert ConstraintReference(slice_identity=identity).slice_identity is identity
 
 
+def test_unknown_quota_scope_is_explicit() -> None:
+    """Provider global resource paths never imply a product quota scope."""
+    identity = EffectiveQuotaSliceIdentity(
+        resource_scope=PROJECT,
+        service="compute.googleapis.com",
+        quota_id="future-provider-quota",
+        dimensions=NormalizedDimensions(()),
+        quota_scope=QuotaScope.UNKNOWN,
+    )
+
+    assert identity.quota_scope is QuotaScope.UNKNOWN
+
+
 def test_slice_identity_rejects_untyped_or_empty_components() -> None:
     """Every exact identity component uses its canonical domain type."""
     dimensions = NormalizedDimensions(())
