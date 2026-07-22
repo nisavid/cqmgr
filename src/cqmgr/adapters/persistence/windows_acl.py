@@ -107,25 +107,25 @@ def restrict_windows_acl(path: Path) -> None:
     encoded_command = base64.b64encode(
         _WINDOWS_PRIVATE_ACL_SCRIPT.encode("utf-16le")
     ).decode("ascii")
-    returncode = -1
     try:
-        returncode = subprocess.run(  # noqa: S603
-            [
-                executable,
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-EncodedCommand",
-                encoded_command,
-            ],
-            check=False,
-            capture_output=True,
-            env=environment,
-            timeout=10,
-        ).returncode
+        if (
+            returncode := subprocess.run(  # noqa: S603
+                [
+                    executable,
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-EncodedCommand",
+                    encoded_command,
+                ],
+                check=False,
+                capture_output=True,
+                env=environment,
+                timeout=10,
+            ).returncode
+        ) != 0:
+            msg = f"Windows private ACL enforcement failed ({returncode})"
+            raise OSError(msg)
     except subprocess.TimeoutExpired as error:
         msg = "Windows private ACL enforcement timed out"
         raise OSError(msg) from error
-    if returncode != 0:
-        msg = f"Windows private ACL enforcement failed ({returncode})"
-        raise OSError(msg)

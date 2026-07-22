@@ -345,13 +345,16 @@ def _read_repository_file(root: Path, directory: str, filename: str) -> bytes:
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             try:
-                descriptor = os.open(filename, flags, dir_fd=directory_descriptor)
+                return _read_regular_file_at(
+                    filename,
+                    flags,
+                    directory_descriptor=directory_descriptor,
+                )
             except OSError as error:
                 if error.errno == errno.ELOOP:
                     msg = "quota snapshot state file must not be a symlink"
                     raise QuotaSnapshotOperationalError(msg) from error
                 raise
-            return _read_regular_descriptor(descriptor)
         finally:
             os.close(directory_descriptor)
     finally:
@@ -375,7 +378,13 @@ def _open_trusted_directory(
     return descriptor
 
 
-def _read_regular_descriptor(descriptor: int) -> bytes:
+def _read_regular_file_at(
+    path: Path | str,
+    flags: int,
+    *,
+    directory_descriptor: int | None = None,
+) -> bytes:
+    descriptor = os.open(path, flags, dir_fd=directory_descriptor)
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
