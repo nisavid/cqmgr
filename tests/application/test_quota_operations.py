@@ -21,6 +21,7 @@ from cqmgr.application.ports.coordination import CancellationToken
 from cqmgr.application.ports.provider_reads import ProviderReadContext
 from cqmgr.application.ports.quota_snapshots import (
     QuotaCursorQueryMismatchError,
+    QuotaSnapshotOperationalError,
     ResolvedQuotaQueryCursor,
     UnknownQuotaCursorError,
 )
@@ -61,6 +62,7 @@ from cqmgr.domain.projects import CanonicalProject
 from cqmgr.domain.quota_queries import (
     OpaqueQueryCursor,
     QuotaQuery,
+    QuotaQueryFilters,
     QuotaQueryItem,
     QuotaQuerySnapshot,
     QuotaSort,
@@ -187,6 +189,7 @@ class MemoryCursors:
         self.snapshots = snapshots
         self.cursors: dict[str, tuple[str, int]] = {}
         self.resolve_error: Exception | None = None
+        self.issue_error: Exception | None = None
 
     def issue(
         self,
@@ -197,6 +200,8 @@ class MemoryCursors:
     ) -> OpaqueQueryCursor:
         """Issue one opaque handle without exposing snapshot state."""
         del now
+        if self.issue_error is not None:
+            raise self.issue_error
         value = f"opaque-{len(self.cursors) + 1}"
         self.cursors[value] = (snapshot_id, offset)
         return OpaqueQueryCursor(value, snapshot_id, offset)
@@ -908,6 +913,54 @@ def test_browse_sorts_snapshots_and_resumes_without_provider_calls() -> None:
     )
 
 
+def test_initial_page_retains_snapshot_when_cursor_issue_fails() -> None:
+    """A local cursor-write failure preserves the collected snapshot context."""
+    fixture = _fixture((_complete(_evidence("first"), _evidence("second")),))
+    fixture.cursors.issue_error = QuotaSnapshotOperationalError("cursor store failed")
+
+    result = asyncio.run(
+        fixture.operations.browse(QuotaBrowseRequest(_context(), _query(), limit=1))
+    )
+
+    assert result.outcome.exit_class is ExitClass.OPERATIONAL_FAILURE
+    assert result.data.query == _query()
+    assert result.data.snapshot_id == "snapshot-1"
+    assert result.data.items[0].identity.quota_id == "first"
+    assert result.data.next_cursor is None
+    assert result.data.reason == "cursor-issue-failed"
+
+
+def test_resumed_page_retains_snapshot_when_cursor_issue_fails() -> None:
+    """A resumed local page retains its bound snapshot when reissue fails."""
+    fixture = _fixture(
+        (
+            _complete(
+                _evidence("first"),
+                _evidence("second"),
+                _evidence("third"),
+            ),
+        )
+    )
+    first = asyncio.run(
+        fixture.operations.browse(QuotaBrowseRequest(_context(), _query(), limit=1))
+    )
+    message = "cursor store failed"
+    fixture.cursors.issue_error = QuotaSnapshotOperationalError(message)
+
+    result = asyncio.run(
+        fixture.operations.browse(
+            QuotaBrowseRequest(cursor=first.data.next_cursor, limit=1)
+        )
+    )
+
+    assert result.outcome.exit_class is ExitClass.OPERATIONAL_FAILURE
+    assert result.data.query == _query()
+    assert result.data.snapshot_id == first.data.snapshot_id
+    assert result.data.items[0].identity.quota_id == "second"
+    assert result.data.next_cursor is None
+    assert result.data.reason == "cursor-issue-failed"
+
+
 @pytest.mark.parametrize(
     "error",
     [UnknownQuotaCursorError("unknown"), QuotaCursorQueryMismatchError("mismatch")],
@@ -970,6 +1023,23 @@ def test_browse_rejects_inapplicable_or_mixed_unit_sort(
     assert fixture.snapshots.snapshots == {}
 
 
+def test_complete_browse_rejects_duplicate_effective_slice_as_provider_failure() -> (
+    None
+):
+    """Duplicate exact provider evidence is an integrity failure, not user input."""
+    evidence = _evidence("duplicate")
+    fixture = _fixture((_complete(evidence, evidence),))
+
+    result = asyncio.run(
+        fixture.operations.browse(QuotaBrowseRequest(_context(), _query()))
+    )
+
+    assert result.outcome.exit_class is ExitClass.OPERATIONAL_FAILURE
+    assert result.outcome.code == StableSymbol("duplicate-effective-slice")
+    assert result.data.reason == "duplicate-effective-slice"
+    assert fixture.snapshots.snapshots == {}
+
+
 def test_incomplete_browse_retains_filtered_items_without_order_or_cursor() -> None:
     """Usable partial evidence stays visible without global claims."""
     fixture = _fixture((_incomplete(_evidence("generic-mutable")),))
@@ -985,6 +1055,26 @@ def test_incomplete_browse_retains_filtered_items_without_order_or_cursor() -> N
     assert result.data.next_cursor is None
     assert result.data.snapshot_id is None
     assert fixture.snapshots.snapshots == {}
+
+
+def test_incomplete_browse_with_no_filtered_rows_uses_incomplete_exit() -> None:
+    """An empty filtered view cannot turn an incomplete scan into unavailability."""
+    query = QuotaQuery(
+        PROJECT,
+        ServiceSource("compute.googleapis.com"),
+        filters=QuotaQueryFilters(cataloged=True),
+    )
+    fixture = _fixture((_incomplete(_evidence("generic")),))
+
+    result = asyncio.run(
+        fixture.operations.browse(QuotaBrowseRequest(_context(), query))
+    )
+
+    assert result.outcome.exit_class is ExitClass.INCOMPLETE_EVIDENCE
+    assert result.data.items == ()
+    assert not result.data.ordered
+    assert result.data.total is None
+    assert result.data.next_cursor is None
 
 
 def test_empty_result_allows_requested_optional_sort() -> None:
@@ -1063,6 +1153,23 @@ def test_inspect_joins_only_exact_authoritative_evidence() -> None:
     assert unrelated_region.identity not in references
 
 
+def test_inspect_mutability_uses_only_complete_exact_effective_read() -> None:
+    """Unrelated preference incompleteness does not erase fresh mutability."""
+    selected = _evidence("generic")
+    fixture = _fixture(
+        (_complete(selected),),
+        preferences=_incomplete(),
+    )
+
+    result = asyncio.run(
+        fixture.operations.inspect(QuotaInspectRequest(_context(), selected.identity))
+    )
+
+    assert result.outcome.exit_class is ExitClass.INCOMPLETE_EVIDENCE
+    assert result.data.item is not None
+    assert result.data.item.predicates.mutable
+
+
 def test_inspect_fails_closed_on_ambiguous_exact_preference() -> None:
     """Duplicate exact provider preferences cannot be selected by guesswork."""
     selected = _evidence("known-guided")
@@ -1080,6 +1187,22 @@ def test_inspect_fails_closed_on_ambiguous_exact_preference() -> None:
     )
 
     assert result.outcome.exit_class is ExitClass.REJECTED_PRECONDITION
+
+
+def test_complete_inspect_rejects_duplicate_effective_slice_as_provider_failure() -> (
+    None
+):
+    """Inspect classifies duplicate exact provider slices as an integrity failure."""
+    selected = _evidence("duplicate")
+    fixture = _fixture((_complete(selected, selected),))
+
+    result = asyncio.run(
+        fixture.operations.inspect(QuotaInspectRequest(_context(), selected.identity))
+    )
+
+    assert result.outcome.exit_class is ExitClass.OPERATIONAL_FAILURE
+    assert result.outcome.code == StableSymbol("duplicate-effective-slice")
+    assert result.data.reason == "duplicate-effective-slice"
 
 
 def test_inspect_is_incomplete_when_guided_constraint_set_is_missing() -> None:
