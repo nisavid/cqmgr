@@ -48,11 +48,12 @@ class InterprocessFileLock:
         _raise_if_stopped(deadline=deadline, cancellation=cancellation)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         stream = self._path.open("a+b")
-        stream.seek(0)
-        if stream.read(1) == b"":
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
             stream.write(b"0")
             stream.flush()
             os.fsync(stream.fileno())
+        stream.seek(0)
         try:
             while True:
                 _raise_if_stopped(deadline=deadline, cancellation=cancellation)
@@ -93,11 +94,12 @@ class InterprocessFileLock:
         _raise_if_stopped(deadline=deadline, cancellation=cancellation)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         stream = self._path.open("a+b")
-        stream.seek(0)
-        if stream.read(1) == b"":
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
             stream.write(b"0")
             stream.flush()
             os.fsync(stream.fileno())
+        stream.seek(0)
         try:
             while True:
                 _raise_if_stopped(deadline=deadline, cancellation=cancellation)
