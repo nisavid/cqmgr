@@ -55,9 +55,7 @@ def _run(
 def main(context: click.Context) -> None:
     """Inspect effective cloud quota and manage exact quota requests."""
     arguments = (
-        (context.invoked_subcommand,)
-        if context.invoked_subcommand is not None
-        else ()
+        (context.invoked_subcommand,) if context.invoked_subcommand is not None else ()
     )
     invocation_kind = classify_invocation(
         arguments,
