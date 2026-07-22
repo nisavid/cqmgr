@@ -54,6 +54,7 @@ from cqmgr.domain.quotas import (
     ProviderRead,
     QuotaPreferenceEvidence,
     QuotaQuantity,
+    QuotaScope,
     UsageObservation,
 )
 from cqmgr.domain.results import (
@@ -1288,12 +1289,7 @@ def _one_exact_usage(
     evidence: EffectiveQuotaEvidence,
     usages: tuple[UsageObservation, ...],
 ) -> UsageObservation | None:
-    locations = set(evidence.applicable_locations)
-    locations.update(
-        value
-        for key, value in evidence.identity.dimensions.items
-        if key in {"location", "region", "zone"}
-    )
+    locations = _exact_usage_locations(evidence)
     matches = []
     for usage in usages:
         metric_labels = dict(usage.metric_labels.items)
@@ -1309,6 +1305,36 @@ def _one_exact_usage(
         msg = "more than one usage series matches the exact quota slice"
         raise _AmbiguousEvidenceError(msg)
     return matches[0] if matches else None
+
+
+def _exact_usage_locations(evidence: EffectiveQuotaEvidence) -> set[str]:
+    dimensions = dict(evidence.identity.dimensions.items)
+    scope_dimension = {
+        QuotaScope.REGIONAL: "region",
+        QuotaScope.ZONAL: "zone",
+    }.get(evidence.identity.quota_scope)
+    if scope_dimension is not None:
+        location = dimensions.get(scope_dimension)
+        if location is None:
+            msg = "quota scope requires an exact location dimension"
+            raise _AmbiguousEvidenceError(msg)
+        return {location}
+
+    dimension_locations = tuple(
+        value
+        for key, value in dimensions.items()
+        if key in {"location", "region", "zone"}
+    )
+    if evidence.identity.quota_scope is QuotaScope.GLOBAL:
+        if dimension_locations:
+            msg = "global quota slice cannot carry a location dimension"
+            raise _AmbiguousEvidenceError(msg)
+    elif len(dimension_locations) > 1:
+        msg = "unknown quota scope has ambiguous location dimensions"
+        raise _AmbiguousEvidenceError(msg)
+    elif dimension_locations:
+        return {dimension_locations[0]}
+    return set(evidence.applicable_locations)
 
 
 def _usage_quantity(
