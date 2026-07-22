@@ -34,17 +34,27 @@ class AuditRecordKind(StrEnum):
     CRITICAL_UNKNOWN = "critical-unknown"
 
 
+class AuditFactName(StrEnum):
+    """Closed V1 fact classifications with explicit retention semantics."""
+
+    PREFERENCE = "preference"
+    PREFERENCE_IDENTITY = "preference-identity"
+    PREVIOUS_SEGMENT = "previous-segment"
+    PROVIDER_BODY = "provider-body"
+    SOURCE = "source"
+
+
 @dataclass(frozen=True, slots=True)
 class AuditFact:
     """One named, explicitly scrubbed audit fact."""
 
-    name: StableSymbol
+    name: AuditFactName
     value: RedactedText
 
     def __post_init__(self) -> None:
         """Require stable names and explicitly safe text."""
-        if not isinstance(self.name, StableSymbol):
-            msg = "audit fact name must be a StableSymbol"
+        if not isinstance(self.name, AuditFactName):
+            msg = "audit fact name must be an AuditFactName"
             raise TypeError(msg)
         if not isinstance(self.value, RedactedText):
             msg = "audit fact value must be RedactedText"

@@ -17,6 +17,7 @@ from cqmgr.adapters.persistence.audit import AuditIntegrityError, FilesystemAudi
 from cqmgr.domain.audit import (
     AUDIT_GENESIS_HASH,
     AuditFact,
+    AuditFactName,
     AuditFailureCode,
     AuditQuery,
     AuditRecordDraft,
@@ -249,7 +250,7 @@ def test_append_scrubs_explicit_secrets_and_machine_paths(tmp_path: Path) -> Non
             correlation_id=f"contact={quota_contact}",
             facts=(
                 AuditFact(
-                    StableSymbol("source"),
+                    AuditFactName.SOURCE,
                     RedactedText(f"credential-path={machine_path}"),
                 ),
             ),
@@ -284,9 +285,9 @@ def test_append_unconditionally_excludes_audit_forbidden_text(
         _draft(
             correlation_id=f"contact={quota_contact};path={machine_path}",
             facts=(
-                AuditFact(StableSymbol("provider-body"), RedactedText(raw_body)),
+                AuditFact(AuditFactName.PROVIDER_BODY, RedactedText(raw_body)),
                 AuditFact(
-                    StableSymbol("preference-identity"),
+                    AuditFactName.PREFERENCE_IDENTITY,
                     RedactedText(safe_identity),
                 ),
             ),
@@ -325,7 +326,7 @@ def test_append_excludes_tokens_and_arbitrary_absolute_paths_by_default(
             correlation_id=f"unsafe={forbidden}",
             facts=(
                 AuditFact(
-                    StableSymbol("preference-identity"),
+                    AuditFactName.PREFERENCE_IDENTITY,
                     RedactedText(safe_identity),
                 ),
             ),
@@ -416,7 +417,7 @@ def test_verification_rejects_noncanonical_record_bytes(
     """Semantically similar JSON is invalid unless every retained byte is canonical."""
     journal = FilesystemAuditJournal(tmp_path)
     journal.append(
-        _draft(facts=(AuditFact(StableSymbol("label"), RedactedText("café")),))
+        _draft(facts=(AuditFact(AuditFactName.SOURCE, RedactedText("café")),))
     )
     path = tmp_path / "audit-00000001.jsonl"
     payload = _record_payload(path)

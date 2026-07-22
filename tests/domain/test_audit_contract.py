@@ -8,6 +8,7 @@ import pytest
 from cqmgr.domain.audit import (
     MAX_AUDIT_QUERY_LIMIT,
     AuditFact,
+    AuditFactName,
     AuditFailureCode,
     AuditQuery,
     AuditRecord,
@@ -34,7 +35,7 @@ def _draft() -> AuditRecordDraft:
         outcome=StableSymbol("submitted"),
         correlation_id=RedactedText("sha256:opaque"),
         diagnostic_codes=(DiagnosticCode("audit-safe"),),
-        facts=(AuditFact(StableSymbol("preference"), RedactedText("safe")),),
+        facts=(AuditFact(AuditFactName.PREFERENCE, RedactedText("safe")),),
     )
 
 
@@ -100,12 +101,21 @@ def test_audit_draft_requires_an_aware_utc_timestamp() -> None:
 def test_audit_fact_rejects_raw_values(name: str, value: object, message: str) -> None:
     """Fact names and values stay inside their stable and scrubbed types."""
     arguments: dict[str, object] = {
-        "name": StableSymbol("preference"),
+        "name": AuditFactName.PREFERENCE,
         "value": RedactedText("safe"),
     }
     arguments[name] = value
     with pytest.raises(TypeError, match=message):
         AuditFact(**arguments)  # type: ignore[arg-type]
+
+
+def test_audit_fact_rejects_unclassified_stable_names() -> None:
+    """Alternate labels cannot smuggle provider responses into retained facts."""
+    with pytest.raises(TypeError, match="AuditFactName"):
+        AuditFact(
+            StableSymbol("provider-response"),  # type: ignore[arg-type]
+            RedactedText("status=PERMISSION_DENIED; debug=opaque"),
+        )
 
 
 @pytest.mark.parametrize(
