@@ -23,6 +23,10 @@ class _InjectedTerminalAuditError(Exception):
     """A test-only terminal audit failure after dispatch."""
 
 
+class _InjectedRecoveryError(Exception):
+    """A test-only quarantine or critical-unknown persistence failure."""
+
+
 @pytest.mark.parametrize("failed_guard", ["audit", "storage", "lock"])
 def test_every_pre_dispatch_failure_proves_zero_provider_writes(
     failed_guard: str,
@@ -95,6 +99,50 @@ def test_post_dispatch_audit_failure_records_critical_unknown_and_quarantine() -
     assert caught.value.outcome.reconciliation_identity.value == (
         "quotaPreferences/request-1"
     )
+
+
+def test_post_dispatch_recovery_attempts_are_isolated_behind_typed_error() -> None:
+    """Each recovery step is attempted and its failure remains typed and inspectable."""
+    attempted: list[str] = []
+
+    async def dispatch() -> str:
+        return "possibly-written"
+
+    def fail_terminal(_result: str) -> None:
+        raise _InjectedTerminalAuditError
+
+    def fail_quarantine(_identity: RedactedText) -> None:
+        attempted.append("quarantine")
+        raise _InjectedRecoveryError
+
+    def fail_unknown(_outcome: CriticalUnknownOutcome) -> None:
+        attempted.append("critical-unknown")
+        raise _InjectedRecoveryError
+
+    with pytest.raises(CriticalUnknownDispatchError) as caught:
+        asyncio.run(
+            AuditedWriteCoordinator[str]().run(
+                hooks=WriteSafetyHooks(
+                    pre_dispatch=(lambda: None,),
+                    record_terminal=fail_terminal,
+                    record_critical_unknown=fail_unknown,
+                    quarantine=fail_quarantine,
+                ),
+                dispatch=dispatch,
+                reconciliation_identity=RedactedText("quotaPreferences/request-1"),
+                quarantine_identity=RedactedText("plan-digest-1"),
+            )
+        )
+
+    assert attempted == ["quarantine", "critical-unknown"]
+    assert [type(error) for error in caught.value.recovery_failures] == [
+        _InjectedRecoveryError,
+        _InjectedRecoveryError,
+    ]
+    assert caught.value.outcome.reconciliation_identity.value == (
+        "quotaPreferences/request-1"
+    )
+    assert caught.value.outcome.quarantine_identity.value == "plan-digest-1"
 
 
 @pytest.mark.parametrize("field", ["reconciliation_identity", "quarantine_identity"])

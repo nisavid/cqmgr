@@ -1,9 +1,11 @@
 """Real-filesystem contracts for the append-only audit journal."""
 
 import base64
+import concurrent.futures
 import hashlib
 import json
 import multiprocessing
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -291,6 +293,39 @@ def test_append_unconditionally_excludes_audit_forbidden_text(tmp_path: Path) ->
     assert record.draft.correlation_id is not None
     assert REDACTION_MARKER in record.draft.correlation_id.value
     assert REDACTION_MARKER in record.draft.facts[0].value.value
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    [
+        "ya29.a0AfH6SMB_token-material",
+        "/mnt/custom/cqmgr/credentials.json",
+        "D:/private/cqmgr/credentials.json",
+    ],
+)
+def test_append_excludes_tokens_and_arbitrary_absolute_paths_by_default(
+    tmp_path: Path,
+    forbidden: str,
+) -> None:
+    """Known access tokens and platform paths never depend on caller term lists."""
+    safe_identity = "quotaPreferences/safe-identity"
+    journal = FilesystemAuditJournal(tmp_path)
+
+    journal.append(
+        _draft(
+            correlation_id=f"unsafe={forbidden}",
+            facts=(
+                AuditFact(
+                    StableSymbol("preference-identity"),
+                    RedactedText(safe_identity),
+                ),
+            ),
+        )
+    )
+    persisted = b"".join(path.read_bytes() for path in tmp_path.glob("*.json*"))
+
+    assert forbidden.encode() not in persisted
+    assert safe_identity.encode() in persisted
 
 
 @pytest.mark.parametrize(
@@ -840,3 +875,44 @@ def test_concurrent_processes_serialize_writers_without_lost_updates(
     records = journal.query(AuditQuery(limit=10)).records
     assert [record.sequence for record in records] == list(range(1, 7))
     assert journal.verify().valid
+
+
+def test_shared_journal_serializes_one_hundred_threaded_appends(tmp_path: Path) -> None:
+    """One shared adapter instance serializes threads without recursive lock errors."""
+    journal = FilesystemAuditJournal(tmp_path)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+        records = tuple(
+            executor.map(
+                lambda number: journal.append(
+                    _draft(correlation_id=f"thread-{number}")
+                ),
+                range(100),
+            )
+        )
+
+    assert sorted(record.sequence for record in records) == list(range(1, 101))
+    assert journal.verify().valid
+
+
+def test_shared_journal_serializes_reads_behind_an_active_write(tmp_path: Path) -> None:
+    """A shared-instance query waits for a durable append transaction to complete."""
+    write_reached_fsync = threading.Event()
+    release_write = threading.Event()
+
+    def block_after_fsync(stage: str) -> None:
+        if stage == "after-record-fsync":
+            write_reached_fsync.set()
+            release_write.wait(timeout=5)
+
+    journal = FilesystemAuditJournal(tmp_path, failure_hook=block_after_fsync)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        append = executor.submit(journal.append, _draft())
+        assert write_reached_fsync.wait(timeout=5)
+        query = executor.submit(journal.query, AuditQuery(limit=10))
+        assert not query.done()
+        release_write.set()
+        appended = append.result(timeout=5)
+        page = query.result(timeout=5)
+
+    assert page.records == (appended,)

@@ -14,6 +14,7 @@ import secrets
 import time
 from contextlib import suppress
 from pathlib import Path
+from threading import Event, Thread
 from typing import TYPE_CHECKING, Any, Final
 
 from cqmgr.adapters.persistence.locking import InterprocessFileLock
@@ -107,6 +108,7 @@ class SharedBudgetCoordinator:
         cancellation: CancellationToken,
     ) -> BudgetGrant:
         """Atomically charge every axis without exceeding the caller deadline."""
+        _validate_deadline(deadline)
         if not isinstance(request, BudgetRequest):
             msg = "budget request must be a BudgetRequest"
             raise TypeError(msg)
@@ -288,6 +290,46 @@ class SharedReadCoalescer:
         cancellation: CancellationToken,
     ) -> RedactedText:
         """Elect one leader and return its safe result to equivalent waiters."""
+        return await self._run(
+            identity,
+            work,
+            deadline=deadline,
+            cancellation=cancellation,
+            sync_completion=None,
+        )
+
+    async def run_sync(
+        self,
+        identity: str,
+        work: Callable[[], RedactedText],
+        *,
+        deadline: float,
+        cancellation: CancellationToken,
+    ) -> RedactedText:
+        """Run sync provider work while fencing its real thread completion."""
+        completion = Event()
+
+        async def tracked_work() -> RedactedText:
+            return await _run_in_owned_thread(work, completion)
+
+        return await self._run(
+            identity,
+            tracked_work,
+            deadline=deadline,
+            cancellation=cancellation,
+            sync_completion=completion,
+        )
+
+    async def _run(
+        self,
+        identity: str,
+        work: Callable[[], Awaitable[RedactedText]],
+        *,
+        deadline: float,
+        cancellation: CancellationToken,
+        sync_completion: Event | None,
+    ) -> RedactedText:
+        _validate_deadline(deadline)
         digest = hashlib.sha256(identity.encode()).hexdigest()
         lock = InterprocessFileLock(self._root / f".{digest}.lock")
         state_path = self._root / f"{digest}.json"
@@ -335,15 +377,27 @@ class SharedReadCoalescer:
                 cancellation.raise_if_cancelled()
                 _raise_deadline_if_elapsed(deadline, self._monotonic)
             except _DetachedLeaderError as detached:
-                cleanup = asyncio.create_task(
-                    _finish_detached_leader(
-                        detached.task,
-                        state_path=state_path,
-                        lock=lock,
+                if sync_completion is not None:
+                    Thread(
+                        target=_finish_detached_sync_leader,
+                        kwargs={
+                            "completion": sync_completion,
+                            "state_path": state_path,
+                            "lock": lock,
+                        },
+                        daemon=True,
+                        name="cqmgr-coalesced-read-cleanup",
+                    ).start()
+                else:
+                    cleanup = asyncio.create_task(
+                        _finish_detached_leader(
+                            detached.task,
+                            state_path=state_path,
+                            lock=lock,
+                        )
                     )
-                )
-                _BACKGROUND_LEADERS.add(cleanup)
-                cleanup.add_done_callback(_BACKGROUND_LEADERS.discard)
+                    _BACKGROUND_LEADERS.add(cleanup)
+                    cleanup.add_done_callback(_BACKGROUND_LEADERS.discard)
                 release_lock = False
                 raise detached.cause from detached
             except BaseException:
@@ -366,6 +420,41 @@ class SharedReadCoalescer:
         finally:
             if release_lock:
                 lock.release()
+
+
+async def _run_in_owned_thread(
+    work: Callable[[], RedactedText],
+    completion: Event,
+) -> RedactedText:
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[RedactedText] = loop.create_future()
+
+    def deliver_result(result: RedactedText) -> None:
+        if not future.done():
+            future.set_result(result)
+
+    def deliver_error(error: BaseException) -> None:
+        if not future.done():
+            future.set_exception(error)
+
+    def invoke() -> None:
+        try:
+            result = work()
+        except Exception as error:  # noqa: BLE001 - forwarded to the async caller
+            with suppress(RuntimeError):
+                loop.call_soon_threadsafe(deliver_error, error)
+        else:
+            with suppress(RuntimeError):
+                loop.call_soon_threadsafe(deliver_result, result)
+        finally:
+            completion.set()
+
+    Thread(
+        target=invoke,
+        daemon=True,
+        name="cqmgr-coalesced-read-worker",
+    ).start()
+    return await future
 
 
 async def _run_bounded_work(
@@ -418,6 +507,17 @@ async def _finish_detached_leader(
     finally:
         state_path.unlink(missing_ok=True)  # noqa: ASYNC240 - short local cleanup
         lock.release()
+
+
+def _finish_detached_sync_leader(
+    *,
+    completion: Event,
+    state_path: Path,
+    lock: InterprocessFileLock,
+) -> None:
+    completion.wait()
+    state_path.unlink(missing_ok=True)
+    lock.release()
 
 
 def _read_cached_result(
@@ -487,6 +587,15 @@ def _raise_deadline_if_elapsed(
 ) -> None:
     if monotonic() >= deadline:
         raise CoordinationDeadlineExceededError
+
+
+def _validate_deadline(deadline: object) -> None:
+    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+        msg = "coordination deadline must be a number"
+        raise TypeError(msg)
+    if not math.isfinite(deadline):
+        msg = "coordination deadline must be finite"
+        raise ValueError(msg)
 
 
 def _read_optional_json(path: Path) -> dict[str, Any] | None:

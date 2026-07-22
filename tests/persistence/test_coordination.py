@@ -142,6 +142,36 @@ def _hold_coalesced_leadership(root: str, ready: object) -> None:
     )
 
 
+def _hold_owned_sync_leadership(  # noqa: PLR0913 - explicit subprocess signals
+    root: str,
+    marker: str,
+    started: multiprocessing.synchronize.Event,
+    release: multiprocessing.synchronize.Event,
+    caller_finished: multiprocessing.synchronize.Event,
+    process_release: multiprocessing.synchronize.Event,
+) -> None:
+    coalescer = SharedReadCoalescer(root)
+
+    def work() -> RedactedText:
+        _record_work(Path(marker))
+        started.set()
+        release.wait(timeout=10)
+        return RedactedText("sync-result")
+
+    try:
+        asyncio.run(
+            coalescer.run_sync(
+                "owned-sync-read",
+                work,
+                deadline=time.monotonic() + 0.05,
+                cancellation=CancellationToken(),
+            )
+        )
+    except CoordinationDeadlineExceededError:
+        caller_finished.set()
+    process_release.wait(timeout=10)
+
+
 @given(
     delay=st.floats(min_value=0, max_value=3600, allow_nan=False, allow_infinity=False),
     attempt=st.integers(min_value=0, max_value=1000),
@@ -212,6 +242,44 @@ def test_cancelled_budget_request_makes_zero_durable_charge(tmp_path: Path) -> N
         )
 
     assert not (tmp_path / "budgets.json").exists()
+
+
+@pytest.mark.parametrize("deadline", [True, "later", math.nan, math.inf, -math.inf])
+def test_public_coordinators_reject_invalid_deadlines_before_side_effects(
+    tmp_path: Path,
+    deadline: object,
+) -> None:
+    """Invalid deadline values cannot charge state, acquire locks, or begin work."""
+    budget_root = tmp_path / "budgets"
+    coalescing_root = tmp_path / "coalescing"
+    work_calls = 0
+
+    async def work() -> RedactedText:
+        nonlocal work_calls
+        work_calls += 1
+        return RedactedText("unsafe")
+
+    with pytest.raises((TypeError, ValueError), match="deadline"):
+        asyncio.run(
+            SharedBudgetCoordinator(budget_root, _limits()).acquire(
+                _request(),
+                deadline=deadline,  # type: ignore[arg-type]
+                cancellation=CancellationToken(),
+            )
+        )
+    with pytest.raises((TypeError, ValueError), match="deadline"):
+        asyncio.run(
+            SharedReadCoalescer(coalescing_root).run(
+                "invalid-deadline",
+                work,
+                deadline=deadline,  # type: ignore[arg-type]
+                cancellation=CancellationToken(),
+            )
+        )
+
+    assert tuple(budget_root.iterdir()) == ()
+    assert tuple(coalescing_root.iterdir()) == ()
+    assert work_calls == 0
 
 
 def test_budget_wait_preserves_deadline_and_conservative_charge(tmp_path: Path) -> None:
@@ -758,7 +826,7 @@ def test_noncooperative_leader_timeout_returns_without_duplicate_work(
     asyncio.run(exercise())
 
 
-def test_to_thread_leader_retains_ownership_until_sync_work_really_ends(
+def test_owned_sync_leader_retains_ownership_until_work_really_ends(
     tmp_path: Path,
 ) -> None:
     """Task cancellation cannot permit duplicate sync provider work in its thread."""
@@ -774,15 +842,12 @@ def test_to_thread_leader_retains_ownership_until_sync_work_really_ends(
         release.wait(timeout=5)
         return RedactedText("thread-result")
 
-    async def threaded() -> RedactedText:
-        return await asyncio.to_thread(sync_read)
-
     async def exercise() -> None:
         with pytest.raises(CoordinationDeadlineExceededError):
             await asyncio.wait_for(
-                coalescer.run(
+                coalescer.run_sync(
                     "threaded-read",
-                    threaded,
+                    sync_read,
                     deadline=time.monotonic() + 0.05,
                     cancellation=CancellationToken(),
                 ),
@@ -790,9 +855,9 @@ def test_to_thread_leader_retains_ownership_until_sync_work_really_ends(
             )
         assert started.is_set()
         with pytest.raises(CoordinationDeadlineExceededError):
-            await coalescer.run(
+            await coalescer.run_sync(
                 "threaded-read",
-                threaded,
+                sync_read,
                 deadline=time.monotonic() + 0.05,
                 cancellation=CancellationToken(),
             )
@@ -801,6 +866,64 @@ def test_to_thread_leader_retains_ownership_until_sync_work_really_ends(
         await asyncio.sleep(0.05)
 
     asyncio.run(exercise())
+
+
+def test_owned_sync_leadership_survives_leader_event_loop_shutdown(
+    tmp_path: Path,
+) -> None:
+    """A successor process cannot duplicate a live worker after asyncio.run exits."""
+    context = multiprocessing.get_context("spawn")
+    started = context.Event()
+    release = context.Event()
+    caller_finished = context.Event()
+    process_release = context.Event()
+    marker = tmp_path / "owned-sync-count"
+    root = tmp_path / "owned-sync"
+    leader = context.Process(
+        target=_hold_owned_sync_leadership,
+        args=(
+            str(root),
+            str(marker),
+            started,
+            release,
+            caller_finished,
+            process_release,
+        ),
+    )
+    leader.start()
+    assert started.wait(timeout=10)
+    assert caller_finished.wait(timeout=10)
+    follower = SharedReadCoalescer(root)
+
+    def follower_work() -> RedactedText:
+        _record_work(marker)
+        return RedactedText("follower")
+
+    with pytest.raises(CoordinationDeadlineExceededError):
+        asyncio.run(
+            follower.run_sync(
+                "owned-sync-read",
+                follower_work,
+                deadline=time.monotonic() + 0.05,
+                cancellation=CancellationToken(),
+            )
+        )
+    assert marker.read_text() == "x"
+    release.set()
+    result = asyncio.run(
+        follower.run_sync(
+            "owned-sync-read",
+            follower_work,
+            deadline=time.monotonic() + 1,
+            cancellation=CancellationToken(),
+        )
+    )
+    process_release.set()
+    leader.join(timeout=10)
+
+    assert result.value == "follower"
+    assert marker.read_text() == "xx"
+    assert leader.exitcode == 0
 
 
 @pytest.mark.parametrize("result_ttl", [0.0, 1.0])
