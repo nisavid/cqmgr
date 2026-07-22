@@ -244,6 +244,102 @@ def test_cancelled_budget_request_makes_zero_durable_charge(tmp_path: Path) -> N
     assert not (tmp_path / "budgets.json").exists()
 
 
+@pytest.mark.parametrize("control", ["cancellation", "deadline"])
+def test_durable_budget_charge_completes_the_acquisition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control: str,
+) -> None:
+    """A committed charge cannot be reported as a rejected acquisition."""
+    token = CancellationToken()
+    now = 100.0
+    original_write = coordination_adapter._atomic_write_json  # noqa: SLF001
+
+    def monotonic() -> float:
+        return now
+
+    def write_then_stop(root: Path, name: str, data: dict[str, object]) -> None:
+        nonlocal now
+        original_write(root, name, data)
+        if control == "cancellation":
+            token.cancel()
+        else:
+            now = 101.0
+
+    monkeypatch.setattr(coordination_adapter, "_atomic_write_json", write_then_stop)
+    grant = asyncio.run(
+        SharedBudgetCoordinator(
+            tmp_path,
+            _limits(capacity=2),
+            monotonic=monotonic,
+        ).acquire(
+            _request(),
+            deadline=101,
+            cancellation=token,
+        )
+    )
+
+    assert grant.request == _request()
+    state = json.loads((tmp_path / "budgets.json").read_text())
+    assert {entry["used"] for entry in state["entries"].values()} == {1}
+
+
+@pytest.mark.parametrize("control", ["cancellation", "deadline"])
+def test_budget_controls_are_rechecked_immediately_before_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control: str,
+) -> None:
+    """Cancellation or expiry during preparation prevents the durable charge."""
+    token = CancellationToken()
+    now = 100.0
+    original_prepare = SharedBudgetCoordinator._prospective_entries  # noqa: SLF001
+
+    def monotonic() -> float:
+        return now
+
+    def prepare_then_stop(
+        coordinator: SharedBudgetCoordinator,
+        state: dict[str, object],
+        request: BudgetRequest,
+        wall_time: float,
+    ) -> tuple[dict[str, object], float | None]:
+        nonlocal now
+        prepared = original_prepare(coordinator, state, request, wall_time)
+        if control == "cancellation":
+            token.cancel()
+        else:
+            now = 101.0
+        return prepared
+
+    monkeypatch.setattr(
+        SharedBudgetCoordinator,
+        "_prospective_entries",
+        prepare_then_stop,
+    )
+    coordinator = SharedBudgetCoordinator(
+        tmp_path,
+        _limits(capacity=2),
+        monotonic=monotonic,
+    )
+    expected = (
+        CoordinationCancelledError
+        if control == "cancellation"
+        else CoordinationDeadlineExceededError
+    )
+
+    with pytest.raises(expected):
+        asyncio.run(
+            coordinator.acquire(
+                _request(),
+                deadline=101,
+                cancellation=token,
+            )
+        )
+
+    assert not (tmp_path / "budgets.json").exists()
+
+
 @pytest.mark.parametrize("deadline", [True, "later", math.nan, math.inf, -math.inf])
 def test_public_coordinators_reject_invalid_deadlines_before_side_effects(
     tmp_path: Path,

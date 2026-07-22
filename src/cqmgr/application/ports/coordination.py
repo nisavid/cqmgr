@@ -122,7 +122,7 @@ class BudgetCoordinator(Protocol):
         deadline: float,
         cancellation: CancellationToken,
     ) -> BudgetGrant:
-        """Charge every applicable axis within the caller's monotonic deadline."""
+        """Commit a charge after checking the caller's deadline and cancellation."""
         ...
 
 

@@ -107,7 +107,7 @@ class SharedBudgetCoordinator:
         deadline: float,
         cancellation: CancellationToken,
     ) -> BudgetGrant:
-        """Atomically charge every axis without exceeding the caller deadline."""
+        """Atomically charge every axis, with the durable write as commit point."""
         _validate_deadline(deadline)
         if not isinstance(request, BudgetRequest):
             msg = "budget request must be a BudgetRequest"
@@ -131,10 +131,12 @@ class SharedBudgetCoordinator:
                 now = self._wall_clock()
                 entries, wait = self._prospective_entries(state, request, now)
                 if wait is None:
-                    self._write_state(entries)
                     cancellation.raise_if_cancelled()
                     if self._monotonic() >= deadline:
                         raise CoordinationDeadlineExceededError
+                    self._write_state(entries)
+                    # Once the charge commits, reporting cancellation or timeout
+                    # would make a retry charge the same acquisition again.
                     return BudgetGrant(charged_at=now, request=request)
             finally:
                 lock.release()
