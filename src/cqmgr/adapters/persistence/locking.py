@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import time
 from pathlib import Path
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
     from io import BufferedRandom
     from os import PathLike
     from types import TracebackType
-    from typing import Self
+    from typing import Never, Self
 
 
 class InterprocessFileLock:
@@ -160,7 +161,7 @@ if os.name == "nt":
         try:
             msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError as error:
-            raise BlockingIOError from error
+            _raise_windows_lock_error(error)
 
     def _unlock(stream: BufferedRandom) -> None:
         stream.seek(0)
@@ -174,3 +175,11 @@ else:
 
     def _unlock(stream: BufferedRandom) -> None:
         fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _raise_windows_lock_error(error: OSError) -> Never:
+    if error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK} or getattr(
+        error, "winerror", None
+    ) in {32, 33, 36}:
+        raise BlockingIOError from error
+    raise error

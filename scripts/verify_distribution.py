@@ -38,6 +38,7 @@ EXPECTED_PACKAGE_FILES = {
     PurePosixPath("application/__init__.py"),
     PurePosixPath("application/configuration.py"),
     PurePosixPath("application/operations/__init__.py"),
+    PurePosixPath("application/operations/audited_write.py"),
     PurePosixPath("application/operations/local.py"),
     PurePosixPath("application/ports/__init__.py"),
     PurePosixPath("application/ports/audit.py"),

@@ -27,7 +27,7 @@ from cqmgr.domain.audit import (
     AuditVerificationFailure,
 )
 from cqmgr.domain.diagnostics import DiagnosticCode
-from cqmgr.domain.redaction import RedactedText
+from cqmgr.domain.redaction import REDACTION_MARKER, RedactedText
 from cqmgr.domain.results import OperationName, StableSymbol
 from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 
@@ -63,6 +63,14 @@ _MANIFEST_FIELDS: Final = frozenset(
 )
 _SHA256_PATTERN: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SEGMENT_PATTERN: Final = re.compile(r"audit-([0-9]{8})\.jsonl\Z")
+_QUOTA_CONTACT_PATTERN: Final = re.compile(
+    r"(?<![\w.+-])[\w.+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![\w.-])"
+)
+_POSIX_MACHINE_PATH_PATTERN: Final = re.compile(
+    r"(?<![\w:])/(?:Users|Volumes|home|private|tmp|var|etc|opt)(?:/[^\s,;]+)+"
+)
+_WINDOWS_MACHINE_PATH_PATTERN: Final = re.compile(r"(?i)(?:[A-Z]:\\|\\\\)[^\s,;]+")
+_RAW_PROVIDER_BODY_PATTERN: Final = re.compile(r"(?s)(?:\{.*\}|\[.*\])")
 
 
 class FilesystemAuditJournal:
@@ -215,11 +223,16 @@ class FilesystemAuditJournal:
         machine_paths: tuple[str, ...],
     ) -> AuditRecordDraft:
         def scrub(value: RedactedText) -> RedactedText:
-            return RedactedText(
+            explicit = RedactedText(
                 value.value,
                 sensitive_values=sensitive_values,
                 machine_paths=machine_paths,
             )
+            automatic = _QUOTA_CONTACT_PATTERN.sub(REDACTION_MARKER, explicit.value)
+            automatic = _POSIX_MACHINE_PATH_PATTERN.sub(REDACTION_MARKER, automatic)
+            automatic = _WINDOWS_MACHINE_PATH_PATTERN.sub(REDACTION_MARKER, automatic)
+            automatic = _RAW_PROVIDER_BODY_PATTERN.sub(REDACTION_MARKER, automatic)
+            return RedactedText(automatic)
 
         return replace(
             draft,
@@ -416,7 +429,10 @@ class FilesystemAuditJournal:
                 self._fail(
                     AuditFailureCode.MISSING_SEGMENT, expected_segment, None, None
                 )
-            for raw_line in path.read_bytes().splitlines(keepends=True):
+            for position, raw_line in enumerate(
+                path.read_bytes().splitlines(keepends=True),
+                start=1,
+            ):
                 if not raw_line.endswith(b"\n"):
                     self._fail(
                         AuditFailureCode.MALFORMED_RECORD,
@@ -430,6 +446,11 @@ class FilesystemAuditJournal:
                     actual_segment=actual_segment,
                     expected_sequence=expected_sequence,
                 )
+                self._verify_rotation_checkpoint(
+                    record,
+                    actual_segment=actual_segment,
+                    position=position,
+                )
                 self._verify_record(
                     record,
                     actual_segment=actual_segment,
@@ -442,6 +463,43 @@ class FilesystemAuditJournal:
         if check_manifest:
             self._verify_manifest(tuple(records))
         return tuple(records)
+
+    def _verify_rotation_checkpoint(
+        self,
+        record: AuditRecord,
+        *,
+        actual_segment: int,
+        position: int,
+    ) -> None:
+        is_checkpoint = record.draft.kind is AuditRecordKind.ROTATION_CHECKPOINT
+        checkpoint_required = actual_segment > 1 and position == 1
+        if is_checkpoint != checkpoint_required:
+            self._fail(
+                AuditFailureCode.INVALID_ROTATION_CHECKPOINT,
+                actual_segment,
+                record.sequence,
+                record.record_id,
+            )
+        if not is_checkpoint:
+            return
+        draft = record.draft
+        valid = (
+            draft.operation == OperationName("audit.rotate")
+            and draft.resource_scope is None
+            and draft.outcome is None
+            and draft.correlation_id is None
+            and not draft.diagnostic_codes
+            and len(draft.facts) == 1
+            and draft.facts[0].name == StableSymbol("previous-segment")
+            and draft.facts[0].value.value == str(actual_segment - 1)
+        )
+        if not valid:
+            self._fail(
+                AuditFailureCode.INVALID_ROTATION_CHECKPOINT,
+                actual_segment,
+                record.sequence,
+                record.record_id,
+            )
 
     def _ordered_segment_paths(self) -> tuple[tuple[int, Path], ...]:
         parsed: list[tuple[int, Path]] = []
