@@ -402,7 +402,7 @@ def test_budget_property_never_grants_more_than_capacity(
             grants += 1
 
         assert grants == min(capacity, attempts)
-        with pytest.raises(CoordinationDeadlineExceededError):
+        with pytest.raises(ValueError, match="capacity"):
             asyncio.run(
                 coordinator.acquire(
                     BudgetRequest(

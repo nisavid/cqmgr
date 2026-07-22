@@ -10,6 +10,7 @@ from cqmgr.domain.audit import (
     AuditFact,
     AuditFailureCode,
     AuditQuery,
+    AuditRecord,
     AuditRecordDraft,
     AuditRecordKind,
     AuditVerification,
@@ -34,6 +35,17 @@ def _draft() -> AuditRecordDraft:
         correlation_id=RedactedText("sha256:opaque"),
         diagnostic_codes=(DiagnosticCode("audit-safe"),),
         facts=(AuditFact(StableSymbol("preference"), RedactedText("safe")),),
+    )
+
+
+def _record() -> AuditRecord:
+    return AuditRecord(
+        record_id="audit-00000000000000000001",
+        sequence=1,
+        segment=1,
+        draft=_draft(),
+        previous_hash="sha256:" + ("0" * 64),
+        record_hash="sha256:" + ("1" * 64),
     )
 
 
@@ -94,6 +106,33 @@ def test_audit_fact_rejects_raw_values(name: str, value: object, message: str) -
     arguments[name] = value
     with pytest.raises(TypeError, match=message):
         AuditFact(**arguments)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "exception", "message"),
+    [
+        ("record_id", 1, TypeError, "record identity"),
+        ("record_id", "audit-1", ValueError, "record identity"),
+        ("sequence", True, TypeError, "sequence"),
+        ("sequence", 0, ValueError, "sequence"),
+        ("segment", True, TypeError, "segment"),
+        ("segment", 0, ValueError, "segment"),
+        ("draft", "draft", TypeError, "draft"),
+        ("previous_hash", 1, TypeError, "previous hash"),
+        ("previous_hash", "sha256:invalid", ValueError, "previous hash"),
+        ("record_hash", 1, TypeError, "record hash"),
+        ("record_hash", "sha256:invalid", ValueError, "record hash"),
+    ],
+)
+def test_audit_record_rejects_noncanonical_runtime_invariants(
+    field: str,
+    value: object,
+    exception: type[Exception],
+    message: str,
+) -> None:
+    """Records cannot exist with identities or chain metadata that cannot persist."""
+    with pytest.raises(exception, match=message):
+        replace(_record(), **{field: value})  # type: ignore[arg-type]
 
 
 def test_audit_query_accepts_closed_utc_range_and_bounded_limit() -> None:
@@ -167,3 +206,53 @@ def test_verification_requires_exactly_one_validity_shape() -> None:
         )
     with pytest.raises(ValueError, match="must have no failure"):
         AuditVerification(valid=False, verified_from=None, verified_through=None)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("code", "record-hash-mismatch", "code"),
+        ("segment", True, "segment"),
+        ("segment", -1, "segment"),
+        ("sequence", True, "sequence"),
+        ("sequence", 0, "sequence"),
+        ("record_id", 1, "record identity"),
+    ],
+)
+def test_verification_failure_rejects_cross_wired_location_values(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    """Integrity failures retain typed codes and exact non-negative locations."""
+    failure = AuditVerificationFailure(
+        AuditFailureCode.RECORD_HASH_MISMATCH,
+        segment=1,
+        sequence=2,
+        record_id="audit-00000000000000000002",
+    )
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        replace(failure, **{field: value})  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("valid", 1, "valid"),
+        ("verified_from", 1, "verified from"),
+        ("verified_through", 1, "verified through"),
+        ("failure", "failure", "failure"),
+    ],
+)
+def test_verification_rejects_cross_wired_range_values(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    """Verification ranges retain their closed runtime result shape."""
+    with pytest.raises(TypeError, match=message):
+        replace(
+            AuditVerification(valid=True, verified_from=None, verified_through=None),
+            **{field: value},  # type: ignore[arg-type]
+        )
