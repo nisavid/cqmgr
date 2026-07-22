@@ -109,7 +109,7 @@ def test_repository_atomically_round_trips_private_canonical_snapshot(
     snapshot_files = list((root / "snapshots").glob("*.json"))
     assert len(snapshot_files) == 1
     assert json.loads(snapshot_files[0].read_bytes())["schema"] == (
-        "cqmgr.quota-query-snapshot/v1"
+        "cqmgr.quota-query-snapshot/v2"
     )
     assert list(root.rglob("*.tmp")) == []
     if stat.S_IMODE(root.stat().st_mode):
@@ -324,7 +324,7 @@ def test_repository_rejects_newer_and_corrupt_snapshot_state(tmp_path: Path) -> 
     path = next((root / "snapshots").glob("*.json"))
 
     document = json.loads(path.read_bytes())
-    document["schema"] = "cqmgr.quota-query-snapshot/v2"
+    document["schema"] = "cqmgr.quota-query-snapshot/v3"
     path.write_text(json.dumps(document))
     with pytest.raises(UnsupportedQuotaSnapshotSchemaError):
         repository.load(snapshot.metadata.snapshot_id, now=NOW)

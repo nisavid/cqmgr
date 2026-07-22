@@ -26,13 +26,18 @@ from cqmgr.application.ports.quota_snapshots import (
 )
 from cqmgr.domain.accelerator_overlay import (
     GpuWorkloadRequirement,
+    QuotaConstraintAssessment,
     ResolutionFailureReason,
     ResolvedQuotaRequirement,
     TpuWorkloadRequirement,
     WorkloadCatalogEvidence,
     WorkloadResolutionError,
 )
-from cqmgr.domain.catalog import CatalogEvidenceSource, ManagementPlane
+from cqmgr.domain.catalog import (
+    AcceleratorConstraintSet,
+    CatalogEvidenceSource,
+    ManagementPlane,
+)
 from cqmgr.domain.quota_queries import (
     QUOTA_QUERY_EVIDENCE_CONTRACT,
     IncompatibleSortUnitsError,
@@ -90,7 +95,7 @@ if TYPE_CHECKING:
         QuotaQuerySnapshotRepository,
     )
     from cqmgr.domain.accelerator_overlay import SemanticAcceleratorOverlay
-    from cqmgr.domain.catalog import AcceleratorConstraintSet, CatalogLocationCoverage
+    from cqmgr.domain.catalog import CatalogLocationCoverage
     from cqmgr.domain.diagnostics import Diagnostic
 
 
@@ -122,29 +127,36 @@ class WorkloadResolutionOperations:
     def __init__(  # noqa: PLR0913
         self,
         effective: EffectiveQuotaReader,
+        usage: UsageReader,
         compute_machine_types: ComputeMachineTypeReader,
         tpu_locations: TpuLocationReader,
         tpu_accelerator_types: TpuAcceleratorTypeReader,
         tpu_runtime_versions: TpuRuntimeVersionReader,
         overlay: SemanticAcceleratorOverlay,
         clock: Clock,
+        *,
+        usage_window: timedelta = timedelta(hours=1),
     ) -> None:
         """Inject every provider-neutral evidence boundary and the semantic overlay."""
         self._effective = effective
+        self._usage = usage
         self._compute_machine_types = compute_machine_types
         self._tpu_locations = tpu_locations
         self._tpu_accelerator_types = tpu_accelerator_types
         self._tpu_runtime_versions = tpu_runtime_versions
         self._overlay = overlay
         self._clock = clock
+        self._usage_window = usage_window
 
-    async def resolve(
+    async def resolve(  # noqa: PLR0911
         self,
         request: QuotaResolveRequest,
     ) -> OperationResult[ResolvedQuotaRequirement | None]:
         """Resolve one exact workload without making a capacity claim."""
         started_at = self._clock.now()
-        effective_read, catalog, diagnostics = await self._read_evidence(request)
+        effective_read, usage_read, catalog, diagnostics = await self._read_evidence(
+            request, started_at
+        )
         if not effective_read.complete:
             gaps = tuple(
                 EvidenceGap(
@@ -175,6 +187,23 @@ class WorkloadResolutionOperations:
                     if has_partial_data
                     else Completeness.unavailable(*gaps)
                 ),
+                data=None,
+                diagnostics=diagnostics,
+            )
+        if not usage_read.complete:
+            gaps = (
+                EvidenceGap(
+                    StableSymbol("cloud-monitoring"),
+                    StableSymbol("quota-usage-read-incomplete"),
+                ),
+            )
+            return self._result(
+                request,
+                started_at,
+                reached=False,
+                outcome="quota-usage-read-incomplete",
+                exit_class=ExitClass.INCOMPLETE_EVIDENCE,
+                completeness=Completeness.incomplete(*gaps),
                 data=None,
                 diagnostics=diagnostics,
             )
@@ -246,6 +275,30 @@ class WorkloadResolutionOperations:
                 data=None,
                 diagnostics=diagnostics,
             )
+        try:
+            assessed = replace(
+                resolved,
+                assessments=_quota_constraint_assessments(
+                    resolved,
+                    effective_read.values,
+                    usage_read.values,
+                ),
+            )
+        except _AmbiguousEvidenceError:
+            gap = EvidenceGap(
+                StableSymbol("cloud-monitoring"),
+                StableSymbol("constraint-usage-incomplete"),
+            )
+            return self._result(
+                request,
+                started_at,
+                reached=False,
+                outcome="constraint-usage-incomplete",
+                exit_class=ExitClass.INCOMPLETE_EVIDENCE,
+                completeness=Completeness.incomplete(gap),
+                data=None,
+                diagnostics=diagnostics,
+            )
         return self._result(
             request,
             started_at,
@@ -253,15 +306,17 @@ class WorkloadResolutionOperations:
             outcome="requirement-resolved",
             exit_class=ExitClass.SUCCESS,
             completeness=Completeness.complete(),
-            data=resolved,
+            data=assessed,
             diagnostics=diagnostics,
         )
 
     async def _read_evidence(
         self,
         request: QuotaResolveRequest,
+        observed_at: datetime,
     ) -> tuple[
         ProviderRead[EffectiveQuotaEvidence],
+        ProviderRead[UsageObservation],
         WorkloadCatalogEvidence,
         tuple[Diagnostic, ...],
     ]:
@@ -271,33 +326,45 @@ class WorkloadResolutionOperations:
             and requirement.management_plane is ManagementPlane.COMPUTE
         )
         if uses_compute:
-            return await self._read_compute_evidence(request.context)
+            return await self._read_compute_evidence(request.context, observed_at)
         return await self._read_legacy_tpu_evidence(
             request.context,
             requirement.zone,
+            observed_at,
         )
 
     async def _read_compute_evidence(
         self,
         context: ProviderReadContext,
+        observed_at: datetime,
     ) -> tuple[
         ProviderRead[EffectiveQuotaEvidence],
+        ProviderRead[UsageObservation],
         WorkloadCatalogEvidence,
         tuple[Diagnostic, ...],
     ]:
-        effective_read, machine_read = await asyncio.gather(
+        effective_read, usage_read, machine_read = await asyncio.gather(
             self._effective.read(
                 EffectiveQuotaReadRequest(context, "compute.googleapis.com")
+            ),
+            self._usage.read(
+                UsageReadRequest(
+                    context,
+                    "compute.googleapis.com",
+                    observed_at - self._usage_window,
+                    observed_at,
+                )
             ),
             self._compute_machine_types.read(ComputeMachineTypeReadRequest(context)),
         )
         diagnostics = _resolution_diagnostics(
-            effective_read.diagnostics,
+            (*effective_read.diagnostics, *usage_read.diagnostics),
             machine_read.read.diagnostics,
             machine_read.location_coverage,
         )
         return (
             effective_read,
+            usage_read,
             WorkloadCatalogEvidence(
                 compute_machine_types=machine_read.values,
                 tpu_locations=(),
@@ -312,19 +379,30 @@ class WorkloadResolutionOperations:
         self,
         context: ProviderReadContext,
         zone: str,
+        observed_at: datetime,
     ) -> tuple[
         ProviderRead[EffectiveQuotaEvidence],
+        ProviderRead[UsageObservation],
         WorkloadCatalogEvidence,
         tuple[Diagnostic, ...],
     ]:
         (
             effective_read,
+            usage_read,
             location_read,
             accelerator_read,
             runtime_read,
         ) = await asyncio.gather(
             self._effective.read(
                 EffectiveQuotaReadRequest(context, "tpu.googleapis.com")
+            ),
+            self._usage.read(
+                UsageReadRequest(
+                    context,
+                    "tpu.googleapis.com",
+                    observed_at - self._usage_window,
+                    observed_at,
+                )
             ),
             self._tpu_locations.read(TpuLocationReadRequest(context)),
             self._tpu_accelerator_types.read(
@@ -340,7 +418,7 @@ class WorkloadResolutionOperations:
             *runtime_read.location_coverage,
         )
         diagnostics = _resolution_diagnostics(
-            effective_read.diagnostics,
+            (*effective_read.diagnostics, *usage_read.diagnostics),
             (
                 *location_read.read.diagnostics,
                 *accelerator_read.read.diagnostics,
@@ -350,6 +428,7 @@ class WorkloadResolutionOperations:
         )
         return (
             effective_read,
+            usage_read,
             WorkloadCatalogEvidence(
                 compute_machine_types=(),
                 tpu_locations=location_read.values,
@@ -468,6 +547,28 @@ class QuotaInspectData:
     status: QuotaRequestStatus | None
     constraint_set: AcceleratorConstraintSet | None
     reason: str | None = None
+    constraint_sets: tuple[AcceleratorConstraintSet, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Normalize singular compatibility only for one unambiguous set."""
+        constraint_sets = self.constraint_sets
+        if not isinstance(constraint_sets, tuple) or any(
+            not isinstance(item, AcceleratorConstraintSet) for item in constraint_sets
+        ):
+            msg = "inspect constraint_sets must contain AcceleratorConstraintSet"
+            raise TypeError(msg)
+        if self.constraint_set is not None:
+            if constraint_sets and constraint_sets != (self.constraint_set,):
+                msg = "inspect singular constraint_set is ambiguous"
+                raise ValueError(msg)
+            constraint_sets = (self.constraint_set,)
+        constraint_sets = tuple(dict.fromkeys(constraint_sets))
+        object.__setattr__(self, "constraint_sets", constraint_sets)
+        object.__setattr__(
+            self,
+            "constraint_set",
+            constraint_sets[0] if len(constraint_sets) == 1 else None,
+        )
 
 
 class _AmbiguousEvidenceError(ValueError):
@@ -724,17 +825,18 @@ class QuotaOperations:
             return self._inspect_rejection(
                 request, started_at, "ambiguous-related-evidence"
             )
-        constraint_set = item.constraint_set
+        constraint_sets = item.constraint_sets
         data = QuotaInspectData(
-            request.identity,
-            evidence,
-            item,
-            preference,
-            usage,
-            status,
-            constraint_set,
+            identity=request.identity,
+            evidence=evidence,
+            item=item,
+            preference=preference,
+            usage=usage,
+            status=status,
+            constraint_set=item.constraint_set,
+            constraint_sets=constraint_sets,
         )
-        if item.predicates.guided and constraint_set is None:
+        if item.predicates.guided and not constraint_sets:
             data = replace(data, reason="constraint-set-incomplete")
             return self._incomplete_result(
                 "quota.inspect",
@@ -849,15 +951,7 @@ class QuotaOperations:
             evidence,
             freshly_validated_mutable=mutable,
         )
-        constraint_set = (
-            None
-            if item.accelerator_id is None
-            else self._overlay.constraint_set(
-                item.accelerator_id,
-                evidence,
-                evidences,
-            )
-        )
+        constraint_sets = self._overlay.constraint_sets(evidence, evidences)
         preference = _one_exact_preference(evidence, preferences)
         usage_value = _joined_usage_value(evidence, usages, strict=strict_usage)
         status = _status(evidence, preference, effective_observed_at)
@@ -881,7 +975,8 @@ class QuotaOperations:
                     else status.effective_confirmation
                 ),
                 evidence_observed_at=effective_observed_at,
-                constraint_set=constraint_set,
+                constraint_sets=constraint_sets,
+                constraint_set=None,
             ),
             status,
         )
@@ -1247,6 +1342,41 @@ def _joined_usage_value(
         return None
 
 
+def _quota_constraint_assessments(
+    resolved: ResolvedQuotaRequirement,
+    evidences: tuple[EffectiveQuotaEvidence, ...],
+    usages: tuple[UsageObservation, ...],
+) -> tuple[QuotaConstraintAssessment, ...]:
+    """Assess every exact limiting slice from authoritative native-unit usage."""
+    assessments = []
+    for reference in resolved.constraint_set.references:
+        matches = tuple(
+            evidence
+            for evidence in evidences
+            if evidence.identity == reference.slice_identity
+        )
+        if len(matches) != 1:
+            msg = "constraint assessment requires one exact effective quota slice"
+            raise _AmbiguousEvidenceError(msg)
+        evidence = matches[0]
+        usage = _usage_quantity(evidence, _one_exact_usage(evidence, usages))
+        if usage is None:
+            msg = "constraint assessment requires exact authoritative usage"
+            raise _AmbiguousEvidenceError(msg)
+        effective = evidence.effective_value
+        required = resolved.required_amount
+        assessments.append(
+            QuotaConstraintAssessment(
+                reference.slice_identity,
+                effective,
+                usage,
+                required,
+                usage.value + required.value <= effective.value,
+            )
+        )
+    return tuple(assessments)
+
+
 def _status(
     evidence: EffectiveQuotaEvidence,
     preference: QuotaPreferenceEvidence | None,
@@ -1339,7 +1469,7 @@ def _constraint_sets(
     """Retain each distinct anchored constraint set represented on a page."""
     return tuple(
         dict.fromkeys(
-            item.constraint_set for item in items if item.constraint_set is not None
+            constraint_set for item in items for constraint_set in item.constraint_sets
         )
     )
 

@@ -286,6 +286,17 @@ class ScriptedOverlay:
             ),
         )
 
+    def constraint_sets(
+        self,
+        evidence: EffectiveQuotaEvidence,
+        evidences: tuple[EffectiveQuotaEvidence, ...],
+    ) -> tuple[AcceleratorConstraintSet, ...]:
+        """Return the fake's one anchored relationship when it is known."""
+        if not evidence.identity.quota_id.startswith("known-"):
+            return ()
+        constraint_set = self.constraint_set(ACCELERATOR, evidence, evidences)
+        return () if constraint_set is None else (constraint_set,)
+
 
 @dataclass
 class OperationFixture:
@@ -379,7 +390,7 @@ def _usage(evidence: EffectiveQuotaEvidence, value: int = 3) -> UsageObservation
         resource_type="consumer_quota",
         resource_labels=NormalizedDimensions(
             (
-                ("location", "us-central1"),
+                ("location", evidence.applicable_locations[0]),
                 ("project_id", "public-schema-project"),
                 ("service", evidence.identity.service),
             )
@@ -421,6 +432,7 @@ def _fixture(
     *,
     preferences: ProviderRead[QuotaPreferenceEvidence] | None = None,
     usage: ProviderRead[UsageObservation] | None = None,
+    overlay: object | None = None,
 ) -> OperationFixture:
     effective = ScriptedReader(effective_reads)
     preference_reader = ScriptedReader((preferences or _complete(),))
@@ -431,7 +443,10 @@ def _fixture(
         cast("EffectiveQuotaReader", effective),
         cast("QuotaPreferenceReader", preference_reader),
         cast("UsageReader", usage_reader),
-        cast("SemanticAcceleratorOverlay", ScriptedOverlay()),
+        cast(
+            "SemanticAcceleratorOverlay",
+            ScriptedOverlay() if overlay is None else overlay,
+        ),
         snapshots,
         cursors,
         FixedClock(),
@@ -663,13 +678,19 @@ def _legacy_tpu_catalog_reads() -> tuple[
 
 def test_resolve_gpu_retains_unrelated_catalog_failures() -> None:
     """Selected-location success is independent of unrelated catalog failures."""
-    effective = ScriptedReader((_complete(*_gpu_quota_evidence()),))
+    regional, global_ = (
+        replace(evidence, effective_value=QuotaQuantity(64, UNIT))
+        for evidence in _gpu_quota_evidence()
+    )
+    effective = ScriptedReader((_complete(regional, global_),))
+    usage = ScriptedReader((_complete(_usage(regional, 55), _usage(global_, 60)),))
     compute = ScriptedCatalogReader((_gpu_catalog_read(),))
     tpu_locations = ScriptedCatalogReader(())
     tpu_accelerators = ScriptedCatalogReader(())
     tpu_runtimes = ScriptedCatalogReader(())
     operations = WorkloadResolutionOperations(
         effective,
+        usage,
         compute,
         tpu_locations,
         tpu_accelerators,
@@ -686,11 +707,75 @@ def test_resolve_gpu_retains_unrelated_catalog_failures() -> None:
     assert result.data is not None
     assert result.data.owning_service == "compute.googleapis.com"
     assert result.data.required_amount == QuotaQuantity(8, UNIT)
+    assert tuple(item.identity for item in result.data.assessments) == (
+        global_.identity,
+        regional.identity,
+    )
+    assert tuple(item.permits for item in result.data.assessments) == (False, True)
+    assert result.data.permits is False
     assert result.diagnostics == (_catalog_diagnostic(),)
     assert len(compute.calls) == 1
     assert tpu_locations.calls == []
     assert tpu_accelerators.calls == []
     assert tpu_runtimes.calls == []
+
+
+@pytest.mark.parametrize("usage_case", ["missing", "ambiguous", "incompatible"])
+def test_resolve_stops_on_untrustworthy_constraint_usage(usage_case: str) -> None:
+    """Every exact limiting slice requires one compatible authoritative series."""
+    regional, global_ = _gpu_quota_evidence()
+    regional_usage = _usage(regional, 0)
+    global_usage = _usage(global_, 0)
+    observations = {
+        "missing": (regional_usage,),
+        "ambiguous": (regional_usage, global_usage, global_usage),
+        "incompatible": (
+            regional_usage,
+            replace(global_usage, unit=OTHER_UNIT.symbol),
+        ),
+    }[usage_case]
+    operations = WorkloadResolutionOperations(
+        ScriptedReader((_complete(regional, global_),)),
+        ScriptedReader((_complete(*observations),)),
+        ScriptedCatalogReader((_gpu_catalog_read(),)),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+
+    result = asyncio.run(
+        operations.resolve(QuotaResolveRequest(_context(), _gpu_requirement()))
+    )
+
+    assert result.outcome.exit_class is ExitClass.INCOMPLETE_EVIDENCE
+    assert result.outcome.code == StableSymbol("constraint-usage-incomplete")
+    assert result.data is None
+    assert result.completeness.has_partial_data
+
+
+def test_resolve_stops_on_incomplete_usage_read() -> None:
+    """A partial Monitoring read cannot support quota sufficiency."""
+    regional, global_ = _gpu_quota_evidence()
+    operations = WorkloadResolutionOperations(
+        ScriptedReader((_complete(regional, global_),)),
+        ScriptedReader((_incomplete(_usage(regional), _usage(global_)),)),
+        ScriptedCatalogReader((_gpu_catalog_read(),)),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+
+    result = asyncio.run(
+        operations.resolve(QuotaResolveRequest(_context(), _gpu_requirement()))
+    )
+
+    assert result.outcome.exit_class is ExitClass.INCOMPLETE_EVIDENCE
+    assert result.outcome.code == StableSymbol("quota-usage-read-incomplete")
+    assert result.data is None
 
 
 def test_resolve_legacy_tpu_uses_only_selected_zone_tpu_catalogs() -> None:
@@ -703,6 +788,7 @@ def test_resolve_legacy_tpu_uses_only_selected_zone_tpu_catalogs() -> None:
     tpu_runtimes = ScriptedCatalogReader((runtime_read,))
     operations = WorkloadResolutionOperations(
         effective,
+        ScriptedReader((_complete(_usage(_legacy_tpu_quota_evidence(), value=0)),)),
         compute,
         tpu_locations,
         tpu_accelerators,
@@ -734,6 +820,7 @@ def test_resolve_compute_tpu_uses_compute_catalog_and_owned_quota() -> None:
     tpu_runtimes = ScriptedCatalogReader(())
     operations = WorkloadResolutionOperations(
         effective,
+        ScriptedReader((_complete(_usage(_compute_tpu_quota_evidence(), value=0)),)),
         compute,
         tpu_locations,
         tpu_accelerators,
@@ -761,6 +848,7 @@ def test_resolve_stops_on_incomplete_required_quota_read() -> None:
     effective = ScriptedReader((_incomplete(*_gpu_quota_evidence()),))
     operations = WorkloadResolutionOperations(
         effective,
+        ScriptedReader((_complete(),)),
         ScriptedCatalogReader((_gpu_catalog_read(),)),
         ScriptedCatalogReader(()),
         ScriptedCatalogReader(()),
@@ -797,6 +885,7 @@ def test_resolve_stops_on_failed_selected_location_catalog_evidence() -> None:
     )
     operations = WorkloadResolutionOperations(
         ScriptedReader((_complete(*_gpu_quota_evidence()),)),
+        ScriptedReader((_complete(),)),
         ScriptedCatalogReader((failed_selected,)),
         ScriptedCatalogReader(()),
         ScriptedCatalogReader(()),
@@ -828,6 +917,7 @@ def test_resolve_rejects_ineligible_exact_quota_slice() -> None:
     )
     operations = WorkloadResolutionOperations(
         ScriptedReader((_complete(regional, global_),)),
+        ScriptedReader((_complete(),)),
         ScriptedCatalogReader((_gpu_catalog_read(),)),
         ScriptedCatalogReader(()),
         ScriptedCatalogReader(()),
@@ -851,6 +941,7 @@ def test_resolve_rejects_ambiguous_exact_quota_slice() -> None:
     regional, global_ = _gpu_quota_evidence()
     operations = WorkloadResolutionOperations(
         ScriptedReader((_complete(regional, regional, global_),)),
+        ScriptedReader((_complete(),)),
         ScriptedCatalogReader((_gpu_catalog_read(),)),
         ScriptedCatalogReader(()),
         ScriptedCatalogReader(()),
@@ -1151,6 +1242,72 @@ def test_inspect_joins_only_exact_authoritative_evidence() -> None:
         companion.identity,
     }
     assert unrelated_region.identity not in references
+
+
+def test_inspect_global_companion_exposes_each_anchored_region_set() -> None:
+    """Inspect preserves alternative regional sets sharing one global slice."""
+    central, global_ = _gpu_quota_evidence()
+    east = replace(
+        central,
+        identity=replace(
+            central.identity,
+            dimensions=NormalizedDimensions(
+                (("gpu_family", "NVIDIA_H100"), ("region", "us-east1"))
+            ),
+        ),
+        applicable_locations=("us-east1",),
+    )
+    fixture = _fixture(
+        (_complete(east, global_, central),),
+        overlay=MAINTAINED_ACCELERATOR_OVERLAY,
+    )
+
+    result = asyncio.run(
+        fixture.operations.inspect(QuotaInspectRequest(_context(), global_.identity))
+    )
+
+    assert result.succeeded
+    assert result.data.constraint_set is None
+    assert tuple(
+        tuple(reference.slice_identity for reference in constraint.references)
+        for constraint in result.data.constraint_sets
+    ) == (
+        (global_.identity, central.identity),
+        (global_.identity, east.identity),
+    )
+
+
+def test_browse_filters_shared_companion_through_related_accelerator_sets() -> None:
+    """Catalog and accelerator facets retain a recognized shared companion."""
+    regional, global_ = _gpu_quota_evidence()
+    fixture = _fixture(
+        (_complete(regional, global_),),
+        overlay=MAINTAINED_ACCELERATOR_OVERLAY,
+    )
+    query = QuotaQuery(
+        PROJECT,
+        ServiceSource("compute.googleapis.com"),
+        filters=QuotaQueryFilters(
+            accelerators=(ACCELERATOR,),
+            cataloged=True,
+            guided=True,
+        ),
+    )
+
+    result = asyncio.run(
+        fixture.operations.browse(QuotaBrowseRequest(_context(), query))
+    )
+
+    assert result.succeeded
+    assert tuple(item.identity for item in result.data.items) == (
+        global_.identity,
+        regional.identity,
+    )
+    companion = result.data.items[0]
+    assert companion.accelerator_id is None
+    assert companion.predicates.cataloged
+    assert companion.predicates.guided
+    assert companion.constraint_sets
 
 
 def test_inspect_mutability_uses_only_complete_exact_effective_read() -> None:
