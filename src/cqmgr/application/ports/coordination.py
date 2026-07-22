@@ -112,6 +112,15 @@ class BudgetGrant:
     request: BudgetRequest
 
 
+class BudgetCommitUnknownError(Exception):
+    """A visible budget charge has an unconfirmed durable commit."""
+
+    def __init__(self, possible_grant: BudgetGrant) -> None:
+        """Retain the possible charge details that forbid a blind retry."""
+        super().__init__("local budget charge durability is unknown")
+        self.possible_grant = possible_grant
+
+
 class BudgetCoordinator(Protocol):
     """Coordinate request charges across local cqmgr processes."""
 
@@ -122,7 +131,7 @@ class BudgetCoordinator(Protocol):
         deadline: float,
         cancellation: CancellationToken,
     ) -> BudgetGrant:
-        """Commit a charge after checking the caller's deadline and cancellation."""
+        """Commit a charge or report typed ambiguity with possible grant details."""
         ...
 
 
