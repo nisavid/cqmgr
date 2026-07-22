@@ -180,21 +180,17 @@ class SecretStore(Protocol):
 
     def probe(self) -> SecretStoreProbe:
         """Return backend identity and capability without exposing a secret."""
-        ...
 
     def get(self, reference: SecretStoreReference) -> SecretStoreOutcome:
         """Read one exact reference."""
-        ...
 
     def create(
         self, reference: SecretStoreReference, secret: SecretValue
     ) -> SecretStoreOutcome:
         """Create one exact reference without replacing an existing item."""
-        ...
 
     def delete(self, reference: SecretStoreReference) -> SecretStoreOutcome:
         """Delete one exact reference."""
-        ...
 
 
 def _is_opaque_identifier(value: object) -> bool:

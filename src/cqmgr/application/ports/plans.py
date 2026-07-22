@@ -86,19 +86,15 @@ class PlanRepository(Protocol):
         self, plan: EncodedPlan, authentication_key: SecretValue
     ) -> PlanRepositoryOutcome:
         """Store verified canonical bytes by digest."""
-        ...
 
     def load(self, digest: str, now: datetime) -> PlanRepositoryOutcome:
         """Load one local plan and its recovered ledger state."""
-        ...
 
     def export(self, plan: EncodedPlan, path: Path) -> PlanRepositoryOutcome:
         """Atomically export exact portable bytes."""
-        ...
 
     def read_export(self, path: Path) -> PlanRepositoryOutcome:
         """Read and validate an explicit plan file for review."""
-        ...
 
     def acquire_lease(
         self,
@@ -108,18 +104,14 @@ class PlanRepository(Protocol):
         lease_duration: timedelta = timedelta(minutes=1),
     ) -> PlanRepositoryOutcome:
         """Acquire one bounded exclusive pre-dispatch lease."""
-        ...
 
     def mark_dispatched(self, lease: PlanLease, now: datetime) -> PlanRepositoryOutcome:
         """Durably consume the plan immediately before dispatch."""
-        ...
 
     def complete(self, lease: PlanLease, now: datetime) -> PlanRepositoryOutcome:
         """Record a durable terminal post-dispatch outcome."""
-        ...
 
     def quarantine(
         self, lease: PlanLease, reason: StableSymbol, now: datetime
     ) -> PlanRepositoryOutcome:
         """Quarantine an interrupted or ambiguous dispatch."""
-        ...

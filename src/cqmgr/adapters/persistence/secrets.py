@@ -36,11 +36,14 @@ _NATIVE_BACKEND_IDENTITIES = {
 
 
 class _KeyringBackend(Protocol):
-    def get_password(self, service: str, username: str) -> str | None: ...
+    def get_password(self, service: str, username: str) -> str | None:
+        """Read one credential value."""
 
-    def set_password(self, service: str, username: str, password: str) -> None: ...
+    def set_password(self, service: str, username: str, password: str) -> None:
+        """Set one credential value."""
 
-    def delete_password(self, service: str, username: str) -> None: ...
+    def delete_password(self, service: str, username: str) -> None:
+        """Delete one credential value."""
 
 
 class NativeSecretStore:
