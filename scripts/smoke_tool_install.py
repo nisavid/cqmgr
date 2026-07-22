@@ -84,8 +84,37 @@ def smoke_artifact(
                 "XDG_STATE_HOME": str(install_home / "xdg-state"),
             }
         )
+        install_artifact = artifact.resolve()
+        if artifact.name.endswith(".tar.gz"):
+            built_directory = temporary / "sdist-wheel"
+            _run(
+                [
+                    "uv",
+                    "build",
+                    "--wheel",
+                    "--no-sources",
+                    "--python",
+                    python,
+                    "--out-dir",
+                    str(built_directory),
+                    str(artifact.resolve()),
+                ],
+                cwd=temporary,
+                environment=install_environment,
+            )
+            built_wheels = list(built_directory.glob("*.whl"))
+            assert len(built_wheels) == 1
+            install_artifact = built_wheels[0]
         _run(
-            ["uv", "tool", "install", "--python", python, str(artifact.resolve())],
+            [
+                "uv",
+                "tool",
+                "install",
+                "--no-build",
+                "--python",
+                python,
+                str(install_artifact),
+            ],
             cwd=temporary,
             environment=install_environment,
         )
