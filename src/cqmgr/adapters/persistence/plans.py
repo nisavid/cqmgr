@@ -65,22 +65,28 @@ $acl.SetSecurityDescriptorSddlForm(
 Set-Acl -LiteralPath $target -AclObject $acl
 $verifiedAcl = Get-Acl -LiteralPath $target
 $verified = @($verifiedAcl.Access)
-$verifiedIdentity = $null
-if ($verified.Count -eq 1) {
-    $verifiedIdentity = $verified[0].IdentityReference.Translate(
-        [System.Security.Principal.SecurityIdentifier]
-    )
+if (-not $verifiedAcl.AreAccessRulesProtected) {
+    exit 21
+}
+if ($verified.Count -ne 1) {
+    exit 22
+}
+$verifiedIdentity = $verified[0].IdentityReference.Translate(
+    [System.Security.Principal.SecurityIdentifier]
+)
+if ($verifiedIdentity.Value -ne $identity.Value) {
+    exit 23
 }
 if (
-    -not $verifiedAcl.AreAccessRulesProtected -or
-    $verified.Count -ne 1 -or
-    $verifiedIdentity.Value -ne $identity.Value -or
     $verified[0].AccessControlType -ne
-        [System.Security.AccessControl.AccessControlType]::Allow -or
-    $verified[0].FileSystemRights -ne
-        [System.Security.AccessControl.FileSystemRights]::FullControl
+    [System.Security.AccessControl.AccessControlType]::Allow
 ) {
-    throw 'Windows private ACL verification failed'
+    exit 24
+}
+$fullControl = [int][System.Security.AccessControl.FileSystemRights]::FullControl
+$actualRights = [int]$verified[0].FileSystemRights
+if (($actualRights -band $fullControl) -ne $fullControl) {
+    exit 25
 }
 """
 
@@ -961,7 +967,7 @@ def _restrict_windows_acl(path: Path) -> None:
         timeout=10,
     )
     if completed.returncode != 0:
-        msg = "Windows private ACL enforcement failed"
+        msg = f"Windows private ACL enforcement failed ({completed.returncode})"
         raise OSError(msg)
 
 
