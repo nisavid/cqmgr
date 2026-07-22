@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Thread
 from typing import TYPE_CHECKING, cast, override
 
 import pytest
@@ -54,6 +56,11 @@ TWO = 2
 GRANTED_VALUE = 64
 INFO_PAGE_SIZE = 17
 MONITORING_PAGE_SIZE = 23
+EXPECTED_USAGE_FILTER = (
+    'metric.type = "serviceruntime.googleapis.com/quota/allocation/usage" '
+    'AND resource.type = "consumer_quota" '
+    'AND resource.labels.service = "compute.googleapis.com"'
+)
 
 
 class OnePagePager:
@@ -274,7 +281,12 @@ class FakeMonitoringPages:
         return result
 
 
-def _context(*, adc_quota_project: bool = True) -> ProviderReadContext:
+def _context(
+    *,
+    adc_quota_project: bool = True,
+    cancellation: CancellationToken | None = None,
+    deadline: float = 100.0,
+) -> ProviderReadContext:
     identity = ADCIdentityEvidence.principal_unverified(
         credential_kind=CredentialKind.UNKNOWN,
         adc_quota_project=(
@@ -288,8 +300,8 @@ def _context(*, adc_quota_project: bool = True) -> ProviderReadContext:
             "Public Schema Project",
         ),
         identity=identity,
-        deadline=100.0,
-        cancellation=CancellationToken(),
+        deadline=deadline,
+        cancellation=cancellation or CancellationToken(),
     )
 
 
@@ -564,6 +576,200 @@ def test_cancellation_after_budget_commit_stops_before_dispatch() -> None:
     assert client.calls == []
 
 
+def test_cancellation_interrupts_active_provider_dispatch_without_task_leaks() -> None:
+    """Thread-safe cancellation promptly stops and joins an active provider task."""
+
+    async def exercise() -> None:
+        token = CancellationToken()
+        started = asyncio.Event()
+        cleaned = asyncio.Event()
+
+        async def dispatch(timeout_seconds: float) -> object:
+            assert timeout_seconds > 0
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cleaned.set()
+
+        call = asyncio.create_task(
+            _policy(RecordingBudget()).call(
+                _context(cancellation=token),
+                provider="cloud-quotas",
+                phase="quota-info-read",
+                identity="active-dispatch",
+                dispatch=dispatch,
+            )
+        )
+        await started.wait()
+        cancelling_thread = Thread(target=token.cancel)
+        cancelling_thread.start()
+        cancelling_thread.join()
+
+        result = await asyncio.wait_for(call, timeout=0.5)
+        await asyncio.sleep(0)
+
+        assert result.diagnostic is not None
+        assert result.diagnostic.code.value == "provider-read-cancelled"
+        assert cleaned.is_set()
+        assert not cancelling_thread.is_alive()
+        assert [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task() and not task.done()
+        ] == []
+
+    asyncio.run(exercise())
+
+
+def test_outer_task_cancellation_propagates_after_dispatch_cleanup() -> None:
+    """Harness cancellation remains CancelledError after child tasks are joined."""
+
+    async def exercise() -> None:
+        started = asyncio.Event()
+        cleaned = asyncio.Event()
+
+        async def dispatch(timeout_seconds: float) -> object:
+            assert timeout_seconds > 0
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cleaned.set()
+
+        call = asyncio.create_task(
+            _policy(RecordingBudget()).call(
+                _context(),
+                provider="cloud-quotas",
+                phase="quota-info-read",
+                identity="outer-cancellation",
+                dispatch=dispatch,
+            )
+        )
+        await started.wait()
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        await asyncio.sleep(0)
+
+        assert cleaned.is_set()
+        assert [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task() and not task.done()
+        ] == []
+
+    asyncio.run(exercise())
+
+
+def test_cancellation_interrupts_retry_backoff_without_task_leaks() -> None:
+    """Cancellation promptly stops and joins a retry backoff task."""
+
+    async def exercise() -> None:
+        token = CancellationToken()
+        backoff_started = asyncio.Event()
+        backoff_cleaned = asyncio.Event()
+        dispatch_calls = 0
+
+        async def dispatch(timeout_seconds: float) -> object:
+            nonlocal dispatch_calls
+            assert timeout_seconds > 0
+            dispatch_calls += 1
+            private_message = "private"
+            raise google_exceptions.ServiceUnavailable(private_message)
+
+        async def sleep(delay: float) -> None:
+            assert delay >= 0
+            backoff_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                backoff_cleaned.set()
+
+        policy = GoogleReadPolicy(
+            RecordingBudget(),
+            NoJitter(),
+            maximum_attempts=2,
+            monotonic=lambda: 0.0,
+            sleep=sleep,
+        )
+        call = asyncio.create_task(
+            policy.call(
+                _context(cancellation=token),
+                provider="cloud-quotas",
+                phase="quota-info-read",
+                identity="retry-backoff",
+                dispatch=dispatch,
+            )
+        )
+        await backoff_started.wait()
+        cancelling_thread = Thread(target=token.cancel)
+        cancelling_thread.start()
+        cancelling_thread.join()
+
+        result = await asyncio.wait_for(call, timeout=0.5)
+        await asyncio.sleep(0)
+
+        assert result.diagnostic is not None
+        assert result.diagnostic.code.value == "provider-read-cancelled"
+        assert dispatch_calls == 1
+        assert backoff_cleaned.is_set()
+        assert not cancelling_thread.is_alive()
+        assert [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task() and not task.done()
+        ] == []
+
+    asyncio.run(exercise())
+
+
+def test_caller_deadline_interrupts_uncooperative_provider_dispatch() -> None:
+    """The caller deadline stops and joins a client that ignores its timeout."""
+
+    async def exercise() -> None:
+        dispatch_started = asyncio.Event()
+        dispatch_cleaned = asyncio.Event()
+
+        async def dispatch(timeout_seconds: float) -> object:
+            assert timeout_seconds > 0
+            dispatch_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                dispatch_cleaned.set()
+
+        deadline = time.monotonic() + 0.02
+        policy = GoogleReadPolicy(
+            RecordingBudget(),
+            NoJitter(),
+            monotonic=time.monotonic,
+        )
+        result = await asyncio.wait_for(
+            policy.call(
+                _context(deadline=deadline),
+                provider="cloud-quotas",
+                phase="quota-info-read",
+                identity="caller-deadline",
+                dispatch=dispatch,
+            ),
+            timeout=0.5,
+        )
+        await asyncio.sleep(0)
+
+        assert dispatch_started.is_set()
+        assert result.diagnostic is not None
+        assert result.diagnostic.code.value == "provider-read-deadline-exceeded"
+        assert dispatch_cleaned.is_set()
+        assert [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task() and not task.done()
+        ] == []
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize(
     ("error", "code"),
     [
@@ -810,7 +1016,7 @@ def test_monitoring_reader_preserves_all_points_intervals_values_and_labels() ->
     client = FakeMonitoringPages([_monitoring_page()])
     request = UsageReadRequest(
         _context(),
-        'metric.type="serviceruntime.googleapis.com/quota/allocation/usage"',
+        "compute.googleapis.com",
         datetime(2026, 7, 22, tzinfo=UTC),
         datetime(2026, 7, 23, tzinfo=UTC),
     )
@@ -834,7 +1040,42 @@ def test_monitoring_reader_preserves_all_points_intervals_values_and_labels() ->
         ("project_id", "public-schema-project"),
         ("service", "compute.googleapis.com"),
     )
-    assert client.calls[0][1] == request.filter
+    assert client.calls[0][1] == EXPECTED_USAGE_FILTER
+
+
+def test_monitoring_usage_query_is_typed_and_complete_when_empty() -> None:
+    """A valid exact service query may complete with no observations, never zero."""
+    client = FakeMonitoringPages([TimeSeriesPage((), "")])
+    result = asyncio.run(
+        GoogleUsageReader(
+            client,
+            _policy(RecordingBudget()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(
+            UsageReadRequest(
+                _context(),
+                "compute.googleapis.com",
+                datetime(2026, 7, 22, tzinfo=UTC),
+                datetime(2026, 7, 23, tzinfo=UTC),
+            )
+        )
+    )
+
+    assert result.complete
+    assert result.values == ()
+    assert client.calls[0][1] == EXPECTED_USAGE_FILTER
+
+
+def test_monitoring_provider_filter_expression_is_not_a_usage_selector() -> None:
+    """Provider filter text cannot cross the typed usage-reader port."""
+    with pytest.raises(ValueError, match="service"):
+        UsageReadRequest(
+            _context(),
+            'metric.type = "arbitrary.googleapis.com/wrong"',
+            datetime(2026, 7, 22, tzinfo=UTC),
+            datetime(2026, 7, 23, tzinfo=UTC),
+        )
 
 
 def test_monitoring_schema_skew_and_partial_page_fail_closed() -> None:
@@ -859,7 +1100,7 @@ def test_monitoring_schema_skew_and_partial_page_fail_closed() -> None:
         ).read(
             UsageReadRequest(
                 _context(),
-                "public-filter",
+                "compute.googleapis.com",
                 datetime(2026, 7, 22, tzinfo=UTC),
                 datetime(2026, 7, 23, tzinfo=UTC),
             )
@@ -907,7 +1148,7 @@ def test_monitoring_declarations_and_project_attribution_fail_closed(
     elif mutation == "resource-type":
         series.resource.type = "future_consumer_quota"
     elif mutation == "service":
-        series.resource.labels["service"] = ""
+        series.resource.labels["service"] = "storage.googleapis.com"
     else:
         series.resource.labels.pop("location")
     result = asyncio.run(
@@ -919,7 +1160,7 @@ def test_monitoring_declarations_and_project_attribution_fail_closed(
         ).read(
             UsageReadRequest(
                 _context(),
-                "public-filter",
+                "compute.googleapis.com",
                 datetime(2026, 7, 22, tzinfo=UTC),
                 datetime(2026, 7, 23, tzinfo=UTC),
             )

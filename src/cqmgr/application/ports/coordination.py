@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import dataclass
 from enum import StrEnum
-from threading import Event
+from threading import Event, Lock
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
@@ -28,6 +29,10 @@ class CancellationToken:
     def __init__(self) -> None:
         """Create a token in the active state."""
         self._event = Event()
+        self._waiters_lock = Lock()
+        self._waiters: set[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = (
+            set()
+        )
 
     @property
     def cancelled(self) -> bool:
@@ -36,12 +41,42 @@ class CancellationToken:
 
     def cancel(self) -> None:
         """Request cooperative cancellation without implying provider reversal."""
-        self._event.set()
+        with self._waiters_lock:
+            self._event.set()
+            waiters = tuple(self._waiters)
+            self._waiters.clear()
+        for loop, waiter in waiters:
+            try:
+                loop.call_soon_threadsafe(_complete_waiter, waiter)
+            except RuntimeError:
+                continue
 
     def raise_if_cancelled(self) -> None:
         """Stop before dispatch when cancellation has already been requested."""
         if self.cancelled:
             raise CoordinationCancelledError
+
+    async def wait(self) -> None:
+        """Wait asynchronously for cancellation from any thread."""
+        if self.cancelled:
+            return
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        entry = (loop, future)
+        with self._waiters_lock:
+            if self._event.is_set():
+                return
+            self._waiters.add(entry)
+        try:
+            await future
+        finally:
+            with self._waiters_lock:
+                self._waiters.discard(entry)
+
+
+def _complete_waiter(waiter: asyncio.Future[None]) -> None:
+    if not waiter.done():
+        waiter.set_result(None)
 
 
 class BudgetScope(StrEnum):
