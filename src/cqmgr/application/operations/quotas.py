@@ -542,6 +542,15 @@ class QuotaOperations:
         evidences = tuple(
             evidence for read in effective_reads for evidence in read.values
         )
+        if _has_duplicate_effective_identities(evidences):
+            return self._duplicate_browse_result(
+                request,
+                query,
+                started_at,
+                diagnostics,
+                complete=complete,
+                has_partial_data=bool(evidences),
+            )
         preferences = preference_read.values
         usages = tuple(value for read in usage_reads for value in read.values)
         service_complete = {
@@ -588,7 +597,7 @@ class QuotaOperations:
                 data,
                 diagnostics,
                 started_at=started_at,
-                has_partial_data=bool(filtered),
+                has_partial_data=bool(evidences),
             )
 
         snapshot_id = self._snapshot_id_factory()
@@ -654,8 +663,37 @@ class QuotaOperations:
             for evidence in effective_read.values
             if evidence.identity == request.identity
         )
-        if len(matches) != 1:
-            reason = "exact-slice-not-found" if not matches else "ambiguous-exact-slice"
+        if len(matches) > 1:
+            reason = "duplicate-effective-slice"
+            data = QuotaInspectData(
+                request.identity, None, None, None, None, None, None, reason
+            )
+            if not complete:
+                return self._incomplete_result(
+                    "quota.inspect",
+                    request.identity.resource_scope,
+                    "exact-slice-inspected",
+                    data,
+                    diagnostics,
+                    started_at=started_at,
+                    has_partial_data=False,
+                    gap_sources=("effective-quota",),
+                    gap_reason=reason,
+                )
+            return self._result(
+                operation="quota.inspect",
+                resource_scope=request.identity.resource_scope,
+                boundary="exact-slice-inspected",
+                reached=False,
+                outcome=reason,
+                exit_class=ExitClass.OPERATIONAL_FAILURE,
+                completeness=Completeness.complete(),
+                data=data,
+                started_at=started_at,
+                diagnostics=diagnostics,
+            )
+        if not matches:
+            reason = "exact-slice-not-found"
             if not complete:
                 data = QuotaInspectData(
                     request.identity, None, None, None, None, None, None, reason
@@ -680,7 +718,7 @@ class QuotaOperations:
                 preferences=preference_read.values,
                 usages=usage_read.values,
                 effective_observed_at=effective_read.observed_at,
-                freshly_validated=complete,
+                freshly_validated=effective_read.complete,
             )
         except (TypeError, ValueError):
             return self._inspect_rejection(
@@ -879,15 +917,38 @@ class QuotaOperations:
     ) -> OperationResult[QuotaBrowseData]:
         end = min(offset + limit, len(snapshot.items))
         items = snapshot.items[offset:end]
-        next_cursor = (
-            self._cursors.issue(
-                snapshot.metadata.snapshot_id,
-                end,
-                now=started_at,
-            ).value
-            if end < len(snapshot.items)
-            else None
-        )
+        try:
+            next_cursor = (
+                self._cursors.issue(
+                    snapshot.metadata.snapshot_id,
+                    end,
+                    now=started_at,
+                ).value
+                if end < len(snapshot.items)
+                else None
+            )
+        except QuotaSnapshotRepositoryError:
+            data = QuotaBrowseData(
+                query=snapshot.metadata.query,
+                items=items,
+                constraint_sets=_constraint_sets(items),
+                ordered=True,
+                total=len(snapshot.items),
+                next_cursor=None,
+                snapshot_id=snapshot.metadata.snapshot_id,
+                reason="cursor-issue-failed",
+            )
+            return self._result(
+                operation="quota.list",
+                resource_scope=snapshot.metadata.query.resource_scope,
+                boundary="logical-page-read",
+                reached=False,
+                outcome="cursor-issue-failed",
+                exit_class=ExitClass.OPERATIONAL_FAILURE,
+                completeness=Completeness.complete(),
+                data=data,
+                started_at=started_at,
+            )
         data = QuotaBrowseData(
             query=snapshot.metadata.query,
             items=items,
@@ -981,6 +1042,46 @@ class QuotaOperations:
             data=data,
             started_at=started_at,
             diagnostics=diagnostics,
+        )
+
+    def _duplicate_browse_result(  # noqa: PLR0913
+        self,
+        request: QuotaBrowseRequest,
+        query: QuotaQuery,
+        started_at: datetime,
+        diagnostics: tuple[Diagnostic, ...],
+        *,
+        complete: bool,
+        has_partial_data: bool,
+    ) -> OperationResult[QuotaBrowseData]:
+        reason = "duplicate-effective-slice"
+        if complete:
+            return self._browse_operational_failure(
+                request,
+                started_at,
+                reason,
+                diagnostics,
+            )
+        data = QuotaBrowseData(
+            query=query,
+            items=(),
+            constraint_sets=(),
+            ordered=False,
+            total=None,
+            next_cursor=None,
+            snapshot_id=None,
+            reason=reason,
+        )
+        return self._incomplete_result(
+            "quota.list",
+            query.resource_scope,
+            "logical-page-read",
+            data,
+            diagnostics,
+            started_at=started_at,
+            has_partial_data=has_partial_data,
+            gap_sources=("effective-quota",),
+            gap_reason=reason,
         )
 
     def _inspect_rejection(
@@ -1222,6 +1323,14 @@ def _sort_value(item: QuotaQueryItem, field: QuotaSortField) -> object | None:
 def _query_requires_usage(query: QuotaQuery) -> bool:
     """Whether the query's requested output semantics depend on usage evidence."""
     return any(sort.field is QuotaSortField.USAGE for sort in query.sort)
+
+
+def _has_duplicate_effective_identities(
+    evidences: tuple[EffectiveQuotaEvidence, ...],
+) -> bool:
+    """Whether provider evidence repeats any exact effective quota identity."""
+    identities = tuple(evidence.identity for evidence in evidences)
+    return len(set(identities)) != len(identities)
 
 
 def _constraint_sets(
