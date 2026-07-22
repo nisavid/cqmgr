@@ -253,6 +253,7 @@ def _publish_exclusive(path: Path, data: bytes) -> None:
     try:
         temporary.chmod(_PRIVATE_FILE_MODE)
         with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
@@ -260,8 +261,9 @@ def _publish_exclusive(path: Path, data: bytes) -> None:
         temporary.unlink()
         _fsync_directory(path.parent)
     except BaseException:
-        with suppress(OSError):
-            os.close(descriptor)
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
         with suppress(OSError):
             temporary.unlink(missing_ok=True)
         raise
