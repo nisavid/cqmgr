@@ -74,8 +74,6 @@ _DIMENSION_PAIR_SIZE = 2
 _LATEST_SNAPSHOT_SCHEMA_VERSION = 3
 _LATEST_CURSOR_SCHEMA_VERSION = 1
 
-type _LegacyQueryBinding = tuple[str, str, tuple[str, ...]]
-
 
 def encode_snapshot_record(snapshot: QuotaQuerySnapshot) -> bytes:
     """Return deterministic UTF-8 JSON containing only normalized evidence."""
@@ -90,10 +88,18 @@ def _encode_snapshot_record(snapshot: QuotaQuerySnapshot, schema: str) -> bytes:
     if schema != QUOTA_QUERY_SNAPSHOT_SCHEMA:
         msg = "cannot encode a superseded quota snapshot schema"
         raise ValueError(msg)
-    document = {"schema": schema, "snapshot": _snapshot(snapshot)}
+    document: dict[str, object] = {
+        "schema": schema,
+        "snapshot": _snapshot(snapshot),
+    }
     if _contains_unsafe_evidence_text(document):
         msg = "snapshot contains unsafe evidence text"
         raise ValueError(msg)
+    return _encode_canonical_document(document)
+
+
+def _encode_canonical_document(document: dict[str, object]) -> bytes:
+    """Encode one already validated record without changing array order."""
     return (
         json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         + "\n"
@@ -130,29 +136,21 @@ def decode_snapshot_record(data: bytes) -> QuotaQuerySnapshot:
         ):
             msg = "stored quota snapshot schema is invalid"
             raise QuotaSnapshotStoredDataError(msg)  # noqa: TRY301
-        legacy_binding: _LegacyQueryBinding | None = None
         if schema == QUOTA_QUERY_SNAPSHOT_SCHEMA:
             snapshot = _decode_snapshot(document["snapshot"])
+            canonical = _encode_snapshot_record(snapshot, cast("str", schema))
         else:
-            snapshot, legacy_binding = _decode_legacy_snapshot(
+            snapshot = _decode_legacy_snapshot(
                 document["snapshot"],
                 schema=cast("str", schema),
             )
+            canonical = _encode_canonical_document(document)
     except (QuotaSnapshotStoredDataError, UnsupportedQuotaSnapshotSchemaError):
         raise
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         msg = "stored quota snapshot is malformed"
         raise QuotaSnapshotStoredDataError(msg) from error
     else:
-        canonical = (
-            _encode_snapshot_record(snapshot, cast("str", schema))
-            if legacy_binding is None
-            else _encode_legacy_snapshot_record(
-                snapshot,
-                schema=cast("str", schema),
-                binding=legacy_binding,
-            )
-        )
         if canonical != data:
             msg = "stored quota snapshot is not canonical"
             raise QuotaSnapshotStoredDataError(msg)
@@ -240,95 +238,6 @@ def _snapshot(snapshot: QuotaQuerySnapshot) -> dict[str, object]:
         ],
         "items": [_item(item) for item in snapshot.items],
     }
-
-
-def _encode_legacy_snapshot_record(
-    snapshot: QuotaQuerySnapshot,
-    *,
-    schema: str,
-    binding: _LegacyQueryBinding,
-) -> bytes:
-    """Reproduce one supported legacy record for canonicality validation."""
-    document = {
-        "schema": schema,
-        "snapshot": _legacy_snapshot(snapshot, schema=schema, binding=binding),
-    }
-    return (
-        json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-        + "\n"
-    ).encode()
-
-
-def _legacy_snapshot(
-    snapshot: QuotaQuerySnapshot,
-    *,
-    schema: str,
-    binding: _LegacyQueryBinding,
-) -> dict[str, object]:
-    metadata = snapshot.metadata
-    return {
-        "metadata": {
-            "snapshot_id": metadata.snapshot_id,
-            "query": _legacy_query(metadata.query, binding),
-            "catalog": {
-                "schema": metadata.catalog.schema,
-                "revision": metadata.catalog.revision,
-                "content_digest": metadata.catalog.content_digest,
-            },
-            "evidence_contract": metadata.evidence_contract,
-            "observed_at": _timestamp(metadata.observed_at),
-            "expires_at": _timestamp(metadata.expires_at),
-            "complete": metadata.complete,
-        },
-        "items": [_legacy_item(item, schema=schema) for item in snapshot.items],
-    }
-
-
-def _legacy_query(
-    query: QuotaQuery,
-    binding: _LegacyQueryBinding,
-) -> dict[str, object]:
-    source_kind, source_value, legacy_services = binding
-    filters = query.filters
-    return {
-        "resource_scope": _scope(query.resource_scope),
-        "source": {"kind": source_kind, "value": source_value},
-        "filters": {
-            "services": list(legacy_services),
-            "accelerators": [value.value for value in filters.accelerators],
-            "locations": list(filters.locations),
-            "quota_scopes": [value.value for value in filters.quota_scopes],
-            "quota_pools": list(filters.quota_pools),
-            "cataloged": filters.cataloged,
-            "guided": filters.guided,
-            "mutable": filters.mutable,
-            "reconciliations": [value.value for value in filters.reconciliations],
-            "grant_satisfactions": [
-                value.value for value in filters.grant_satisfactions
-            ],
-            "effective_confirmations": [
-                value.value for value in filters.effective_confirmations
-            ],
-            "text": filters.text,
-        },
-        "sort": [
-            {"field": value.field.value, "direction": value.direction.value}
-            for value in query.sort
-        ],
-    }
-
-
-def _legacy_item(item: QuotaQueryItem, *, schema: str) -> dict[str, object]:
-    encoded = _item(item)
-    encoded.pop("catalog_groups")
-    constraint_sets = cast("list[object]", encoded.pop("constraint_sets"))
-    if schema.endswith("/v1"):
-        encoded["constraint_set"] = (
-            constraint_sets[0] if len(constraint_sets) == 1 else None
-        )
-    else:
-        encoded["constraint_sets"] = constraint_sets
-    return encoded
 
 
 def _query(query: QuotaQuery) -> dict[str, object]:
@@ -512,7 +421,7 @@ def _decode_legacy_snapshot(
     value: object,
     *,
     schema: str,
-) -> tuple[QuotaQuerySnapshot, _LegacyQueryBinding]:
+) -> QuotaQuerySnapshot:
     table = _exact_object(value, {"metadata", "items"}, "snapshot")
     metadata = _exact_object(
         table["metadata"],
@@ -532,7 +441,7 @@ def _decode_legacy_snapshot(
     )
     observed_at = _datetime(metadata["observed_at"], "observed_at")
     complete = _bool(metadata["complete"], "complete")
-    query, binding, catalog_groups = _decode_legacy_query(metadata["query"])
+    query, catalog_groups = _decode_legacy_query(metadata["query"])
     source_coverage = tuple(
         (
             (
@@ -555,7 +464,7 @@ def _decode_legacy_snapshot(
         )
         for service in V1_PROVIDER_SERVICES
     )
-    snapshot = QuotaQuerySnapshot(
+    return QuotaQuerySnapshot(
         metadata=QuerySnapshotMetadata(
             snapshot_id=_string(metadata["snapshot_id"], "snapshot_id"),
             query=query,
@@ -581,12 +490,11 @@ def _decode_legacy_snapshot(
             for item in _list(table["items"], "items")
         ),
     )
-    return snapshot, binding
 
 
 def _decode_legacy_query(
     value: object,
-) -> tuple[QuotaQuery, _LegacyQueryBinding, tuple[CatalogGroupId, ...]]:
+) -> tuple[QuotaQuery, tuple[CatalogGroupId, ...]]:
     table = _exact_object(
         value, {"resource_scope", "source", "filters", "sort"}, "query"
     )
@@ -687,12 +595,7 @@ def _decode_legacy_query(
     if query.services != (selected_service,):
         msg = "stored quota query cannot be represented by the V1 provider inventory"
         raise QuotaSnapshotStoredDataError(msg)
-    binding: _LegacyQueryBinding = (
-        source_kind,
-        source_value,
-        legacy_filters.services,
-    )
-    return query, binding, catalog_groups
+    return query, catalog_groups
 
 
 def _decode_query(value: object) -> QuotaQuery:
