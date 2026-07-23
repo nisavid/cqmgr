@@ -796,7 +796,7 @@ def test_tpu_resolution_cancellation_joins_started_provider_reads() -> None:
 
         call.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await call
+            _ = await call
         await asyncio.sleep(0)
 
         assert effective.cleaned.is_set()
