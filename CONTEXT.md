@@ -107,10 +107,11 @@ A versioned, surface-neutral record that identifies an operation, resource scope
 _Avoid_: Raw provider response, rendered command output
 
 **Watch event**:
-A versioned, ordered record emitted when a material reconciliation,
-effective-quota, or aggregate bundle observation changes. Polling ticks and
-unchanged refreshes are not watch events; a terminal event carries the final
-operation result.
+A versioned, ordered record. Every stream begins with one initial authoritative
+subject observation even when no value changed; later records are emitted only
+when a material reconciliation, effective-quota, or aggregate bundle
+observation changes. Polling ticks and unchanged refreshes after initialization
+are not watch events; a terminal event carries the final operation result.
 _Avoid_: Poll result, repeated snapshot
 
 **Watch condition**:

@@ -530,10 +530,12 @@ reviewed deterministic order: accelerator- or location-specific children
 precede broader companion constraints, with canonical exact-slice identity as
 the final tie-breaker. Before each provider call it fsyncs that child's dispatch
 intent. A terminal outcome is fsynced before the next child starts. Recovery may
-continue only with a child that has no persisted dispatch intent after all prior
-outcomes are terminal. A dispatch intent without a terminal outcome is durably
-`unknown`, stops later dispatch, and requires read-after-unknown reconciliation;
-it is never dispatched again automatically. Apply stops at the first child whose
+continue only with a child that has no persisted dispatch intent after every
+prior outcome is durably `accepted`. A prior `failed` or `unknown` outcome stops
+that Apply and preserves every later child as `unattempted`. A dispatch intent
+without a terminal outcome is durably `unknown`, stops later dispatch, and
+requires read-after-unknown reconciliation; it is never dispatched again
+automatically. Apply stops at the first child whose
 acceptance cannot be proven, marks every later child `unattempted`, and never
 attempts rollback. Each plan-child disposition is exactly `accepted`, `failed`,
 `unknown`, or `unattempted`. A transport-unknown dispatch is `unknown`, not
