@@ -9,7 +9,7 @@ import time
 from datetime import UTC, datetime
 from threading import Event
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from google.cloud import compute_v1, tpu_v2
@@ -101,7 +101,7 @@ def test_official_compute_page_clients_close_owned_transport(
         transport=SimpleNamespace(close=lambda: closed.append(True))
     )
 
-    page_client = wrapper(cast("Any", client))
+    page_client = wrapper(client)  # type: ignore[arg-type]
     asyncio.run(page_client.close())
 
     assert closed == [True]
@@ -134,7 +134,7 @@ def test_compute_close_waits_for_shielded_sync_worker_after_cancellation() -> No
 
     async def exercise() -> None:
         page_client = OfficialComputeMachineTypesPageClient(
-            cast("Any", BlockingGeneratedClient())
+            BlockingGeneratedClient(),  # type: ignore[arg-type]
         )
         read_task = asyncio.create_task(
             page_client.machine_types(
@@ -148,7 +148,7 @@ def test_compute_close_waits_for_shielded_sync_worker_after_cancellation() -> No
         await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=0.5)
         read_task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await read_task
+            _ = await read_task
 
         try:
             close_task = asyncio.create_task(page_client.close())

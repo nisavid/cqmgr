@@ -468,7 +468,8 @@ def test_copy_cli_uses_canonical_names_and_round_trips_through_click(
 
     assert arguments[:3] == ["cqmgr", "quota", "list"]
     assert "q" not in arguments
-    assert "compute.googleapis.com" in arguments
+    service_index = arguments.index("--service")
+    assert arguments[service_index + 1] == "compute.googleapis.com"
     assert "compute" not in arguments
     assert arguments.count("--resource-scope") == 1
     result = CliRunner().invoke(main, arguments[1:])
@@ -552,7 +553,8 @@ def test_exact_slice_copy_cli_round_trips_canonical_identity(
     arguments = __import__("shlex").split(copied)
 
     assert arguments[:3] == ["cqmgr", "quota", "inspect"]
-    assert "compute.googleapis.com" in arguments
+    service_index = arguments.index("--service")
+    assert arguments[service_index + 1] == "compute.googleapis.com"
     result = CliRunner().invoke(main, arguments[1:])
     assert result.exit_code == 0, result.output
     assert operations.inspect_calls[0][0] == selector

@@ -36,8 +36,6 @@ if TYPE_CHECKING:
     from pathlib import Path
     from typing import Protocol
 
-    from cqmgr.adapters.google.cloud_quotas import GoogleEffectiveQuotaReader
-
     class _HasClient(Protocol):
         _client: object
 
@@ -64,7 +62,8 @@ class _RecordingADCRuntime:
         *,
         timeout_seconds: float = 10.0,
     ) -> None:
-        del snapshot, timeout_seconds
+        assert snapshot is self.snapshot
+        assert timeout_seconds > 0
 
     def fetch_user_info(
         self,
@@ -217,11 +216,8 @@ def test_unavailable_budget_storage_is_a_typed_coordination_failure(
             "CQMGR_BUDGET_PATH": str(blocked_parent / "budgets"),
         }
     )
-    effective = cast(
-        "GoogleEffectiveQuotaReader",
-        operations._quotas._effective,  # noqa: SLF001
-    )
-    budget = effective._policy._budget  # noqa: SLF001
+    effective = operations._quotas._effective  # noqa: SLF001
+    budget = effective._policy._budget  # type: ignore[attr-defined]  # noqa: SLF001
 
     async def acquire() -> None:
         await budget.acquire(

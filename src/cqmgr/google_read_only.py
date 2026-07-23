@@ -128,7 +128,7 @@ class LazyClientProxy[ClientT]:
                 return
             result = close()
         if inspect.isawaitable(result):
-            await result
+            _ = await result
 
 
 class OwnedClientPool:
