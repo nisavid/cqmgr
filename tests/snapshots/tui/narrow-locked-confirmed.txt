@@ -1,0 +1,25 @@
+layout=narrow
+workspace=quotas
+scope=projects/123456789
+scope-lock=LOCKED
+principal=principal://accounts.google.com/operator@example.com
+outcome=succeeded
+complete=yes
+copy-cli=cqmgr quota inspect --resource-scope projects/123456789 --service compute.googleapis.com --quota-id GPUS-ALL-REGIONS-per-project --location us-central1 --dimension location=us-central1 --output human
+status=COMPLETE — operation boundary reached
+coverage=Provider coverage:  compute.googleapis.com: complete (1/1 pages)  tpu.googleapis.com: complete (1/1 pages)  Aggregate completeness: complete
+detail=Quota detail
+Operation: quota.inspect
+Outcome: succeeded
+Complete: yes
+Service: compute.googleapis.com
+Quota ID: GPUS-ALL-REGIONS-per-project
+Dimensions: location=us-central1
+Quota scope: regional
+Effective: 8 1
+Usage: 2 1
+Predicates: discovered=yes cataloged=yes guided=yes mutable=yes
+Reconciliation: settled
+Grant satisfaction: full
+Effective confirmation: confirmed
+audit=Select a retained record to inspect its exact chain facts.

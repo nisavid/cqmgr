@@ -1,6 +1,7 @@
 """Click group with stable canonical command aliases."""
 
 from collections.abc import Mapping
+from itertools import pairwise
 from typing import Any, override
 
 import click
@@ -27,6 +28,19 @@ _DEFAULT_ALIAS_REGISTRIES: Mapping[str, Mapping[str, str | None]] = {
     "plan": {"review": "r", "apply": "a"},
     "audit": {"list": "l", "inspect": "i", "verify": "v"},
 }
+
+
+def canonical_command_path(*path: str) -> tuple[str, ...]:
+    """Validate and return one canonical path from the explicit alias registry."""
+    if not path or path[0] != "cqmgr":
+        msg = "a canonical command path must begin with 'cqmgr'"
+        raise ValueError(msg)
+    for parent, child in pairwise(path):
+        registry = _DEFAULT_ALIAS_REGISTRIES.get(parent)
+        if registry is None or child not in registry:
+            msg = f"canonical command {child!r} is not registered under {parent!r}"
+            raise ValueError(msg)
+    return tuple(path)
 
 
 class CanonicalAliasGroup(click.Group):

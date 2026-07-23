@@ -6,6 +6,8 @@ import shlex
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from cqmgr.adapters.cli.group import canonical_command_path
+
 if TYPE_CHECKING:
     from cqmgr.application.operations.read_only import (
         QuotaInspectSelector,
@@ -18,6 +20,20 @@ if TYPE_CHECKING:
     from cqmgr.domain.scopes import ResourceScope
 
 _MAXIMUM_LIMIT = 1000
+_QUOTA_LIST_COMMAND = canonical_command_path("cqmgr", "quota", "list")
+_QUOTA_INSPECT_COMMAND = canonical_command_path("cqmgr", "quota", "inspect")
+_COMPUTE_RESOLVE_COMMAND = canonical_command_path(
+    "cqmgr",
+    "quota",
+    "resolve",
+    "compute-instance",
+)
+_CLOUD_TPU_RESOLVE_COMMAND = canonical_command_path(
+    "cqmgr",
+    "quota",
+    "resolve",
+    "cloud-tpu-slice",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,9 +82,7 @@ def quota_list_copy_cli(
 
     filters = query.filters
     arguments = [
-        "cqmgr",
-        "quota",
-        "list",
+        *_QUOTA_LIST_COMMAND,
         "--resource-scope",
         resource_scope.canonical_name,
     ]
@@ -148,16 +162,13 @@ def quota_resolve_copy_cli(
         msg = "Copy CLI presentation must use CopyCliPresentation"
         raise TypeError(msg)
 
-    leaf = (
-        "compute-instance"
+    command = (
+        _COMPUTE_RESOLVE_COMMAND
         if isinstance(requirement, ComputeInstanceRequirement)
-        else "cloud-tpu-slice"
+        else _CLOUD_TPU_RESOLVE_COMMAND
     )
     arguments = [
-        "cqmgr",
-        "quota",
-        "resolve",
-        leaf,
+        *command,
         "--resource-scope",
         resource_scope.canonical_name,
     ]
@@ -214,9 +225,7 @@ def quota_inspect_copy_cli(
         raise TypeError(msg)
 
     arguments = [
-        "cqmgr",
-        "quota",
-        "inspect",
+        *_QUOTA_INSPECT_COMMAND,
         "--resource-scope",
         resource_scope.canonical_name,
         "--service",

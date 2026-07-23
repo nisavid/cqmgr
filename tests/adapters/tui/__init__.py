@@ -1,0 +1,1 @@
+"""Textual adapter contract tests."""

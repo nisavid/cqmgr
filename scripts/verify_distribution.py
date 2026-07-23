@@ -50,6 +50,7 @@ EXPECTED_PACKAGE_FILES = {
     PurePosixPath("adapters/serialization/quota_snapshots.py"),
     PurePosixPath("adapters/serialization/results.py"),
     PurePosixPath("adapters/tui/__init__.py"),
+    PurePosixPath("adapters/tui/app.py"),
     PurePosixPath("application/__init__.py"),
     PurePosixPath("application/configuration.py"),
     PurePosixPath("application/operations/__init__.py"),

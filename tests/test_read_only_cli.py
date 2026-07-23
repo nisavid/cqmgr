@@ -17,6 +17,7 @@ from cqmgr.adapters.cli.copy_cli import (
     quota_list_copy_cli,
     quota_resolve_copy_cli,
 )
+from cqmgr.adapters.cli.group import canonical_command_path
 from cqmgr.application.operations.read_only import (
     QuotaInspectSelector,
     ReadOnlyQuotaQuery,
@@ -49,6 +50,29 @@ if TYPE_CHECKING:
     import pytest
 
 USAGE_EXIT = 2
+
+
+def test_copy_cli_canonical_paths_are_derived_from_the_alias_registry() -> None:
+    """Generated commands use registered canonical siblings, never aliases."""
+    assert canonical_command_path("cqmgr", "quota", "list") == (
+        "cqmgr",
+        "quota",
+        "list",
+    )
+    assert canonical_command_path(
+        "cqmgr",
+        "quota",
+        "resolve",
+        "cloud-tpu-slice",
+    ) == ("cqmgr", "quota", "resolve", "cloud-tpu-slice")
+
+    with __import__("pytest").raises(
+        ValueError,
+        match="not registered",
+    ):
+        canonical_command_path("cqmgr", "q", "list")
+
+
 REJECTED_PRECONDITION_EXIT = 3
 QUERY_LIMIT = 20
 INSTANCE_COUNT = 2

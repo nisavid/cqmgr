@@ -1,0 +1,21 @@
+layout=medium
+workspace=quotas
+scope=projects/123456789
+scope-lock=unlocked
+principal=principal://accounts.google.com/operator@example.com
+outcome=provider-source-incomplete
+complete=no
+compute.googleapis.com: complete
+tpu.googleapis.com: incomplete
+compute.googleapis.com GPUS-ALL-REGIONS-per-project us-central1
+discovered=yes cataloged=yes guided=yes mutable=yes
+compute.googleapis.com NEW-PROVIDER-HARDWARE us-east1
+discovered=yes cataloged=no guided=no mutable=no
+tpu.googleapis.com TPU-V6E-CHIPS us-central2
+discovered=yes cataloged=yes guided=no mutable=no
+copy-cli=cqmgr quota list --resource-scope projects/123456789 --limit 100 --output human
+status=PROVIDER-SOURCE-INCOMPLETE — exit 6; evidence incomplete
+coverage=Provider coverage:  compute.googleapis.com: complete (1/1 pages)  tpu.googleapis.com: incomplete (1/2 pages)  Aggregate completeness: incomplete  WARNING tpu-location-page-failed: Cloud TPU location evidence is incomplete; refresh the inventory.
+detail=Quota detail
+Select an exact effective quota slice.
+audit=Select a retained record to inspect its exact chain facts.
