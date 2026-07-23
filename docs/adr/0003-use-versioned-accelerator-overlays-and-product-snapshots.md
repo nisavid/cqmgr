@@ -1,5 +1,6 @@
 ---
-status: accepted
+status: superseded
+superseded_by: 0004-use-a-versioned-federated-provider-inventory
 ---
 
 # Use versioned accelerator overlays and bounded product snapshots
