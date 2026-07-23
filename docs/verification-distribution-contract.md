@@ -384,7 +384,8 @@ The ordinary canary may perform only bounded:
 - Resource Manager project lookup;
 - `QuotaInfo` get and list for the explicit
   `compute.googleapis.com` and `tpu.googleapis.com` services;
-- `QuotaPreference` get and list;
+- `QuotaPreference` get and list for the explicit
+  `compute.googleapis.com` and `tpu.googleapis.com` services;
 - Monitoring time-series list;
 - Compute aggregated accelerator-type and machine-type lists; and
 - TPU location, accelerator-type, and runtime-version lists.
@@ -398,7 +399,9 @@ The identity deliberately lacks quota-update, service-enablement, and resource
 provisioning permissions. The ordinary canary composition contains no create,
 update, patch, delete, quota-request Preview, Apply, or `validateOnly` port. The
 separate Spot canary exposes only the documented read-only capacity-advice
-operation despite its provider Preview lifecycle. A permission audit proves all
+operation despite its provider Preview lifecycle. Request-path tests assert that
+QuotaInfo and QuotaPreference reads name only the two V1 service DNS names. A
+permission audit proves all
 other mutation-shaped capabilities absent. Adapter contract tests assert the
 exact RPC or HTTP method and path template for every allowlisted operation,
 including `POST .../advice/capacity` and `POST .../advice/capacityHistory`.
