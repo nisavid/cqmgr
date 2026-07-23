@@ -1536,6 +1536,41 @@ def test_inspect_joins_only_exact_authoritative_evidence() -> None:
     assert unrelated_region.identity not in references
 
 
+def test_inspect_joins_dimensionless_preference_to_explicit_global_slice() -> None:
+    """Preference scope uncertainty does not hide an otherwise exact global match."""
+    selected = replace(
+        _evidence("GPUS-ALL-REGIONS-per-project"),
+        identity=EffectiveQuotaSliceIdentity(
+            PROJECT,
+            "compute.googleapis.com",
+            "GPUS-ALL-REGIONS-per-project",
+            NormalizedDimensions(),
+            QuotaScope.GLOBAL,
+        ),
+        declared_dimensions=(),
+        applicable_locations=("global",),
+    )
+    preference_identity = replace(
+        selected.identity,
+        quota_scope=QuotaScope.UNKNOWN,
+    )
+    fixture = _fixture(
+        (_complete(selected),),
+        preferences=_complete(_preference(preference_identity)),
+        usage=_complete(_usage(selected)),
+    )
+
+    result = asyncio.run(
+        fixture.operations.inspect(QuotaInspectRequest(_context(), selected.identity))
+    )
+
+    assert result.succeeded
+    assert result.data.item is not None
+    assert result.data.item.desired_value == QuotaQuantity(8, UNIT)
+    assert result.data.item.granted_value == QuotaQuantity(8, UNIT)
+    assert result.data.item.reconciliation is Reconciliation.SETTLED
+
+
 def test_inspect_does_not_join_usage_from_another_applicable_location() -> None:
     """A dimensioned slice joins usage only at its exact location."""
     evidence = replace(

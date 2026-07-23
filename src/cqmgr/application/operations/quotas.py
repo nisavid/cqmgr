@@ -1476,11 +1476,31 @@ def _one_exact_preference(
     evidence: EffectiveQuotaEvidence,
     preferences: tuple[QuotaPreferenceEvidence, ...],
 ) -> QuotaPreferenceEvidence | None:
-    matches = tuple(item for item in preferences if item.identity == evidence.identity)
+    matches = tuple(
+        item
+        for item in preferences
+        if _preference_matches_effective_slice(item, evidence)
+    )
     if len(matches) > 1:
         msg = "more than one provider preference matches the exact quota slice"
         raise _AmbiguousEvidenceError(msg)
     return matches[0] if matches else None
+
+
+def _preference_matches_effective_slice(
+    preference: QuotaPreferenceEvidence,
+    evidence: EffectiveQuotaEvidence,
+) -> bool:
+    preference_identity = preference.identity
+    effective_identity = evidence.identity
+    return (
+        preference_identity.resource_scope == effective_identity.resource_scope
+        and preference_identity.service == effective_identity.service
+        and preference_identity.quota_id == effective_identity.quota_id
+        and preference_identity.dimensions == effective_identity.dimensions
+        and preference_identity.quota_scope
+        in (effective_identity.quota_scope, QuotaScope.UNKNOWN)
+    )
 
 
 def _one_exact_usage(
