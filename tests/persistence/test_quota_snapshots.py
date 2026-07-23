@@ -36,11 +36,13 @@ from cqmgr.domain.catalog import (
 )
 from cqmgr.domain.quota_queries import (
     QUOTA_QUERY_EVIDENCE_CONTRACT,
+    V1_PROVIDER_SERVICES,
+    ProviderSourceCoverage,
     QuerySnapshotMetadata,
     QuotaQuery,
+    QuotaQueryFilters,
     QuotaQueryItem,
     QuotaQuerySnapshot,
-    ServiceSource,
 )
 from cqmgr.domain.quotas import (
     EffectiveQuotaSliceIdentity,
@@ -59,7 +61,7 @@ PRIVATE_FILE_MODE = 0o600
 
 def _snapshot(*, expires_at: datetime | None = None) -> QuotaQuerySnapshot:
     scope = ResourceScope(ResourceScopeKind.PROJECT, "projects/123")
-    query = QuotaQuery(scope, ServiceSource("compute.googleapis.com"))
+    query = QuotaQuery(scope, filters=QuotaQueryFilters(services=("compute",)))
     item = QuotaQueryItem(
         identity=EffectiveQuotaSliceIdentity(
             scope,
@@ -93,6 +95,17 @@ def _snapshot(*, expires_at: datetime | None = None) -> QuotaQuerySnapshot:
             observed_at=datetime(2026, 7, 22, 8, tzinfo=UTC),
             expires_at=expires_at or datetime(2026, 7, 22, 9, tzinfo=UTC),
             complete=True,
+            source_coverage=tuple(
+                ProviderSourceCoverage.complete(
+                    service,
+                    pages_attempted=1,
+                    pages_completed=1,
+                    observed_at=datetime(2026, 7, 22, 8, tzinfo=UTC),
+                )
+                if service == "compute.googleapis.com"
+                else ProviderSourceCoverage.intentionally_unqueried(service)
+                for service in V1_PROVIDER_SERVICES
+            ),
         ),
         (item,),
     )
@@ -113,7 +126,7 @@ def test_repository_atomically_round_trips_private_canonical_snapshot(
     snapshot_files = list((root / "snapshots").glob("*.json"))
     assert len(snapshot_files) == 1
     assert json.loads(snapshot_files[0].read_bytes())["schema"] == (
-        "cqmgr.quota-query-snapshot/v2"
+        "cqmgr.quota-query-snapshot/v3"
     )
     assert list(root.rglob("*.tmp")) == []
     if os.name != "nt":
@@ -295,7 +308,10 @@ def test_repository_snapshot_id_is_immutable_and_idempotent(tmp_path: Path) -> N
 
     conflicting = replace(
         snapshot,
-        metadata=replace(snapshot.metadata, complete=False),
+        metadata=replace(
+            snapshot.metadata,
+            expires_at=snapshot.metadata.expires_at + timedelta(minutes=1),
+        ),
     )
     with pytest.raises(QuotaSnapshotConflictError):
         repository.save(conflicting)
@@ -362,7 +378,7 @@ def test_cursor_rejects_query_mismatch_before_resolution(tmp_path: Path) -> None
     cursor = repository.issue(snapshot.metadata.snapshot_id, 0, now=NOW)
     mismatch = replace(
         snapshot.metadata.query,
-        source=ServiceSource("storage.googleapis.com"),
+        filters=QuotaQueryFilters(services=("tpu",)),
     )
 
     with pytest.raises(QuotaCursorQueryMismatchError):
@@ -491,7 +507,7 @@ def test_repository_rejects_newer_and_corrupt_snapshot_state(tmp_path: Path) -> 
     path = next((root / "snapshots").glob("*.json"))
 
     document = json.loads(path.read_bytes())
-    document["schema"] = "cqmgr.quota-query-snapshot/v3"
+    document["schema"] = "cqmgr.quota-query-snapshot/v4"
     path.write_text(json.dumps(document))
     with pytest.raises(UnsupportedQuotaSnapshotSchemaError):
         repository.load(snapshot.metadata.snapshot_id, now=NOW)

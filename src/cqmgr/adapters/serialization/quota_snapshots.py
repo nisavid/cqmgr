@@ -18,8 +18,10 @@ from cqmgr.domain.catalog import (
     CatalogMetadata,
     CatalogPredicates,
 )
+from cqmgr.domain.diagnostics import DiagnosticCode
 from cqmgr.domain.quota_queries import (
-    CatalogGroupSource,
+    ProviderSourceCoverage,
+    ProviderSourceCoverageState,
     QuerySnapshotMetadata,
     QuotaQuery,
     QuotaQueryFilters,
@@ -27,7 +29,6 @@ from cqmgr.domain.quota_queries import (
     QuotaQuerySnapshot,
     QuotaSort,
     QuotaSortField,
-    ServiceSource,
     SortDirection,
 )
 from cqmgr.domain.quotas import (
@@ -45,8 +46,7 @@ from cqmgr.domain.status import (
     Reconciliation,
 )
 
-QUOTA_QUERY_SNAPSHOT_SCHEMA = "cqmgr.quota-query-snapshot/v2"
-_LEGACY_QUOTA_QUERY_SNAPSHOT_SCHEMA = "cqmgr.quota-query-snapshot/v1"
+QUOTA_QUERY_SNAPSHOT_SCHEMA = "cqmgr.quota-query-snapshot/v3"
 QUOTA_QUERY_CURSOR_SCHEMA = "cqmgr.quota-query-cursor/v1"
 _SCHEMA = re.compile(r"cqmgr\.quota-query-snapshot/v([0-9]+)\Z")
 _CURSOR_SCHEMA = re.compile(r"cqmgr\.quota-query-cursor/v([0-9]+)\Z")
@@ -60,7 +60,8 @@ _CREDENTIAL_MARKERS = (
     "ya29.",
 )
 _DIMENSION_PAIR_SIZE = 2
-_LATEST_SNAPSHOT_SCHEMA_VERSION = 2
+_LATEST_SNAPSHOT_SCHEMA_VERSION = 3
+_LATEST_CURSOR_SCHEMA_VERSION = 1
 
 
 def encode_snapshot_record(snapshot: QuotaQuerySnapshot) -> bytes:
@@ -73,8 +74,10 @@ def encode_snapshot_record(snapshot: QuotaQuerySnapshot) -> bytes:
 
 def _encode_snapshot_record(snapshot: QuotaQuerySnapshot, schema: str) -> bytes:
     """Encode one supported snapshot generation for canonicality checks."""
-    legacy = schema == _LEGACY_QUOTA_QUERY_SNAPSHOT_SCHEMA
-    document = {"schema": schema, "snapshot": _snapshot(snapshot, legacy=legacy)}
+    if schema != QUOTA_QUERY_SNAPSHOT_SCHEMA:
+        msg = "cannot encode a superseded quota snapshot schema"
+        raise ValueError(msg)
+    document = {"schema": schema, "snapshot": _snapshot(snapshot)}
     if _contains_unsafe_evidence_text(document):
         msg = "snapshot contains unsafe evidence text"
         raise ValueError(msg)
@@ -108,14 +111,10 @@ def decode_snapshot_record(data: bytes) -> QuotaQuerySnapshot:
             {"schema", "snapshot"},
             "snapshot document",
         )
-        if schema not in {
-            QUOTA_QUERY_SNAPSHOT_SCHEMA,
-            _LEGACY_QUOTA_QUERY_SNAPSHOT_SCHEMA,
-        }:
+        if schema != QUOTA_QUERY_SNAPSHOT_SCHEMA:
             msg = "stored quota snapshot schema is invalid"
             raise QuotaSnapshotStoredDataError(msg)  # noqa: TRY301
-        legacy = schema == _LEGACY_QUOTA_QUERY_SNAPSHOT_SCHEMA
-        snapshot = _decode_snapshot(document["snapshot"], legacy=legacy)
+        snapshot = _decode_snapshot(document["snapshot"])
     except (QuotaSnapshotStoredDataError, UnsupportedQuotaSnapshotSchemaError):
         raise
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -158,7 +157,7 @@ def decode_cursor_binding(data: bytes) -> tuple[str, int]:
         if (
             isinstance(schema, str)
             and (match := _CURSOR_SCHEMA.fullmatch(schema))
-            and int(match.group(1)) > 1
+            and int(match.group(1)) > _LATEST_CURSOR_SCHEMA_VERSION
         ):
             msg = "stored quota cursor uses a newer schema"
             raise UnsupportedQuotaSnapshotSchemaError(msg)  # noqa: TRY301
@@ -184,9 +183,7 @@ def decode_cursor_binding(data: bytes) -> tuple[str, int]:
         return result
 
 
-def _snapshot(
-    snapshot: QuotaQuerySnapshot, *, legacy: bool = False
-) -> dict[str, object]:
+def _snapshot(snapshot: QuotaQuerySnapshot) -> dict[str, object]:
     metadata = snapshot.metadata
     return {
         "metadata": {
@@ -198,26 +195,28 @@ def _snapshot(
                 "content_digest": metadata.catalog.content_digest,
             },
             "evidence_contract": metadata.evidence_contract,
+            "inventory_revision": metadata.inventory_revision,
+            "source_coverage": [
+                _source_coverage(item) for item in metadata.source_coverage
+            ],
             "observed_at": _timestamp(metadata.observed_at),
             "expires_at": _timestamp(metadata.expires_at),
             "complete": metadata.complete,
         },
-        "items": [_item(item, legacy=legacy) for item in snapshot.items],
+        "ordered_slice_identities": [
+            _identity(item.identity) for item in snapshot.items
+        ],
+        "items": [_item(item) for item in snapshot.items],
     }
 
 
 def _query(query: QuotaQuery) -> dict[str, object]:
-    source: dict[str, object]
-    if isinstance(query.source, ServiceSource):
-        source = {"kind": "service", "value": query.source.service}
-    else:
-        source = {"kind": "catalog-group", "value": query.source.group_id.value}
     filters = query.filters
     return {
         "resource_scope": _scope(query.resource_scope),
-        "source": source,
         "filters": {
             "services": list(filters.services),
+            "catalog_groups": [value.value for value in filters.catalog_groups],
             "accelerators": [value.value for value in filters.accelerators],
             "locations": list(filters.locations),
             "quota_scopes": [value.value for value in filters.quota_scopes],
@@ -241,7 +240,7 @@ def _query(query: QuotaQuery) -> dict[str, object]:
     }
 
 
-def _item(item: QuotaQueryItem, *, legacy: bool) -> dict[str, object]:
+def _item(item: QuotaQueryItem) -> dict[str, object]:
     quantity = item.effective_value
     encoded: dict[str, object] = {
         "identity": _identity(item.identity),
@@ -251,6 +250,7 @@ def _item(item: QuotaQueryItem, *, legacy: bool) -> dict[str, object]:
         ),
         "location": item.location,
         "quota_pool": item.quota_pool,
+        "catalog_groups": [value.value for value in item.catalog_groups],
         "predicates": {
             "discovered": item.predicates.discovered,
             "cataloged": item.predicates.cataloged,
@@ -274,13 +274,24 @@ def _item(item: QuotaQueryItem, *, legacy: bool) -> dict[str, object]:
             else _timestamp(item.evidence_observed_at)
         ),
     }
-    if legacy:
-        encoded["constraint_set"] = _constraint_set(item.constraint_set)
-    else:
-        encoded["constraint_sets"] = [
-            _constraint_set(constraint_set) for constraint_set in item.constraint_sets
-        ]
+    encoded["constraint_sets"] = [
+        _constraint_set(constraint_set) for constraint_set in item.constraint_sets
+    ]
     return encoded
+
+
+def _source_coverage(value: ProviderSourceCoverage) -> dict[str, object]:
+    return {
+        "service": value.service,
+        "state": value.state.value,
+        "pages_attempted": value.pages_attempted,
+        "pages_completed": value.pages_completed,
+        "page_cap_reached": value.page_cap_reached,
+        "observed_at": (
+            None if value.observed_at is None else _timestamp(value.observed_at)
+        ),
+        "diagnostic_codes": [code.value for code in value.diagnostic_codes],
+    }
 
 
 def _constraint_set(
@@ -314,8 +325,12 @@ def _scope(scope: ResourceScope) -> dict[str, str]:
     return {"kind": scope.kind.value, "name": scope.canonical_name}
 
 
-def _decode_snapshot(value: object, *, legacy: bool) -> QuotaQuerySnapshot:
-    table = _exact_object(value, {"metadata", "items"}, "snapshot")
+def _decode_snapshot(value: object) -> QuotaQuerySnapshot:
+    table = _exact_object(
+        value,
+        {"metadata", "ordered_slice_identities", "items"},
+        "snapshot",
+    )
     metadata = _exact_object(
         table["metadata"],
         {
@@ -323,6 +338,8 @@ def _decode_snapshot(value: object, *, legacy: bool) -> QuotaQuerySnapshot:
             "query",
             "catalog",
             "evidence_contract",
+            "inventory_revision",
+            "source_coverage",
             "observed_at",
             "expires_at",
             "complete",
@@ -332,7 +349,7 @@ def _decode_snapshot(value: object, *, legacy: bool) -> QuotaQuerySnapshot:
     catalog = _exact_object(
         metadata["catalog"], {"schema", "revision", "content_digest"}, "catalog"
     )
-    return QuotaQuerySnapshot(
+    snapshot = QuotaQuerySnapshot(
         metadata=QuerySnapshotMetadata(
             snapshot_id=_string(metadata["snapshot_id"], "snapshot_id"),
             query=_decode_query(metadata["query"]),
@@ -344,34 +361,39 @@ def _decode_snapshot(value: object, *, legacy: bool) -> QuotaQuerySnapshot:
             evidence_contract=_string(
                 metadata["evidence_contract"], "evidence_contract"
             ),
+            inventory_revision=_string(
+                metadata["inventory_revision"], "inventory_revision"
+            ),
+            source_coverage=tuple(
+                _decode_source_coverage(item)
+                for item in _list(metadata["source_coverage"], "source_coverage")
+            ),
             observed_at=_datetime(metadata["observed_at"], "observed_at"),
             expires_at=_datetime(metadata["expires_at"], "expires_at"),
             complete=_bool(metadata["complete"], "complete"),
         ),
-        items=tuple(
-            _decode_item(item, legacy=legacy) for item in _list(table["items"], "items")
-        ),
+        items=tuple(_decode_item(item) for item in _list(table["items"], "items")),
     )
+    ordered_identities = tuple(
+        _decode_identity(item)
+        for item in _list(
+            table["ordered_slice_identities"],
+            "ordered_slice_identities",
+        )
+    )
+    if ordered_identities != tuple(item.identity for item in snapshot.items):
+        msg = "stored ordered slice identities do not match snapshot items"
+        raise QuotaSnapshotStoredDataError(msg)
+    return snapshot
 
 
 def _decode_query(value: object) -> QuotaQuery:
-    table = _exact_object(
-        value, {"resource_scope", "source", "filters", "sort"}, "query"
-    )
-    source = _exact_object(table["source"], {"kind", "value"}, "query.source")
-    source_kind = _string(source["kind"], "query.source.kind")
-    source_value = _string(source["value"], "query.source.value")
-    if source_kind == "service":
-        decoded_source: ServiceSource | CatalogGroupSource = ServiceSource(source_value)
-    elif source_kind == "catalog-group":
-        decoded_source = CatalogGroupSource(CatalogGroupId(source_value))
-    else:
-        msg = "stored quota query source is invalid"
-        raise QuotaSnapshotStoredDataError(msg)
+    table = _exact_object(value, {"resource_scope", "filters", "sort"}, "query")
     filters = _exact_object(
         table["filters"],
         {
             "services",
+            "catalog_groups",
             "accelerators",
             "locations",
             "quota_scopes",
@@ -388,9 +410,15 @@ def _decode_query(value: object) -> QuotaQuery:
     )
     return QuotaQuery(
         resource_scope=_decode_scope(table["resource_scope"]),
-        source=decoded_source,
         filters=QuotaQueryFilters(
             services=_strings(filters["services"], "services"),
+            catalog_groups=tuple(
+                CatalogGroupId(item)
+                for item in _strings(
+                    filters["catalog_groups"],
+                    "catalog_groups",
+                )
+            ),
             accelerators=tuple(
                 AcceleratorId(item)
                 for item in _strings(filters["accelerators"], "accelerators")
@@ -434,8 +462,7 @@ def _decode_sort(value: object) -> QuotaSort:
     )
 
 
-def _decode_item(value: object, *, legacy: bool) -> QuotaQueryItem:
-    constraint_key = "constraint_set" if legacy else "constraint_sets"
+def _decode_item(value: object) -> QuotaQueryItem:
     table = _exact_object(
         value,
         {
@@ -444,6 +471,7 @@ def _decode_item(value: object, *, legacy: bool) -> QuotaQueryItem:
             "accelerator_id",
             "location",
             "quota_pool",
+            "catalog_groups",
             "predicates",
             "effective_value",
             "usage_value",
@@ -453,7 +481,7 @@ def _decode_item(value: object, *, legacy: bool) -> QuotaQueryItem:
             "grant_satisfaction",
             "effective_confirmation",
             "evidence_observed_at",
-            constraint_key,
+            "constraint_sets",
         },
         "item",
     )
@@ -470,6 +498,10 @@ def _decode_item(value: object, *, legacy: bool) -> QuotaQueryItem:
         accelerator_id=None if accelerator is None else AcceleratorId(accelerator),
         location=_optional_string(table["location"], "location"),
         quota_pool=_optional_string(table["quota_pool"], "quota_pool"),
+        catalog_groups=tuple(
+            CatalogGroupId(item)
+            for item in _strings(table["catalog_groups"], "catalog_groups")
+        ),
         predicates=CatalogPredicates(
             _bool(predicates["discovered"], "discovered"),
             _bool(predicates["cataloged"], "cataloged"),
@@ -494,16 +526,59 @@ def _decode_item(value: object, *, legacy: bool) -> QuotaQueryItem:
             if table["evidence_observed_at"] is None
             else _datetime(table["evidence_observed_at"], "evidence_observed_at")
         ),
-        constraint_sets=(
-            ()
-            if legacy and table[constraint_key] is None
-            else (
-                (_decode_constraint_set(table[constraint_key]),)
-                if legacy
-                else tuple(
-                    _decode_constraint_set(item)
-                    for item in _list(table[constraint_key], "constraint_sets")
-                )
+        constraint_sets=tuple(
+            _decode_constraint_set(item)
+            for item in _list(table["constraint_sets"], "constraint_sets")
+        ),
+    )
+
+
+def _decode_source_coverage(value: object) -> ProviderSourceCoverage:
+    table = _exact_object(
+        value,
+        {
+            "service",
+            "state",
+            "pages_attempted",
+            "pages_completed",
+            "page_cap_reached",
+            "observed_at",
+            "diagnostic_codes",
+        },
+        "source_coverage",
+    )
+    attempted = table["pages_attempted"]
+    completed = table["pages_completed"]
+    if any(
+        isinstance(count, bool) or not isinstance(count, int)
+        for count in (attempted, completed)
+    ):
+        msg = "stored source coverage page counts are invalid"
+        raise QuotaSnapshotStoredDataError(msg)
+    attempted_count = cast("int", attempted)
+    completed_count = cast("int", completed)
+    observed = table["observed_at"]
+    return ProviderSourceCoverage(
+        service=_string(table["service"], "source_coverage.service"),
+        state=ProviderSourceCoverageState(
+            _string(table["state"], "source_coverage.state")
+        ),
+        pages_attempted=attempted_count,
+        pages_completed=completed_count,
+        page_cap_reached=_bool(
+            table["page_cap_reached"],
+            "source_coverage.page_cap_reached",
+        ),
+        observed_at=(
+            None
+            if observed is None
+            else _datetime(observed, "source_coverage.observed_at")
+        ),
+        diagnostic_codes=tuple(
+            DiagnosticCode(item)
+            for item in _strings(
+                table["diagnostic_codes"],
+                "source_coverage.diagnostic_codes",
             )
         ),
     )

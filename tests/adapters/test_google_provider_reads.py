@@ -468,6 +468,63 @@ def test_preference_reader_preserves_lifecycle_etag_and_timestamps() -> None:
     assert "public.fixture@example.com" not in repr(result)
 
 
+def test_preference_reader_attributes_known_schema_failure_to_its_service() -> None:
+    """One malformed TPU item cannot invalidate a complete Compute partition."""
+    compute = cloudquotas_v1.QuotaPreference(_preference_page().items[0])
+    tpu = cloudquotas_v1.QuotaPreference(compute)
+    tpu.service = "tpu.googleapis.com"
+    cloudquotas_v1.QuotaPreference.pb(tpu).ClearField("quota_config")
+    reader = GoogleQuotaPreferenceReader(
+        FakeCloudQuotasPages(
+            preference_pages=[QuotaPreferencePage((compute, tpu), "")]
+        ),
+        _policy(RecordingBudget()),
+        page_size=1,
+        now=lambda: NOW,
+    )
+
+    result = asyncio.run(
+        reader.read(
+            QuotaPreferenceReadRequest(
+                _context(),
+                ("compute.googleapis.com", "tpu.googleapis.com"),
+            )
+        )
+    )
+
+    assert result.complete_for("compute.googleapis.com")
+    assert not result.complete_for("tpu.googleapis.com")
+    assert tuple(item.identity.service for item in result.values) == (
+        "compute.googleapis.com",
+    )
+
+
+def test_preference_reader_ignores_known_unselected_service_schema_failure() -> None:
+    """A selected Compute inventory does not own a malformed known TPU item."""
+    tpu = cloudquotas_v1.QuotaPreference(_preference_page().items[0])
+    tpu.service = "tpu.googleapis.com"
+    cloudquotas_v1.QuotaPreference.pb(tpu).ClearField("quota_config")
+    reader = GoogleQuotaPreferenceReader(
+        FakeCloudQuotasPages(preference_pages=[QuotaPreferencePage((tpu,), "")]),
+        _policy(RecordingBudget()),
+        page_size=1,
+        now=lambda: NOW,
+    )
+
+    result = asyncio.run(
+        reader.read(
+            QuotaPreferenceReadRequest(
+                _context(),
+                ("compute.googleapis.com",),
+            )
+        )
+    )
+
+    assert result.complete_for("compute.googleapis.com")
+    assert result.values == ()
+    assert result.diagnostics == ()
+
+
 def test_page_cap_retains_values_but_marks_effective_read_incomplete() -> None:
     """A required next page cannot be hidden behind usable first-page evidence."""
     pages = _quota_info_pages()

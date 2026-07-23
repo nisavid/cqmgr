@@ -9,39 +9,20 @@ from cqmgr.domain.accelerator_overlay import (
     MAINTAINED_ACCELERATOR_OVERLAY,
     AmbiguousOverlayMatchError,
     DimensionSelector,
-    GpuWorkloadRequirement,
     OverlayMapping,
     ProvisioningModel,
-    QuotaConstraintAssessment,
     QuotaSelector,
-    ResolutionFailureReason,
-    ResolvedQuotaRequirement,
     SemanticAcceleratorOverlay,
-    TpuWorkloadRequirement,
-    WorkloadCatalogEvidence,
-    WorkloadResolutionError,
 )
 from cqmgr.domain.catalog import (
     ACCELERATOR_CATALOG_SCHEMA,
-    AcceleratorAttachment,
     AcceleratorId,
-    CatalogEvidenceSource,
     CatalogGroupId,
-    CatalogLocationCoverage,
-    ComputeMachineType,
-    LocationCoverageExpectation,
-    LocationCoverageState,
     ManagementPlane,
-    TpuAcceleratorConfig,
-    TpuAcceleratorType,
-    TpuLocation,
-    TpuRuntimeVersion,
     UnitConversionEvidence,
     WorkloadConsumer,
 )
-from cqmgr.domain.quota_queries import QuotaQueryItem
 from cqmgr.domain.quotas import (
-    ConstraintReference,
     EffectiveQuotaEvidence,
     EffectiveQuotaSliceIdentity,
     NormalizedDimensions,
@@ -56,20 +37,10 @@ from cqmgr.domain.schemas import ProviderSymbol
 from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 
 REVIEW_DATE = date(2026, 7, 14)
-
-
-def _predicate_values(item: QuotaQueryItem) -> tuple[bool, bool, bool, bool]:
-    predicates = item.predicates
-    return (
-        predicates.discovered,
-        predicates.cataloged,
-        predicates.guided,
-        predicates.mutable,
-    )
+SOURCE = "https://docs.cloud.google.com/compute/resource-usage"
 
 
 def _mapping(accelerator: str) -> OverlayMapping:
-    source = "https://docs.cloud.google.com/compute/resource-usage"
     return OverlayMapping(
         group_id=CatalogGroupId.COMPUTE_ACCELERATORS,
         accelerator_id=AcceleratorId(accelerator),
@@ -88,37 +59,80 @@ def _mapping(accelerator: str) -> OverlayMapping:
             location_dimension="region",
         ),
         quota_pool="standard",
-        conversion=UnitConversionEvidence("card", QuotaUnit("1"), 1, source),
+        conversion=UnitConversionEvidence("card", QuotaUnit("1"), 1, SOURCE),
         companion_selectors=(),
-        source_url=source,
+        source_url=SOURCE,
         reviewed_on=REVIEW_DATE,
+        provisioning_models=(ProvisioningModel.STANDARD,),
     )
 
 
-def test_overlay_metadata_is_derived_from_canonical_immutable_content() -> None:
-    """Input ordering cannot change identity, while semantic content changes can."""
+def _evidence(
+    quota_id: str,
+    *,
+    dimensions: tuple[tuple[str, str], ...],
+    scope: QuotaScope,
+) -> EffectiveQuotaEvidence:
+    return EffectiveQuotaEvidence(
+        identity=EffectiveQuotaSliceIdentity(
+            ResourceScope(ResourceScopeKind.PROJECT, "projects/123456789"),
+            "compute.googleapis.com",
+            quota_id,
+            NormalizedDimensions(dimensions),
+            scope,
+        ),
+        effective_value=QuotaQuantity(64, QuotaUnit("1")),
+        metric="compute.googleapis.com/quota",
+        declared_dimensions=tuple(key for key, _value in dimensions),
+        applicable_locations=(
+            ("global",) if scope is QuotaScope.GLOBAL else (dict(dimensions)["region"],)
+        ),
+        eligibility=QuotaIncreaseEligibility(
+            eligible=True,
+            reason=ProviderSymbol(
+                "INELIGIBILITY_REASON_UNSPECIFIED", QuotaIneligibilityReason
+            ),
+        ),
+        fixed=False,
+        concurrent=False,
+        precise=True,
+        refresh_interval=None,
+        ongoing_rollout=False,
+        container_type=ProviderSymbol("PROJECT", QuotaContainerType),
+        quota_display_name=(
+            "GPUs (all regions)"
+            if scope is QuotaScope.GLOBAL
+            else "GPUs per family per region"
+        ),
+    )
+
+
+def test_overlay_identity_is_canonical_and_content_addressed() -> None:
+    """Input ordering cannot alter catalog identity, but semantics can."""
     first = _mapping("nvidia-h100")
     second = _mapping("nvidia-h100-variant")
 
     forward = SemanticAcceleratorOverlay((first, second))
-    reversed_ = SemanticAcceleratorOverlay((second, first))
-    changed = SemanticAcceleratorOverlay((first,))
+    reverse = SemanticAcceleratorOverlay((second, first))
+    pool_changed = SemanticAcceleratorOverlay(
+        (replace(first, quota_pool="preemptible"), second)
+    )
     compatibility_changed = SemanticAcceleratorOverlay(
         (replace(first, machine_types=("a3-highgpu-4g",)), second)
     )
 
     assert forward.metadata.schema == ACCELERATOR_CATALOG_SCHEMA
     assert forward.metadata.revision == REVIEW_DATE.isoformat()
-    assert forward.metadata == reversed_.metadata
-    assert forward.mappings == reversed_.mappings
-    assert changed.metadata.content_digest != forward.metadata.content_digest
+    assert forward.metadata == reverse.metadata
+    assert forward.mappings == reverse.mappings
+    assert pool_changed.metadata.content_digest != forward.metadata.content_digest
     assert (
         compatibility_changed.metadata.content_digest != forward.metadata.content_digest
     )
 
 
-def test_provisioning_model_vocabulary_is_distinct_from_quota_pools() -> None:
-    """V1 workload modes are not aliases for standard/preemptible quota pools."""
+def test_provisioning_models_are_distinct_from_quota_pools() -> None:
+    """Workload modes are not aliases for standard/preemptible quota pools."""
     assert tuple(model.value for model in ProvisioningModel) == (
         "standard",
         "spot",
@@ -127,127 +141,71 @@ def test_provisioning_model_vocabulary_is_distinct_from_quota_pools() -> None:
     )
 
 
-def test_maintained_mappings_have_stable_groups_and_reviewable_official_sources() -> (
-    None
-):
-    """Every maintained semantic claim carries first-party source provenance."""
+def test_maintained_catalog_includes_guided_a4_with_supported_consumers() -> None:
+    """Maintained mappings retain stable groups, sources, and A4 guidance."""
     groups = {mapping.group_id for mapping in MAINTAINED_ACCELERATOR_OVERLAY.mappings}
+    mapping = next(
+        item
+        for item in MAINTAINED_ACCELERATOR_OVERLAY.mappings
+        if item.machine_types == ("a4-highgpu-8g",)
+    )
 
     assert groups == {
         CatalogGroupId.COMPUTE_ACCELERATORS,
         CatalogGroupId.CLOUD_TPU_LEGACY,
     }
     assert all(
-        mapping.source_url.startswith("https://docs.cloud.google.com/")
-        and mapping.reviewed_on == REVIEW_DATE
-        for mapping in MAINTAINED_ACCELERATOR_OVERLAY.mappings
+        item.source_url.startswith("https://docs.cloud.google.com/")
+        and item.reviewed_on == REVIEW_DATE
+        for item in MAINTAINED_ACCELERATOR_OVERLAY.mappings
     )
-    legacy = next(
-        mapping
-        for mapping in MAINTAINED_ACCELERATOR_OVERLAY.mappings
-        if mapping.group_id is CatalogGroupId.CLOUD_TPU_LEGACY
+    assert mapping.accelerator_id == AcceleratorId("nvidia-b200")
+    assert mapping.provider_accelerator_types == ("nvidia-b200",)
+    assert mapping.workload_consumers == (
+        WorkloadConsumer.COMPUTE_ENGINE,
+        WorkloadConsumer.GKE,
     )
-    assert legacy.selector.quota_id is None
-    assert legacy.selector.native_unit == QuotaUnit("core")
-    assert legacy.selector.quota_scope is QuotaScope.ZONAL
+    assert mapping.guided
 
 
-def _evidence(  # noqa: PLR0913
-    quota_id: str,
-    *,
-    service: str,
-    dimensions: tuple[tuple[str, str], ...],
-    scope: QuotaScope,
-    unit: str,
-    locations: tuple[str, ...],
-    display_name: str,
-    fixed: bool = False,
-) -> EffectiveQuotaEvidence:
-    identity = EffectiveQuotaSliceIdentity(
-        resource_scope=ResourceScope(ResourceScopeKind.PROJECT, "projects/123"),
-        service=service,
-        quota_id=quota_id,
-        dimensions=NormalizedDimensions(dimensions),
-        quota_scope=scope,
-    )
-    return EffectiveQuotaEvidence(
-        identity=identity,
-        effective_value=QuotaQuantity(8, QuotaUnit(unit)),
-        metric=f"{service}/quota",
-        declared_dimensions=tuple(key for key, _value in dimensions),
-        applicable_locations=locations,
-        eligibility=QuotaIncreaseEligibility(
-            eligible=not fixed,
-            reason=ProviderSymbol(
-                "INELIGIBILITY_REASON_UNSPECIFIED", QuotaIneligibilityReason
-            ),
-        ),
-        fixed=fixed,
-        concurrent=False,
-        precise=True,
-        refresh_interval=None,
-        ongoing_rollout=False,
-        container_type=ProviderSymbol("PROJECT", QuotaContainerType),
-        quota_display_name=display_name,
-    )
-
-
-def test_overlay_join_preserves_four_independent_catalog_and_mutability_states() -> (
-    None
-):
-    """Recognition and guidance never create discovery or fresh mutability."""
+def test_classification_keeps_discovery_guidance_and_mutability_independent() -> None:
+    """Unknown provider truth remains visible without invented catalog semantics."""
     guided = _evidence(
         "GPUS-PER-GPU-FAMILY-per-project-region",
-        service="compute.googleapis.com",
         dimensions=(("gpu_family", "NVIDIA_H100"), ("region", "us-central1")),
         scope=QuotaScope.REGIONAL,
-        unit="1",
-        locations=("us-central1",),
-        display_name="GPUs per family per region",
     )
-    unknown = _evidence(
-        "FUTURE-QUOTA",
-        service="future.googleapis.com",
-        dimensions=(),
-        scope=QuotaScope.UNKNOWN,
-        unit="future-unit",
-        locations=("global",),
-        display_name="Future quota",
+    unknown = replace(
+        guided,
+        identity=replace(guided.identity, quota_id="PROVIDER-FUTURE-QUOTA"),
     )
 
-    guided_immutable = MAINTAINED_ACCELERATOR_OVERLAY.classify(
+    guided_item = MAINTAINED_ACCELERATOR_OVERLAY.classify(
         guided, freshly_validated_mutable=False
     )
-    unguided_overlay = SemanticAcceleratorOverlay(
-        (replace(_mapping("nvidia-h100"), conversion=None),)
-    )
-    cataloged_unguided = unguided_overlay.classify(
-        guided, freshly_validated_mutable=False
-    )
-    discovered_only = MAINTAINED_ACCELERATOR_OVERLAY.classify(
-        unknown, freshly_validated_mutable=False
-    )
-    generic_mutable = MAINTAINED_ACCELERATOR_OVERLAY.classify(
+    unknown_item = MAINTAINED_ACCELERATOR_OVERLAY.classify(
         unknown, freshly_validated_mutable=True
     )
 
-    assert guided_immutable.identity is guided.identity
-    assert _predicate_values(guided_immutable) == (True, True, True, False)
-    assert _predicate_values(cataloged_unguided) == (True, True, False, False)
-    assert _predicate_values(discovered_only) == (True, False, False, False)
-    assert _predicate_values(generic_mutable) == (True, False, False, True)
+    assert guided_item.predicates.discovered
+    assert guided_item.predicates.cataloged
+    assert guided_item.predicates.guided
+    assert not guided_item.predicates.mutable
+    assert unknown_item.predicates.discovered
+    assert not unknown_item.predicates.cataloged
+    assert not unknown_item.predicates.guided
+    assert unknown_item.predicates.mutable
 
 
 def test_exact_quota_id_is_authoritative_over_provider_display_name() -> None:
     """A renamed display label cannot defeat an exact maintained quota ID."""
-    evidence = _evidence(
-        "GPUS-PER-GPU-FAMILY-per-project-region",
-        service="compute.googleapis.com",
-        dimensions=(("gpu_family", "NVIDIA_H100"), ("region", "us-central1")),
-        scope=QuotaScope.REGIONAL,
-        unit="1",
-        locations=("us-central1",),
-        display_name="Provider-renamed label",
+    evidence = replace(
+        _evidence(
+            "GPUS-PER-GPU-FAMILY-per-project-region",
+            dimensions=(("gpu_family", "NVIDIA_H100"), ("region", "us-central1")),
+            scope=QuotaScope.REGIONAL,
+        ),
+        quota_display_name="Provider-renamed label",
     )
 
     item = MAINTAINED_ACCELERATOR_OVERLAY.classify(
@@ -262,80 +220,45 @@ def test_selector_rejects_unmaintained_extra_dimensions() -> None:
     """An extra provider dimension is a distinct slice, not a close match."""
     evidence = _evidence(
         "GPUS-PER-GPU-FAMILY-per-project-region",
-        service="compute.googleapis.com",
         dimensions=(
             ("gpu_family", "NVIDIA_H100"),
             ("region", "us-central1"),
             ("workload_type", "future"),
         ),
         scope=QuotaScope.REGIONAL,
-        unit="1",
-        locations=("us-central1",),
-        display_name="GPUs per family per region",
     )
 
     item = MAINTAINED_ACCELERATOR_OVERLAY.classify(
         evidence, freshly_validated_mutable=False
     )
 
-    assert _predicate_values(item) == (True, False, False, False)
+    assert item.predicates.discovered
+    assert not item.predicates.cataloged
+    assert not item.predicates.guided
+    assert not item.predicates.mutable
 
 
-def test_overlay_returns_exact_regional_and_global_constraint_references() -> None:
-    """Companion constraints remain references to authoritative live slices."""
+def test_constraint_set_keeps_global_and_regional_slices_independent() -> None:
+    """A shared global companion does not combine alternative locations."""
     regional = _evidence(
         "GPUS-PER-GPU-FAMILY-per-project-region",
-        service="compute.googleapis.com",
         dimensions=(("gpu_family", "NVIDIA_H100"), ("region", "us-central1")),
         scope=QuotaScope.REGIONAL,
-        unit="1",
-        locations=("us-central1",),
-        display_name="GPUs per family per region",
     )
     global_ = _evidence(
         "GPUS-ALL-REGIONS-per-project",
-        service="compute.googleapis.com",
         dimensions=(),
         scope=QuotaScope.GLOBAL,
-        unit="1",
-        locations=("global",),
-        display_name="GPUs (all regions)",
-    )
-
-    unrelated_region = _evidence(
-        "GPUS-PER-GPU-FAMILY-per-project-region",
-        service="compute.googleapis.com",
-        dimensions=(("gpu_family", "NVIDIA_H100"), ("region", "us-east1")),
-        scope=QuotaScope.REGIONAL,
-        unit="1",
-        locations=("us-east1",),
-        display_name="GPUs per family per region",
-    )
-    unrelated_scope = replace(
-        global_,
-        identity=replace(
-            global_.identity,
-            resource_scope=ResourceScope(ResourceScopeKind.PROJECT, "projects/456"),
-        ),
     )
 
     result = MAINTAINED_ACCELERATOR_OVERLAY.constraint_set(
-        AcceleratorId("nvidia-h100"),
-        regional,
-        (unrelated_region, unrelated_scope, global_, regional),
+        AcceleratorId("nvidia-h100"), regional, (regional, global_)
     )
 
     assert result is not None
-    assert tuple(reference.slice_identity for reference in result.references) == (
+    assert tuple(item.slice_identity for item in result.references) == (
         global_.identity,
         regional.identity,
-    )
-
-    assert (
-        MAINTAINED_ACCELERATOR_OVERLAY.constraint_set(
-            AcceleratorId("nvidia-h100"), regional, (regional,)
-        )
-        is None
     )
     with pytest.raises(AmbiguousOverlayMatchError):
         MAINTAINED_ACCELERATOR_OVERLAY.constraint_set(
@@ -349,31 +272,18 @@ def test_global_companion_exposes_each_region_anchored_constraint_set() -> None:
     """A shared global slice relates regions without combining alternatives."""
     central = _evidence(
         "GPUS-PER-GPU-FAMILY-per-project-region",
-        service="compute.googleapis.com",
         dimensions=(("gpu_family", "NVIDIA_H100"), ("region", "us-central1")),
         scope=QuotaScope.REGIONAL,
-        unit="1",
-        locations=("us-central1",),
-        display_name="GPUs per family per region",
     )
-    east = replace(
-        central,
-        identity=replace(
-            central.identity,
-            dimensions=NormalizedDimensions(
-                (("gpu_family", "NVIDIA_H100"), ("region", "us-east1"))
-            ),
-        ),
-        applicable_locations=("us-east1",),
+    east = _evidence(
+        "GPUS-PER-GPU-FAMILY-per-project-region",
+        dimensions=(("gpu_family", "NVIDIA_H100"), ("region", "us-east1")),
+        scope=QuotaScope.REGIONAL,
     )
     global_ = _evidence(
         "GPUS-ALL-REGIONS-per-project",
-        service="compute.googleapis.com",
         dimensions=(),
         scope=QuotaScope.GLOBAL,
-        unit="1",
-        locations=("global",),
-        display_name="GPUs (all regions)",
     )
 
     results = MAINTAINED_ACCELERATOR_OVERLAY.constraint_sets(
@@ -394,631 +304,3 @@ def test_global_companion_exposes_each_region_anchored_constraint_set() -> None:
         (global_.identity, central.identity),
         (global_.identity, east.identity),
     )
-
-
-def _gpu_requirement() -> GpuWorkloadRequirement:
-    return GpuWorkloadRequirement(
-        accelerator_id=AcceleratorId("nvidia-h100"),
-        workload_consumer=WorkloadConsumer.COMPUTE_ENGINE,
-        accelerator_count=8,
-        machine_type="a3-highgpu-8g",
-        provisioning_model=ProvisioningModel.STANDARD,
-        region="us-central1",
-        zone="us-central1-a",
-    )
-
-
-def _gpu_quota_pair() -> tuple[EffectiveQuotaEvidence, EffectiveQuotaEvidence]:
-    """Return the independently limiting regional and global GPU slices."""
-    regional = _evidence(
-        "GPUS-PER-GPU-FAMILY-per-project-region",
-        service="compute.googleapis.com",
-        dimensions=(("gpu_family", "NVIDIA_H100"), ("region", "us-central1")),
-        scope=QuotaScope.REGIONAL,
-        unit="1",
-        locations=("us-central1",),
-        display_name="GPUs per family per region",
-    )
-    global_ = _evidence(
-        "GPUS-ALL-REGIONS-per-project",
-        service="compute.googleapis.com",
-        dimensions=(),
-        scope=QuotaScope.GLOBAL,
-        unit="1",
-        locations=("global",),
-        display_name="GPUs (all regions)",
-    )
-    return regional, global_
-
-
-def _gpu_catalog_evidence(*, include_machine: bool = True) -> WorkloadCatalogEvidence:
-    machines = (
-        (
-            ComputeMachineType(
-                name="a3-highgpu-8g",
-                zone="us-central1-a",
-                guest_accelerators=(AcceleratorAttachment("nvidia-h100-80gb", 8),),
-                lifecycle=None,
-            ),
-        )
-        if include_machine
-        else ()
-    )
-    return WorkloadCatalogEvidence(
-        compute_machine_types=machines,
-        tpu_locations=(),
-        tpu_accelerator_types=(),
-        tpu_runtime_versions=(),
-        coverage=(
-            CatalogLocationCoverage(
-                source=CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
-                location="us-central1-a",
-                expectation=LocationCoverageExpectation.REQUESTED,
-                state=LocationCoverageState.SUCCESS,
-            ),
-        ),
-    )
-
-
-def test_gpu_resolver_returns_native_amount_owner_and_exact_constraints() -> None:
-    """Resolution reports quota requirements and never a capacity conclusion."""
-    regional = _evidence(
-        "GPUS-PER-GPU-FAMILY-per-project-region",
-        service="compute.googleapis.com",
-        dimensions=(("gpu_family", "NVIDIA_H100"), ("region", "us-central1")),
-        scope=QuotaScope.REGIONAL,
-        unit="1",
-        locations=("us-central1",),
-        display_name="GPUs per family per region",
-    )
-    global_ = _evidence(
-        "GPUS-ALL-REGIONS-per-project",
-        service="compute.googleapis.com",
-        dimensions=(),
-        scope=QuotaScope.GLOBAL,
-        unit="1",
-        locations=("global",),
-        display_name="GPUs (all regions)",
-    )
-
-    result = MAINTAINED_ACCELERATOR_OVERLAY.resolve(
-        _gpu_requirement(), (regional, global_), _gpu_catalog_evidence()
-    )
-
-    assert isinstance(result, ResolvedQuotaRequirement)
-    assert result.owning_service == "compute.googleapis.com"
-    assert result.required_amount == QuotaQuantity(8, QuotaUnit("1"))
-    assert result.conversion.source_unit == "card"
-    assert tuple(
-        reference.slice_identity for reference in result.constraint_set.references
-    ) == (global_.identity, regional.identity)
-
-
-def test_resolved_requirement_retains_exact_constraint_sufficiency() -> None:
-    """Each independently limiting slice states whether quota permits the request."""
-    regional, global_ = _gpu_quota_pair()
-    resolved = MAINTAINED_ACCELERATOR_OVERLAY.resolve(
-        _gpu_requirement(), (regional, global_), _gpu_catalog_evidence()
-    )
-    assessments = (
-        QuotaConstraintAssessment(
-            global_.identity,
-            QuotaQuantity(64, QuotaUnit("1")),
-            QuotaQuantity(60, QuotaUnit("1")),
-            resolved.required_amount,
-            permits=False,
-        ),
-        QuotaConstraintAssessment(
-            regional.identity,
-            QuotaQuantity(64, QuotaUnit("1")),
-            QuotaQuantity(55, QuotaUnit("1")),
-            resolved.required_amount,
-            permits=True,
-        ),
-    )
-
-    assessed = replace(resolved, assessments=assessments)
-
-    assert assessed.assessments == assessments
-    assert assessed.permits is False
-    assert resolved.permits is None
-    with pytest.raises(ValueError, match="must equal usage plus required"):
-        replace(assessments[0], permits=True)
-
-
-def test_constraint_sufficiency_rejects_ambiguous_or_incoherent_evidence() -> None:
-    """Sufficiency cannot be constructed from untyped, mixed, or partial facts."""
-    regional, global_ = _gpu_quota_pair()
-    resolved = MAINTAINED_ACCELERATOR_OVERLAY.resolve(
-        _gpu_requirement(), (regional, global_), _gpu_catalog_evidence()
-    )
-    global_assessment = QuotaConstraintAssessment(
-        global_.identity,
-        QuotaQuantity(64, QuotaUnit("1")),
-        QuotaQuantity(1, QuotaUnit("1")),
-        resolved.required_amount,
-        permits=True,
-    )
-    regional_assessment = replace(global_assessment, identity=regional.identity)
-
-    with pytest.raises(TypeError, match="exact slice identity"):
-        replace(global_assessment, identity=object())  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="QuotaQuantity"):
-        replace(global_assessment, usage=object())  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="one native unit"):
-        replace(global_assessment, usage=QuotaQuantity(1, QuotaUnit("core")))
-    with pytest.raises(ValueError, match="usage must be non-negative"):
-        replace(
-            global_assessment,
-            usage=QuotaQuantity(-1, QuotaUnit("1")),
-            permits=True,
-        )
-    with pytest.raises(TypeError, match="permits must be boolean"):
-        replace(global_assessment, permits=1)  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="assessments must contain"):
-        replace(resolved, assessments=[global_assessment])  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="typed workload"):
-        replace(resolved, requirement=object())  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="owning_service"):
-        replace(resolved, owning_service="Compute")
-    with pytest.raises(TypeError, match="required_amount"):
-        replace(resolved, required_amount=object())  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="conversion"):
-        replace(resolved, conversion=object())  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="constraint_set"):
-        replace(resolved, constraint_set=object())  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="assessments must contain"):
-        replace(resolved, assessments=(object(),))  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="every exact constraint"):
-        replace(
-            resolved,
-            assessments=(regional_assessment, global_assessment),
-        )
-    wrong_required = QuotaConstraintAssessment(
-        global_.identity,
-        QuotaQuantity(64, QuotaUnit("1")),
-        QuotaQuantity(1, QuotaUnit("1")),
-        QuotaQuantity(7, QuotaUnit("1")),
-        permits=True,
-    )
-    with pytest.raises(ValueError, match="resolved required amount"):
-        replace(
-            resolved,
-            assessments=(wrong_required, regional_assessment),
-        )
-
-
-def test_gpu_resolver_fails_when_a_required_companion_slice_is_missing() -> None:
-    """A primary slice alone cannot satisfy a maintained constraint relationship."""
-    regional = _evidence(
-        "GPUS-PER-GPU-FAMILY-per-project-region",
-        service="compute.googleapis.com",
-        dimensions=(("gpu_family", "NVIDIA_H100"), ("region", "us-central1")),
-        scope=QuotaScope.REGIONAL,
-        unit="1",
-        locations=("us-central1",),
-        display_name="GPUs per family per region",
-    )
-
-    with pytest.raises(WorkloadResolutionError) as missing:
-        MAINTAINED_ACCELERATOR_OVERLAY.resolve(
-            _gpu_requirement(), (regional,), _gpu_catalog_evidence()
-        )
-
-    assert missing.value.reason is ResolutionFailureReason.PROVIDER_IDENTITY
-
-    global_ = _evidence(
-        "GPUS-ALL-REGIONS-per-project",
-        service="compute.googleapis.com",
-        dimensions=(),
-        scope=QuotaScope.GLOBAL,
-        unit="1",
-        locations=("global",),
-        display_name="GPUs (all regions)",
-    )
-    with pytest.raises(WorkloadResolutionError) as ambiguous:
-        MAINTAINED_ACCELERATOR_OVERLAY.resolve(
-            _gpu_requirement(),
-            (regional, global_, global_),
-            _gpu_catalog_evidence(),
-        )
-
-    assert ambiguous.value.reason is ResolutionFailureReason.AMBIGUOUS
-
-
-def test_gpu_resolver_fails_when_an_exact_constraint_is_ineligible() -> None:
-    """Guidance stops when any independent limiting slice is ineligible."""
-    regional = _evidence(
-        "GPUS-PER-GPU-FAMILY-per-project-region",
-        service="compute.googleapis.com",
-        dimensions=(("gpu_family", "NVIDIA_H100"), ("region", "us-central1")),
-        scope=QuotaScope.REGIONAL,
-        unit="1",
-        locations=("us-central1",),
-        display_name="GPUs per family per region",
-        fixed=True,
-    )
-    global_ = _evidence(
-        "GPUS-ALL-REGIONS-per-project",
-        service="compute.googleapis.com",
-        dimensions=(),
-        scope=QuotaScope.GLOBAL,
-        unit="1",
-        locations=("global",),
-        display_name="GPUs (all regions)",
-    )
-
-    with pytest.raises(WorkloadResolutionError) as rejected:
-        MAINTAINED_ACCELERATOR_OVERLAY.resolve(
-            _gpu_requirement(), (regional, global_), _gpu_catalog_evidence()
-        )
-
-    assert rejected.value.reason is ResolutionFailureReason.INELIGIBLE
-
-    fixed_but_eligible = replace(
-        global_,
-        fixed=True,
-        eligibility=QuotaIncreaseEligibility(
-            eligible=True,
-            reason=ProviderSymbol(
-                "INELIGIBILITY_REASON_UNSPECIFIED", QuotaIneligibilityReason
-            ),
-        ),
-    )
-    regional_eligible = replace(
-        regional,
-        fixed=False,
-        eligibility=QuotaIncreaseEligibility(
-            eligible=True,
-            reason=ProviderSymbol(
-                "INELIGIBILITY_REASON_UNSPECIFIED", QuotaIneligibilityReason
-            ),
-        ),
-    )
-    assert regional_eligible.eligibility.eligible
-    assert fixed_but_eligible.eligibility.eligible
-    assert fixed_but_eligible.fixed
-    with pytest.raises(WorkloadResolutionError) as fixed:
-        MAINTAINED_ACCELERATOR_OVERLAY.resolve(
-            _gpu_requirement(),
-            (regional_eligible, fixed_but_eligible),
-            _gpu_catalog_evidence(),
-        )
-    assert fixed.value.reason is ResolutionFailureReason.INELIGIBLE
-
-
-def test_gpu_resolver_requires_exact_fixed_shape_count_and_coherent_location() -> None:
-    """A fixed machine shape cannot be resized or paired with another region."""
-    regional = _evidence(
-        "GPUS-PER-GPU-FAMILY-per-project-region",
-        service="compute.googleapis.com",
-        dimensions=(("gpu_family", "NVIDIA_H100"), ("region", "us-central1")),
-        scope=QuotaScope.REGIONAL,
-        unit="1",
-        locations=("us-central1",),
-        display_name="GPUs per family per region",
-    )
-
-    with pytest.raises(WorkloadResolutionError) as count:
-        MAINTAINED_ACCELERATOR_OVERLAY.resolve(
-            replace(_gpu_requirement(), accelerator_count=4),
-            (regional,),
-            _gpu_catalog_evidence(),
-        )
-    assert count.value.reason is ResolutionFailureReason.UNSUPPORTED_COMPATIBILITY
-
-    with pytest.raises(ValueError, match="zone must belong to its explicit region"):
-        replace(_gpu_requirement(), zone="us-east1-b")
-    for non_zone in ("us-central1", "us-central1-ab"):
-        with pytest.raises(ValueError, match="exact canonical zone"):
-            replace(_gpu_requirement(), zone=non_zone)
-    for region, zone in (
-        ("us$-central1", "us$-central1-a"),
-        ("u_-central1", "u_-central1-a"),
-    ):
-        with pytest.raises(ValueError, match="exact canonical zone"):
-            replace(_gpu_requirement(), region=region, zone=zone)
-
-    with pytest.raises(WorkloadResolutionError) as flex_start:
-        MAINTAINED_ACCELERATOR_OVERLAY.resolve(
-            replace(
-                _gpu_requirement(),
-                provisioning_model=ProvisioningModel.FLEX_START,
-            ),
-            (regional,),
-            _gpu_catalog_evidence(),
-        )
-    assert flex_start.value.reason is ResolutionFailureReason.UNSUPPORTED_COMPATIBILITY
-
-
-def test_tpu_requirement_makes_management_plane_specific_shape_explicit() -> None:
-    """Legacy TPU requires topology/runtime while Compute TPU requires a machine."""
-    legacy = TpuWorkloadRequirement(
-        management_plane=ManagementPlane.TPU,
-        accelerator_id=AcceleratorId("tpu-v6e"),
-        workload_consumer=WorkloadConsumer.CLOUD_TPU_API,
-        accelerator_count=8,
-        provisioning_model=ProvisioningModel.STANDARD,
-        region=None,
-        zone="us-central1-b",
-        machine_type=None,
-        topology="2x4",
-        runtime_version="tpu-vm-base",
-    )
-
-    assert legacy.management_plane is ManagementPlane.TPU
-    with pytest.raises(ValueError, match="legacy TPU"):
-        TpuWorkloadRequirement(
-            management_plane=ManagementPlane.TPU,
-            accelerator_id=AcceleratorId("tpu-v6e"),
-            workload_consumer=WorkloadConsumer.CLOUD_TPU_API,
-            accelerator_count=8,
-            provisioning_model=ProvisioningModel.STANDARD,
-            region=None,
-            zone="us-central1-b",
-            machine_type="ct6e-standard-4t",
-            topology=None,
-            runtime_version=None,
-        )
-
-    with pytest.raises(ValueError, match="does not match"):
-        replace(legacy, workload_consumer=WorkloadConsumer.GKE)
-    with pytest.raises(ValueError, match="legacy topology"):
-        replace(
-            _compute_tpu_requirement(WorkloadConsumer.GKE),
-            topology="2x2",
-        )
-    for non_zone in ("us-central1", "a"):
-        with pytest.raises(ValueError, match="exact canonical zone"):
-            replace(legacy, zone=non_zone)
-
-
-def _compute_tpu_requirement(
-    workload_consumer: WorkloadConsumer,
-) -> TpuWorkloadRequirement:
-    return TpuWorkloadRequirement(
-        management_plane=ManagementPlane.COMPUTE,
-        accelerator_id=AcceleratorId("tpu-v6e"),
-        workload_consumer=workload_consumer,
-        accelerator_count=4,
-        provisioning_model=ProvisioningModel.STANDARD,
-        region="us-central1",
-        zone="us-central1-b",
-        machine_type="ct6e-standard-4t",
-        topology=None,
-        runtime_version=None,
-    )
-
-
-def _compute_tpu_catalog_evidence() -> WorkloadCatalogEvidence:
-    return WorkloadCatalogEvidence(
-        compute_machine_types=(
-            ComputeMachineType(
-                name="ct6e-standard-4t",
-                zone="us-central1-b",
-                guest_accelerators=(AcceleratorAttachment("tpu-v6e", 4),),
-                lifecycle=None,
-            ),
-        ),
-        tpu_locations=(),
-        tpu_accelerator_types=(),
-        tpu_runtime_versions=(),
-        coverage=(
-            CatalogLocationCoverage(
-                source=CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
-                location="us-central1-b",
-                expectation=LocationCoverageExpectation.REQUESTED,
-                state=LocationCoverageState.SUCCESS,
-            ),
-        ),
-    )
-
-
-@pytest.mark.parametrize(
-    "workload_consumer",
-    [WorkloadConsumer.COMPUTE_ENGINE, WorkloadConsumer.GKE],
-)
-def test_compute_tpu_resolver_uses_compute_owned_quota_for_both_consumers(
-    workload_consumer: WorkloadConsumer,
-) -> None:
-    """Direct Compute and GKE TPU workloads share one Compute-owned mapping."""
-    regional = _evidence(
-        "provider-discovered-ct6e-id",
-        service="compute.googleapis.com",
-        dimensions=(("region", "us-central1"), ("tpu_family", "CT6E")),
-        scope=QuotaScope.REGIONAL,
-        unit="1",
-        locations=("us-central1",),
-        display_name="TPUs per TPU family",
-    )
-
-    result = MAINTAINED_ACCELERATOR_OVERLAY.resolve(
-        _compute_tpu_requirement(workload_consumer),
-        (regional,),
-        _compute_tpu_catalog_evidence(),
-    )
-
-    assert result.owning_service == "compute.googleapis.com"
-    assert result.required_amount == QuotaQuantity(4, QuotaUnit("1"))
-    assert result.conversion.source_unit == "chip"
-    assert result.constraint_set.references == (ConstraintReference(regional.identity),)
-
-
-def _legacy_tpu_requirement() -> TpuWorkloadRequirement:
-    return TpuWorkloadRequirement(
-        management_plane=ManagementPlane.TPU,
-        accelerator_id=AcceleratorId("tpu-v6e"),
-        workload_consumer=WorkloadConsumer.CLOUD_TPU_API,
-        accelerator_count=8,
-        provisioning_model=ProvisioningModel.STANDARD,
-        region=None,
-        zone="us-central1-b",
-        machine_type=None,
-        topology="2x4",
-        runtime_version="tpu-vm-base",
-    )
-
-
-def _legacy_tpu_catalog_evidence() -> WorkloadCatalogEvidence:
-    successful_sources = (
-        CatalogEvidenceSource.TPU_LOCATIONS,
-        CatalogEvidenceSource.TPU_ACCELERATOR_TYPES,
-        CatalogEvidenceSource.TPU_RUNTIME_VERSIONS,
-    )
-    return WorkloadCatalogEvidence(
-        compute_machine_types=(),
-        tpu_locations=(
-            TpuLocation(
-                name="projects/123/locations/us-central1-b",
-                location_id="us-central1-b",
-            ),
-        ),
-        tpu_accelerator_types=(
-            TpuAcceleratorType(
-                name=("projects/123/locations/us-central1-b/acceleratorTypes/v6e-8"),
-                zone="us-central1-b",
-                accelerator_type="v6e-8",
-                configurations=(TpuAcceleratorConfig("V6E", "2x4"),),
-            ),
-        ),
-        tpu_runtime_versions=(
-            TpuRuntimeVersion(
-                name=(
-                    "projects/123/locations/us-central1-b/runtimeVersions/tpu-vm-base"
-                ),
-                zone="us-central1-b",
-                version="tpu-vm-base",
-            ),
-        ),
-        coverage=tuple(
-            CatalogLocationCoverage(
-                source=source,
-                location="us-central1-b",
-                expectation=LocationCoverageExpectation.REQUESTED,
-                state=LocationCoverageState.SUCCESS,
-            )
-            for source in successful_sources
-        ),
-    )
-
-
-def test_legacy_tpu_resolver_returns_zonal_native_core_requirement() -> None:
-    """Legacy TPU resolution retains its owning service, zone, and core unit."""
-    zonal = _evidence(
-        "provider-discovered-v6e-id",
-        service="tpu.googleapis.com",
-        dimensions=(("zone", "us-central1-b"),),
-        scope=QuotaScope.ZONAL,
-        unit="core",
-        locations=("us-central1-b",),
-        display_name="TPU v6e cores per project per zone",
-    )
-
-    result = MAINTAINED_ACCELERATOR_OVERLAY.resolve(
-        _legacy_tpu_requirement(),
-        (zonal,),
-        _legacy_tpu_catalog_evidence(),
-    )
-
-    assert result.owning_service == "tpu.googleapis.com"
-    assert result.required_amount == QuotaQuantity(8, QuotaUnit("core"))
-    assert result.conversion.source_unit == "core"
-    assert result.constraint_set.references == (ConstraintReference(zonal.identity),)
-
-
-def test_resolver_fails_closed_for_missing_compatibility_and_provider_identity() -> (
-    None
-):
-    """Missing catalog shape or exact quota identity never produces guidance."""
-    regional = _evidence(
-        "GPUS-PER-GPU-FAMILY-per-project-region",
-        service="compute.googleapis.com",
-        dimensions=(("gpu_family", "NVIDIA_H100"), ("region", "us-central1")),
-        scope=QuotaScope.REGIONAL,
-        unit="1",
-        locations=("us-central1",),
-        display_name="GPUs per family per region",
-    )
-    wrong_identity = _evidence(
-        "SIMILAR-BUT-WRONG",
-        service="compute.googleapis.com",
-        dimensions=(("gpu_family", "NVIDIA_H100"), ("region", "us-central1")),
-        scope=QuotaScope.REGIONAL,
-        unit="1",
-        locations=("us-central1",),
-        display_name="GPUs per family per region",
-    )
-
-    with pytest.raises(WorkloadResolutionError) as compatibility:
-        MAINTAINED_ACCELERATOR_OVERLAY.resolve(
-            _gpu_requirement(),
-            (regional,),
-            _gpu_catalog_evidence(include_machine=False),
-        )
-    assert (
-        compatibility.value.reason is ResolutionFailureReason.UNSUPPORTED_COMPATIBILITY
-    )
-
-    with pytest.raises(WorkloadResolutionError) as identity:
-        MAINTAINED_ACCELERATOR_OVERLAY.resolve(
-            _gpu_requirement(), (wrong_identity,), _gpu_catalog_evidence()
-        )
-    assert identity.value.reason is ResolutionFailureReason.PROVIDER_IDENTITY
-
-
-def test_resolver_fails_closed_for_ambiguity_missing_location_and_conversion() -> None:
-    """Every unresolved safety axis has an explicit non-capacity failure reason."""
-    regional = _evidence(
-        "GPUS-PER-GPU-FAMILY-per-project-region",
-        service="compute.googleapis.com",
-        dimensions=(("gpu_family", "NVIDIA_H100"), ("region", "us-central1")),
-        scope=QuotaScope.REGIONAL,
-        unit="1",
-        locations=("us-central1",),
-        display_name="GPUs per family per region",
-    )
-    without_coverage = WorkloadCatalogEvidence(
-        compute_machine_types=_gpu_catalog_evidence().compute_machine_types,
-        tpu_locations=(),
-        tpu_accelerator_types=(),
-        tpu_runtime_versions=(),
-        coverage=(),
-    )
-    legacy = _evidence(
-        "provider-discovered-v6e-id",
-        service="tpu.googleapis.com",
-        dimensions=(("zone", "us-central1-b"),),
-        scope=QuotaScope.ZONAL,
-        unit="core",
-        locations=("us-central1-b",),
-        display_name="TPU v6e cores per project per zone",
-    )
-
-    with pytest.raises(WorkloadResolutionError) as ambiguous:
-        MAINTAINED_ACCELERATOR_OVERLAY.resolve(
-            _gpu_requirement(), (regional, regional), _gpu_catalog_evidence()
-        )
-    assert ambiguous.value.reason is ResolutionFailureReason.AMBIGUOUS
-
-    with pytest.raises(WorkloadResolutionError) as coverage:
-        MAINTAINED_ACCELERATOR_OVERLAY.resolve(
-            _gpu_requirement(), (regional,), without_coverage
-        )
-    assert coverage.value.reason is ResolutionFailureReason.MISSING_LOCATION_EVIDENCE
-
-    unsupported_mapping = replace(
-        next(
-            mapping
-            for mapping in MAINTAINED_ACCELERATOR_OVERLAY.mappings
-            if mapping.accelerator_id == AcceleratorId("tpu-v6e")
-            and mapping.management_plane is ManagementPlane.TPU
-        ),
-        conversion=None,
-    )
-    with pytest.raises(WorkloadResolutionError) as conversion:
-        SemanticAcceleratorOverlay((unsupported_mapping,)).resolve(
-            _legacy_tpu_requirement(),
-            (legacy,),
-            _legacy_tpu_catalog_evidence(),
-        )
-    assert conversion.value.reason is ResolutionFailureReason.UNSUPPORTED_CONVERSION

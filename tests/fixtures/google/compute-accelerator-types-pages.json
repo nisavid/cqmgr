@@ -1,0 +1,42 @@
+{
+  "pages": [
+    {
+      "items": {
+        "zones/us-central1-a": {
+          "acceleratorTypes": [
+            {
+              "name": "nvidia-b200",
+              "zone": "us-central1-a",
+              "selfLink": "https://www.googleapis.com/compute/v1/projects/public-schema-project/zones/us-central1-a/acceleratorTypes/nvidia-b200",
+              "deprecated": {"state": "DEPRECATED"}
+            }
+          ]
+        }
+      },
+      "nextPageToken": "public-compute-accelerator-page-2",
+      "unreachables": []
+    },
+    {
+      "items": {
+        "zones/us-central1-b": {
+          "acceleratorTypes": [
+            {
+              "name": "provider-next-x",
+              "zone": "us-central1-b",
+              "selfLink": "https://www.googleapis.com/compute/v1/projects/public-schema-project/zones/us-central1-b/acceleratorTypes/provider-next-x",
+              "deprecated": {"state": "PROVIDER_FUTURE_STATE"}
+            }
+          ]
+        },
+        "zones/us-east1-d": {
+          "warning": {
+            "code": "NO_RESULTS_ON_PAGE",
+            "message": "Public documentation example: no matching accelerator types."
+          }
+        }
+      },
+      "nextPageToken": "",
+      "unreachables": ["zones/us-west8-a"]
+    }
+  ]
+}

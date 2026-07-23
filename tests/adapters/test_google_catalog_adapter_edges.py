@@ -15,8 +15,11 @@ from google.cloud import compute_v1, tpu_v2
 from google.cloud.location import locations_pb2
 
 from cqmgr.adapters.google.compute_catalog import (
+    ComputeAcceleratorTypesPage,
+    ComputeAcceleratorTypesScope,
     ComputeMachineTypesPage,
     ComputeMachineTypesScope,
+    GoogleComputeAcceleratorTypeReader,
     GoogleComputeMachineTypeReader,
 )
 from cqmgr.adapters.google.read_policy import GoogleReadPolicy
@@ -31,6 +34,7 @@ from cqmgr.adapters.google.tpu_catalog import (
 )
 from cqmgr.application.ports.catalog_reads import (
     CatalogRead,
+    ComputeAcceleratorTypeReadRequest,
     ComputeMachineTypeReadRequest,
     TpuAcceleratorTypeReadRequest,
     TpuLocationReadRequest,
@@ -86,6 +90,25 @@ class ComputePages:
         self.calls = 0
 
     async def machine_types(self, **kwargs: object) -> ComputeMachineTypesPage:
+        del kwargs
+        self.calls += 1
+        value = self.pages.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
+class ComputeAcceleratorPages:
+    """Script materialized Compute accelerator-type pages."""
+
+    def __init__(
+        self,
+        pages: Sequence[ComputeAcceleratorTypesPage | BaseException] = (),
+    ) -> None:
+        self.pages = list(pages)
+        self.calls = 0
+
+    async def accelerator_types(self, **kwargs: object) -> ComputeAcceleratorTypesPage:
         del kwargs
         self.calls += 1
         value = self.pages.pop(0)
@@ -158,6 +181,14 @@ def _diagnostic_codes[ValueT](result: CatalogRead[ValueT]) -> list[str]:
 
 def test_readers_reject_nonpositive_pagination_limits() -> None:
     """Every catalog reader requires finite positive pagination bounds."""
+    with pytest.raises(ValueError, match="page_size"):
+        GoogleComputeAcceleratorTypeReader(
+            ComputeAcceleratorPages(), _policy(), page_size=0
+        )
+    with pytest.raises(ValueError, match="maximum_pages"):
+        GoogleComputeAcceleratorTypeReader(
+            ComputeAcceleratorPages(), _policy(), maximum_pages=0
+        )
     with pytest.raises(ValueError, match="page_size"):
         GoogleComputeMachineTypeReader(ComputePages(), _policy(), page_size=0)
     with pytest.raises(ValueError, match="maximum_pages"):
@@ -301,6 +332,63 @@ def test_compute_reader_rejects_items_outside_the_requested_project_and_zone() -
         "provider-schema-invalid",
         "provider-schema-invalid",
         "compute-catalog-scope-invalid",
+    ]
+    assert not result.complete
+
+
+def test_compute_accelerator_reader_rejects_misattributed_provider_items() -> None:
+    """Compute accelerator evidence must prove its project, scope, and name."""
+    valid = compute_v1.AcceleratorType(
+        name="nvidia-b200",
+        zone="us-central1-a",
+        self_link=(
+            "https://www.googleapis.com/compute/v1/projects/public-schema-project/"
+            "zones/us-central1-a/acceleratorTypes/nvidia-b200"
+        ),
+    )
+    page = ComputeAcceleratorTypesPage(
+        scopes=(
+            ComputeAcceleratorTypesScope(
+                "zones/us-central1-a",
+                (
+                    valid,
+                    compute_v1.AcceleratorType(
+                        name="provider-next-x",
+                        zone="us-central1-a",
+                        self_link=(
+                            "https://www.googleapis.com/compute/v1/projects/other/"
+                            "zones/us-central1-a/acceleratorTypes/provider-next-x"
+                        ),
+                    ),
+                    compute_v1.AcceleratorType(
+                        name="provider-next-y",
+                        zone="us-east1-b",
+                        self_link=(
+                            "https://www.googleapis.com/compute/v1/projects/"
+                            "public-schema-project/zones/us-east1-b/"
+                            "acceleratorTypes/provider-next-y"
+                        ),
+                    ),
+                    compute_v1.AcceleratorType(name="identity-missing"),
+                ),
+            ),
+        ),
+        next_page_token="",
+    )
+
+    result = asyncio.run(
+        GoogleComputeAcceleratorTypeReader(
+            ComputeAcceleratorPages((page,)), _policy(), now=lambda: NOW
+        ).read(ComputeAcceleratorTypeReadRequest(_context()))
+    )
+
+    assert [item.name for item in result.values] == ["nvidia-b200"]
+    assert result.location_coverage[0].state is LocationCoverageState.FAILED
+    assert _diagnostic_codes(result) == [
+        "provider-schema-invalid",
+        "provider-schema-invalid",
+        "provider-schema-invalid",
+        "compute-accelerator-catalog-scope-invalid",
     ]
     assert not result.complete
 

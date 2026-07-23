@@ -47,6 +47,7 @@ class CatalogLifecycle(StrEnum):
 class CatalogEvidenceSource(StrEnum):
     """Stable provider-neutral catalog read sources."""
 
+    COMPUTE_ACCELERATOR_TYPES = "compute-accelerator-types"
     COMPUTE_MACHINE_TYPES = "compute-machine-types"
     TPU_LOCATIONS = "tpu-locations"
     TPU_ACCELERATOR_TYPES = "tpu-accelerator-types"
@@ -238,6 +239,26 @@ class AcceleratorAttachment:
         ):
             msg = "accelerator attachment count must be a positive integer"
             raise ValueError(msg)
+
+
+@dataclass(frozen=True, slots=True)
+class ComputeAcceleratorType:
+    """Normalized project-visible Compute accelerator evidence for one zone."""
+
+    name: str
+    zone: str
+    lifecycle: ProviderSymbol[CatalogLifecycle] | None
+
+    def __post_init__(self) -> None:
+        """Preserve exact identity and open provider lifecycle text."""
+        _require_nonempty_string(self.name, "Compute accelerator type name")
+        _require_location_id(self.zone, "Compute accelerator type zone")
+        if self.lifecycle is not None and (
+            not isinstance(self.lifecycle, ProviderSymbol)
+            or self.lifecycle.enum_type is not CatalogLifecycle
+        ):
+            msg = "lifecycle must preserve CatalogLifecycle provider text"
+            raise TypeError(msg)
 
 
 @dataclass(frozen=True, slots=True)

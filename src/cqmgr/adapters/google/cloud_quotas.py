@@ -250,6 +250,7 @@ class GoogleQuotaPreferenceReader(_CloudQuotasReader):
         completed = 0
         values: list[QuotaPreferenceEvidence] = []
         diagnostics = []
+        diagnostic_services: list[str | None] = []
         cap = False
         while attempted < self._maximum_pages:
             attempted += 1
@@ -269,6 +270,7 @@ class GoogleQuotaPreferenceReader(_CloudQuotasReader):
             )
             if result.diagnostic is not None:
                 diagnostics.append(result.diagnostic)
+                diagnostic_services.append(None)
                 break
             page = result.value
             if page is None:
@@ -276,12 +278,16 @@ class GoogleQuotaPreferenceReader(_CloudQuotasReader):
                 raise RuntimeError(msg)
             completed += 1
             for item in page.items:
-                try:
-                    values.append(_map_preference(item, request))
-                except (TypeError, ValueError, OverflowError):
+                mapped, attributed_service, invalid = _selected_preference(
+                    item, request
+                )
+                if mapped is not None:
+                    values.append(mapped)
+                if invalid:
                     diagnostics.append(
                         schema_diagnostic("quota-preference-read", "cloud-quotas")
                     )
+                    diagnostic_services.append(attributed_service)
             token = page.next_page_token
             if not token:
                 break
@@ -291,11 +297,13 @@ class GoogleQuotaPreferenceReader(_CloudQuotasReader):
             diagnostics.append(
                 page_cap_diagnostic("quota-preference-read", "cloud-quotas")
             )
+            diagnostic_services.append(None)
         return ProviderRead(
             values=tuple(values),
             coverage=ProviderReadCoverage(attempted, completed, cap),
             observed_at=self._now(),
             diagnostics=tuple(diagnostics),
+            diagnostic_services=tuple(diagnostic_services),
         )
 
 
@@ -413,6 +421,29 @@ def _map_preference(
         update_time=_timestamp(preference, "update_time"),
         request_origin=_origin_symbol(preference.quota_config),
     )
+
+
+def _selected_preference(
+    preference: cloudquotas_v1.QuotaPreference,
+    request: QuotaPreferenceReadRequest,
+) -> tuple[QuotaPreferenceEvidence | None, str | None, bool]:
+    """Map one selected partition or return its attributable schema failure."""
+    try:
+        _require_service(preference.service)
+    except ValueError:
+        attributed_service = None
+    else:
+        attributed_service = preference.service
+    if (
+        request.services
+        and attributed_service is not None
+        and attributed_service not in request.services
+    ):
+        return None, None, False
+    try:
+        return _map_preference(preference, request), attributed_service, False
+    except (TypeError, ValueError, OverflowError):
+        return None, attributed_service, True
 
 
 def _timestamp(

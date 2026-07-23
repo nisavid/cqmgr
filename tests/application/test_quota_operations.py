@@ -18,7 +18,10 @@ from cqmgr.application.operations.quotas import (
 )
 from cqmgr.application.ports.catalog_reads import CatalogRead
 from cqmgr.application.ports.coordination import CancellationToken
-from cqmgr.application.ports.provider_reads import ProviderReadContext
+from cqmgr.application.ports.provider_reads import (
+    EffectiveQuotaReadRequest,
+    ProviderReadContext,
+)
 from cqmgr.application.ports.quota_snapshots import (
     QuotaCursorQueryMismatchError,
     QuotaSnapshotOperationalError,
@@ -27,27 +30,29 @@ from cqmgr.application.ports.quota_snapshots import (
 )
 from cqmgr.domain.accelerator_overlay import (
     MAINTAINED_ACCELERATOR_OVERLAY,
-    GpuWorkloadRequirement,
+    AllCompatibleLocations,
+    CandidateLocations,
+    CloudTpuSliceRequirement,
+    ComputeInstanceRequirement,
     ProvisioningModel,
-    TpuWorkloadRequirement,
 )
 from cqmgr.domain.catalog import (
     AcceleratorAttachment,
     AcceleratorConstraintSet,
     AcceleratorId,
     CatalogEvidenceSource,
+    CatalogGroupId,
     CatalogLocationCoverage,
     CatalogMetadata,
     CatalogPredicates,
+    ComputeAcceleratorType,
     ComputeMachineType,
     LocationCoverageExpectation,
     LocationCoverageState,
-    ManagementPlane,
     TpuAcceleratorConfig,
     TpuAcceleratorType,
     TpuLocation,
     TpuRuntimeVersion,
-    WorkloadConsumer,
 )
 from cqmgr.domain.diagnostics import (
     Diagnostic,
@@ -61,13 +66,13 @@ from cqmgr.domain.identity import ADCIdentityEvidence, CredentialKind
 from cqmgr.domain.projects import CanonicalProject
 from cqmgr.domain.quota_queries import (
     OpaqueQueryCursor,
+    ProviderSourceCoverageState,
     QuotaQuery,
     QuotaQueryFilters,
     QuotaQueryItem,
     QuotaQuerySnapshot,
     QuotaSort,
     QuotaSortField,
-    ServiceSource,
 )
 from cqmgr.domain.quotas import (
     ConstraintReference,
@@ -102,9 +107,14 @@ from cqmgr.domain.status import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from cqmgr.application.ports.catalog_reads import (
+        TpuAcceleratorTypeReadRequest,
+        TpuRuntimeVersionReadRequest,
+    )
     from cqmgr.application.ports.provider_reads import (
         EffectiveQuotaReader,
         QuotaPreferenceReader,
+        QuotaPreferenceReadRequest,
         UsageReader,
     )
     from cqmgr.domain.accelerator_overlay import SemanticAcceleratorOverlay
@@ -327,29 +337,31 @@ def _identity(
     *,
     unit: QuotaUnit = UNIT,
     region: str = "us-central1",
+    service: str = "compute.googleapis.com",
 ) -> EffectiveQuotaSliceIdentity:
     del unit
     return EffectiveQuotaSliceIdentity(
         PROJECT,
-        "compute.googleapis.com",
+        service,
         quota_id,
         NormalizedDimensions((("region", region),)),
         QuotaScope.REGIONAL,
     )
 
 
-def _evidence(
+def _evidence(  # noqa: PLR0913
     quota_id: str,
     *,
     value: int = 8,
     unit: QuotaUnit = UNIT,
     eligible: bool = True,
     fixed: bool = False,
+    service: str = "compute.googleapis.com",
 ) -> EffectiveQuotaEvidence:
     return EffectiveQuotaEvidence(
-        identity=_identity(quota_id, unit=unit),
+        identity=_identity(quota_id, unit=unit, service=service),
         effective_value=QuotaQuantity(value, unit),
-        metric=f"compute.googleapis.com/{quota_id}",
+        metric=f"{service}/{quota_id}",
         declared_dimensions=("region",),
         applicable_locations=("us-central1",),
         eligibility=QuotaIncreaseEligibility(
@@ -436,7 +448,9 @@ def _fixture(
 ) -> OperationFixture:
     effective = ScriptedReader(effective_reads)
     preference_reader = ScriptedReader((preferences or _complete(),))
-    usage_reader = ScriptedReader((usage or _complete(),))
+    usage_reader = ScriptedReader(
+        tuple((usage or _complete()) for _ in effective_reads)
+    )
     snapshots = MemorySnapshots()
     cursors = MemoryCursors(snapshots)
     operations = QuotaOperations(
@@ -463,18 +477,19 @@ def _fixture(
 
 
 def _query(*sorts: QuotaSort) -> QuotaQuery:
-    return QuotaQuery(PROJECT, ServiceSource("compute.googleapis.com"), sort=sorts)
+    return QuotaQuery(
+        PROJECT,
+        filters=QuotaQueryFilters(services=("compute",)),
+        sort=sorts,
+    )
 
 
-def _gpu_requirement() -> GpuWorkloadRequirement:
-    return GpuWorkloadRequirement(
-        accelerator_id=ACCELERATOR,
-        workload_consumer=WorkloadConsumer.COMPUTE_ENGINE,
-        accelerator_count=8,
+def _gpu_requirement() -> ComputeInstanceRequirement:
+    return ComputeInstanceRequirement(
         machine_type="a3-highgpu-8g",
+        instance_count=1,
         provisioning_model=ProvisioningModel.STANDARD,
-        region="us-central1",
-        zone="us-central1-a",
+        locations=CandidateLocations(("us-central1-a",)),
     )
 
 
@@ -547,33 +562,40 @@ def _gpu_catalog_read() -> CatalogRead[ComputeMachineType]:
     )
 
 
-def _legacy_tpu_requirement() -> TpuWorkloadRequirement:
-    return TpuWorkloadRequirement(
-        management_plane=ManagementPlane.TPU,
-        accelerator_id=AcceleratorId("tpu-v6e"),
-        workload_consumer=WorkloadConsumer.CLOUD_TPU_API,
-        accelerator_count=8,
-        provisioning_model=ProvisioningModel.STANDARD,
-        region=None,
-        zone="us-central1-b",
-        machine_type=None,
-        topology="2x4",
-        runtime_version="tpu-vm-base",
+def _compute_accelerator_catalog_read(
+    accelerator_type: str = "nvidia-h100-80gb",
+    zone: str = "us-central1-a",
+) -> CatalogRead[ComputeAcceleratorType]:
+    return CatalogRead(
+        _complete(ComputeAcceleratorType(accelerator_type, zone, None)),
+        (
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+                zone,
+                LocationCoverageExpectation.REQUESTED,
+                LocationCoverageState.SUCCESS,
+            ),
+        ),
     )
 
 
-def _compute_tpu_requirement() -> TpuWorkloadRequirement:
-    return TpuWorkloadRequirement(
-        management_plane=ManagementPlane.COMPUTE,
-        accelerator_id=AcceleratorId("tpu-v6e"),
-        workload_consumer=WorkloadConsumer.GKE,
-        accelerator_count=4,
+def _legacy_tpu_requirement() -> CloudTpuSliceRequirement:
+    return CloudTpuSliceRequirement(
+        accelerator_type="v6e-8",
+        topology="2x4",
+        runtime_version="tpu-vm-base",
+        slice_count=1,
         provisioning_model=ProvisioningModel.STANDARD,
-        region="us-central1",
-        zone="us-central1-b",
+        locations=CandidateLocations(("us-central1-b",)),
+    )
+
+
+def _compute_tpu_requirement() -> ComputeInstanceRequirement:
+    return ComputeInstanceRequirement(
         machine_type="ct6e-standard-4t",
-        topology=None,
-        runtime_version=None,
+        instance_count=1,
+        provisioning_model=ProvisioningModel.STANDARD,
+        locations=CandidateLocations(("us-central1-b",)),
     )
 
 
@@ -614,64 +636,71 @@ def _compute_tpu_catalog_read() -> CatalogRead[ComputeMachineType]:
     )
 
 
-def _legacy_tpu_quota_evidence() -> EffectiveQuotaEvidence:
+def _legacy_tpu_quota_evidence(
+    zone: str = "us-central1-b",
+) -> EffectiveQuotaEvidence:
     return replace(
         _evidence("provider-discovered-v6e-id", unit=QuotaUnit("core")),
         identity=EffectiveQuotaSliceIdentity(
             PROJECT,
             "tpu.googleapis.com",
             "provider-discovered-v6e-id",
-            NormalizedDimensions((("zone", "us-central1-b"),)),
+            NormalizedDimensions((("zone", zone),)),
             QuotaScope.ZONAL,
         ),
         metric="tpu.googleapis.com/provider-discovered-v6e-id",
         declared_dimensions=("zone",),
-        applicable_locations=("us-central1-b",),
+        applicable_locations=(zone,),
         quota_display_name="TPU v6e cores per project per zone",
     )
 
 
-def _coverage(source: CatalogEvidenceSource) -> CatalogLocationCoverage:
+def _coverage(
+    source: CatalogEvidenceSource,
+    zone: str = "us-central1-b",
+) -> CatalogLocationCoverage:
     return CatalogLocationCoverage(
         source,
-        "us-central1-b",
+        zone,
         LocationCoverageExpectation.REQUESTED,
         LocationCoverageState.SUCCESS,
     )
 
 
-def _legacy_tpu_catalog_reads() -> tuple[
+def _legacy_tpu_catalog_reads(
+    zone: str = "us-central1-b",
+) -> tuple[
     CatalogRead[TpuLocation],
     CatalogRead[TpuAcceleratorType],
     CatalogRead[TpuRuntimeVersion],
 ]:
     location = TpuLocation(
-        "projects/123456789/locations/us-central1-b",
-        "us-central1-b",
+        f"projects/123456789/locations/{zone}",
+        zone,
     )
     accelerator = TpuAcceleratorType(
-        "projects/123456789/locations/us-central1-b/acceleratorTypes/v6e-8",
-        "us-central1-b",
+        f"projects/123456789/locations/{zone}/acceleratorTypes/v6e-8",
+        zone,
         "v6e-8",
         (TpuAcceleratorConfig("V6E", "2x4"),),
     )
     runtime = TpuRuntimeVersion(
-        "projects/123456789/locations/us-central1-b/runtimeVersions/tpu-vm-base",
-        "us-central1-b",
+        f"projects/123456789/locations/{zone}/runtimeVersions/tpu-vm-base",
+        zone,
         "tpu-vm-base",
     )
     return (
         CatalogRead(
             _complete(location),
-            (_coverage(CatalogEvidenceSource.TPU_LOCATIONS),),
+            (_coverage(CatalogEvidenceSource.TPU_LOCATIONS, zone),),
         ),
         CatalogRead(
             _complete(accelerator),
-            (_coverage(CatalogEvidenceSource.TPU_ACCELERATOR_TYPES),),
+            (_coverage(CatalogEvidenceSource.TPU_ACCELERATOR_TYPES, zone),),
         ),
         CatalogRead(
             _complete(runtime),
-            (_coverage(CatalogEvidenceSource.TPU_RUNTIME_VERSIONS),),
+            (_coverage(CatalogEvidenceSource.TPU_RUNTIME_VERSIONS, zone),),
         ),
     )
 
@@ -685,12 +714,14 @@ def test_resolve_gpu_retains_unrelated_catalog_failures() -> None:
     effective = ScriptedReader((_complete(regional, global_),))
     usage = ScriptedReader((_complete(_usage(regional, 55), _usage(global_, 60)),))
     compute = ScriptedCatalogReader((_gpu_catalog_read(),))
+    compute_accelerators = ScriptedCatalogReader((_compute_accelerator_catalog_read(),))
     tpu_locations = ScriptedCatalogReader(())
     tpu_accelerators = ScriptedCatalogReader(())
     tpu_runtimes = ScriptedCatalogReader(())
     operations = WorkloadResolutionOperations(
         effective,
         usage,
+        compute_accelerators,
         compute,
         tpu_locations,
         tpu_accelerators,
@@ -705,15 +736,20 @@ def test_resolve_gpu_retains_unrelated_catalog_failures() -> None:
 
     assert result.succeeded
     assert result.data is not None
-    assert result.data.owning_service == "compute.googleapis.com"
-    assert result.data.required_amount == QuotaQuantity(8, UNIT)
-    assert tuple(item.identity for item in result.data.assessments) == (
+    location = result.data.locations[0]
+    assert location.owning_service == "compute.googleapis.com"
+    assert tuple(item.required for item in location.constraint_requirements) == (
+        QuotaQuantity(8, UNIT),
+        QuotaQuantity(8, UNIT),
+    )
+    assert tuple(item.identity for item in location.assessments) == (
         global_.identity,
         regional.identity,
     )
-    assert tuple(item.permits for item in result.data.assessments) == (False, True)
-    assert result.data.permits is False
+    assert tuple(item.permits for item in location.assessments) == (False, True)
+    assert location.permits is False
     assert result.diagnostics == (_catalog_diagnostic(),)
+    assert len(compute_accelerators.calls) == 1
     assert len(compute.calls) == 1
     assert tpu_locations.calls == []
     assert tpu_accelerators.calls == []
@@ -740,6 +776,7 @@ def test_resolve_stops_on_untrustworthy_constraint_usage(usage_case: str) -> Non
     operations = WorkloadResolutionOperations(
         ScriptedReader((_complete(regional, global_),)),
         ScriptedReader((_complete(*observations),)),
+        ScriptedCatalogReader((_compute_accelerator_catalog_read(),)),
         ScriptedCatalogReader((_gpu_catalog_read(),)),
         ScriptedCatalogReader(()),
         ScriptedCatalogReader(()),
@@ -764,6 +801,7 @@ def test_resolve_stops_on_incomplete_usage_read() -> None:
     operations = WorkloadResolutionOperations(
         ScriptedReader((_complete(regional, global_),)),
         ScriptedReader((_incomplete(_usage(regional), _usage(global_)),)),
+        ScriptedCatalogReader((_compute_accelerator_catalog_read(),)),
         ScriptedCatalogReader((_gpu_catalog_read(),)),
         ScriptedCatalogReader(()),
         ScriptedCatalogReader(()),
@@ -792,6 +830,7 @@ def test_resolve_legacy_tpu_uses_only_selected_zone_tpu_catalogs() -> None:
     operations = WorkloadResolutionOperations(
         effective,
         ScriptedReader((_complete(_usage(_legacy_tpu_quota_evidence(), value=0)),)),
+        ScriptedCatalogReader(()),
         compute,
         tpu_locations,
         tpu_accelerators,
@@ -806,12 +845,71 @@ def test_resolve_legacy_tpu_uses_only_selected_zone_tpu_catalogs() -> None:
 
     assert result.succeeded
     assert result.data is not None
-    assert result.data.owning_service == "tpu.googleapis.com"
-    assert result.data.required_amount == QuotaQuantity(8, QuotaUnit("core"))
+    location = result.data.locations[0]
+    assert location.owning_service == "tpu.googleapis.com"
+    assert tuple(item.required for item in location.constraint_requirements) == (
+        QuotaQuantity(8, QuotaUnit("core")),
+    )
     assert compute.calls == []
     assert len(tpu_locations.calls) == 1
     assert len(tpu_accelerators.calls) == 1
     assert len(tpu_runtimes.calls) == 1
+
+
+def test_resolve_cloud_tpu_all_compatible_reads_every_discovered_zone() -> None:
+    """All-compatible fans out both TPU child catalogs for each discovered zone."""
+    zones = ("us-central1-b", "us-east1-d")
+    first_reads = _legacy_tpu_catalog_reads(zones[0])
+    second_reads = _legacy_tpu_catalog_reads(zones[1])
+    location_read = CatalogRead(
+        _complete(first_reads[0].values[0], second_reads[0].values[0]),
+        (
+            *first_reads[0].location_coverage,
+            *second_reads[0].location_coverage,
+        ),
+    )
+    quotas = tuple(_legacy_tpu_quota_evidence(zone) for zone in zones)
+    tpu_accelerators = ScriptedCatalogReader((first_reads[1], second_reads[1]))
+    tpu_runtimes = ScriptedCatalogReader((first_reads[2], second_reads[2]))
+    operations = WorkloadResolutionOperations(
+        ScriptedReader((_complete(*quotas),)),
+        ScriptedReader((_complete(*(_usage(quota, 0) for quota in quotas)),)),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader((location_read,)),
+        tpu_accelerators,
+        tpu_runtimes,
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+    requirement = replace(
+        _legacy_tpu_requirement(),
+        locations=AllCompatibleLocations(),
+    )
+
+    result = asyncio.run(
+        operations.resolve(QuotaResolveRequest(_context(), requirement))
+    )
+
+    assert result.succeeded
+    assert result.data is not None
+    assert result.data.all_compatible_locations_exhaustive is True
+    assert tuple(location.location for location in result.data.locations) == zones
+    assert all(location.permits is True for location in result.data.locations)
+    assert (
+        tuple(
+            cast("TpuAcceleratorTypeReadRequest", call).zone
+            for call in tpu_accelerators.calls
+        )
+        == zones
+    )
+    assert (
+        tuple(
+            cast("TpuRuntimeVersionReadRequest", call).zone
+            for call in tpu_runtimes.calls
+        )
+        == zones
+    )
 
 
 def test_resolve_compute_tpu_uses_compute_catalog_and_owned_quota() -> None:
@@ -824,6 +922,9 @@ def test_resolve_compute_tpu_uses_compute_catalog_and_owned_quota() -> None:
     operations = WorkloadResolutionOperations(
         effective,
         ScriptedReader((_complete(_usage(_compute_tpu_quota_evidence(), value=0)),)),
+        ScriptedCatalogReader(
+            (_compute_accelerator_catalog_read("tpu-v6e", "us-central1-b"),)
+        ),
         compute,
         tpu_locations,
         tpu_accelerators,
@@ -838,8 +939,11 @@ def test_resolve_compute_tpu_uses_compute_catalog_and_owned_quota() -> None:
 
     assert result.succeeded
     assert result.data is not None
-    assert result.data.owning_service == "compute.googleapis.com"
-    assert result.data.required_amount == QuotaQuantity(4, UNIT)
+    location = result.data.locations[0]
+    assert location.owning_service == "compute.googleapis.com"
+    assert tuple(item.required for item in location.constraint_requirements) == (
+        QuotaQuantity(4, UNIT),
+    )
     assert len(compute.calls) == 1
     assert tpu_locations.calls == []
     assert tpu_accelerators.calls == []
@@ -852,6 +956,7 @@ def test_resolve_stops_on_incomplete_required_quota_read() -> None:
     operations = WorkloadResolutionOperations(
         effective,
         ScriptedReader((_complete(),)),
+        ScriptedCatalogReader((_compute_accelerator_catalog_read(),)),
         ScriptedCatalogReader((_gpu_catalog_read(),)),
         ScriptedCatalogReader(()),
         ScriptedCatalogReader(()),
@@ -889,6 +994,7 @@ def test_resolve_stops_on_failed_selected_location_catalog_evidence() -> None:
     operations = WorkloadResolutionOperations(
         ScriptedReader((_complete(*_gpu_quota_evidence()),)),
         ScriptedReader((_complete(),)),
+        ScriptedCatalogReader((_compute_accelerator_catalog_read(),)),
         ScriptedCatalogReader((failed_selected,)),
         ScriptedCatalogReader(()),
         ScriptedCatalogReader(()),
@@ -903,7 +1009,10 @@ def test_resolve_stops_on_failed_selected_location_catalog_evidence() -> None:
 
     assert result.outcome.exit_class is ExitClass.INCOMPLETE_EVIDENCE
     assert result.outcome.code == StableSymbol("missing-location-evidence")
-    assert result.data is None
+    assert result.data is not None
+    failure_reason = result.data.locations[0].failure_reason
+    assert failure_reason is not None
+    assert failure_reason.value == "missing-location-evidence"
     assert result.completeness.has_partial_data
     assert result.diagnostics == (diagnostic,)
 
@@ -921,6 +1030,7 @@ def test_resolve_rejects_ineligible_exact_quota_slice() -> None:
     operations = WorkloadResolutionOperations(
         ScriptedReader((_complete(regional, global_),)),
         ScriptedReader((_complete(),)),
+        ScriptedCatalogReader((_compute_accelerator_catalog_read(),)),
         ScriptedCatalogReader((_gpu_catalog_read(),)),
         ScriptedCatalogReader(()),
         ScriptedCatalogReader(()),
@@ -935,7 +1045,10 @@ def test_resolve_rejects_ineligible_exact_quota_slice() -> None:
 
     assert result.outcome.exit_class is ExitClass.REJECTED_PRECONDITION
     assert result.outcome.code == StableSymbol("ineligible")
-    assert result.data is None
+    assert result.data is not None
+    failure_reason = result.data.locations[0].failure_reason
+    assert failure_reason is not None
+    assert failure_reason.value == "ineligible"
     assert result.completeness.is_complete
 
 
@@ -945,6 +1058,7 @@ def test_resolve_rejects_ambiguous_exact_quota_slice() -> None:
     operations = WorkloadResolutionOperations(
         ScriptedReader((_complete(regional, regional, global_),)),
         ScriptedReader((_complete(),)),
+        ScriptedCatalogReader((_compute_accelerator_catalog_read(),)),
         ScriptedCatalogReader((_gpu_catalog_read(),)),
         ScriptedCatalogReader(()),
         ScriptedCatalogReader(()),
@@ -959,7 +1073,10 @@ def test_resolve_rejects_ambiguous_exact_quota_slice() -> None:
 
     assert result.outcome.exit_class is ExitClass.REJECTED_PRECONDITION
     assert result.outcome.code == StableSymbol("ambiguous")
-    assert result.data is None
+    assert result.data is not None
+    failure_reason = result.data.locations[0].failure_reason
+    assert failure_reason is not None
+    assert failure_reason.value == "ambiguous"
 
 
 def test_browse_sorts_snapshots_and_resumes_without_provider_calls() -> None:
@@ -1005,6 +1122,132 @@ def test_browse_sorts_snapshots_and_resumes_without_provider_calls() -> None:
         len(fixture.preferences.calls),
         len(fixture.usage.calls),
     )
+
+
+def test_bare_browse_federates_both_v1_providers_with_bound_coverage() -> None:
+    """A bare query reads Compute and TPU and binds both into its cursor snapshot."""
+    compute = _evidence("compute-quota")
+    tpu = _evidence("tpu-quota", service="tpu.googleapis.com")
+    fixture = _fixture((_complete(compute), _complete(tpu)))
+
+    result = asyncio.run(
+        fixture.operations.browse(QuotaBrowseRequest(_context(), QuotaQuery(PROJECT)))
+    )
+
+    assert result.succeeded
+    assert tuple(
+        cast("EffectiveQuotaReadRequest", request).service
+        for request in fixture.effective.calls
+    ) == (
+        "compute.googleapis.com",
+        "tpu.googleapis.com",
+    )
+    assert tuple(item.identity.service for item in result.data.items) == (
+        "compute.googleapis.com",
+        "tpu.googleapis.com",
+    )
+    assert tuple(item.state for item in result.data.source_coverage) == (
+        ProviderSourceCoverageState.COMPLETE,
+        ProviderSourceCoverageState.COMPLETE,
+    )
+    snapshot = fixture.snapshots.snapshots[result.data.snapshot_id or ""]
+    assert snapshot.metadata.source_coverage == result.data.source_coverage
+
+
+def test_preference_schema_failure_degrades_only_its_provider_coverage() -> None:
+    """Assignable preference failures retain unrelated provider completeness."""
+    diagnostic = Diagnostic(
+        DiagnosticCode("provider-schema-invalid"),
+        Severity.ERROR,
+        DiagnosticPhase("quota-preference-read"),
+        DiagnosticSource("cloud-quotas"),
+        RetryDisposition.AFTER_UPGRADE,
+        RedactedText("The provider returned malformed preference evidence."),
+    )
+    preferences = ProviderRead[QuotaPreferenceEvidence](
+        (),
+        ProviderReadCoverage(2, 2),
+        NOW,
+        (diagnostic,),
+        ("tpu.googleapis.com",),
+    )
+    fixture = _fixture(
+        (
+            _complete(_evidence("compute-quota")),
+            _complete(_evidence("tpu-quota", service="tpu.googleapis.com")),
+        ),
+        preferences=preferences,
+    )
+
+    result = asyncio.run(
+        fixture.operations.browse(QuotaBrowseRequest(_context(), QuotaQuery(PROJECT)))
+    )
+
+    assert result.outcome.exit_class is ExitClass.INCOMPLETE_EVIDENCE
+    assert tuple(item.state for item in result.data.source_coverage) == (
+        ProviderSourceCoverageState.COMPLETE,
+        ProviderSourceCoverageState.INCOMPLETE,
+    )
+    assert tuple(item.pages_attempted for item in result.data.source_coverage) == (4, 4)
+    assert result.data.source_coverage[0].diagnostic_codes == ()
+    assert result.data.source_coverage[1].diagnostic_codes == (
+        DiagnosticCode("provider-schema-invalid"),
+    )
+    preference_request = cast(
+        "QuotaPreferenceReadRequest", fixture.preferences.calls[0]
+    )
+    assert preference_request.services == (
+        "compute.googleapis.com",
+        "tpu.googleapis.com",
+    )
+
+
+def test_service_filter_prunes_reads_rows_and_marks_other_provider_unqueried() -> None:
+    """Input shorthand selects only Compute without treating TPU as a failure."""
+    fixture = _fixture((_complete(_evidence("compute-quota")),))
+    query = QuotaQuery(
+        PROJECT,
+        filters=QuotaQueryFilters(services=("compute",)),
+    )
+
+    result = asyncio.run(
+        fixture.operations.browse(QuotaBrowseRequest(_context(), query))
+    )
+
+    assert result.succeeded
+    assert [
+        cast("EffectiveQuotaReadRequest", request).service
+        for request in fixture.effective.calls
+    ] == ["compute.googleapis.com"]
+    assert tuple(item.identity.service for item in result.data.items) == (
+        "compute.googleapis.com",
+    )
+    assert tuple(item.state for item in result.data.source_coverage) == (
+        ProviderSourceCoverageState.COMPLETE,
+        ProviderSourceCoverageState.INTENTIONALLY_UNQUERIED,
+    )
+
+
+def test_catalog_group_filter_prunes_nonmember_rows() -> None:
+    """Provider pruning and displayed-row filtering use the same group facet."""
+    fixture = _fixture(
+        (_complete(_evidence("known-guided", service="tpu.googleapis.com")),)
+    )
+    query = QuotaQuery(
+        PROJECT,
+        filters=QuotaQueryFilters(catalog_groups=(CatalogGroupId.CLOUD_TPU_LEGACY,)),
+    )
+
+    result = asyncio.run(
+        fixture.operations.browse(QuotaBrowseRequest(_context(), query))
+    )
+
+    assert result.succeeded
+    assert result.data.items == ()
+    assert [
+        cast("EffectiveQuotaReadRequest", request).service
+        for request in fixture.effective.calls
+    ] == ["tpu.googleapis.com"]
 
 
 def test_initial_page_retains_snapshot_when_cursor_issue_fails() -> None:
@@ -1148,6 +1391,13 @@ def test_incomplete_browse_retains_filtered_items_without_order_or_cursor() -> N
     assert result.data.total is None
     assert result.data.next_cursor is None
     assert result.data.snapshot_id is None
+    assert tuple(item.state for item in result.data.source_coverage) == (
+        ProviderSourceCoverageState.INCOMPLETE,
+        ProviderSourceCoverageState.INTENTIONALLY_UNQUERIED,
+    )
+    assert tuple(
+        code.value for code in result.data.source_coverage[0].diagnostic_codes
+    ) == ("provider-page-cap-reached",)
     assert fixture.snapshots.snapshots == {}
 
 
@@ -1155,8 +1405,7 @@ def test_incomplete_browse_with_no_filtered_rows_uses_incomplete_exit() -> None:
     """An empty filtered view cannot turn an incomplete scan into unavailability."""
     query = QuotaQuery(
         PROJECT,
-        ServiceSource("compute.googleapis.com"),
-        filters=QuotaQueryFilters(cataloged=True),
+        filters=QuotaQueryFilters(services=("compute",), cataloged=True),
     )
     fixture = _fixture((_incomplete(_evidence("generic")),))
 
@@ -1361,8 +1610,8 @@ def test_browse_filters_shared_companion_through_related_accelerator_sets() -> N
     )
     query = QuotaQuery(
         PROJECT,
-        ServiceSource("compute.googleapis.com"),
         filters=QuotaQueryFilters(
+            services=("compute",),
             accelerators=(ACCELERATOR,),
             cataloged=True,
             guided=True,

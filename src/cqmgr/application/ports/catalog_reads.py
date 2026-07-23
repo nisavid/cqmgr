@@ -11,6 +11,7 @@ from cqmgr.domain.quotas import ProviderRead
 
 if TYPE_CHECKING:
     from cqmgr.domain.catalog import (
+        ComputeAcceleratorType,
         ComputeMachineType,
         TpuAcceleratorType,
         TpuLocation,
@@ -48,6 +49,19 @@ class CatalogRead[ReadT]:
         return self.read.complete and all(
             item.complete for item in self.location_coverage
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ComputeAcceleratorTypeReadRequest:
+    """Read project-visible Compute accelerator types across returned scopes."""
+
+    context: ProviderReadContext
+
+    def __post_init__(self) -> None:
+        """Require explicit bounded provider context."""
+        if not isinstance(self.context, ProviderReadContext):
+            msg = "Compute accelerator catalog request requires ProviderReadContext"
+            raise TypeError(msg)
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +158,17 @@ class ComputeMachineTypeReader(Protocol):
         request: ComputeMachineTypeReadRequest,
     ) -> CatalogRead[ComputeMachineType]:
         """Return normalized machine types with scoped coverage."""
+        ...
+
+
+class ComputeAcceleratorTypeReader(Protocol):
+    """Read normalized Compute accelerator-type catalog evidence."""
+
+    async def read(
+        self,
+        request: ComputeAcceleratorTypeReadRequest,
+    ) -> CatalogRead[ComputeAcceleratorType]:
+        """Return normalized accelerator types with scoped coverage."""
         ...
 
 
