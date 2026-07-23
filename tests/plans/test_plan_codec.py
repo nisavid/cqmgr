@@ -315,8 +315,13 @@ def _canonical(value: object) -> bytes:
     ).encode()
 
 
-def _mutated_plan_bytes(path: tuple[str, ...], value: object) -> bytes:
-    envelope = json.loads(PlanCodec.encode(_plan(), LOCAL_KEY).bytes)
+def _mutated_plan_bytes(
+    path: tuple[str | int, ...],
+    value: object,
+    *,
+    plan: QuotaRequestPlan | QuotaRequestBundlePlan | None = None,
+) -> bytes:
+    envelope = json.loads(PlanCodec.encode(plan or _plan(), LOCAL_KEY).bytes)
     target = envelope["plan"]
     for component in path[:-1]:
         target = target[component]
@@ -515,6 +520,52 @@ def test_plan_rejects_cross_scope_unit_and_binding_inconsistency() -> None:
         replace(plan, installation_id="")
     with pytest.raises(ValueError, match="aware UTC"):
         replace(plan, issued_at=NOW.replace(tzinfo=None))
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        (
+            "target_strategy",
+            TargetStrategy.MINIMUM,
+            "manual target strategy",
+        ),
+        ("target_derivation", "manual-absolute", "target_derivation"),
+        ("child_id", "", "child_id"),
+        ("usage", QuotaQuantity(3, QuotaUnit("GiBy")), "target unit"),
+        ("workload", "4", "target unit"),
+        ("prior_desired", QuotaQuantity(8, QuotaUnit("GiBy")), "target unit"),
+        ("granted", object(), "target unit"),
+        ("direct_accelerator_rank", 2, "direct accelerator rank"),
+        ("scope_breadth_rank", 5, "scope breadth rank"),
+    ],
+)
+def test_single_plan_rejects_invalid_child_dispatch_bindings(
+    field_name: str,
+    value: object,
+    message: str,
+) -> None:
+    """A single plan retains the same exact child dispatch contract as a bundle."""
+    with pytest.raises((TypeError, ValueError), match=message):
+        replace(_plan(), **cast("Any", {field_name: value}))
+
+
+@pytest.mark.parametrize(
+    ("plan", "path", "value"),
+    [
+        (_plan(), ("kind",), "collection"),
+        (_plan(), ("children",), []),
+        (_bundle_plan(), ("children", 0, "direct_accelerator_rank"), True),
+    ],
+)
+def test_decode_rejects_invalid_single_shape_and_dispatch_rank(
+    plan: QuotaRequestPlan | QuotaRequestBundlePlan,
+    path: tuple[str | int, ...],
+    value: object,
+) -> None:
+    """Authenticated bytes cannot weaken plan kind, arity, or dispatch ordering."""
+    with pytest.raises(PlanDecodeError, match="content is invalid"):
+        PlanCodec.decode(_mutated_plan_bytes(path, value, plan=plan))
 
 
 def test_review_validation_and_every_ledger_state_fail_closed() -> None:
