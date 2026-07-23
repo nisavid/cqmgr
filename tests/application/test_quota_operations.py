@@ -332,6 +332,11 @@ def _context() -> ProviderReadContext:
     )
 
 
+def _effective_service(request: object) -> str:
+    assert isinstance(request, EffectiveQuotaReadRequest)
+    return request.service
+
+
 def _identity(
     quota_id: str,
     *,
@@ -1176,8 +1181,7 @@ def test_bare_browse_federates_both_v1_providers_with_bound_coverage() -> None:
 
     assert result.succeeded
     assert tuple(
-        cast("EffectiveQuotaReadRequest", request).service
-        for request in fixture.effective.calls
+        _effective_service(request) for request in fixture.effective.calls
     ) == (
         "compute.googleapis.com",
         "tpu.googleapis.com",
@@ -1255,10 +1259,9 @@ def test_service_filter_prunes_reads_rows_and_marks_other_provider_unqueried() -
     )
 
     assert result.succeeded
-    assert [
-        cast("EffectiveQuotaReadRequest", request).service
-        for request in fixture.effective.calls
-    ] == ["compute.googleapis.com"]
+    assert [_effective_service(request) for request in fixture.effective.calls] == [
+        "compute.googleapis.com"
+    ]
     assert tuple(item.identity.service for item in result.data.items) == (
         "compute.googleapis.com",
     )
@@ -1284,10 +1287,9 @@ def test_catalog_group_filter_prunes_nonmember_rows() -> None:
 
     assert result.succeeded
     assert result.data.items == ()
-    assert [
-        cast("EffectiveQuotaReadRequest", request).service
-        for request in fixture.effective.calls
-    ] == ["tpu.googleapis.com"]
+    assert [_effective_service(request) for request in fixture.effective.calls] == [
+        "tpu.googleapis.com"
+    ]
 
 
 def test_initial_page_retains_snapshot_when_cursor_issue_fails() -> None:
