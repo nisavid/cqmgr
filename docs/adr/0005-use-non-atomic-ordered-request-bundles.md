@@ -43,7 +43,8 @@ top-level `kind` beside `schema`: `single` requires exactly one child and
 `bundle` permits one or more ordered children. Unknown kinds fail closed.
 An explicit exact-slice target is represented as strategy `manual` and kind
 `single`. A workload-derived constraint set is kind `bundle` even when exactly
-one child remains after verified no-ops are removed. When no child remains,
+one child remains after verified no-ops are removed, including when its selected
+strategy is `manual`. When no child remains,
 Preview returns the complete verified-no-op result without issuing a plan;
 `single` remains reserved for an explicit exact-slice target and Apply has no
 all-no-op input to consume.
@@ -52,8 +53,12 @@ Apply is deliberately non-atomic. It freshly revalidates every child before the
 consumption barrier and before any provider write. A failed revalidation appends
 and fsyncs a terminal no-write Apply result, crosses no consumption barrier, and
 leaves the plan unused but inapplicable; a new Preview is required. Apply then
-dispatches non-no-op children in deterministic accelerator-first order, using
-canonical exact-slice identity as the final tie-breaker. It stops at the first
+dispatches non-no-op children in one canonical order. The comparator first ranks
+accelerator- or location-specific constraints before broader companion
+constraints, then orders by the canonical exact-slice identity tuple of resource
+scope, canonical service DNS name, quota ID, location, quota scope, and sorted
+dimension key/value pairs. No-op composition evidence is outside this dispatch
+order. Apply uses the exact order bound into the plan and stops at the first
 conclusively failed child or any `unknown` child and never attempts later
 children; transport uncertainty is one possible cause of `unknown`. Each
 dispatched child receives one
@@ -89,11 +94,12 @@ uncertainty.
 
 Watch observes the accepted children of one applied bundle, including a
 partially applied bundle whose aggregate Apply failed. It retains every ordered
-child, verified no-op, disposition, provider reconciliation identity, target,
-status evidence, and resume checkpoint, while polling only accepted children.
-Failed, unknown, and unattempted children are not Watch targets; an unknown child
-first requires read-after-unknown reconciliation, and a bundle with no accepted
-child is not watchable. The aggregate `granted` or `fulfilled` condition is
+plan child, disposition, provider reconciliation identity, target, status
+evidence, and resume checkpoint, while polling only accepted children. Verified
+Preview no-ops remain composition evidence outside the Watch subject. Failed,
+unknown, and unattempted children are not Watch targets; an unknown child first
+requires read-after-unknown reconciliation, and a bundle with no accepted child
+is not watchable. The aggregate `granted` or `fulfilled` condition is
 reached only when every accepted child reaches that condition. A conclusive
 unmet accepted child terminates the aggregate condition without flattening
 other child states. Timeout and interruption preserve the latest material
