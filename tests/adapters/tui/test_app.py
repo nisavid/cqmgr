@@ -1001,6 +1001,39 @@ def test_completed_inspection_owns_result_and_copy_cli_over_older_refresh() -> N
     asyncio.run(scenario())
 
 
+def test_audit_workspace_owns_state_over_older_quota_refresh() -> None:
+    """An older provider read cannot replace the active local Audit operation."""
+
+    async def scenario() -> None:
+        operations = BrowseInspectRaceOperations()
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            app.action_refresh()
+            await operations.refresh_started.wait()
+
+            await pilot.click("#workspace-audit")
+            await pilot.pause()
+            audit_result = app.last_result
+            assert audit_result is not None
+            assert audit_result.operation == OperationName("audit.list")
+            audit_status = str(_static(app, "#status-line").content)
+            audit_instrument = str(_static(app, "#instrument-bar").content)
+            audit_copy_cli = app.last_copied_cli
+
+            operations.release_refresh.set()
+            await operations.refresh_returned.wait()
+            await pilot.pause()
+
+            assert app.active_workspace == "audit"
+            assert app.last_result is audit_result
+            assert str(_static(app, "#status-line").content) == audit_status
+            assert str(_static(app, "#instrument-bar").content) == audit_instrument
+            assert app.last_copied_cli == audit_copy_cli
+
+    asyncio.run(scenario())
+
+
 def test_tui_and_cli_consume_the_same_typed_query_and_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
