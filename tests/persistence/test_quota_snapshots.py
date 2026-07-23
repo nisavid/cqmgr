@@ -137,6 +137,47 @@ def test_repository_atomically_round_trips_private_canonical_snapshot(
         assert stat.S_IMODE(snapshot_files[0].stat().st_mode) == PRIVATE_FILE_MODE
 
 
+def test_repository_resolves_unexpired_cursor_bound_to_legacy_snapshot(
+    tmp_path: Path,
+) -> None:
+    """An opaque cursor survives an in-place upgrade from snapshot v2 to v3."""
+    root = tmp_path / "quota-query-snapshots"
+    repository = FilesystemQuotaQuerySnapshots(root, token_factory=lambda: TOKEN)
+    snapshot = _snapshot()
+    repository.save(snapshot)
+    cursor = repository.issue(snapshot.metadata.snapshot_id, 0, now=NOW)
+    snapshot_path = next((root / "snapshots").glob("*.json"))
+    document = json.loads(snapshot_path.read_bytes())
+    document["schema"] = "cqmgr.quota-query-snapshot/v2"
+    retained = document["snapshot"]
+    metadata = retained["metadata"]
+    metadata.pop("inventory_revision")
+    metadata.pop("source_coverage")
+    retained.pop("ordered_slice_identities")
+    query = metadata["query"]
+    query["source"] = {"kind": "service", "value": "compute.googleapis.com"}
+    query["filters"].pop("catalog_groups")
+    for item in retained["items"]:
+        item.pop("catalog_groups")
+    snapshot_path.write_bytes(
+        (
+            json.dumps(
+                document,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode()
+    )
+
+    resolved = repository.resolve(cursor.value, now=NOW)
+
+    assert resolved.offset == 0
+    assert resolved.snapshot.items == snapshot.items
+    assert resolved.snapshot.metadata.query == snapshot.metadata.query
+
+
 def test_repository_restricts_acl_on_directories_temporary_and_final_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
