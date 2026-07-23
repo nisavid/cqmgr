@@ -1300,6 +1300,11 @@ def _compute_all_compatible_coverage_complete(
         or any(not item.complete for item in (*machine_records, *accelerator_records))
     ):
         return False
+    if len(accelerator_records) == 1 and (
+        accelerator_records[0].location == "global"
+        and accelerator_records[0].state is LocationCoverageState.EMPTY
+    ):
+        return True
     locations = {item.location for item in machine_records if item.location != "global"}
     return all(
         len(
@@ -1318,22 +1323,47 @@ def _location_coverage(
     location: str,
     catalog: WorkloadCatalogEvidence,
 ) -> tuple[CatalogLocationCoverage, ...]:
+    if isinstance(requirement, ComputeInstanceRequirement):
+        return _compute_location_coverage(catalog, location)
     sources = (
-        (
-            CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
-            CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
-        )
-        if isinstance(requirement, ComputeInstanceRequirement)
-        else (
-            CatalogEvidenceSource.TPU_LOCATIONS,
-            CatalogEvidenceSource.TPU_ACCELERATOR_TYPES,
-            CatalogEvidenceSource.TPU_RUNTIME_VERSIONS,
-        )
+        CatalogEvidenceSource.TPU_LOCATIONS,
+        CatalogEvidenceSource.TPU_ACCELERATOR_TYPES,
+        CatalogEvidenceSource.TPU_RUNTIME_VERSIONS,
     )
     return tuple(
         item
         for item in catalog.coverage
         if item.location == location and item.source in sources
+    )
+
+
+def _compute_location_coverage(
+    catalog: WorkloadCatalogEvidence,
+    location: str,
+) -> tuple[CatalogLocationCoverage, ...]:
+    exact_accelerator_records = tuple(
+        item
+        for item in catalog.coverage
+        if item.source is CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES
+        and item.location == location
+    )
+    return tuple(
+        item
+        for item in catalog.coverage
+        if (
+            item.location == location
+            and item.source
+            in (
+                CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+                CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+            )
+        )
+        or (
+            not exact_accelerator_records
+            and item.source is CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES
+            and item.location == "global"
+            and item.state is LocationCoverageState.EMPTY
+        )
     )
 
 
@@ -1348,11 +1378,7 @@ def _derive_workload_facts(  # noqa: C901, PLR0912
             CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
             CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
         )
-        records = tuple(
-            item
-            for item in catalog.coverage
-            if item.source in required_sources and item.location == location
-        )
+        records = _compute_location_coverage(catalog, location)
         if (
             len(records) != len(required_sources)
             or {item.source for item in records} != set(required_sources)
