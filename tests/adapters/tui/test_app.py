@@ -600,6 +600,54 @@ class FailedReadOnlyOperations(ScriptedReadOnlyOperations):
         raise RuntimeError(msg)
 
 
+class BrowseInspectRaceOperations(ScriptedReadOnlyOperations):
+    """Delay a refresh past a completed exact-slice inspection."""
+
+    def __init__(self) -> None:
+        super().__init__(_browse_result())
+        self.refresh_started = asyncio.Event()
+        self.release_refresh = asyncio.Event()
+        self.refresh_returned = asyncio.Event()
+
+    @override
+    async def browse(
+        self,
+        query: ReadOnlyQuotaQuery | None = None,
+        *,
+        cursor: str | None = None,
+        limit: int = 100,
+        deadline: float,
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[QuotaBrowseData]:
+        if not self.browse_calls:
+            return await super().browse(
+                query,
+                cursor=cursor,
+                limit=limit,
+                deadline=deadline,
+                cancellation=cancellation,
+                scope_input=scope_input,
+            )
+        assert query is not None
+        self.browse_calls.append(
+            (
+                query,
+                {
+                    "cursor": cursor,
+                    "limit": limit,
+                    "deadline": deadline,
+                    "cancellation": cancellation,
+                    "scope_input": scope_input,
+                },
+            )
+        )
+        self.refresh_started.set()
+        await self.release_refresh.wait()
+        self.refresh_returned.set()
+        return self.result
+
+
 def test_wide_shell_opens_federated_quota_inspector_with_semantic_evidence() -> None:
     """The default workspace preserves provider truth and independent predicates."""
 
@@ -916,6 +964,41 @@ def test_partial_failure_and_superseded_reads_remain_explicit_and_safe() -> None
     asyncio.run(partial_scenario())
     asyncio.run(failure_scenario())
     asyncio.run(cancellation_scenario())
+
+
+def test_completed_inspection_owns_result_and_copy_cli_over_older_refresh() -> None:
+    """An older browse cannot replace a newer exact-slice detail operation."""
+
+    async def scenario() -> None:
+        operations = BrowseInspectRaceOperations()
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            app.action_refresh()
+            await operations.refresh_started.wait()
+
+            _table(app, "#quota-ledger").focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.last_result is operations.inspect_result
+            assert app.last_copied_cli is not None
+            assert app.last_copied_cli.startswith("cqmgr quota inspect ")
+            assert "Operation: quota.inspect" in str(
+                _static(app, "#quota-detail").content
+            )
+
+            operations.release_refresh.set()
+            await operations.refresh_returned.wait()
+            await pilot.pause()
+
+            assert app.last_result is operations.inspect_result
+            assert app.last_copied_cli is not None
+            assert app.last_copied_cli.startswith("cqmgr quota inspect ")
+            assert "Operation: quota.inspect" in str(
+                _static(app, "#quota-detail").content
+            )
+
+    asyncio.run(scenario())
 
 
 def test_tui_and_cli_consume_the_same_typed_query_and_result(

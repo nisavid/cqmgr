@@ -307,6 +307,7 @@ class CloudQuotaManagerApp(App[None]):
         self._last_focus_id: str | None = None
         self._provider_worker: Worker[Any] | None = None
         self._cancellation: CancellationToken | None = None
+        self._provider_generation = 0
 
     @override
     def compose(self) -> ComposeResult:
@@ -462,21 +463,32 @@ class CloudQuotaManagerApp(App[None]):
         self.set_class(self._detail_route and mode == "narrow", "detail-route")
 
     def _start_quota_load(self, query: ReadOnlyQuotaQuery) -> None:
-        if self._cancellation is not None:
-            self._cancellation.cancel()
+        generation = self._claim_provider_view()
         self._cancellation = CancellationToken()
         self._provider_worker = self.run_worker(
-            self._load_quotas(query, self._cancellation),
+            self._load_quotas(query, self._cancellation, generation),
             group="quota-load",
             exclusive=True,
             exit_on_error=False,
         )
 
+    def _claim_provider_view(self) -> int:
+        if self._cancellation is not None:
+            self._cancellation.cancel()
+        self._provider_generation += 1
+        return self._provider_generation
+
+    def _owns_provider_view(self, generation: int) -> bool:
+        return generation == self._provider_generation
+
     async def _load_quotas(
         self,
         query: ReadOnlyQuotaQuery,
         cancellation: CancellationToken,
+        generation: int,
     ) -> None:
+        if cancellation.cancelled or not self._owns_provider_view(generation):
+            return
         self._set_status("READING — querying required provider inventory")
         try:
             result = await self.read_only.browse(
@@ -486,15 +498,18 @@ class CloudQuotaManagerApp(App[None]):
                 scope_input=self.scope_input,
             )
         except asyncio.CancelledError:
-            self._set_status("CANCELLED — prior provider read superseded")
+            if self._owns_provider_view(generation):
+                self._set_status("CANCELLED — prior provider read superseded")
             raise
         except Exception:  # noqa: BLE001 - no typed result exists for worker failure
-            self._set_status(
-                "ERROR — quota inventory unavailable; retry the read-only operation"
-            )
+            if self._owns_provider_view(generation):
+                self._set_status(
+                    "ERROR — quota inventory unavailable; retry the read-only operation"
+                )
             return
-        if cancellation.cancelled:
-            self._set_status("CANCELLED — prior provider read superseded")
+        if cancellation.cancelled or not self._owns_provider_view(generation):
+            if self._owns_provider_view(generation):
+                self._set_status("CANCELLED — prior provider read superseded")
             return
         self.last_result = result
         self._render_instrument(result)
@@ -925,19 +940,28 @@ class CloudQuotaManagerApp(App[None]):
         self._detail_route = self.layout_mode == "narrow"
         self.set_class(self._detail_route, "detail-route")
         self._last_focus_id = "quota-ledger"
+        generation = self._claim_provider_view()
         self.run_worker(
-            self._inspect_quota(selector),
+            self._inspect_quota(selector, generation),
             group="quota-inspect",
             exclusive=True,
             exit_on_error=False,
         )
 
-    async def _inspect_quota(self, selector: QuotaInspectSelector) -> None:
+    async def _inspect_quota(
+        self,
+        selector: QuotaInspectSelector,
+        generation: int,
+    ) -> None:
+        if not self._owns_provider_view(generation):
+            return
         result = await self.read_only.inspect(
             selector,
             deadline=self._deadline(),
             scope_input=self.scope_input,
         )
+        if not self._owns_provider_view(generation):
+            return
         self.last_result = result
         self._render_instrument(result)
         self._render_quota_detail(result)
@@ -1054,11 +1078,14 @@ class CloudQuotaManagerApp(App[None]):
         requirement: ComputeInstanceRequirement | CloudTpuSliceRequirement,
     ) -> OperationResult[Any]:
         """Resolve one typed workload and retain its exact cross-surface result."""
+        generation = self._claim_provider_view()
         result = await self.read_only.resolve(
             requirement,
             deadline=self._deadline(),
             scope_input=self.scope_input,
         )
+        if not self._owns_provider_view(generation):
+            return result
         self.last_result = result
         self._render_instrument(result)
         self._render_workload_result(result)
