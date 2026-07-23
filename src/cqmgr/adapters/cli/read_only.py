@@ -19,6 +19,7 @@ from cqmgr.domain.accelerator_overlay import (
     ComputeInstanceRequirement,
     ResolvedWorkloadRequirement,
 )
+from cqmgr.domain.obtainability import ObtainabilityComparison
 
 if TYPE_CHECKING:
     from cqmgr.domain.quota_queries import ProviderSourceCoverage, QuotaQueryItem
@@ -430,11 +431,140 @@ def _data_lines(data: object) -> list[str]:  # noqa: PLR0911
         return _incomplete_inspect_lines(data)
     if isinstance(data, ResolvedWorkloadRequirement):
         return _resolution_lines(data)
+    if isinstance(data, ObtainabilityComparison):
+        return _obtainability_lines(data)
     if isinstance(data, ReadOnlyFailureData):
         return [f"Reason: {data.reason}"]
     if data is None:
         return ["Result data: unavailable"]
     return [json.dumps(data, ensure_ascii=False, sort_keys=True, default=str)]
+
+
+def _obtainability_lines(data: ObtainabilityComparison) -> list[str]:
+    """Render exact request identity, transparent rank, and every evidence interval."""
+    lines = [
+        f"Provider status: {data.preview_status}",
+        f"Capacity guarantee: {'no' if data.no_capacity_guarantee else 'yes'}",
+    ]
+    if data.resolver_provenance is not None:
+        lines.append("Resolver provenance:")
+        lines.extend(_resolution_lines(data.resolver_provenance))
+    for coverage in data.catalog_coverage:
+        lines.extend(
+            (
+                f"Catalog product: {coverage.product_id}",
+                f"Catalog product service: {coverage.service}",
+                f"Cataloged: {str(coverage.cataloged).lower()}",
+                "Current advice supported: "
+                f"{str(coverage.current_advice_supported).lower()}",
+                f"History supported: {str(coverage.history_supported).lower()}",
+                "Coverage reasons: " + (", ".join(coverage.reasons) or "none"),
+            )
+        )
+    for index, assessment in enumerate(data.candidates, start=1):
+        candidate = assessment.candidate
+        machine = candidate.machine
+        lines.extend(
+            (
+                f"Obtainability candidate {index}:",
+                f"Candidate identity: {candidate.candidate_id}",
+                f"Candidate endpoint region: {candidate.endpoint_region}",
+                "Candidate zones: " + (", ".join(candidate.zones) or "none"),
+                f"Machine type: {machine.machine_type}",
+                "GPU type: "
+                + (machine.gpu.accelerator_type if machine.gpu is not None else "none"),
+                "GPU count: "
+                + (str(machine.gpu.count) if machine.gpu is not None else "none"),
+                f"Local SSD count: {machine.local_ssd_count}",
+                f"VM quantity: {candidate.vm_count}",
+                f"Distribution shape: {candidate.distribution_shape.value}",
+                "Rank: "
+                + (str(assessment.rank) if assessment.rank is not None else "unranked"),
+                "Unranked reasons: "
+                + (
+                    ", ".join(item.value for item in assessment.unranked_reasons)
+                    or "none"
+                ),
+            )
+        )
+        advice = assessment.advice
+        if advice is None:
+            lines.extend(
+                (
+                    "Provider obtainability: unavailable",
+                    "Estimated uptime: unavailable",
+                )
+            )
+        else:
+            band = assessment.band
+            lines.extend(
+                (
+                    "Provider obtainability: "
+                    f"{advice.obtainability} "
+                    f"({band.value if band is not None else 'unavailable'})",
+                    f"Estimated uptime: {advice.estimated_uptime}",
+                    f"Advice retrieved at: {_timestamp(advice.retrieved_at)}",
+                    f"Advice source: {advice.source}",
+                )
+            )
+            for shard in advice.shards:
+                lines.extend(
+                    (
+                        f"Recommended shard zone: {shard.zone}",
+                        f"Recommended shard machine type: {shard.machine_type}",
+                        f"Recommended shard VM count: {shard.vm_count}",
+                        "Recommended shard provisioning model: "
+                        f"{shard.provisioning_model}",
+                    )
+                )
+        lines.extend(
+            (
+                "30-day p90 preemption rate: "
+                + (
+                    str(assessment.preemption_p90)
+                    if assessment.preemption_p90 is not None
+                    else "unavailable"
+                ),
+                "Total-request hourly price: "
+                + (
+                    f"USD {assessment.total_request_hourly_price_usd}"
+                    if assessment.total_request_hourly_price_usd is not None
+                    else "unavailable"
+                ),
+            )
+        )
+        history = assessment.history
+        if history is not None:
+            lines.extend(
+                (
+                    f"History location: {history.location}",
+                    f"History retrieved at: {_timestamp(history.retrieved_at)}",
+                    f"History source: {history.source}",
+                    "Preemption attributable: "
+                    f"{str(history.preemption_attributable).lower()}",
+                    f"Price attributable: {str(history.price_attributable).lower()}",
+                    "Price covers complete machine request: "
+                    f"{str(history.price_covers_complete_machine).lower()}",
+                )
+            )
+            lines.extend(
+                (
+                    "Preemption interval: "
+                    f"{_timestamp(item.started_at)} through "
+                    f"{_timestamp(item.finished_at)}; rate {item.rate}"
+                )
+                for item in history.preemption
+            )
+            lines.extend(
+                (
+                    "Price interval: "
+                    f"{_timestamp(item.started_at)} through "
+                    f"{_timestamp(item.finished_at)}; "
+                    f"USD {item.usd_per_vm_hour} per VM hour"
+                )
+                for item in history.prices
+            )
+    return lines
 
 
 def _human_lines(result: OperationResult[Any]) -> list[str]:

@@ -26,12 +26,15 @@ from cqmgr.adapters.cli.read_only_requests import (
     parse_cloud_tpu_slice_requirement,
     parse_compute_instance_requirement,
     parse_dimensions,
+    parse_obtainability_candidates,
+    parse_obtainability_shape,
     parse_read_only_quota_query,
 )
 from cqmgr.application.configuration import (
     InterfaceSettingKey,
     parse_resource_scope_name,
 )
+from cqmgr.application.operations.obtainability import AdviceSupport
 from cqmgr.application.operations.quotas import QuotaBrowseRequest
 from cqmgr.application.operations.read_only import (
     QuotaInspectSelector,
@@ -59,6 +62,17 @@ _OUTPUT_OPTION = click.option(
     show_default=True,
 )
 _PROVIDER_OPERATION_SECONDS = 60.0
+
+
+def _require_obtainability_location_mode(
+    candidates: tuple[str, ...],
+    *,
+    all_compatible: bool,
+) -> None:
+    """Require exactly one explicit or resolver-expanded candidate mode."""
+    if all_compatible == bool(candidates):
+        msg = "select exactly one obtainability location mode"
+        raise ValueError(msg)
 
 
 def _presentation_options[CommandT: Callable[..., Any]](
@@ -705,6 +719,117 @@ def resolve_cloud_tpu_slice(  # noqa: PLR0913
         lambda: operations.resolve(
             requirement,
             deadline=_provider_deadline(),
+            scope_input=scope_input,
+        ),
+        presentation,
+        operations.aclose,
+    )
+
+
+@main.group(cls=CanonicalAliasGroup)
+def obtainability() -> None:
+    """Compare exact Spot VM requests without making a capacity guarantee."""
+
+
+@obtainability.command(name="compare")
+@_presentation_options
+@click.option("--all-compatible-locations", is_flag=True)
+@click.option("--candidate", multiple=True)
+@click.option(
+    "--distribution-shape",
+    required=True,
+    type=click.Choice(("any", "any-single-zone", "balanced")),
+)
+@click.option("--vm-count", required=True)
+@click.option("--gpu-count")
+@click.option("--gpu-type")
+@click.option("--machine-type", required=True)
+@_scope_options
+@_OUTPUT_OPTION
+def obtainability_compare(  # noqa: PLR0913
+    output: str,
+    resource_scope: str | None,
+    profile: str | None,
+    machine_type: str,
+    gpu_type: str | None,
+    gpu_count: str | None,
+    vm_count: str,
+    distribution_shape: str,
+    candidate: tuple[str, ...],
+    all_compatible_locations: bool,
+    no_color: bool,
+    quiet: bool,
+) -> None:
+    """Compare current Preview advice and attributable Spot history."""
+    operations = build_read_only_operations()
+    presentation = Presentation(output, no_color, quiet)
+    try:
+        scope_input = _read_only_scope_input(resource_scope, profile)
+        machine, count, shape = parse_obtainability_shape(
+            machine_type=machine_type,
+            gpu_type=gpu_type,
+            gpu_count=gpu_count,
+            vm_count=vm_count,
+            distribution_shape=distribution_shape,
+        )
+        _require_obtainability_location_mode(
+            candidate,
+            all_compatible=all_compatible_locations,
+        )
+        custom_machine = (
+            machine_type.startswith("custom-") or "-custom-" in machine_type
+        )
+        tpu_machine = machine_type.startswith(("ct", "tpu-"))
+        support = AdviceSupport(
+            current_advice_supported=not custom_machine and not tpu_machine,
+            history_supported=not custom_machine and not tpu_machine,
+        )
+        candidates = (
+            ()
+            if all_compatible_locations
+            else parse_obtainability_candidates(
+                machine_type=machine_type,
+                gpu_type=gpu_type,
+                gpu_count=gpu_count,
+                vm_count=vm_count,
+                distribution_shape=distribution_shape,
+                candidates=candidate,
+            )
+        )
+    except (TypeError, ValueError) as error:
+        reason = str(error)
+        _run_read_only(
+            lambda: operations.compare_obtainability_usage_failure(reason),
+            presentation,
+            operations.aclose,
+        )
+        return
+    if all_compatible_locations:
+        requirement = parse_compute_instance_requirement(
+            machine_type=machine_type,
+            instance_count=str(count),
+            provisioning_model="spot",
+            locations=(),
+            all_compatible=True,
+        )
+        _run_read_only(
+            lambda: operations.compare_obtainability_all_compatible(
+                requirement,
+                machine=machine,
+                distribution_shape=shape,
+                deadline=_provider_deadline(),
+                support=support,
+                scope_input=scope_input,
+            ),
+            presentation,
+            operations.aclose,
+        )
+        return
+    _run_read_only(
+        lambda: operations.compare_obtainability(
+            candidates,
+            deadline=_provider_deadline(),
+            support=support,
             scope_input=scope_input,
         ),
         presentation,
