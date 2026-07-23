@@ -77,7 +77,7 @@ class ComputeAcceleratorTypesPageClient(Protocol):
         timeout_seconds: float,
     ) -> ComputeAcceleratorTypesPage:
         """Return one materialized aggregated-list page."""
-        ...
+        raise NotImplementedError
 
 
 class OfficialComputeAcceleratorTypesPageClient:
