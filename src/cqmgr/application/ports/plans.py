@@ -53,7 +53,6 @@ class DecodedPlan(Protocol):
 
     def authenticate(self, key: bytes) -> bool:
         """Verify the issuing installation authenticator."""
-        ...
 
 
 class PlanCodec(Protocol):
@@ -62,12 +61,10 @@ class PlanCodec(Protocol):
     @staticmethod
     def encode(plan: QuotaPlan, key: bytes) -> EncodedPlan:
         """Encode one plan into canonical authenticated bytes."""
-        ...
 
     @staticmethod
     def decode(data: bytes) -> DecodedPlan:
         """Verify canonical encoding and digest before returning contents."""
-        ...
 
 
 @dataclass(frozen=True, slots=True)
