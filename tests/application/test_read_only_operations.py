@@ -713,6 +713,28 @@ def test_missing_scope_is_a_rejected_precondition_before_provider_setup() -> Non
     assert quotas.browse_requests == []
 
 
+def test_explicit_scope_with_stale_selected_profile_is_a_typed_failure() -> None:
+    """A stale billing profile cannot escape the provider setup result contract."""
+    facade, _, _, resolver, identity_provider, quotas, _ = service(
+        selection=SelectionState(selected_profile="deleted")
+    )
+
+    returned = asyncio.run(
+        facade.browse(
+            ReadOnlyQuotaQuery(),
+            deadline=5.0,
+            scope_input=ReadOnlyScopeInput(explicit_resource_scope=scope("123456789")),
+        )
+    )
+
+    assert returned.outcome.exit_class is ExitClass.REJECTED_PRECONDITION
+    assert returned.outcome.code == StableSymbol("unknown-profile")
+    assert returned.resource_scope == scope("123456789")
+    assert resolver.references == []
+    assert identity_provider.quota_projects == []
+    assert quotas.browse_requests == []
+
+
 def test_project_resolution_failure_preserves_only_safe_diagnostics() -> None:
     """Canonicalization follows configured ADC and retains normalized guidance."""
     diagnostic = Diagnostic(
