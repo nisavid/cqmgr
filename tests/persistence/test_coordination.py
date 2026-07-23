@@ -1019,7 +1019,7 @@ def test_owned_sync_leader_retains_ownership_until_work_really_ends(
         assert await asyncio.to_thread(started.wait, 1)
         leader.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await leader
+            _ = await leader
 
         with pytest.raises(CoordinationDeadlineExceededError):
             await coalescer.run_sync(
