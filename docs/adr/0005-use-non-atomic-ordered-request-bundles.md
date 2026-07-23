@@ -51,8 +51,9 @@ all-no-op input to consume.
 Apply is deliberately non-atomic. It freshly revalidates every child before the
 first provider write. It then dispatches non-no-op children in deterministic
 accelerator-first order, using canonical exact-slice identity as the final
-tie-breaker. It stops at the first conclusively failed or transport-unknown
-child and never attempts later children. Each dispatched child receives one
+tie-breaker. It stops at the first conclusively failed child or any `unknown`
+child and never attempts later children; transport uncertainty is one possible
+cause of `unknown`. Each dispatched child receives one
 durable disposition:
 
 - `accepted` when the provider is proven to have accepted the bound intent;
@@ -74,7 +75,9 @@ and quarantined, so lease expiry never makes it reusable. Every consumed plan
 retains a durable Apply record. Each child dispatch intent is fsynced before the
 provider call and its terminal outcome is fsynced before the next child begins.
 Recovery may resume only a child with no persisted dispatch intent after every
-prior outcome is terminal. A dispatch intent without a terminal outcome becomes
+prior outcome is durably `accepted`. A prior `failed` or `unknown` outcome stops
+that Apply and leaves every later child `unattempted`. A dispatch intent without
+a terminal outcome becomes
 a durable `unknown`, stops later dispatch, and requires read-after-unknown
 reconciliation; it is never dispatched again automatically. Interruption,
 transport uncertainty, or persistence failure never causes a blind retry.

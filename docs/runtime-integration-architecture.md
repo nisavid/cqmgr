@@ -446,7 +446,7 @@ ambiguous and quarantined rather than reconstructed as available.
 
 Storage ports express these behaviors directly:
 
-- `PlanRepository` stores canonical bundle bytes by digest, verifies
+- `PlanRepository` stores canonical single or bundle plan bytes by digest, verifies
   authentication, leases, consumes, and quarantines plans;
 - `AuditJournal` appends and fsyncs bundle and child pre-Apply intent, appends
   ordered child and aggregate outcomes, queries records, and verifies hash
