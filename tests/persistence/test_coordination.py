@@ -165,7 +165,7 @@ def _hold_owned_sync_leadership(  # noqa: PLR0913 - explicit subprocess signals
             coalescer.run_sync(
                 "owned-sync-read",
                 work,
-                deadline=time.monotonic() + 0.05,
+                deadline=time.monotonic() + 5,
                 cancellation=CancellationToken(),
             )
         )
