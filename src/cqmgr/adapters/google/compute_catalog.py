@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
+from threading import Lock, Thread
 from typing import TYPE_CHECKING, Protocol
 
 from google.cloud import compute_v1
@@ -43,6 +46,126 @@ from cqmgr.domain.schemas import ProviderSymbol
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+
+class _BoundedDaemonWorkers[ResultT]:
+    """Run sync provider calls without extending CLI shutdown."""
+
+    def __init__(
+        self,
+        close_transport: Callable[[], None],
+        *,
+        maximum_workers: int,
+        thread_name: str,
+    ) -> None:
+        """Bind a concurrency ceiling and transport owned by the workers."""
+        self._close_transport = close_transport
+        self._slots = asyncio.Semaphore(maximum_workers)
+        self._thread_name = thread_name
+        self._lock = Lock()
+        self._active_workers = 0
+        self._close_requested = False
+        self._transport_closed = False
+
+    async def run(self, operation: Callable[[], ResultT]) -> ResultT:
+        """Await one daemon-backed provider call without making it cancellable."""
+        await self._slots.acquire()
+        loop = asyncio.get_running_loop()
+        result: asyncio.Future[ResultT] = loop.create_future()
+        result.add_done_callback(self._observe_result)
+        with self._lock:
+            if self._close_requested:
+                self._slots.release()
+                msg = "Compute catalog client is closed"
+                raise RuntimeError(msg)
+            self._active_workers += 1
+        worker = Thread(
+            target=self._execute,
+            args=(operation, loop, result),
+            name=self._thread_name,
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except BaseException:
+            with self._lock:
+                self._active_workers -= 1
+            self._slots.release()
+            raise
+        return await asyncio.shield(result)
+
+    async def close(self) -> None:
+        """Return promptly and close the transport after its last call stops."""
+        close_now = False
+        with self._lock:
+            if self._close_requested:
+                return
+            self._close_requested = True
+            if self._active_workers == 0:
+                self._transport_closed = True
+                close_now = True
+        if close_now:
+            self._close_transport()
+
+    def _execute(
+        self,
+        operation: Callable[[], ResultT],
+        loop: asyncio.AbstractEventLoop,
+        result: asyncio.Future[ResultT],
+    ) -> None:
+        """Run one sync call and publish its outcome while the loop remains live."""
+        try:
+            value = operation()
+        except Exception as error:  # noqa: BLE001 - preserve provider SDK failures
+            with suppress(RuntimeError):
+                loop.call_soon_threadsafe(self._deliver_error, result, error)
+        else:
+            with suppress(RuntimeError):
+                loop.call_soon_threadsafe(self._deliver_result, result, value)
+        finally:
+            self._finish_worker()
+
+    def _deliver_error(
+        self,
+        result: asyncio.Future[ResultT],
+        error: BaseException,
+    ) -> None:
+        """Release capacity and expose one provider failure."""
+        self._slots.release()
+        if not result.done():
+            result.set_exception(error)
+
+    def _deliver_result(
+        self,
+        result: asyncio.Future[ResultT],
+        value: ResultT,
+    ) -> None:
+        """Release capacity and expose one provider page."""
+        self._slots.release()
+        if not result.done():
+            result.set_result(value)
+
+    @staticmethod
+    def _observe_result(result: asyncio.Future[ResultT]) -> None:
+        """Consume a late provider failure after its caller was cancelled."""
+        if not result.cancelled():
+            _ = result.exception()
+
+    def _finish_worker(self) -> None:
+        """Close the transport from the final worker when shutdown was requested."""
+        close_now = False
+        with self._lock:
+            self._active_workers -= 1
+            if (
+                self._close_requested
+                and self._active_workers == 0
+                and not self._transport_closed
+            ):
+                self._transport_closed = True
+                close_now = True
+        if close_now:
+            with suppress(Exception):
+                self._close_transport()
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,11 +212,14 @@ class OfficialComputeAcceleratorTypesPageClient:
         *,
         maximum_workers: int = 4,
     ) -> None:
-        """Bind one client and cap concurrent default-executor dispatches."""
+        """Bind one client and cap concurrent daemon-worker dispatches."""
         _require_positive(maximum_workers, "Compute catalog maximum_workers")
         self._client = client
-        self._worker_slots = asyncio.Semaphore(maximum_workers)
-        self._workers: set[asyncio.Task[ComputeAcceleratorTypesPage]] = set()
+        self._workers = _BoundedDaemonWorkers[ComputeAcceleratorTypesPage](
+            self._close_transport,
+            maximum_workers=maximum_workers,
+            thread_name="cqmgr-compute-accelerator-types",
+        )
 
     async def accelerator_types(
         self,
@@ -105,9 +231,8 @@ class OfficialComputeAcceleratorTypesPageClient:
         timeout_seconds: float,
     ) -> ComputeAcceleratorTypesPage:
         """Run exactly one sync generated-client page in a bounded worker."""
-        await self._worker_slots.acquire()
-        worker = asyncio.create_task(
-            asyncio.to_thread(
+        return await self._workers.run(
+            partial(
                 self._accelerator_types,
                 project=project,
                 max_results=max_results,
@@ -116,24 +241,14 @@ class OfficialComputeAcceleratorTypesPageClient:
                 timeout_seconds=timeout_seconds,
             )
         )
-        self._workers.add(worker)
-        worker.add_done_callback(self._release_worker_slot)
-        return await asyncio.shield(worker)
 
     async def close(self) -> None:
-        """Drain shielded sync calls before closing their shared transport."""
-        await asyncio.gather(*tuple(self._workers), return_exceptions=True)
-        self._client.transport.close()
+        """Release promptly while active sync calls retain their transport."""
+        await self._workers.close()
 
-    def _release_worker_slot(
-        self,
-        worker: asyncio.Task[ComputeAcceleratorTypesPage],
-    ) -> None:
-        """Release concurrency only after the uncancellable sync call stops."""
-        self._workers.discard(worker)
-        self._worker_slots.release()
-        if not worker.cancelled():
-            worker.exception()
+    def _close_transport(self) -> None:
+        """Close the generated transport once no sync call owns it."""
+        self._client.transport.close()
 
     def _accelerator_types(
         self,
@@ -216,11 +331,14 @@ class OfficialComputeMachineTypesPageClient:
         *,
         maximum_workers: int = 4,
     ) -> None:
-        """Bind one client and cap concurrent default-executor dispatches."""
+        """Bind one client and cap concurrent daemon-worker dispatches."""
         _require_positive(maximum_workers, "Compute catalog maximum_workers")
         self._client = client
-        self._worker_slots = asyncio.Semaphore(maximum_workers)
-        self._workers: set[asyncio.Task[ComputeMachineTypesPage]] = set()
+        self._workers = _BoundedDaemonWorkers[ComputeMachineTypesPage](
+            self._close_transport,
+            maximum_workers=maximum_workers,
+            thread_name="cqmgr-compute-machine-types",
+        )
 
     async def machine_types(
         self,
@@ -232,9 +350,8 @@ class OfficialComputeMachineTypesPageClient:
         timeout_seconds: float,
     ) -> ComputeMachineTypesPage:
         """Run exactly one sync generated-client page in a bounded worker."""
-        await self._worker_slots.acquire()
-        worker = asyncio.create_task(
-            asyncio.to_thread(
+        return await self._workers.run(
+            partial(
                 self._machine_types,
                 project=project,
                 max_results=max_results,
@@ -243,24 +360,14 @@ class OfficialComputeMachineTypesPageClient:
                 timeout_seconds=timeout_seconds,
             )
         )
-        self._workers.add(worker)
-        worker.add_done_callback(self._release_worker_slot)
-        return await asyncio.shield(worker)
 
     async def close(self) -> None:
-        """Drain shielded sync calls before closing their shared transport."""
-        await asyncio.gather(*tuple(self._workers), return_exceptions=True)
-        self._client.transport.close()
+        """Release promptly while active sync calls retain their transport."""
+        await self._workers.close()
 
-    def _release_worker_slot(
-        self,
-        worker: asyncio.Task[ComputeMachineTypesPage],
-    ) -> None:
-        """Release concurrency only after the uncancellable sync call stops."""
-        self._workers.discard(worker)
-        self._worker_slots.release()
-        if not worker.cancelled():
-            worker.exception()
+    def _close_transport(self) -> None:
+        """Close the generated transport once no sync call owns it."""
+        self._client.transport.close()
 
     def _machine_types(
         self,
