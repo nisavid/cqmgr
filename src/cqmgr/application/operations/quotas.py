@@ -454,32 +454,38 @@ class WorkloadResolutionOperations:
                 )
             )
         )
-        location_read = await self._tpu_locations.read(TpuLocationReadRequest(context))
-        zones = (
-            requirement.locations.values
-            if isinstance(requirement.locations, CandidateLocations)
-            else tuple(location.location_id for location in location_read.values)
-        )
-        accelerator_reads = await asyncio.gather(
-            *(
-                self._tpu_accelerator_types.read(
-                    TpuAcceleratorTypeReadRequest(context, zone)
-                )
-                for zone in zones
-            ),
-        )
-        runtime_reads = await asyncio.gather(
-            *(
-                self._tpu_runtime_versions.read(
-                    TpuRuntimeVersionReadRequest(context, zone)
-                )
-                for zone in zones
-            ),
-        )
-        effective_read, usage_read = await asyncio.gather(
-            effective_task,
-            usage_task,
-        )
+        tasks = (effective_task, usage_task)
+        try:
+            location_read = await self._tpu_locations.read(
+                TpuLocationReadRequest(context)
+            )
+            zones = (
+                requirement.locations.values
+                if isinstance(requirement.locations, CandidateLocations)
+                else tuple(location.location_id for location in location_read.values)
+            )
+            accelerator_reads = await asyncio.gather(
+                *(
+                    self._tpu_accelerator_types.read(
+                        TpuAcceleratorTypeReadRequest(context, zone)
+                    )
+                    for zone in zones
+                ),
+            )
+            runtime_reads = await asyncio.gather(
+                *(
+                    self._tpu_runtime_versions.read(
+                        TpuRuntimeVersionReadRequest(context, zone)
+                    )
+                    for zone in zones
+                ),
+            )
+            effective_read, usage_read = await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
         location_coverage = _selected_tpu_location_coverage(
             requirement,
             location_read,
