@@ -103,7 +103,7 @@ application operations to:
 8. review a local or exported plan without applying it;
 9. Apply one authenticated, unexpired, unused single or bundle plan after complete
    all-child revalidation and explicit resource-scope acknowledgement;
-10. Watch every accepted child to an explicit aggregate `granted` or
+10. Watch every child in the accepted Watch set to an explicit aggregate `granted` or
     `fulfilled` condition and caller-controlled deadline; and
 11. list, inspect, and verify append-only local audit evidence.
 
@@ -249,15 +249,19 @@ version.
 
 V1 Watch is backed by one durable local cqmgr Apply record and does not adopt
 unrelated provider requests. Its subject retains every ordered plan child and
-Apply disposition while polling only accepted children. An initial Watch binds
-the complete subject, every accepted child preference and target, condition,
-and deadline. The aggregate condition is reached only when every accepted child
-reaches it. Every event emits a non-secret, locally authenticated opaque resume
-token that binds the subject, child request identities, condition, provider
-lineages, and durable checkpoint. Resume accepts that token plus a new deadline
-and fails closed before polling when its installation, Apply record,
-complete child identities, durable checkpoint, or applicable
-etag-or-stable-trace lineage evidence cannot be verified.
+immutable Apply disposition while polling only the accepted Watch set. That set
+contains children accepted during Apply plus unknown children with authenticated
+accepted resolution evidence. An initial Watch binds the complete subject,
+every watched child preference and target, condition, deadline, and
+unknown-resolution journal checkpoint. The aggregate condition is reached only
+when every watched child reaches it. Every event emits a non-secret, locally
+authenticated opaque resume token that binds the subject, watched request
+identities, condition, provider lineages, resolution checkpoint, and durable
+observation checkpoint. Resume accepts that token plus a new deadline, may
+advance through valid later resolution appends, and fails closed before polling
+when its installation, Apply record, complete child identities, resolution
+chain, durable checkpoint, or applicable etag-or-stable-trace lineage evidence
+cannot be verified.
 
 ## Mutation safety invariants
 
@@ -307,12 +311,16 @@ These requirements are hard gates rather than interface guidance:
     is an explicit bundle child; other remaining bottlenecks warn.
 11. **Deterministic non-atomic writes.** Existing exact preferences use semantic
     identity and current etag; new preferences use a deterministic identity.
-    Children dispatch in accelerator-first order with canonical exact-slice
-    identity as the final tie-breaker. Apply stops at the first conclusively
-    `failed` child or any `unknown` child, preserves preceding `accepted`
-    children, and marks later children `unattempted`. Multiple or conflicting
-    matches fail closed. Transport or persistence uncertainty is reconciled by
-    reading the child identity and is never retried blindly.
+    Preview binds child order using
+    `(direct_accelerator_rank, scope_breadth_rank, exact_slice_identity)` and
+    fails closed when a child cannot map to one rank pair. Apply uses that order
+    unchanged and stops at the first conclusively `failed` child or any
+    `unknown` child, preserves preceding `accepted` children, and marks later
+    children `unattempted`. Multiple or conflicting matches fail closed.
+    Transport or persistence uncertainty is reconciled by reading the child
+    identity and is never retried blindly. A proven
+    read-after-unknown result is appended once as accepted or failed resolution
+    evidence without rewriting the durable `unknown` Apply disposition.
 12. **Write-ahead audit.** Preview evidence is appended and fsynced before
     Preview succeeds. After complete revalidation, Apply separately appends and
     fsyncs the complete ordered pre-Apply intent before crossing the consumption
@@ -455,7 +463,7 @@ the handoff.
 | 10 | Obtainability vertical slice | Implement supported Spot advice and history adapters, comparison and transparent ranking, coverage handling, and equivalent CLI behavior. | 8, 9 |
 | 11 | Compose, Preview, and plan review | Implement `minimum`, `preserve-headroom`, and `manual` target strategies, dangerous-change gates, child no-op behavior, all-child preflight, ordered single or bundle plan issuance/export/review, cross-surface handoff, and zero-write safety proofs. | 4, 5, 7, 8, 9 |
 | 12 | Non-atomic Apply and deterministic reconciliation | Implement accelerator-first child preference create/amend, complete fresh revalidation, acknowledgements, durable ordered dispatch, stop after conclusive failure or transport uncertainty, `accepted`/`failed`/`unknown`/`unattempted` outcomes, read-after-unknown reconciliation, audit outcomes, and at-most-one-write-per-child proofs. | 11 |
-| 13 | Watch and lifecycle observation | Implement adaptive accepted-child polling, material child and aggregate event streams, single and bundle Apply-record intent binding, authenticated resume tokens, deadlines, interruption, and single or aggregate `granted` and `fulfilled` conditions. | 12 |
+| 13 | Watch and lifecycle observation | Implement adaptive accepted-Watch-set polling, material child and aggregate event streams, single and bundle Apply-record intent binding, authenticated resume tokens, deadlines, interruption, and single or aggregate `granted` and `fulfilled` conditions. | 12 |
 | 14 | Textual shell and quota inspector | Deliver the adaptive shell, scope instrument, Quotas workspace, filters, exact-slice detail, Audit workspace, keyboard behavior, and CLI fallback over read-only operations. | 9 |
 | 15 | Textual obtainability workspace | Deliver exact-configuration composition, candidate coverage, transparent ranking, unranked evidence, and Copy CLI behavior. | 10, 14 |
 | 16 | Textual mutation and lifecycle routes | Deliver single and bundle compose, Plan Review, non-atomic Apply, and Watch routes with locked scope, child acknowledgements and dispositions, return context, and cross-surface equivalence. | 11, 12, 13, 14 |

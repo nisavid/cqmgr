@@ -334,10 +334,13 @@ known constraint set, selected location, strategy, normalized workload,
 ordered non-no-op children, per-child absolute targets and units, evidence,
 preference identities and etags, and all ordinary identity, contact, warning,
 acknowledgement, expiry, and installation-trust facts. Dispatch order is
-deterministic and accelerator-first: accelerator- or location-specific
-children precede broader companion constraints, with canonical exact-slice
-identity as the final tie-breaker. The bound order is public result evidence
-and Apply may not recompute it.
+the exact comparator
+`(direct_accelerator_rank, scope_breadth_rank, exact_slice_identity)`: direct
+accelerator quantity precedes companion quota; scope breadth orders zone,
+region, multi-region/all-regions/global, then broader provider scope; canonical
+exact-slice identity breaks remaining ties. A child that cannot map to one rank
+pair makes Preview fail closed. The bound order is public result evidence and
+Apply may not recompute it.
 
 `cqmgr.quota-request-plan/v1` is defined before its first release as a
 discriminated union with required top-level `kind: "single"|"bundle"` beside
@@ -350,20 +353,27 @@ schema is released, an incompatible plan or child change requires a new
 plan-schema version.
 
 Apply is deliberately non-atomic. It first freshly revalidates the entire
-bundle before any provider write, durably records one bundle pre-intent,
-consumes the single-use plan, and then dispatches children in their bound
-order. Each child has at most one provider write and its own deterministic
-preference reconciliation. An accepted child is never rolled back. The first
-conclusively failed or transport-unknown child stops dispatch. A conclusive
+bundle before any provider write. A failed revalidation invalidates the plan
+under its lock and durably records the terminal no-write result; it does not
+consume or dispatch the plan, and a new Preview is required. Successful
+revalidation durably records one bundle pre-intent, consumes the single-use
+plan, and then dispatches children in their bound order. Each child has at most
+one provider write. Its durable dispatch intent binds the deterministic
+provider-visible QuotaPreference identity that the adapter must use for create
+or amend and later reconciliation. An accepted child is never rolled back. The
+first conclusively failed child or any unknown child stops dispatch. A conclusive
 provider rejection or failure is `failed`; a dispatched child whose acceptance
 cannot be proven is `unknown`; every earlier accepted child is `accepted`; and
 every later child is `unattempted`. An unknown dispatch is consumed and
 quarantined, then reconciled through a read at its deterministic preference
-identity before any new Preview or Apply may supersede it. Apply reaches its
-success boundary only when every non-no-op child is accepted. Its aggregate
-result preserves all child dispositions and exact provider identities instead
-of reporting transaction or rollback semantics. Verified preflight no-ops
-remain composition facts and are never rewritten as dispatch dispositions.
+identity before any new Preview or Apply may supersede it. Reconciliation
+appends one authenticated `accepted` or `failed` unknown dispatch resolution;
+it never rewrites the immutable `unknown` Apply disposition. Conflicting
+resolution evidence fails closed. Apply reaches its success boundary only when
+every non-no-op child is accepted during Apply. Its aggregate result preserves
+all child dispositions and exact provider identities instead of reporting
+transaction or rollback semantics. Verified preflight no-ops remain composition
+facts and are never rewritten as dispatch dispositions.
 
 Watch accepts one shared intent identity for both subject shapes. The
 application and CLI expose `intent_id` / `--intent-id`; the durable Apply
@@ -371,7 +381,10 @@ record and its `subject.kind` discriminator determine whether Watch loads a
 single or bundle subject. There is no parallel plan-ID or bundle-ID selector.
 Resume accepts the authenticated resume token and recovers the same intent
 identity and complete ordered subject without asking the caller to restate
-either shape.
+either shape. The token also binds the accepted Watch set and the authenticated
+unknown-resolution journal checkpoint. A resume may advance through later valid
+append-only resolutions, but it rejects missing, conflicting, or unauthenticated
+resolution history.
 
 ## Configuration and profiles
 
@@ -448,11 +461,11 @@ ambiguous and quarantined rather than reconstructed as available.
 
 Storage ports express these behaviors directly:
 
-- `PlanRepository` stores canonical single or bundle plan bytes by digest, verifies
-  authentication, leases, consumes, and quarantines plans;
+- `PlanRepository` stores canonical single or bundle plan bytes by digest,
+  verifies authentication, leases, invalidates, consumes, and quarantines plans;
 - `AuditJournal` appends and fsyncs bundle and child pre-Apply intent, appends
-  ordered child and aggregate outcomes, queries records, and verifies hash
-  continuity;
+  ordered child and aggregate outcomes and single-assignment unknown dispatch
+  resolutions, queries records, and verifies hash continuity;
 - `ConfigRepository` validates versioned snapshots and performs atomic updates;
   and
 - `SelectionStateRepository` independently persists selected profile and direct

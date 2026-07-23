@@ -126,7 +126,7 @@ load or refresh ADC, resolve an acting principal, call Resource Manager or a
 quota provider, or claim that a selected project is accessible. Acting
 principal and impersonation-chain evidence belongs only to the provider-scoped
 operation that observed it. Until such an operation runs, the TUI says
-`principal not observed`; it does not turn the selected resource scope into
+`acting principal deferred (offline)`; it does not turn the selected resource scope into
 identity evidence.
 
 Apply has an independent acknowledgement gate. `plan apply` requires the full
@@ -282,9 +282,10 @@ An initial `request watch` accepts one `--intent-id INTENT_ID`,
 `--deadline TIMESTAMP`. The durable local intent and plan discriminators
 identify a single or bundle subject; the public CLI does not duplicate that
 fact in another flag. The identifier must resolve to a durable local cqmgr
-Apply record with at least one accepted child. Preview records, plans that have
-not been applied, unrelated provider preferences, missing or inconsistent child
-records, and Apply records with no accepted child are rejected before polling.
+Apply record with a nonempty accepted Watch set. Preview records, plans that
+have not been applied, unrelated provider preferences, missing or inconsistent
+child records, conflicting resolution history, and Apply records with an empty
+accepted Watch set are rejected before polling.
 A resumed Watch uses `--resume TOKEN` instead of the
 initial identity and condition options and requires a new absolute `--deadline`;
 shared presentation options remain available. `plan review` and `plan apply`
@@ -377,7 +378,7 @@ The TUI has three sibling workspaces:
 A persistent instrument bar shows the active canonical resource scope, its
 resolution source, provider identity evidence when a provider-scoped operation
 has observed it, and evidence freshness or completeness. Before that
-observation it shows `principal not observed`; opening the TUI or changing local
+observation it shows `acting principal deferred (offline)`; opening the TUI or changing local
 scope never initializes ADC merely to populate the bar. These are authoritative
 words and values; color and optional glyphs only reinforce them.
 
@@ -520,16 +521,22 @@ principal, warnings, acknowledgements, expiry, authentication state,
 non-atomicity, and Apply capability. Apply never rebuilds, reorders, splits, or
 refreshes a different plan silently.
 
-Apply records and fsyncs the complete pre-intent, then crosses one fail-closed
-single-use barrier before dispatch: under the plan lock it creates the immutable
-consumption marker and commits the ledger consumption transition. Either half
-of a partially persisted barrier makes the plan consumed and quarantined; lease
-expiry never makes it reusable. Every consumed plan retains a durable Apply
-record even when no child was accepted. Apply then processes children in the
-reviewed deterministic order: accelerator- or location-specific children
-precede broader companion constraints, with canonical exact-slice identity as
-the final tie-breaker. Before each provider call it fsyncs that child's dispatch
-intent. A terminal outcome is fsynced before the next child starts. Recovery may
+Apply first revalidates every child under the plan lock before pre-intent,
+consumption, or provider access. Failed revalidation persists a terminal
+invalidated-plan state and no-write result; later Apply rejects that plan and a
+new Preview is required. Only successful revalidation records and fsyncs the
+complete pre-intent, then crosses one fail-closed single-use barrier before
+dispatch: under the same plan lock it creates the immutable consumption marker
+and commits the ledger consumption transition. Either half of a partially
+persisted barrier makes the plan consumed and quarantined; lease expiry never
+makes it reusable. Every consumed plan retains a durable Apply record even when
+no child was accepted. Apply then processes children using the exact comparator
+`(direct_accelerator_rank, scope_breadth_rank, exact_slice_identity)`: direct
+accelerator quantity precedes companion quota; scope breadth orders zone,
+region, multi-region/all-regions/global, then broader provider scope; canonical
+exact-slice identity breaks remaining ties. A child that cannot map to one rank
+pair fails during Preview. Before each provider call Apply fsyncs that child's
+dispatch intent. A terminal outcome is fsynced before the next child starts. Recovery may
 continue only with a child that has no persisted dispatch intent after every
 prior outcome is durably `accepted`. A prior `failed` or `unknown` outcome stops
 that Apply and preserves every later child as `unattempted`. A dispatch intent
@@ -561,10 +568,13 @@ An initial `request watch` identifies one durable local single or bundle Apply
 record, supplies `--condition granted|fulfilled`, and supplies an absolute
 `--deadline TIMESTAMP`. V1 does not adopt unrelated provider preferences. The
 Watch event subject has `kind: single|bundle` and every ordered plan child plus
-its Apply disposition; a single subject has exactly one child. Watch polls and
-evaluates conditions only for the accepted subset. An Apply with no accepted
-child is not watchable. Unknown kinds or inconsistent children fail before
-polling.
+its immutable Apply disposition; a single subject has exactly one child.
+Read-after-unknown reconciliation appears as separate authenticated resolution
+evidence and never relabels an `unknown` Apply disposition. Watch polls and
+evaluates conditions only for the accepted Watch set: children accepted during
+Apply plus unknown children with an accepted resolution. An empty accepted
+Watch set is not watchable. Unknown kinds, inconsistent children, or conflicting
+resolution history fail before polling.
 
 A material child event names its `child_id`. Aggregate events change only when
 the bundle-level condition or outcome changes. Every event emits the locally
@@ -574,7 +584,10 @@ and condition options, because the token binds them, and requires a new absolute
 `--deadline`. Shared presentation options remain available. Invalid,
 foreign-installation, unknown-lineage, structurally inconsistent, or superseded
 tokens return rejected-precondition before polling. Omitting `--resume` starts
-a new observation stream rather than claiming a resume.
+a new observation stream rather than claiming a resume. A valid resume may
+advance through authenticated unknown-resolution records appended after its
+journal checkpoint; it emits the material child evidence and a replacement
+token before polling a newly accepted child.
 
 A single or bundle Watch reaches `granted` only when every accepted subject
 child has settled at its target. It reaches `fulfilled` only when those same
