@@ -355,7 +355,7 @@ def _map_quota_info(
             service=info.service,
             quota_id=info.quota_id,
             dimensions=dimensions,
-            quota_scope=_quota_scope(dimensions),
+            quota_scope=_quota_scope(dimensions, applicable_locations),
         )
         results.append(
             EffectiveQuotaEvidence(
@@ -493,12 +493,17 @@ def _container_symbol(
     return ProviderSymbol(raw, QuotaContainerType)
 
 
-def _quota_scope(dimensions: NormalizedDimensions) -> QuotaScope:
+def _quota_scope(
+    dimensions: NormalizedDimensions,
+    applicable_locations: tuple[str, ...] = (),
+) -> QuotaScope:
     keys = {key for key, _ in dimensions.items}
     if "zone" in keys:
         return QuotaScope.ZONAL
     if "region" in keys:
         return QuotaScope.REGIONAL
+    if applicable_locations == ("global",):
+        return QuotaScope.GLOBAL
     return QuotaScope.UNKNOWN
 
 

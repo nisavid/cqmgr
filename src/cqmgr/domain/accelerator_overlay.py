@@ -1300,11 +1300,9 @@ def _compute_all_compatible_coverage_complete(
         or any(not item.complete for item in (*machine_records, *accelerator_records))
     ):
         return False
-    if len(accelerator_records) == 1 and (
-        accelerator_records[0].location == "global"
-        and accelerator_records[0].state is LocationCoverageState.EMPTY
-    ):
-        return True
+    global_empty_records = _compute_global_empty_records(catalog)
+    if global_empty_records:
+        return _compute_global_empty_is_authoritative(catalog)
     locations = {item.location for item in machine_records if item.location != "global"}
     return all(
         len(
@@ -1360,10 +1358,39 @@ def _compute_location_coverage(
         )
         or (
             not exact_accelerator_records
+            and _compute_global_empty_is_authoritative(catalog)
             and item.source is CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES
             and item.location == "global"
             and item.state is LocationCoverageState.EMPTY
         )
+    )
+
+
+def _compute_global_empty_records(
+    catalog: WorkloadCatalogEvidence,
+) -> tuple[CatalogLocationCoverage, ...]:
+    return tuple(
+        item
+        for item in catalog.coverage
+        if item.source is CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES
+        and item.location == "global"
+        and item.state is LocationCoverageState.EMPTY
+    )
+
+
+def _compute_global_empty_is_authoritative(
+    catalog: WorkloadCatalogEvidence,
+) -> bool:
+    accelerator_records = tuple(
+        item
+        for item in catalog.coverage
+        if item.source is CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES
+    )
+    global_empty_records = _compute_global_empty_records(catalog)
+    return (
+        len(global_empty_records) == 1
+        and len(accelerator_records) == 1
+        and not catalog.compute_accelerator_types
     )
 
 
@@ -1374,6 +1401,12 @@ def _derive_workload_facts(  # noqa: C901, PLR0912
     catalog: WorkloadCatalogEvidence,
 ) -> tuple[OverlayMapping, int]:
     if isinstance(requirement, ComputeInstanceRequirement):
+        global_empty_records = _compute_global_empty_records(catalog)
+        if global_empty_records and not _compute_global_empty_is_authoritative(catalog):
+            raise WorkloadResolutionError(
+                ResolutionFailureReason.MISSING_LOCATION_EVIDENCE,
+                "Compute accelerator evidence is internally inconsistent.",
+            )
         required_sources = (
             CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
             CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
