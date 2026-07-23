@@ -107,8 +107,8 @@ def test_official_compute_page_clients_close_owned_transport(
     assert closed == [True]
 
 
-def test_compute_close_waits_for_shielded_sync_worker_after_cancellation() -> None:
-    """Transport shutdown follows real completion of a cancelled sync page read."""
+def test_compute_close_defers_transport_without_waiting_for_cancelled_worker() -> None:
+    """CLI cleanup returns while a stuck sync page safely owns its transport."""
     started = Event()
     release = Event()
     finished = Event()
@@ -150,20 +150,15 @@ def test_compute_close_waits_for_shielded_sync_worker_after_cancellation() -> No
         with pytest.raises(asyncio.CancelledError):
             _ = await read_task
 
-        try:
-            close_task = asyncio.create_task(page_client.close())
-            await asyncio.sleep(0.01)
-            assert not close_task.done()
-            assert closed_after_finish == []
-        finally:
-            release.set()
-        await asyncio.wait_for(close_task, timeout=0.5)
+        await asyncio.wait_for(page_client.close(), timeout=0.05)
+        assert closed_after_finish == []
 
     try:
         asyncio.run(exercise())
     finally:
         release.set()
 
+    assert finished.wait(timeout=0.5)
     assert closed_after_finish == [True]
 
 
