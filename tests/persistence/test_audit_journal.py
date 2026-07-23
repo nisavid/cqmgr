@@ -13,7 +13,11 @@ from pathlib import Path
 import pytest
 
 import cqmgr.adapters.persistence.audit as audit_adapter
-from cqmgr.adapters.persistence.audit import AuditIntegrityError, FilesystemAuditJournal
+from cqmgr.adapters.persistence.audit import (
+    AuditIntegrityError,
+    EmptyAuditJournal,
+    FilesystemAuditJournal,
+)
 from cqmgr.domain.audit import (
     AUDIT_GENESIS_HASH,
     AuditFact,
@@ -100,6 +104,21 @@ def test_empty_journal_verifies_as_an_empty_retained_range(tmp_path: Path) -> No
     assert result.valid
     assert result.verified_from is None
     assert result.verified_through is None
+
+
+def test_empty_read_view_preserves_cursor_and_endpoint_failures() -> None:
+    """A missing journal stays empty without accepting invented identities."""
+    journal = EmptyAuditJournal()
+
+    with pytest.raises(ValueError, match="cursor is invalid"):
+        journal.query(AuditQuery(cursor="opaque-cursor"))
+
+    verification = journal.verify(from_record_id="audit-missing")
+
+    assert not verification.valid
+    assert verification.failure is not None
+    assert verification.failure.code is AuditFailureCode.RECORD_NOT_FOUND
+    assert verification.failure.record_id == "audit-missing"
 
 
 def test_segment_size_must_leave_room_for_a_rotation_checkpoint(tmp_path: Path) -> None:

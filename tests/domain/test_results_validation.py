@@ -427,6 +427,18 @@ def test_operation_results_require_typed_collections_and_times() -> None:
             finished_at=NOW,
             data=None,
         )
+    with pytest.raises(TypeError, match="identity_evidence"):
+        OperationResult(
+            operation=valid.operation,
+            resource_scope=SCOPE,
+            boundary=valid.boundary,
+            outcome=valid.outcome,
+            completeness=valid.completeness,
+            started_at=NOW,
+            finished_at=NOW,
+            data=None,
+            identity_evidence="unsafe identity evidence",  # type: ignore[arg-type]
+        )
 
     assert valid.schema == OPERATION_RESULT_SCHEMA
 

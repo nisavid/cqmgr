@@ -7,7 +7,7 @@ import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from threading import Event, Timer
-from typing import TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, override
 
 import pytest
 
@@ -20,8 +20,6 @@ from cqmgr.application.configuration import ConfigSnapshot, Profile, SelectionSt
 from cqmgr.application.operations.quotas import (
     QuotaBrowseData,
     QuotaInspectData,
-    QuotaOperations,
-    WorkloadResolutionOperations,
 )
 from cqmgr.application.operations.read_only import (
     IncompleteQuotaInspectData,
@@ -392,11 +390,8 @@ def service(  # noqa: PLR0913 - explicit fixture dependencies stay independent
         selection_repository,
         resolver,
         identity_provider,
-        cast("QuotaOperations", quota_operations),
-        cast(
-            "WorkloadResolutionOperations",
-            workloads or UnusedWorkloadOperations(),
-        ),
+        quota_operations,  # type: ignore[arg-type]
+        workloads or UnusedWorkloadOperations(),  # type: ignore[arg-type]
         FixedClock(),
         monotonic=lambda: 0.0,
     )
@@ -487,8 +482,8 @@ def test_identity_is_resolved_before_resource_manager_canonicalization() -> None
         MemoryRepository(SelectionState(direct_resource_scope=scope("123456789"))),
         resolver,
         identity_provider,
-        cast("QuotaOperations", quotas),
-        cast("WorkloadResolutionOperations", UnusedWorkloadOperations()),
+        quotas,  # type: ignore[arg-type]
+        UnusedWorkloadOperations(),  # type: ignore[arg-type]
         FixedClock(),
         monotonic=lambda: 0.0,
     )
@@ -515,8 +510,8 @@ def test_resource_manager_read_is_charged_before_dispatch() -> None:
         MemoryRepository(SelectionState(direct_resource_scope=scope("123456789"))),
         resolver,
         identity_provider,
-        cast("QuotaOperations", quotas),
-        cast("WorkloadResolutionOperations", UnusedWorkloadOperations()),
+        quotas,  # type: ignore[arg-type]
+        UnusedWorkloadOperations(),  # type: ignore[arg-type]
         FixedClock(),
         monotonic=lambda: 0.0,
         budget=budget,
@@ -549,8 +544,8 @@ def test_corrupt_budget_state_blocks_resource_manager_dispatch(
         MemoryRepository(SelectionState(direct_resource_scope=scope("123456789"))),
         resolver,
         RecordingIdentityProvider(identity()),
-        cast("QuotaOperations", quotas),
-        cast("WorkloadResolutionOperations", UnusedWorkloadOperations()),
+        quotas,  # type: ignore[arg-type]
+        UnusedWorkloadOperations(),  # type: ignore[arg-type]
         FixedClock(),
         budget=budget,
     )
@@ -624,8 +619,8 @@ def test_deadline_expires_while_local_configuration_is_loading() -> None:
         selection,
         resolver,
         identity_provider,
-        cast("QuotaOperations", quotas),
-        cast("WorkloadResolutionOperations", UnusedWorkloadOperations()),
+        quotas,  # type: ignore[arg-type]
+        UnusedWorkloadOperations(),  # type: ignore[arg-type]
         FixedClock(),
     )
 
@@ -661,8 +656,8 @@ def test_deadline_abandons_hung_adc_discovery_without_executor_shutdown_wait() -
         MemoryRepository(SelectionState(direct_resource_scope=scope("123456789"))),
         resolver,
         GoogleADCIdentityProvider(BlockingADCRuntime(started, release, completed)),
-        cast("QuotaOperations", quotas),
-        cast("WorkloadResolutionOperations", UnusedWorkloadOperations()),
+        quotas,  # type: ignore[arg-type]
+        UnusedWorkloadOperations(),  # type: ignore[arg-type]
         FixedClock(),
     )
     release_timer.start()

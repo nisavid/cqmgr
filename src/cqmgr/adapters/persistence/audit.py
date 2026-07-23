@@ -135,9 +135,9 @@ class EmptyAuditJournal:
             raise ValueError(msg)
         return AuditQueryPage(records=(), next_cursor=None)
 
-    def inspect(self, record_id: str) -> AuditRecord | None:
+    def inspect(self, record_id: str) -> AuditRecord | None:  # noqa: ARG002
         """Report that an exact record is absent."""
-        del record_id
+        return None
 
     def verify(
         self,

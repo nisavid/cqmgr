@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from cqmgr.application.configuration import (
     ConfigSnapshot,
@@ -89,7 +89,6 @@ if TYPE_CHECKING:
         ComputeInstanceRequirement,
         ResolvedWorkloadRequirement,
     )
-    from cqmgr.domain.projects import CanonicalProject
     from cqmgr.domain.quotas import EffectiveQuotaSliceIdentity
 
 
@@ -634,7 +633,10 @@ class ReadOnlyOperations:
                 unavailable_source="resource-manager",
                 identity_evidence=ProviderIdentityEvidence.from_adc(identity),
             )
-        project = cast("CanonicalProject", project_resolution.project)
+        project = project_resolution.project
+        if project is None:
+            msg = "successful project resolution must contain canonical evidence"
+            raise AssertionError(msg)
         context = ProviderReadContext(
             project=project,
             identity=identity,

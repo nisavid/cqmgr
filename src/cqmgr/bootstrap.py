@@ -296,8 +296,8 @@ def build_read_only_operations(  # noqa: PLR0915 - explicit composition root
     )
 
     class _UnsupportedFederatedSubjectResolver:
-        def resolve(self, credential: object) -> None:
-            del credential
+        def resolve(self, credential: object) -> None:  # noqa: ARG002
+            return None
 
     paths = runtime_paths(environment)
     clock = SystemClock()
