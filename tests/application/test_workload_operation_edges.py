@@ -55,11 +55,13 @@ from cqmgr.domain.identity import ADCIdentityEvidence, CredentialKind
 from cqmgr.domain.projects import CanonicalProject
 from cqmgr.domain.quota_queries import QuotaQuery
 from cqmgr.domain.quotas import (
+    EffectiveQuotaEvidence,
     EffectiveQuotaSliceIdentity,
     NormalizedDimensions,
     ProviderRead,
     ProviderReadCoverage,
     QuotaScope,
+    UsageObservation,
 )
 from cqmgr.domain.redaction import RedactedText
 from cqmgr.domain.results import ExitClass, StableSymbol
@@ -116,6 +118,25 @@ class ScriptedCatalogReader[ValueT]:
         """Return the next catalog observation."""
         self.calls.append(request)
         return self.reads.pop(0)
+
+
+class BlockingReader[ValueT]:
+    """Expose cancellation cleanup for one indefinitely blocked read."""
+
+    def __init__(self) -> None:
+        """Start with an unentered and uncleaned read."""
+        self.started = asyncio.Event()
+        self.cleaned = asyncio.Event()
+
+    async def read(self, request: object) -> ValueT:
+        """Block until cancellation and expose the coroutine cleanup."""
+        del request
+        self.started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            self.cleaned.set()
+        raise AssertionError
 
 
 def _context() -> ProviderReadContext:
@@ -521,6 +542,52 @@ def test_resolve_rejects_a_candidate_absent_from_complete_tpu_inventory() -> Non
     assert location.coverage[0].state is LocationCoverageState.EMPTY
     assert len(accelerator_reader.calls) == 1
     assert len(runtime_reader.calls) == 1
+
+
+def test_tpu_resolution_cancellation_joins_started_provider_reads() -> None:
+    """Cancelling catalog discovery also stops owned quota and usage reads."""
+
+    async def exercise() -> None:
+        effective = BlockingReader[ProviderRead[EffectiveQuotaEvidence]]()
+        usage = BlockingReader[ProviderRead[UsageObservation]]()
+        locations = BlockingReader[CatalogRead[TpuLocation]]()
+        operations = WorkloadResolutionOperations(
+            effective,
+            usage,
+            ScriptedCatalogReader(()),
+            ScriptedCatalogReader(()),
+            locations,
+            ScriptedCatalogReader(()),
+            ScriptedCatalogReader(()),
+            MAINTAINED_ACCELERATOR_OVERLAY,
+            FixedClock(),
+        )
+        call = asyncio.create_task(
+            operations.resolve(
+                QuotaResolveRequest(_context(), _legacy_tpu_requirement())
+            )
+        )
+        await asyncio.gather(
+            effective.started.wait(),
+            usage.started.wait(),
+            locations.started.wait(),
+        )
+
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        await asyncio.sleep(0)
+
+        assert effective.cleaned.is_set()
+        assert usage.cleaned.is_set()
+        assert locations.cleaned.is_set()
+        assert [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task() and not task.done()
+        ] == []
+
+    asyncio.run(exercise())
 
 
 def test_resolve_retains_a_candidate_missing_from_incomplete_tpu_inventory() -> None:
