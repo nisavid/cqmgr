@@ -53,6 +53,21 @@ class PlanLedgerState(StrEnum):
     QUARANTINED = "quarantined"
 
 
+class PlanKind(StrEnum):
+    """Closed V1 quota request plan subject kinds."""
+
+    SINGLE = "single"
+    BUNDLE = "bundle"
+
+
+class TargetStrategy(StrEnum):
+    """Explicit rule used to derive absolute quota targets."""
+
+    MINIMUM = "minimum"
+    PRESERVE_HEADROOM = "preserve-headroom"
+    MANUAL = "manual"
+
+
 class PlanIncapability(StrEnum):
     """Stable reasons trustworthy plan contents cannot be Applied."""
 
@@ -134,6 +149,201 @@ class EvidenceBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class QuotaRequestPlanChild:
+    """One ordered independently mutable child bound into a bundle plan."""
+
+    child_id: str
+    slice_identity: EffectiveQuotaSliceIdentity
+    target: QuotaQuantity
+    effective: QuotaQuantity
+    usage: QuotaQuantity | None
+    workload: QuotaQuantity | None
+    prior_desired: QuotaQuantity | None
+    granted: QuotaQuantity | None
+    preference_name: str | None
+    preference_etag: str | None
+    target_strategy: TargetStrategy
+    target_derivation: StableSymbol
+    direct_accelerator_rank: int
+    scope_breadth_rank: int
+    warnings: tuple[StableSymbol, ...]
+    required_acknowledgements: tuple[StableSymbol, ...]
+    acknowledgements: tuple[StableSymbol, ...]
+    evidence: tuple[EvidenceBinding, ...]
+
+    def __post_init__(self) -> None:  # noqa: C901
+        """Reject child bindings that cannot be reviewed or ordered exactly."""
+        if not isinstance(self.child_id, str) or not self.child_id:
+            msg = "plan child_id must be a non-empty string"
+            raise ValueError(msg)
+        if not isinstance(self.slice_identity, EffectiveQuotaSliceIdentity):
+            msg = "plan child requires exact slice identity"
+            raise TypeError(msg)
+        quantities = (
+            self.target,
+            self.effective,
+            self.usage,
+            self.workload,
+            self.prior_desired,
+            self.granted,
+        )
+        if any(
+            value is not None and not isinstance(value, QuotaQuantity)
+            for value in quantities
+        ):
+            msg = "plan child quantities must be QuotaQuantity values"
+            raise TypeError(msg)
+        units = {value.unit for value in quantities if value is not None}
+        if len(units) != 1:
+            msg = "plan child quantities must use one native unit"
+            raise ValueError(msg)
+        _require_optional_nonempty(self.preference_name, "preference_name")
+        _require_optional_nonempty(self.preference_etag, "preference_etag")
+        if not isinstance(self.target_strategy, TargetStrategy):
+            msg = "plan child target_strategy must be a TargetStrategy"
+            raise TypeError(msg)
+        if not isinstance(self.target_derivation, StableSymbol):
+            msg = "plan child target_derivation must be a StableSymbol"
+            raise TypeError(msg)
+        if self.direct_accelerator_rank not in {0, 1}:
+            msg = "plan child direct accelerator rank is unsupported"
+            raise ValueError(msg)
+        if self.scope_breadth_rank not in {0, 1, 2, 3, 4}:
+            msg = "plan child scope breadth rank is unsupported"
+            raise ValueError(msg)
+        _require_tuple_of(self.warnings, StableSymbol, "warnings")
+        _require_tuple_of(
+            self.required_acknowledgements,
+            StableSymbol,
+            "required_acknowledgements",
+        )
+        _require_tuple_of(self.acknowledgements, StableSymbol, "acknowledgements")
+        _require_tuple_of(self.evidence, EvidenceBinding, "evidence")
+        if not set(self.acknowledgements).issubset(self.required_acknowledgements):
+            msg = "acknowledgements must be required by the plan child"
+            raise ValueError(msg)
+        if len({item.name for item in self.evidence}) != len(self.evidence):
+            msg = "plan child evidence names must be unique"
+            raise ValueError(msg)
+
+    @property
+    def order_key(self) -> tuple[object, ...]:
+        """Return the exact accelerator-first deterministic comparator."""
+        identity = self.slice_identity
+        return (
+            self.direct_accelerator_rank,
+            self.scope_breadth_rank,
+            identity.resource_scope.canonical_name,
+            identity.service,
+            identity.quota_id,
+            identity.dimensions.items,
+            identity.quota_scope.value,
+        )
+
+    @property
+    def unresolved_acknowledgements(self) -> tuple[StableSymbol, ...]:
+        """Return required child acknowledgements absent from Preview input."""
+        acknowledged = frozenset(self.acknowledgements)
+        return tuple(
+            item for item in self.required_acknowledgements if item not in acknowledged
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class QuotaRequestBundlePlan:
+    """Canonical ordered workload-bundle authorization produced by Preview."""
+
+    resource_scope: ResourceScope
+    kind: PlanKind
+    selected_location: str
+    target_strategy: TargetStrategy
+    normalized_workload: str
+    children: tuple[QuotaRequestPlanChild, ...]
+    constraints: tuple[ConstraintReference, ...]
+    principal: PlanPrincipal
+    contact_binding: ContactBinding
+    installation_id: str
+    issued_at: datetime
+    expires_at: datetime
+    schema: str = field(default=PLAN_SCHEMA, init=False)
+
+    def __post_init__(self) -> None:  # noqa: C901, PLR0912
+        """Require one complete, canonically ordered bundle subject."""
+        if not isinstance(self.resource_scope, ResourceScope):
+            msg = "resource_scope must be a ResourceScope"
+            raise TypeError(msg)
+        if self.kind is not PlanKind.BUNDLE:
+            msg = "workload request plan kind must be bundle"
+            raise ValueError(msg)
+        if not isinstance(self.selected_location, str) or not self.selected_location:
+            msg = "bundle selected_location must be non-empty"
+            raise ValueError(msg)
+        if not isinstance(self.target_strategy, TargetStrategy):
+            msg = "bundle target_strategy must be a TargetStrategy"
+            raise TypeError(msg)
+        if (
+            not isinstance(self.normalized_workload, str)
+            or not self.normalized_workload
+        ):
+            msg = "bundle normalized_workload must be non-empty"
+            raise ValueError(msg)
+        if (
+            not isinstance(self.children, tuple)
+            or not self.children
+            or any(
+                not isinstance(child, QuotaRequestPlanChild) for child in self.children
+            )
+        ):
+            msg = "bundle children must be a non-empty tuple of plan children"
+            raise ValueError(msg)
+        if len({child.child_id for child in self.children}) != len(self.children):
+            msg = "bundle plan child IDs must be unique"
+            raise ValueError(msg)
+        if (
+            tuple(sorted(self.children, key=lambda child: child.order_key))
+            != self.children
+        ):
+            msg = "bundle plan children must use deterministic accelerator-first order"
+            raise ValueError(msg)
+        if any(
+            child.slice_identity.resource_scope != self.resource_scope
+            for child in self.children
+        ):
+            msg = "bundle child resource scope must match the plan"
+            raise ValueError(msg)
+        _require_tuple_of(self.constraints, ConstraintReference, "constraints")
+        _require_plan_constraints(self.resource_scope, self.constraints)
+        if not isinstance(self.principal, PlanPrincipal):
+            msg = "principal must be a PlanPrincipal"
+            raise TypeError(msg)
+        if not isinstance(self.contact_binding, ContactBinding):
+            msg = "contact_binding must be a ContactBinding"
+            raise TypeError(msg)
+        if not isinstance(self.installation_id, str) or not self.installation_id:
+            msg = "installation_id must be a non-empty string"
+            raise ValueError(msg)
+        require_utc(self.issued_at, "issued_at")
+        require_utc(self.expires_at, "expires_at")
+        if self.expires_at - self.issued_at != PLAN_LIFETIME:
+            msg = "quota request plans must expire exactly 15 minutes after issuance"
+            raise ValueError(msg)
+
+    def is_expired(self, now: datetime) -> bool:
+        """Return whether applicability has ended at the supplied UTC time."""
+        require_utc(now, "now")
+        return now >= self.expires_at
+
+    @property
+    def unresolved_acknowledgements(self) -> tuple[StableSymbol, ...]:
+        """Return unresolved acknowledgements across every ordered child."""
+        return tuple(
+            acknowledgement
+            for child in self.children
+            for acknowledgement in child.unresolved_acknowledgements
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class QuotaRequestPlan:
     """Canonical single-slice authorization produced by Preview."""
 
@@ -154,9 +364,21 @@ class QuotaRequestPlan:
     installation_id: str
     issued_at: datetime
     expires_at: datetime
+    target_strategy: TargetStrategy = TargetStrategy.MANUAL
+    target_derivation: StableSymbol = field(
+        default_factory=lambda: StableSymbol("manual-absolute")
+    )
+    child_id: str = "single"
+    usage: QuotaQuantity | None = None
+    workload: QuotaQuantity | None = None
+    prior_desired: QuotaQuantity | None = None
+    granted: QuotaQuantity | None = None
+    direct_accelerator_rank: int = 0
+    scope_breadth_rank: int = 0
+    kind: PlanKind = field(default=PlanKind.SINGLE, init=False)
     schema: str = field(default=PLAN_SCHEMA, init=False)
 
-    def __post_init__(self) -> None:  # noqa: C901
+    def __post_init__(self) -> None:  # noqa: C901, PLR0912, PLR0915
         """Enforce exact identity, evidence, and fixed-lifetime bindings."""
         if not isinstance(self.resource_scope, ResourceScope):
             msg = "resource_scope must be a ResourceScope"
@@ -208,6 +430,32 @@ class QuotaRequestPlan:
         if self.expires_at - self.issued_at != PLAN_LIFETIME:
             msg = "quota request plans must expire exactly 15 minutes after issuance"
             raise ValueError(msg)
+        if self.target_strategy is not TargetStrategy.MANUAL:
+            msg = "single-slice plans must use the manual target strategy"
+            raise ValueError(msg)
+        if not isinstance(self.target_derivation, StableSymbol):
+            msg = "target_derivation must be a StableSymbol"
+            raise TypeError(msg)
+        if not isinstance(self.child_id, str) or not self.child_id:
+            msg = "single plan child_id must be non-empty"
+            raise ValueError(msg)
+        for value in (
+            self.usage,
+            self.workload,
+            self.prior_desired,
+            self.granted,
+        ):
+            if value is not None and (
+                not isinstance(value, QuotaQuantity) or value.unit != self.target.unit
+            ):
+                msg = "single plan child quantities must use the target unit"
+                raise ValueError(msg)
+        if self.direct_accelerator_rank not in {0, 1}:
+            msg = "single plan direct accelerator rank is unsupported"
+            raise ValueError(msg)
+        if self.scope_breadth_rank not in {0, 1, 2, 3, 4}:
+            msg = "single plan scope breadth rank is unsupported"
+            raise ValueError(msg)
 
     def is_expired(self, now: datetime) -> bool:
         """Return whether applicability has ended at the supplied UTC time."""
@@ -222,12 +470,41 @@ class QuotaRequestPlan:
             item for item in self.required_acknowledgements if item not in acknowledged
         )
 
+    @property
+    def children(self) -> tuple[QuotaRequestPlanChild, ...]:
+        """Expose the single mutation through the common ordered-child shape."""
+        return (
+            QuotaRequestPlanChild(
+                child_id=self.child_id,
+                slice_identity=self.slice_identity,
+                target=self.target,
+                effective=self.effective,
+                usage=self.usage,
+                workload=self.workload,
+                prior_desired=self.prior_desired,
+                granted=self.granted,
+                preference_name=self.preference_name,
+                preference_etag=self.preference_etag,
+                target_strategy=self.target_strategy,
+                target_derivation=self.target_derivation,
+                direct_accelerator_rank=self.direct_accelerator_rank,
+                scope_breadth_rank=self.scope_breadth_rank,
+                warnings=self.warnings,
+                required_acknowledgements=self.required_acknowledgements,
+                acknowledgements=self.acknowledgements,
+                evidence=self.evidence,
+            ),
+        )
+
+
+type QuotaPlan = QuotaRequestPlan | QuotaRequestBundlePlan
+
 
 @dataclass(frozen=True, slots=True)
 class PlanReview:
     """Trustworthy canonical contents and independent Apply capability."""
 
-    plan: QuotaRequestPlan
+    plan: QuotaPlan
     digest: str
     authenticated: bool
     state: PlanLedgerState
@@ -236,7 +513,7 @@ class PlanReview:
 
 
 def review_plan(  # noqa: C901, PLR0913
-    plan: QuotaRequestPlan,
+    plan: QuotaPlan,
     *,
     digest: str,
     authenticated: bool,
@@ -245,8 +522,8 @@ def review_plan(  # noqa: C901, PLR0913
     now: datetime,
 ) -> PlanReview:
     """Classify applicability without hiding safe digest-valid contents."""
-    if not isinstance(plan, QuotaRequestPlan):
-        msg = "plan must be a QuotaRequestPlan"
+    if not isinstance(plan, (QuotaRequestPlan, QuotaRequestBundlePlan)):
+        msg = "plan must be a QuotaRequestPlan or QuotaRequestBundlePlan"
         raise TypeError(msg)
     if not _is_exact_digest(digest, "sha256"):
         msg = "plan digest must be an exact lowercase sha256 digest"

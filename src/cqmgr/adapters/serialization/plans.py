@@ -15,8 +15,13 @@ from cqmgr.domain.plans import (
     PLAN_SCHEMA,
     ContactBinding,
     EvidenceBinding,
+    PlanKind,
     PlanPrincipal,
+    QuotaPlan,
+    QuotaRequestBundlePlan,
     QuotaRequestPlan,
+    QuotaRequestPlanChild,
+    TargetStrategy,
 )
 from cqmgr.domain.quotas import (
     ConstraintReference,
@@ -41,7 +46,7 @@ class PlanDecodeError(ValueError):
 class DecodedPlan:
     """Digest-valid canonical plan with an untrusted issuer authenticator."""
 
-    plan: QuotaRequestPlan
+    plan: QuotaPlan
     digest: str
     authentication: str
     bytes: bytes
@@ -56,10 +61,10 @@ class PlanCodec:
     """Encode and decode the exact V1 portable plan representation."""
 
     @staticmethod
-    def encode(plan: QuotaRequestPlan, key: bytes) -> EncodedPlan:
+    def encode(plan: QuotaPlan, key: bytes) -> EncodedPlan:
         """Return deterministic authenticated bytes for one valid plan."""
-        if not isinstance(plan, QuotaRequestPlan):
-            msg = "plan must be a QuotaRequestPlan"
+        if not isinstance(plan, (QuotaRequestPlan, QuotaRequestBundlePlan)):
+            msg = "plan must be a QuotaRequestPlan or QuotaRequestBundlePlan"
             raise TypeError(msg)
         _require_key(key)
         plan_mapping = _plan_mapping(plan)
@@ -181,9 +186,12 @@ def _slice(value: EffectiveQuotaSliceIdentity) -> dict[str, object]:
     }
 
 
-def _plan_mapping(plan: QuotaRequestPlan) -> dict[str, object]:
+def _plan_mapping(plan: QuotaPlan) -> dict[str, object]:
+    if isinstance(plan, QuotaRequestBundlePlan):
+        return _bundle_plan_mapping(plan)
     return {
         "acknowledgements": [item.value for item in plan.acknowledgements],
+        "children": [_plan_child_mapping(plan.children[0])],
         "constraints": [_slice(item.slice_identity) for item in plan.constraints],
         "contact_binding": {
             "source": plan.contact_binding.source.value,
@@ -203,6 +211,7 @@ def _plan_mapping(plan: QuotaRequestPlan) -> dict[str, object]:
         "expires_at": _time(plan.expires_at),
         "installation_id": plan.installation_id,
         "issued_at": _time(plan.issued_at),
+        "kind": plan.kind.value,
         "preference": {
             "etag": plan.preference_etag,
             "name": plan.preference_name,
@@ -220,6 +229,69 @@ def _plan_mapping(plan: QuotaRequestPlan) -> dict[str, object]:
         "target": _quantity(plan.target),
         "warnings": [item.value for item in plan.warnings],
     }
+
+
+def _bundle_plan_mapping(plan: QuotaRequestBundlePlan) -> dict[str, object]:
+    return {
+        "children": [_plan_child_mapping(child) for child in plan.children],
+        "constraints": [_slice(item.slice_identity) for item in plan.constraints],
+        "contact_binding": {
+            "source": plan.contact_binding.source.value,
+            "source_identity": plan.contact_binding.source_identity,
+            "value_digest": plan.contact_binding.value_digest,
+        },
+        "expires_at": _time(plan.expires_at),
+        "installation_id": plan.installation_id,
+        "issued_at": _time(plan.issued_at),
+        "kind": plan.kind.value,
+        "normalized_workload": plan.normalized_workload,
+        "principal": {
+            "impersonation_chain": list(plan.principal.impersonation_chain),
+            "stable_identity": plan.principal.stable_identity,
+        },
+        "resource_scope": _scope(plan.resource_scope),
+        "schema": plan.schema,
+        "selected_location": plan.selected_location,
+        "target_strategy": plan.target_strategy.value,
+    }
+
+
+def _plan_child_mapping(child: QuotaRequestPlanChild) -> dict[str, object]:
+    return {
+        "acknowledgements": [item.value for item in child.acknowledgements],
+        "child_id": child.child_id,
+        "direct_accelerator_rank": child.direct_accelerator_rank,
+        "effective": _quantity(child.effective),
+        "evidence": [
+            {
+                "name": item.name.value,
+                "observed_at": _time(item.observed_at),
+                "value_digest": item.value_digest,
+            }
+            for item in child.evidence
+        ],
+        "granted": _optional_quantity(child.granted),
+        "preference": {
+            "etag": child.preference_etag,
+            "name": child.preference_name,
+        },
+        "prior_desired": _optional_quantity(child.prior_desired),
+        "required_acknowledgements": [
+            item.value for item in child.required_acknowledgements
+        ],
+        "scope_breadth_rank": child.scope_breadth_rank,
+        "slice": _slice(child.slice_identity),
+        "target": _quantity(child.target),
+        "target_derivation": child.target_derivation.value,
+        "target_strategy": child.target_strategy.value,
+        "usage": _optional_quantity(child.usage),
+        "warnings": [item.value for item in child.warnings],
+        "workload": _optional_quantity(child.workload),
+    }
+
+
+def _optional_quantity(value: QuotaQuantity | None) -> dict[str, str] | None:
+    return None if value is None else _quantity(value)
 
 
 def _parse_time(value: object) -> datetime:
@@ -267,9 +339,12 @@ def _parse_slice(value: object) -> EffectiveQuotaSliceIdentity:
     )
 
 
-def _parse_plan(value: dict[str, Any]) -> QuotaRequestPlan:
+def _parse_plan(value: dict[str, Any]) -> QuotaPlan:
+    if value.get("kind") == PlanKind.BUNDLE.value:
+        return _parse_bundle_plan(value)
     expected = {
         "acknowledgements",
+        "children",
         "constraints",
         "contact_binding",
         "effective",
@@ -278,6 +353,7 @@ def _parse_plan(value: dict[str, Any]) -> QuotaRequestPlan:
         "expires_at",
         "installation_id",
         "issued_at",
+        "kind",
         "preference",
         "principal",
         "required_acknowledgements",
@@ -292,6 +368,16 @@ def _parse_plan(value: dict[str, Any]) -> QuotaRequestPlan:
     principal = _exact_mapping(
         mapping["principal"], {"impersonation_chain", "stable_identity"}
     )
+    if mapping["kind"] != PlanKind.SINGLE.value:
+        msg = "single plan kind is unsupported"
+        raise ValueError(msg)
+    parsed_children = tuple(
+        _parse_plan_child(item) for item in _list(mapping["children"])
+    )
+    if len(parsed_children) != 1:
+        msg = "single plan must contain exactly one child"
+        raise ValueError(msg)
+    child = parsed_children[0]
     contact = _exact_mapping(
         mapping["contact_binding"],
         {"source", "source_identity", "value_digest"},
@@ -341,7 +427,138 @@ def _parse_plan(value: dict[str, Any]) -> QuotaRequestPlan:
         installation_id=_string(mapping["installation_id"]),
         issued_at=_parse_time(mapping["issued_at"]),
         expires_at=_parse_time(mapping["expires_at"]),
+        target_strategy=child.target_strategy,
+        target_derivation=child.target_derivation,
+        child_id=child.child_id,
+        usage=child.usage,
+        workload=child.workload,
+        prior_desired=child.prior_desired,
+        granted=child.granted,
+        direct_accelerator_rank=child.direct_accelerator_rank,
+        scope_breadth_rank=child.scope_breadth_rank,
     )
+
+
+def _parse_bundle_plan(value: dict[str, Any]) -> QuotaRequestBundlePlan:
+    expected = {
+        "children",
+        "constraints",
+        "contact_binding",
+        "expires_at",
+        "installation_id",
+        "issued_at",
+        "kind",
+        "normalized_workload",
+        "principal",
+        "resource_scope",
+        "schema",
+        "selected_location",
+        "target_strategy",
+    }
+    mapping = _exact_mapping(value, expected)
+    principal = _exact_mapping(
+        mapping["principal"], {"impersonation_chain", "stable_identity"}
+    )
+    contact = _exact_mapping(
+        mapping["contact_binding"],
+        {"source", "source_identity", "value_digest"},
+    )
+    return QuotaRequestBundlePlan(
+        resource_scope=_parse_scope(mapping["resource_scope"]),
+        kind=PlanKind(_string(mapping["kind"])),
+        selected_location=_string(mapping["selected_location"]),
+        target_strategy=TargetStrategy(_string(mapping["target_strategy"])),
+        normalized_workload=_string(mapping["normalized_workload"]),
+        children=tuple(_parse_plan_child(item) for item in _list(mapping["children"])),
+        constraints=tuple(
+            ConstraintReference(_parse_slice(item))
+            for item in _list(mapping["constraints"])
+        ),
+        principal=PlanPrincipal(
+            stable_identity=_string(principal["stable_identity"]),
+            impersonation_chain=tuple(_string_list(principal["impersonation_chain"])),
+        ),
+        contact_binding=ContactBinding(
+            source=StableSymbol(_string(contact["source"])),
+            source_identity=_string(contact["source_identity"]),
+            value_digest=_string(contact["value_digest"]),
+        ),
+        installation_id=_string(mapping["installation_id"]),
+        issued_at=_parse_time(mapping["issued_at"]),
+        expires_at=_parse_time(mapping["expires_at"]),
+    )
+
+
+def _parse_plan_child(value: object) -> QuotaRequestPlanChild:
+    expected = {
+        "acknowledgements",
+        "child_id",
+        "direct_accelerator_rank",
+        "effective",
+        "evidence",
+        "granted",
+        "preference",
+        "prior_desired",
+        "required_acknowledgements",
+        "scope_breadth_rank",
+        "slice",
+        "target",
+        "target_derivation",
+        "target_strategy",
+        "usage",
+        "warnings",
+        "workload",
+    }
+    mapping = _exact_mapping(value, expected)
+    preference = _exact_mapping(mapping["preference"], {"etag", "name"})
+    return QuotaRequestPlanChild(
+        child_id=_string(mapping["child_id"]),
+        slice_identity=_parse_slice(mapping["slice"]),
+        target=_parse_quantity(mapping["target"]),
+        effective=_parse_quantity(mapping["effective"]),
+        usage=_parse_optional_quantity(mapping["usage"]),
+        workload=_parse_optional_quantity(mapping["workload"]),
+        prior_desired=_parse_optional_quantity(mapping["prior_desired"]),
+        granted=_parse_optional_quantity(mapping["granted"]),
+        preference_name=_optional_string(preference["name"]),
+        preference_etag=_optional_string(preference["etag"]),
+        target_strategy=TargetStrategy(_string(mapping["target_strategy"])),
+        target_derivation=StableSymbol(_string(mapping["target_derivation"])),
+        direct_accelerator_rank=_integer(mapping["direct_accelerator_rank"]),
+        scope_breadth_rank=_integer(mapping["scope_breadth_rank"]),
+        warnings=tuple(
+            StableSymbol(item) for item in _string_list(mapping["warnings"])
+        ),
+        required_acknowledgements=tuple(
+            StableSymbol(item)
+            for item in _string_list(mapping["required_acknowledgements"])
+        ),
+        acknowledgements=tuple(
+            StableSymbol(item) for item in _string_list(mapping["acknowledgements"])
+        ),
+        evidence=tuple(
+            EvidenceBinding(
+                name=StableSymbol(_string(item_mapping["name"])),
+                value_digest=_string(item_mapping["value_digest"]),
+                observed_at=_parse_time(item_mapping["observed_at"]),
+            )
+            for item_mapping in (
+                _exact_mapping(item, {"name", "observed_at", "value_digest"})
+                for item in _list(mapping["evidence"])
+            )
+        ),
+    )
+
+
+def _parse_optional_quantity(value: object) -> QuotaQuantity | None:
+    return None if value is None else _parse_quantity(value)
+
+
+def _integer(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        msg = "plan field must be an integer"
+        raise TypeError(msg)
+    return value
 
 
 def _exact_mapping(value: object, fields: set[str]) -> dict[str, Any]:

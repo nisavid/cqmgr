@@ -865,6 +865,7 @@ def test_concurrent_different_exports_never_overwrite(tmp_path: Path) -> None:
     """Only one complete plan can claim an explicit export destination."""
     first = _encoded()
     decoded = PlanCodec.decode(first.bytes)
+    assert isinstance(decoded.plan, QuotaRequestPlan)
     second = PlanCodec.encode(
         replace(decoded.plan, target=QuotaQuantity(9, QuotaUnit("1"))), KEY
     )

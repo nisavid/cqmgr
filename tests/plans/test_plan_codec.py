@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -16,9 +16,13 @@ from cqmgr.domain.plans import (
     ContactBinding,
     EvidenceBinding,
     PlanIncapability,
+    PlanKind,
     PlanLedgerState,
     PlanPrincipal,
+    QuotaRequestBundlePlan,
     QuotaRequestPlan,
+    QuotaRequestPlanChild,
+    TargetStrategy,
     review_plan,
 )
 from cqmgr.domain.quotas import (
@@ -92,6 +96,50 @@ def _plan() -> QuotaRequestPlan:
     )
 
 
+def _bundle_child() -> QuotaRequestPlanChild:
+    """Build one complete bundle child for invariant tests."""
+    return QuotaRequestPlanChild(
+        child_id="direct",
+        slice_identity=SLICE,
+        target=QuotaQuantity(8, UNIT),
+        effective=QuotaQuantity(4, UNIT),
+        usage=QuotaQuantity(3, UNIT),
+        workload=QuotaQuantity(5, UNIT),
+        prior_desired=None,
+        granted=None,
+        preference_name=None,
+        preference_etag=None,
+        target_strategy=TargetStrategy.MINIMUM,
+        target_derivation=StableSymbol("usage-plus-workload"),
+        direct_accelerator_rank=0,
+        scope_breadth_rank=1,
+        warnings=(),
+        required_acknowledgements=(),
+        acknowledgements=(),
+        evidence=(),
+    )
+
+
+def _bundle_plan(
+    children: tuple[QuotaRequestPlanChild, ...] | None = None,
+) -> QuotaRequestBundlePlan:
+    """Build one complete canonical bundle plan."""
+    return QuotaRequestBundlePlan(
+        resource_scope=SCOPE,
+        kind=PlanKind.BUNDLE,
+        selected_location="us-central1",
+        target_strategy=TargetStrategy.MINIMUM,
+        normalized_workload="compute-instance:n1-standard-8:1",
+        children=children or (_bundle_child(),),
+        constraints=(ConstraintReference(SLICE),),
+        principal=_plan().principal,
+        contact_binding=_plan().contact_binding,
+        installation_id="installation-123",
+        issued_at=NOW,
+        expires_at=NOW + PLAN_LIFETIME,
+    )
+
+
 def test_plan_encoding_is_canonical_stable_and_authenticated() -> None:
     """One semantic plan has one stable byte encoding and digest handle."""
     encoded = PlanCodec.encode(_plan(), LOCAL_KEY)
@@ -108,6 +156,127 @@ def test_plan_encoding_is_canonical_stable_and_authenticated() -> None:
     assert decoded.digest == encoded.digest
     assert decoded.authenticate(LOCAL_KEY)
     assert not decoded.authenticate(b"f" * 32)
+
+
+def test_bundle_plan_encoding_binds_kind_order_and_child_derivations() -> None:
+    """Portable bundle bytes retain every ordered independently mutable child."""
+    child = QuotaRequestPlanChild(
+        child_id="direct",
+        slice_identity=SLICE,
+        target=QuotaQuantity(8, UNIT),
+        effective=QuotaQuantity(4, UNIT),
+        usage=QuotaQuantity(3, UNIT),
+        workload=QuotaQuantity(5, UNIT),
+        prior_desired=None,
+        granted=None,
+        preference_name=None,
+        preference_etag=None,
+        target_strategy=TargetStrategy.MINIMUM,
+        target_derivation=StableSymbol("usage-plus-workload"),
+        direct_accelerator_rank=0,
+        scope_breadth_rank=1,
+        warnings=(),
+        required_acknowledgements=(),
+        acknowledgements=(),
+        evidence=(),
+    )
+    plan = QuotaRequestBundlePlan(
+        resource_scope=SCOPE,
+        kind=PlanKind.BUNDLE,
+        selected_location="us-central1",
+        target_strategy=TargetStrategy.MINIMUM,
+        normalized_workload="compute-instance:n1-standard-8:1",
+        children=(child,),
+        constraints=(ConstraintReference(SLICE),),
+        principal=_plan().principal,
+        contact_binding=_plan().contact_binding,
+        installation_id="installation-123",
+        issued_at=NOW,
+        expires_at=NOW + PLAN_LIFETIME,
+    )
+
+    encoded = PlanCodec.encode(plan, LOCAL_KEY)
+    decoded = PlanCodec.decode(encoded.bytes)
+
+    assert decoded.plan == plan
+    assert decoded.plan.kind is PlanKind.BUNDLE
+    assert decoded.plan.children == (child,)
+    assert b'"kind":"bundle"' in encoded.bytes
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        ("child_id", "", "child_id"),
+        ("slice_identity", "slice", "slice identity"),
+        ("target", 8, "quantities"),
+        ("usage", QuotaQuantity(3, QuotaUnit("GiBy")), "native unit"),
+        ("preference_name", "", "preference_name"),
+        ("target_strategy", "minimum", "target_strategy"),
+        ("target_derivation", "formula", "target_derivation"),
+        ("direct_accelerator_rank", 2, "direct accelerator"),
+        ("scope_breadth_rank", 9, "scope breadth"),
+        ("warnings", ["warning"], "warnings"),
+        ("acknowledgements", (StableSymbol("unbound"),), "required"),
+        (
+            "evidence",
+            (
+                EvidenceBinding(StableSymbol("effective"), SHA256_A, NOW),
+                EvidenceBinding(StableSymbol("effective"), SHA256_B, NOW),
+            ),
+            "unique",
+        ),
+    ],
+)
+def test_bundle_child_rejects_unreviewable_bindings(
+    field_name: str,
+    value: object,
+    message: str,
+) -> None:
+    """Every child field remains exact, typed, and internally coherent."""
+    with pytest.raises((TypeError, ValueError), match=message):
+        replace(_bundle_child(), **cast("Any", {field_name: value}))
+
+
+def test_bundle_plan_rejects_inconsistent_subject_shapes() -> None:
+    """A bundle cannot weaken its kind, order, scope, or trust bindings."""
+    plan = _bundle_plan()
+    other_scope = ResourceScope(ResourceScopeKind.PROJECT, "projects/987654321")
+    other_slice = replace(SLICE, resource_scope=other_scope)
+    later = replace(
+        _bundle_child(),
+        child_id="companion",
+        direct_accelerator_rank=1,
+        scope_breadth_rank=3,
+    )
+    invalid_values: tuple[tuple[str, object, str], ...] = (
+        ("resource_scope", "project", "resource_scope"),
+        ("kind", PlanKind.SINGLE, "kind"),
+        ("selected_location", "", "selected_location"),
+        ("target_strategy", "minimum", "target_strategy"),
+        ("normalized_workload", "", "normalized_workload"),
+        ("children", (), "non-empty"),
+        (
+            "children",
+            (_bundle_child(), _bundle_child()),
+            "IDs must be unique",
+        ),
+        ("children", (later, _bundle_child()), "deterministic"),
+        (
+            "children",
+            (replace(_bundle_child(), slice_identity=other_slice),),
+            "resource scope",
+        ),
+        ("constraints", ["slice"], "constraints"),
+        ("principal", "principal", "principal"),
+        ("contact_binding", "contact", "contact_binding"),
+        ("installation_id", "", "installation_id"),
+        ("issued_at", NOW.replace(tzinfo=None), "aware UTC"),
+        ("expires_at", NOW + timedelta(minutes=16), "15 minutes"),
+    )
+    for field_name, value, message in invalid_values:
+        with pytest.raises((TypeError, ValueError), match=message):
+            replace(plan, **cast("Any", {field_name: value}))
 
 
 def test_plan_decode_rejects_noncanonical_tampered_and_newer_schema_bytes() -> None:
