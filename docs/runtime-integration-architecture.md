@@ -98,7 +98,11 @@ and credential objects never cross an adapter boundary.
   plan-keyring state, so help and local-only profile, configuration, and audit
   operations remain offline;
 - loads validated configuration and mutable selection state;
-- resolves explicit profiles and the project resource scope;
+- resolves explicit profiles and the locally selected project resource scope
+  without loading acting-principal evidence;
+- resolves and canonicalizes provider-scoped projects and acting-principal
+  evidence only when the selected operation crosses a provider-read or
+  provider-mutation seam;
 - consumes ADC, including externally configured impersonated ADC, and
   initializes provider clients, the shared budget coordinator, storage, locks,
   clocks, and serializers;
@@ -131,8 +135,8 @@ The default adapters use official Python clients:
 | --- | --- |
 | Effective quota and quota preferences | `google-cloud-quotas`, with read and mutation ports kept separate even when one client implements both. |
 | Quota usage | `google-cloud-monitoring`; usage observations remain separate from effective quota. |
-| Compute accelerator catalog | `google-cloud-compute` v1 with partial-success evidence retained. |
-| Legacy Cloud TPU catalog | `google-cloud-tpu` v2 read methods only. |
+| Compute accelerator catalog | `google-cloud-compute` v1 aggregated accelerator-type and machine-type reads with pagination, per-scope warnings, lifecycle, and partial-success evidence retained. |
+| Legacy Cloud TPU catalog | `google-cloud-tpu` v2 location, accelerator-type, and runtime-version read methods only, with independent per-location coverage retained. |
 | Spot capacity advice | `google-cloud-compute-v1beta` behind an independently disableable read-only port. |
 | Project canonicalization | The official Resource Manager client behind a project resolver. |
 
@@ -151,6 +155,50 @@ code.
 its output. Setup and recovery diagnostics may instruct an operator to run an
 exact `gcloud auth application-default` command outside `cqmgr`.
 
+### Federated provider inventory and catalog evidence
+
+The V1 provider inventory set is one read module over the supported
+`compute.googleapis.com` and `tpu.googleapis.com` sources. With no service or
+catalog-group filter, it federates both providers. Service and catalog-group
+filters prune both the provider reads and the displayed rows to providers that
+can satisfy the filters; coverage and completeness are then scoped explicitly
+to that queried provider set. The interface accepts `compute` and `tpu` as
+service-selector shorthand, but query identity, result data, persistence,
+audit, plans, and copied commands use the canonical full service DNS names.
+Filtering never suppresses unknown provider-declared hardware within a queried
+provider. V1 does not enumerate enabled services through Service Usage.
+
+The Compute adapter exhausts `acceleratorTypes.aggregatedList` and
+`machineTypes.aggregatedList`, requests partial-success behavior, and retains
+every page, scope warning, unreachable scope, deprecation state, replacement,
+and observation time. The Cloud TPU adapter first exhausts the supported
+location list, then independently exhausts accelerator types and runtime
+versions for every returned location. A failed page or location is coverage
+evidence, never an empty catalog. GKE contributes a versioned semantic overlay
+over Compute-owned inventory and quota evidence; it adds no Container API
+reads.
+
+The accelerator catalog is release-relative. Its maintained
+`cqmgr.accelerator-catalog/v1` overlay and normalized provider-declared
+inventory evidence record:
+
+- the two supported provider sources and exact published methods;
+- provider and catalog schema versions, retrieval times, and complete page
+  chains;
+- every successful and failed scope or location;
+- discovered hardware identities, lifecycle, machine or accelerator
+  relationships, topology, runtime, quota-unit, and restriction evidence;
+- the first-party source and review date for maintained semantic mappings; and
+- the immutable overlay content digest and normalized inventory-evidence
+  digest.
+
+An exhaustive claim is valid only relative to the named release evidence,
+discovery project, observation time, and all successfully enumerated scopes.
+Any unexhausted page, warning that prevents a scope read, or unreachable
+required location marks the affected coverage incomplete. Project-visible
+inventory never claims universal availability, and catalog compatibility never
+claims physical capacity.
+
 ## Authentication and identity
 
 Application Default Credentials are the runtime credential contract. The
@@ -168,6 +216,14 @@ The following concepts stay separate:
 
 Neither the ADC-discovered project nor the ADC quota project becomes the
 resource scope.
+
+Local scope, profile, configuration, help, and audit operations do not load
+ADC or acting-principal evidence. Their results state that identity loading was
+deferred because the operation was offline; this is an explicit non-applicable
+fact, not missing or incomplete evidence. A provider-scoped operation
+canonicalizes the selected project and resolves acting-principal and
+impersonation-chain evidence before its first provider read. Preview and Apply
+continue to require the exact stable-principal evidence described below.
 
 Before Preview, the identity adapter produces a verified auth context using the
 credential-type-specific authoritative surface:
@@ -217,10 +273,103 @@ GKE support is a semantic overlay over Compute-owned quota and accelerator
 catalog data. V1 does not read clusters, node pools, workloads, or the Container
 API.
 
-Accelerator workflows supply first-class Compute and Cloud TPU service groups.
-Generic quota browsing accepts an explicit canonical service DNS name. V1 does
-not enumerate enabled services through Service Usage or claim a cross-service
-total.
+Accelerator workflows use the two-service provider inventory set. A bare browse
+queries both providers. Canonical service DNS names and the stable
+`compute-accelerators` and `cloud-tpu-legacy` catalog groups filter both actual
+reads and returned rows; `compute` and `tpu` are accepted only as input
+shorthand and normalize immediately to their full service DNS names. Browse
+coverage reports every queried Compute or Cloud TPU source and location
+independently, identifies intentionally unqueried providers, and evaluates
+completeness only over the queried provider set. It never infers a
+cross-service provider total from incomplete coverage.
+
+## Workload resolution and quota target bundles
+
+Workload resolution accepts exactly one of two typed requirement shapes:
+
+- a Compute instance requirement with machine type, instance count,
+  provisioning model, and either explicit candidate locations or all
+  compatible locations; or
+- a Cloud TPU slice requirement with accelerator type, topology, runtime
+  version, slice count, provisioning model, and either explicit candidate
+  locations or all compatible locations.
+
+The resolver derives accelerator attachment, quota-pool, native-unit, and
+supported-workload-consumer facts from provider and catalog evidence. V1
+reports those consumers as result metadata and exposes no workload-consumer
+input because current Compute and GKE consumers resolve to the same quota
+constraints. A later workflow may add an explicit consumer input only when the
+choice changes compatibility or quota requirements. The resolver returns one
+independent result per candidate location. Each location result contains its
+compatibility disposition, exact native-unit requirement, exact constraint
+set, source coverage, and incompatibility, ambiguity, or incomplete reasons. A
+complete selected location may resolve when unrelated locations are incomplete; an
+all-compatible-locations request retains every incomplete or rejected
+location and cannot claim globally exhaustive compatibility unless the
+release-relative provider inventory coverage is complete. Alternative
+locations are never combined into one constraint set, and a shared global
+constraint remains an independent companion slice in each applicable
+location-anchored set.
+
+Request composition selects one compatible location result and derives an
+absolute target for every deficient independently mutable child through one
+explicit strategy:
+
+- `minimum`, the default, uses fresh usage plus the normalized workload
+  requirement for each deficient slice;
+- `preserve-headroom` uses current effective quota plus the normalized workload
+  requirement; or
+- `manual` uses an explicit absolute target supplied for each selected child
+  and applies the ordinary sufficiency and decrease gates.
+
+For `minimum`, a slice that already permits the normalized workload is a
+verified no-op; it is not silently decreased and an existing provider intent
+is not superseded. A bundle in which every child is a verified no-op returns a
+successful Preview with no plan or Apply capability.
+
+A quota request plan binds one quota request bundle containing the complete
+known constraint set, selected location, strategy, normalized workload,
+ordered non-no-op children, per-child absolute targets and units, evidence,
+preference identities and etags, and all ordinary identity, contact, warning,
+acknowledgement, expiry, and installation-trust facts. Dispatch order is
+deterministic and accelerator-first: accelerator- or location-specific
+children precede broader companion constraints, with canonical exact-slice
+identity as the final tie-breaker. The bound order is public result evidence
+and Apply may not recompute it.
+
+`cqmgr.quota-request-plan/v1` is defined before its first release as a
+discriminated union with required top-level `kind: "single"|"bundle"` beside
+the schema field. A single plan binds exactly one ordered child; a bundle plan
+binds one or more ordered children. Exact-slice composition uses strategy
+`manual` and kind `single`; workload-derived composition uses kind `bundle`
+even when only one non-no-op child remains. Child records may gain additive fields
+within v1, but their order is semantic. Unknown kinds are rejected. After the
+schema is released, an incompatible plan or child change requires a new
+plan-schema version.
+
+Apply is deliberately non-atomic. It first freshly revalidates the entire
+bundle before any provider write, durably records one bundle pre-intent,
+consumes the single-use plan, and then dispatches children in their bound
+order. Each child has at most one provider write and its own deterministic
+preference reconciliation. An accepted child is never rolled back. The first
+conclusively failed or transport-unknown child stops dispatch. A conclusive
+provider rejection or failure is `failed`; a dispatched child whose acceptance
+cannot be proven is `unknown`; every earlier accepted child is `accepted`; and
+every later child is `unattempted`. An unknown dispatch is consumed and
+quarantined, then reconciled through a read at its deterministic preference
+identity before any new Preview or Apply may supersede it. Apply reaches its
+success boundary only when every non-no-op child is accepted. Its aggregate
+result preserves all child dispositions and exact provider identities instead
+of reporting transaction or rollback semantics. Verified preflight no-ops
+remain composition facts and are never rewritten as dispatch dispositions.
+
+Watch accepts one shared intent identity for both subject shapes. The
+application and CLI expose `intent_id` / `--intent-id`; the durable Apply
+record and its `subject.kind` discriminator determine whether Watch loads a
+single or bundle subject. There is no parallel plan-ID or bundle-ID selector.
+Resume accepts the authenticated resume token and recovers the same intent
+identity and complete ordered subject without asking the caller to restate
+either shape.
 
 ## Configuration and profiles
 
@@ -280,12 +429,13 @@ keyring from an operational keyring failure. No file-backed secret fallback is
 created silently.
 
 One authenticated local consumption ledger and one immutable native-keyring
-consumption marker enforce single use. Apply acquires an exclusive lease,
-creates and verifies the digest-bound marker once, and records dispatch before
-the provider call. A dispatched plan is never reusable, including after an
-older authentic filesystem snapshot is replayed. An interrupted or ambiguous
-dispatch quarantines the plan and requires deterministic provider
-reconciliation or a new Preview.
+consumption marker enforce single use for the complete bundle. Apply acquires
+an exclusive lease, creates and verifies the digest-bound marker once, and
+records bundle dispatch before the first provider call. A dispatched plan is
+never reusable, including after an older authentic filesystem snapshot is
+replayed. Interruption or an ambiguous child dispatch quarantines the plan and
+requires deterministic reconciliation of that child and every already accepted
+child before a new Preview.
 The repository and marker adapter share one exact cqmgr lock instance. Marker
 operations expose only create and read, require the repository to own that lock,
 and are rejected through the ordinary rotatable-secret API.
@@ -296,23 +446,27 @@ ambiguous and quarantined rather than reconstructed as available.
 
 Storage ports express these behaviors directly:
 
-- `PlanRepository` stores canonical bytes by digest, verifies authentication,
-  leases, consumes, and quarantines plans;
-- `AuditJournal` appends and fsyncs pre-Apply intent, appends outcomes, queries
-  records, and verifies hash continuity;
+- `PlanRepository` stores canonical bundle bytes by digest, verifies
+  authentication, leases, consumes, and quarantines plans;
+- `AuditJournal` appends and fsyncs bundle and child pre-Apply intent, appends
+  ordered child and aggregate outcomes, queries records, and verifies hash
+  continuity;
 - `ConfigRepository` validates versioned snapshots and performs atomic updates;
   and
 - `SelectionStateRepository` independently persists selected profile and direct
   project selection.
 
-Every Preview, including a verified no-op, appends and fsyncs its audit record
-before returning success. Apply revalidates the plan, evidence, and identity;
-appends and fsyncs the bound pre-Apply intent; durably leases and marks the plan
-as dispatched; and only then calls the provider. A provider outcome is appended
-and fsynced before Apply reports success. Failure to persist a post-dispatch
-outcome produces a critical unknown result and leaves the plan quarantined for
-reconciliation. Every terminal post-dispatch Apply result is appended and
-fsynced before it is returned, not only successful results.
+Every Preview, including an all-no-op bundle, appends and fsyncs its audit
+record before returning success. Apply revalidates the complete plan, evidence,
+child order, and identity; appends and fsyncs the bound bundle pre-Apply intent;
+durably leases and marks the plan as dispatched; and only then calls the first
+child provider operation. Each child disposition is appended and fsynced before
+the next child is attempted. The aggregate provider outcome is appended and
+fsynced before Apply reports success or failure. Failure to persist a
+post-dispatch child or aggregate outcome produces a critical unknown result and
+leaves the plan quarantined for reconciliation. Every terminal post-dispatch
+Apply result is appended and fsynced before it is returned, not only successful
+results.
 
 Provider adapters normalize responses immediately. Local persistence retains
 only the safe fields required for operation results, plans, completeness,
@@ -349,9 +503,12 @@ never use blind generic retries. Deterministic preference identity, etag, and
 read-after-unknown reconciliation own ambiguous outcomes.
 
 Adapters consume provider pages internally and return domain observations with
-page coverage and explicit failures. A pager never crosses a port. A failed page
-or location produces an incomplete observation rather than an empty or complete
-collection.
+page, source, and location coverage plus explicit failures. A pager never
+crosses a port. The federated inventory module preserves each provider's
+coverage independently. A failed page or location produces an incomplete
+observation rather than an empty or complete collection, while a location-local
+resolver may still succeed when all evidence required for that location is
+complete.
 
 ## Accessibility boundary
 

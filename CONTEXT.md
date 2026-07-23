@@ -1,6 +1,9 @@
 # Cloud Quota Manager
 
-Cloud Quota Manager presents effective quota state and manages quota requests, targets, and grants. Its first complete product workflows cover Compute accelerator quotas for NVIDIA GPUs and TPUs while its core domain remains applicable to other quota families.
+Cloud Quota Manager presents effective quota state and manages quota requests,
+targets, and grants. Its first complete product workflows cover specialized
+accelerator hardware declared by the supported Compute and Cloud TPU provider
+inventory while its core domain remains applicable to other quota families.
 
 ## Language
 
@@ -28,16 +31,43 @@ _Avoid_: Default project, ADC quota project
 The absolute desired limit requested for one exact effective quota slice.
 _Avoid_: Quota increment, quota request amount, quota preference
 
+**Quota target strategy**:
+The explicit rule that derives one absolute quota target for each selected
+constraint. `minimum` requests fresh usage plus the normalized workload
+requirement for each deficient slice, `preserve-headroom` requests the current
+effective value plus the workload requirement, and `manual` uses an
+operator-supplied absolute value for each child. `minimum` never decreases quota
+or silently supersedes an existing provider intent. An equal or higher desired
+value is preserved; a lower conflicting intent requires an explicit manual
+target or a new Preview after settlement. `manual` retains every sufficiency
+and dangerous-decrease gate.
+_Avoid_: Quota increment, hidden default, automatic optimization
+
 **Quota request**:
-The operator and provider lifecycle that asks Google to reconcile one exact slice toward a quota target and reports the resulting grant.
-_Avoid_: Quota preference, change request
+The operator and provider lifecycle for one child that asks Google to reconcile
+one exact slice toward its quota target and reports the resulting grant.
+_Avoid_: Quota preference, request bundle, change request
+
+**Quota request bundle**:
+One reviewed operator intent containing one or more independently mutable exact
+quota slices and their absolute targets. A bundle is applied in deterministic
+accelerator-first order and is deliberately non-atomic.
+_Avoid_: Transaction, batch quota, combined quota
+
+**Bundle child disposition**:
+The durable Apply outcome for one ordered child: `accepted` when the provider
+accepted the bound intent, `failed` when the provider conclusively rejected or
+failed the dispatch, `unknown` when acceptance cannot be established safely, or
+`unattempted` when an earlier child failed or became unknown.
+_Avoid_: Rolled back, partially successful transaction
 
 **Quota preference**:
 The Google Cloud `QuotaPreference` resource that stores the provider identity, requested target, granted value, etag, and reconciliation evidence for a quota request. Use this term only for provider-resource detail and structured provenance.
 _Avoid_: Product-facing request, quota target
 
 **Quota request plan**:
-A time-bounded, single-use authorization to create or amend the provider resource for one exact quota target against freshly validated state.
+A time-bounded, single-use authorization to create or amend every ordered child
+provider resource in one quota request bundle against freshly validated state.
 _Avoid_: Confirmation token, quota request
 
 **Quota contact**:
@@ -65,7 +95,11 @@ A granted quota request backed by a fresh effective-quota observation equal to i
 _Avoid_: Accepted, request-settled, granted
 
 **Operation success boundary**:
-The lifecycle condition an operation promises to reach before reporting success. Preview may reach a verified no-op; Apply reaches its boundary only when the provider accepts the bound quota request. Only a watch that requests effective confirmation promises `effective-confirmed`.
+The lifecycle condition an operation promises to reach before reporting
+success. Preview may reach a verified no-op. Apply reaches its boundary only
+when every non-no-op child is accepted; a failed or unknown child preserves
+preceding accepted children and leaves later children unattempted. Only a watch
+that requests effective confirmation promises `effective-confirmed`.
 _Avoid_: Quota update succeeded, command completed
 
 **Operation result**:
@@ -73,11 +107,20 @@ A versioned, surface-neutral record that identifies an operation, resource scope
 _Avoid_: Raw provider response, rendered command output
 
 **Watch event**:
-A versioned, ordered record emitted when a material reconciliation or effective-quota observation changes. Polling ticks and unchanged refreshes are not watch events; a terminal event carries the final operation result.
+A versioned, ordered record emitted when a material reconciliation,
+effective-quota, or aggregate bundle observation changes. Polling ticks and
+unchanged refreshes are not watch events; a terminal event carries the final
+operation result.
 _Avoid_: Poll result, repeated snapshot
 
 **Watch condition**:
-The explicitly selected lifecycle observation a watch promises to reach. A granted condition requires the grant to equal the quota target. A fulfilled condition additionally requires fresh effective quota to equal both. Either condition fails when a settled grant differs from the target, including zero when the target is greater than zero, and times out at its caller-controlled deadline when the required evidence remains inconclusive.
+The explicitly selected lifecycle observation a watch promises to reach. For one
+request, a granted condition requires the grant to equal the quota target and a
+fulfilled condition additionally requires fresh effective quota to equal both.
+For a bundle, the condition is reached only when every accepted child reaches
+it. A child fails the condition when its settled grant differs from its target,
+including zero when the target is greater than zero. Watch times out at its
+caller-controlled deadline when required evidence remains inconclusive.
 _Avoid_: Polling duration, success
 
 **Incomplete observation**:
@@ -137,13 +180,27 @@ One effective quota identified by its resource scope, service, quota ID, exact d
 _Avoid_: Quota row, accelerator quota
 
 **Accelerator catalog**:
-A view that relates effective quota slices to accelerator, machine, topology, provisioning, unit, location, lifecycle, and restriction metadata.
+A release-relative view of every specialized accelerator hardware identity
+declared by the supported provider inventory at the catalog's review point. It
+relates effective quota slices to accelerator, machine, topology, provisioning,
+unit, location, lifecycle, and restriction metadata without turning the catalog
+into a static allowlist.
 _Avoid_: Static hardware list, quota allowlist
 
 **Accelerator constraint set**:
-The related effective quota slices that can independently limit one accelerator workload, such as regional and all-regions GPU limits.
-One exact slice can participate in multiple location-anchored sets; a shared global companion does not combine alternative regions.
+The related effective quota slices that can independently limit one accelerator
+workload at one compatible location, such as regional and all-regions GPU
+limits. One exact slice can participate in multiple location-anchored sets; a
+shared global companion does not combine alternative locations.
 _Avoid_: Synthesized quota, combined quota
+
+**Provider inventory set**:
+The versioned V1 read boundary that federates the supported
+`compute.googleapis.com` and `tpu.googleapis.com` sources. Service and catalog
+group filters select the required provider subset and displayed rows; a bare
+query selects both providers and every result states its queried-source
+coverage.
+_Avoid_: Enabled-service discovery, capacity inventory, source selector
 
 **Quota pool**:
 A quota limit for one consumption category, such as standard, preemptible, committed, or virtual-workstation use.
@@ -156,6 +213,20 @@ _Avoid_: Quota pool, quota category
 **Compatibility**:
 Provider-visible evidence that an accelerator, machine shape, topology, provisioning model, and location can be used together. Compatibility does not imply capacity.
 _Avoid_: Availability, capacity
+
+**Compute instance requirement**:
+A workload-first Compute shape consisting of machine type, instance count,
+provisioning model, and explicit candidate locations or all compatible
+locations. Applicable accelerator attachment and quota-pool facts are derived
+from provider and catalog evidence.
+_Avoid_: GPU quota row, capacity request
+
+**Cloud TPU slice requirement**:
+A workload-first Cloud TPU shape consisting of accelerator type, topology,
+runtime version, slice count, provisioning model, and explicit candidate
+locations or all compatible locations. Applicable quota-pool facts are derived
+from provider and catalog evidence.
+_Avoid_: TPU capacity request, inferred topology
 
 **Discovered**:
 Present in authoritative provider data, whether or not the manager recognizes its product semantics.
@@ -174,5 +245,7 @@ The Google Cloud service that owns a quota resource.
 _Avoid_: Workload service
 
 **Workload consumer**:
-A service or workload that consumes quota owned by another service, such as GKE consuming Compute Engine accelerator quota.
+A service or workload that consumes quota owned by another service, such as GKE
+consuming Compute Engine accelerator quota. It is stated only when it materially
+changes resolution or operator understanding.
 _Avoid_: Service owner

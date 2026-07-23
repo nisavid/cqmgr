@@ -104,9 +104,11 @@ are installed and tested outside the checkout. The cqmgr wheel is pure Python;
 that does not imply its dependency closure is platform independent.
 
 An artifact-content audit requires the declared package, license, README,
-schemas, and runtime resources and rejects credentials, local configuration,
-caches, development-only assets needed accidentally at runtime, private test
-data, absolute machine paths, or undeclared executables.
+schemas, accelerator-catalog overlay, release evidence manifest, and runtime
+resources. It rejects credentials, local configuration, caches,
+development-only assets needed accidentally at runtime, private test data,
+absolute machine paths, undeclared executables, or a static hardware allowlist
+that could silently replace provider-declared inventory.
 
 ## Verification layers
 
@@ -133,24 +135,67 @@ upgrades are deliberate compatibility changes.
 Pure tests cover:
 
 - resource-scope and profile precedence;
+- explicit offline identity deferral without ADC or provider canonicalization;
 - exact effective-quota-slice identity and dimension normalization;
+- the V1 Compute and Cloud TPU provider inventory set, bare federation, and
+  service or catalog-group filtering that prunes both reads and rows;
+- `compute` and `tpu` input shorthand canonicalized to
+  `compute.googleapis.com` and `tpu.googleapis.com` in every durable shape;
+- queried-provider coverage and completeness, including intentionally unqueried
+  providers, failed pages, Compute warnings, and Cloud TPU location failures;
 - independent discovered, cataloged, guided, and mutable predicates and their
   filter combinations;
+- release-relative catalog manifests, overlay and normalized-evidence digests,
+  page and location exhaustion, lifecycle, unknown provider-declared hardware,
+  and fail-closed exhaustive claims;
+- discriminated Compute-instance and Cloud-TPU-slice requirements, exact
+  normalization, and independent compatible, incompatible, ambiguous,
+  and incomplete per-location results;
+- derived supported-workload-consumer metadata, with no V1 consumer input and
+  no divergence between current Compute and GKE quota constraints;
+- `minimum`, `preserve-headroom`, and `manual` target strategies, native-unit
+  isolation, sufficiency and decrease gates, and verified all-no-op results;
 - units, integer quantities, unknown provider values, and schema enums;
 - status axes, headlines, completeness, operation boundaries, and exit classes;
 - cursor binding and pagination completeness;
 - deterministic obtainability-candidate identity and lexicographic ranking,
   including exact ties and unranked non-attributable evidence;
-- plan canonicalization, digest stability, authentication, expiry, tamper
-  rejection, and single-use state;
+- single and bundle plan canonicalization, discriminators, deterministic
+  accelerator-first child order, digest stability, authentication, expiry,
+  tamper rejection, and single-use state;
+- non-atomic child dispositions `accepted`, `failed`, `unknown`, and
+  `unattempted`, with verified no-op kept outside dispatch disposition;
+- aggregate Watch conditions, ordered child summaries, shared intent identity,
+  and complete resume-token subject binding;
 - redaction and the exclusion of credentials, quota contacts, raw provider
   bodies, and machine paths; and
 - supported version acceptance and fail-closed newer-version rejection.
 
-Hypothesis state machines exercise plan availability, lease, dispatch,
-consumption and quarantine; audit append, rotation, tampering and crash
-recovery; Watch progression, resume, interruption and timeout; configuration
-precedence; partial provider pages; and concurrent budget acquisition.
+Hypothesis state machines exercise plan availability, lease, complete-bundle
+preflight, ordered child dispatch, accepted/failed/unknown/unattempted
+transitions, single consumption, unknown-dispatch quarantine and
+read-after-unknown reconciliation; audit append, rotation, tampering and crash
+recovery; aggregate Watch progression, per-child lineage, shared-intent resume,
+interruption and timeout; configuration precedence; partial provider pages and
+locations; and concurrent budget acquisition.
+
+### Hermetic catalog and integration validation
+
+The catalog and integration contract suite is a required hermetic gate. It
+makes no provider call, requires no cloud identity, and uses only secret-free
+fixtures derived from public schemas and documented examples. The fixture
+corpus contains independently pageable Compute accelerator-type and
+machine-type reads plus Cloud TPU location, accelerator-type, and
+runtime-version reads, including unknown hardware, lifecycle transitions,
+partial success, duplicate and reordered pages, and location-local failure.
+
+A deterministic generator normalizes those fixtures into the release evidence
+manifest and catalog digest. Tests shuffle page and location order, vary
+pagination boundaries, and prove identical complete inputs produce identical
+canonical evidence while every omitted, failed, unreachable, or unexhausted
+required source changes coverage and blocks an exhaustive claim. The checked-in
+snapshot contains no live project identifier or response body and is reviewed
+as release-relative evidence, never as physical-capacity evidence.
 
 ### Application operation contracts
 
@@ -158,6 +203,16 @@ Scripted in-memory ports, virtual clocks, deterministic jitter, and controlled
 cancellation cover every operation and exit class. Required mutation-safety
 scenarios include:
 
+- offline scope, profile, config, help, and audit operations never import or
+  initialize ADC, provider clients, mutation ports, or keyring-backed plan
+  capability;
+- bare inventory browsing reads both V1 providers, while service and
+  catalog-group filters prune actual reads and returned rows and report
+  completeness only for the queried provider set;
+- workload resolution returns one typed result per candidate location without
+  combining alternative locations or collapsing companion constraints;
+- target composition proves each strategy formula, native-unit boundary,
+  verified no-op, and deterministic accelerator-first child order;
 - a verified no-op Preview returns no plan;
 - canonical, digest-valid expired, foreign, consumed, or unacknowledged plans
   remain safely reviewable with no Apply capability;
@@ -165,11 +220,19 @@ scenarios include:
   writes;
 - acknowledgement, resource scope, principal, contact binding, etag, expiry,
   and installation-trust failures stop before dispatch;
-- a dispatched Apply has one durable pre-intent, at most one provider call, and
-  one durable terminal outcome or critical unknown record;
-- ambiguous dispatch consumes and quarantines the plan before reconciliation;
-  and
-- Watch emits only material changes and exactly one terminal operation result.
+- Apply freshly revalidates the complete bundle before the first write and then
+  performs at most one provider write per child in the bound order;
+- a conclusively failed child stops dispatch, retains prior accepted children,
+  marks later children unattempted, and performs no rollback;
+- an ambiguous dispatch is `unknown`, consumes and quarantines the plan, stops
+  later dispatch, and requires read-after-unknown reconciliation at the
+  deterministic preference identity;
+- every dispatched child has one durable pre-intent and one durable terminal
+  outcome or critical unknown record; and
+- Watch selects both single and bundle Apply records through the shared
+  `intent_id`, emits only material child or aggregate changes, reaches a bundle
+  condition only when every accepted child does, and emits exactly one terminal
+  operation result.
 
 ### Provider adapter contracts
 
@@ -178,11 +241,21 @@ derived only from public schemas and documented examples. No response body from
 a private or test project is committed, even after attempted redaction.
 
 Fixtures cover Resource Manager, Cloud Quotas `QuotaInfo` and
-`QuotaPreference`, Monitoring usage, Compute machine types and Spot advice,
-and TPU locations, accelerators, and runtime versions. They exercise
-pagination, partial locations, unknown fields and enums, resource names,
-64-bit values, etags, throttling, retry classification, transport failures,
-schema skew, and normalized diagnostic evidence.
+`QuotaPreference` for both `compute.googleapis.com` and `tpu.googleapis.com`,
+Monitoring usage, Compute aggregated accelerator types and machine types,
+Compute Spot advice, and Cloud TPU locations, accelerator types, and runtime
+versions. They exercise pagination, Compute partial success, scope warnings and
+unreachable scopes, Cloud TPU per-location success and failure, unknown
+hardware, lifecycle and replacement fields, unknown schema fields and enums,
+resource names, 64-bit values, etags, throttling, retry classification,
+transport failures, schema skew, and normalized diagnostic evidence.
+
+Adapter orchestration tests prove that a bare inventory query calls both
+providers, a service or catalog-group filter calls only providers capable of
+satisfying it, and returned coverage names exactly those queried providers.
+They also prove that successful results cannot manufacture coverage for an
+intentionally skipped provider and that every durable service identity uses
+the canonical full DNS name.
 
 Local HTTP or gRPC stubs may verify transport mechanics. They are not provider
 emulators and cannot establish Google semantics. Generated-client DTOs,
@@ -193,12 +266,15 @@ credentials, pagers, exceptions, and retry objects never cross adapter ports.
 Real temporary filesystems and subprocesses verify:
 
 - atomic configuration and mutable-selection updates;
-- plan permissions, authentication, foreign-plan review, cross-key Apply
-  rejection, leases, single-use across processes, crash windows, and stale-lock
-  recovery;
-- audit pre-intent and terminal-result fsync ordering, concurrent writers,
-  rotation checkpoints, truncation, deletion, reordering, tampering, and exact
-  first-failure reporting;
+- canonical single and bundle plan bytes, ordered children, permissions,
+  authentication, foreign-plan review, cross-key Apply rejection, leases,
+  single-use across processes, crash windows, and stale-lock recovery;
+- bundle pre-intent and per-child terminal fsync ordering, accepted, failed,
+  unknown, and unattempted retention, unknown-dispatch quarantine, concurrent
+  writers, rotation checkpoints, truncation, deletion, reordering, tampering,
+  and exact first-failure reporting;
+- append-only audit correspondence for bundle order, every child disposition,
+  deterministic preference identity, and aggregate result;
 - shared interprocess request budgets, cancellation, coalescing, conservative
   token accounting, and poll deadlines; and
 - fake keyring behavior plus real supported-backend smoke tests.
@@ -213,6 +289,14 @@ Click runner and installed-package subprocess tests cover canonical commands
 and aliases, TTY dispatch, stdout and stderr separation, JSON and NDJSON schema
 validity, exit classes, no-color output, secret redaction, and offline commands
 that must not initialize ADC, providers, or the keyring.
+
+Interface tests cover bare two-provider browsing; service and catalog-group
+read pruning; accepted `compute` and `tpu` shorthand; canonical full-domain
+service identities in JSON, cursors, audit, plans, and Copy CLI; typed workload
+shapes and independent per-location results; all target strategies; single and
+bundle plan discriminators; ordered Apply dispositions; and shared
+`--intent-id` Watch selection with subject-kind discrimination. Unknown plan,
+Watch-subject, and child schema kinds fail closed.
 
 Textual Pilot is authoritative for keyboard navigation, focus and return
 preservation, locked resource scope, worker cancellation and failure, semantic
@@ -230,8 +314,10 @@ under the same installation trust boundary.
 The initial gate is:
 
 - 100 percent branch coverage for plan validation and consumption, audit-chain
-  integrity, redaction, status and exit classification, and provider-mutation
-  gates; and
+  integrity, redaction, status and exit classification, provider-mutation
+  gates, complete-bundle preflight, child dispatch ordering and dispositions,
+  unknown-dispatch quarantine, aggregate Watch conditions, and resume lineage;
+  and
 - 90 percent branch coverage across the project.
 
 Nightly and release workflows run targeted mutation tests against the critical
@@ -265,7 +351,7 @@ the dependable screen-reader and automation surface.
 | --- | --- |
 | Every pull request | Locked sync and build; Ruff; Pyrefly; all Python 3.12–3.14 core contracts on Linux; representative smoke on every stable supported OS; CLI, Pilot, persistence, package, vulnerability, and license checks appropriate to the diff. No cloud identity is available to forked or otherwise untrusted pull requests. |
 | Scheduled | Full stable OS/architecture and Python matrix; compatibility canaries; real keyring backends; high-iteration property, mutation, crash, subprocess, and concurrency tests; fresh dependency resolution; bounded live-read-only provider canaries. |
-| Release commit | Every supported platform at its oldest and latest stable image; every Python minor; real supported keyrings; source distribution and wheel installation; exact dependency and artifact policy; all deep tests; live-read-only canaries; provenance and publication preflight. |
+| Release commit | Every supported platform at its oldest and latest stable image; every Python minor; real supported keyrings; source distribution and wheel installation; exact dependency and artifact policy; all deep tests; hermetic release-relative exhaustive catalog evidence; live-read-only canaries; provenance and publication preflight. |
 | Post-publication | Exact-version PyPI uv-tool installation and offline smoke on the supported matrix; published hashes, attestations, GitHub Release assets, tag, version, and commit agreement. |
 
 Dependency compatibility gates three resolutions:
@@ -290,10 +376,11 @@ authorized by this contract.
 The ordinary canary may perform only bounded:
 
 - Resource Manager project lookup;
-- `QuotaInfo` get and list;
+- `QuotaInfo` get and list for the explicit
+  `compute.googleapis.com` and `tpu.googleapis.com` services;
 - `QuotaPreference` get and list;
 - Monitoring time-series list;
-- Compute machine-type list; and
+- Compute aggregated accelerator-type and machine-type lists; and
 - TPU location, accelerator-type, and runtime-version lists.
 
 A separate canary may call the documented read-only Spot capacity advice
@@ -315,9 +402,15 @@ never enables an API, changes quota, creates capacity, or relies on ambient
 `gcloud` state.
 
 Scheduled canaries and the exact release commit's canaries are release gates.
-Live evidence retains only normalized source, coverage, shape, timing, and
-pass/fail facts; no raw body, credential, principal email, quota contact, or
-private identifier is retained.
+The release canary exhausts every page and every discovered supported Cloud TPU
+location required by its declared two-provider evidence set; any warning,
+unreachable scope, failed subsource, or unexhausted page is explicit coverage
+and prevents an exhaustive live claim. Live evidence retains only normalized
+source, coverage, lifecycle, shape, timing, method/path identity, safe digests,
+and pass/fail facts; no raw body, credential, principal email, quota contact,
+or private identifier is retained. Even complete canary evidence describes
+catalog visibility for the named project and observation time, never physical
+capacity or universal regional availability.
 
 Direct-user ADC receives hermetic `authorized_user` discovery, refresh,
 identity-scope, quota-project, failure, and redaction contracts on every
@@ -395,6 +488,9 @@ approved. Before the first release, the implementation plan must also:
 - configure the protected GitHub publication environment;
 - arrange the dedicated live-read-only project, custom role, and short-lived
   identity without granting quota mutation or provisioning authority;
+- generate and review the hermetic release-relative exhaustive provider
+  inventory manifest, overlay digest, normalized evidence digest, and every
+  declared coverage limitation;
 - qualify every supported native keyring and decide whether the KWallet canary
   may be promoted;
 - keep Windows arm64 a canary until upstream wheels and the full matrix pass;

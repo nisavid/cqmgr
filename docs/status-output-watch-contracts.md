@@ -19,26 +19,32 @@ fulfilled.
 
 | Domain operation | Success boundary | Required result facts |
 | --- | --- | --- |
-| Establish resource scope | The canonical project is resolved from explicit input, an explicitly named profile, a direct local selection, or the explicitly selected local profile. V1 rejects folder and organization operations without inferring a project. | Resource-scope type and canonical resource name; acting principal and impersonation chain; resolution source. |
-| Browse quota | The requested logical page or bounded query is read with complete required provider evidence. | Canonical resource scope; query and page identity; exact slices; constraint-set relationships; source observation times; continuation identity when present. |
+| Establish resource scope | The canonical project selection is resolved offline from explicit input, an explicitly named profile, a direct local selection, or the explicitly selected local profile. V1 rejects folder and organization operations without inferring a project. | Resource-scope type and selected resource name; resolution source; explicit `identity_evidence: deferred-offline`. Provider canonicalization, acting principal, and impersonation chain are deliberately not loaded. |
+| Browse quota | The requested logical page or bounded query is read completely from its explicit queried-provider set. A bare query federates Compute and Cloud TPU; service or catalog-group filters prune provider reads and displayed rows. | Canonical resource scope; canonicalized query and page identity; exact slices; constraint-set relationships; independent queried-provider source/location coverage; intentionally unqueried providers; release-relative catalog digests and observation times; continuation identity when present. |
 | Inspect slice | One complete exact effective quota slice and its required related evidence are read. | Provider identity; dimensions and quota scope; effective value; usage; provider quota preference; eligibility; related constraints; independent source times and completeness. |
-| Resolve requirement | The supplied workload requirement resolves without guessing to a supported constraint set. | Normalized requirement; owning service and management plane; exact slices; compatibility and ambiguity evidence. |
+| Resolve requirement | The supplied Compute instance or Cloud TPU slice requirement resolves without guessing for every requested candidate location. | Discriminated normalized requirement; per-location compatibility disposition, native-unit requirement, owning service and management plane, exact constraint set, coverage, and ambiguity or rejection evidence. |
 | Assess Spot advice | The exact supported VM request is assessed for the requested evidence. | Full machine configuration, quantity, distribution, locations, provider coverage, Preview status, observation or interval times, and every available advice datum. |
-| Compose request | One absolute quota target is validated against one exact mutable slice and current evidence. | Exact slice; quota target and unit; prior desired, granted, effective, and usage values; direction; required warnings and acknowledgements. |
-| Preview plan | A locally portable, integrity-protected quota request plan is produced, or an identical quota target against a settled request is freshly verified as a no-op. V1 Apply capability is bound to the issuing installation. | Bound resource scope, slice, evidence, identity, intent, principal, warnings, and acknowledgements; plan expiry, digest, issuing-installation trust, and Apply capability when a plan is produced, otherwise the no-op reason. |
+| Compose request | One direct exact-slice target or one selected compatible workload location is converted into absolute targets for every selected independently mutable child. | Request form; resource scope; exact-slice `manual` target or normalized workload, location, and selected strategy; complete ordered child set; exact slices, absolute targets, and units; prior desired, granted, effective, and fresh usage values; no-op children; directions; required warnings and acknowledgements. |
+| Preview plan | A locally portable, integrity-protected single or bundle quota request plan is produced, or every child is freshly verified as a no-op. V1 Apply capability is bound to the issuing installation. | Plan subject kind; bound resource scope; exact-slice `manual` input for `single`, or selected location, strategy, normalized workload, and complete constraint set for `bundle`; ordered non-no-op children; per-child evidence, identity, intent, principal, warnings, and acknowledgements; plan expiry, digest, issuing-installation trust, and Apply capability when a plan is produced, otherwise every no-op reason. |
 | Review plan | Canonical plan bytes and their digest are verified and all trustworthy bound evidence is presented without applying it. Expiry, foreign issuer, prior consumption, or unresolved acknowledgements remove Apply capability but do not make safe inspection fail. | Every bound plan fact, canonical and digest verification state, expiry, issuer and consumption state, unresolved acknowledgements, Apply capability, and exact incapability reasons. |
-| Apply plan | The provider quota preference is proven accepted under the bound intent. A verified no-op has no Apply capability. | Plan digest; resource scope and slice; quota target; provider preference identity, etag, and trace when present; submitted observation; audit reference. |
-| Watch request | The explicitly selected Watch condition is reached. | Quota request and provider preference identity; selected condition; orthogonal status; target, granted, and effective values; all material observations and final outcome. |
+| Apply plan | Every non-no-op child in the bound deterministic accelerator-first order is proven accepted. Apply is non-atomic; the first conclusively failed or transport-unknown child stops dispatch and accepted children are never rolled back. A verified all-no-op Preview has no Apply capability. | Plan digest and subject kind; resource scope; bound child order; every child's exact slice, target, unit, disposition, provider preference identity, etag and trace when present, submitted observation, and audit reference; aggregate boundary and outcome. |
+| Watch request | The explicitly selected Watch condition is reached for one accepted request or for every accepted child of a bundle. | Single or bundle subject identity; selected condition; durable Apply record; ordered children and dispositions; per-accepted-child preference identity, orthogonal status, target, granted, effective, and lineage values; aggregate state; all material observations and final outcome. |
 | Inspect audit | The requested bounded audit query is read completely. | Query and record identities; canonical resource scopes; observation times; continuity metadata. |
 | Verify audit | The requested records and rotation checkpoints form a valid chain. | Verified range and checkpoints, or the exact first continuity failure and affected range. |
 
-Apply therefore succeeds at `submitted`. A verified no-op is a successful
-Preview result with no Apply capability. Apply does not wait for preference
-settlement or effective quota. A timeout or transport failure after the
-provider call is reconciled through the deterministic preference identity.
-Only a result proven to contain the bound accepted intent reaches the Apply
-boundary; unchanged, conflicting, and unknown results require a new preview
-and do not report success.
+Apply therefore succeeds at `submitted` only when every non-no-op child is
+accepted. A verified all-no-op bundle is a successful Preview result with no
+Apply capability. Apply does not wait for preference settlement or effective
+quota. A timeout or transport failure after a child provider call is reconciled
+through that child's deterministic preference identity before any later child
+can be attempted. Only a result proven to contain the bound accepted child
+intent receives disposition `accepted`. A conclusive rejection or failure is
+`failed`; a dispatched child whose acceptance remains unproven is `unknown`.
+Either stops dispatch, preceding accepted children remain accepted, later
+children are `unattempted`, and the aggregate Apply boundary is not reached.
+An unknown child is consumed and quarantined until read-after-unknown
+reconciliation proves its outcome. A verified preflight no-op is a composition
+fact, not a dispatch disposition.
 
 An intentionally bounded page with a continuation identity is complete for
 that page. A failed required page, source, or refresh is an incomplete
@@ -51,6 +57,71 @@ result sets `apply_capability` to `false` with exact reasons. Invalid canonical
 encoding or a digest mismatch prevents trusted review and returns a
 non-success result. Apply against a plan that is no longer applicable returns
 the appropriate stale, conflicting, authorization, or precondition class.
+
+## Requirement, target, and bundle results
+
+A requirement result is a discriminated Compute instance or Cloud TPU slice
+shape. Compute binds machine type, instance count, provisioning model, and
+explicit candidate locations or all compatible locations. Cloud TPU binds
+accelerator type, topology, runtime version, slice count, provisioning model,
+and explicit candidate locations or all compatible locations. Supported
+workload consumers are derived and reported as metadata; V1 has no consumer
+input because its current Compute and GKE consumers have identical quota
+constraints. The result contains an ordered per-location record rather than
+one synthesized global answer. Each record is `compatible`, `incompatible`,
+`ambiguous`, or `incomplete` and carries the exact native-unit requirement,
+constraint set, coverage, and reasons applicable to that location. A
+compatible selected location may be complete when unrelated locations are
+incomplete; an all-compatible-locations result cannot claim exhaustive
+coverage when any required provider location was not enumerated completely.
+
+Request composition records one explicit target strategy:
+
+- `minimum`, the default, sets each deficient child's target to fresh usage
+  plus the normalized workload requirement. A child that already permits the
+  workload is a no-op; the strategy never silently decreases it or supersedes
+  an existing provider intent.
+- `preserve-headroom` sets each selected child's target to current effective
+  quota plus the normalized workload requirement.
+- `manual` requires one explicit absolute target for each selected child and
+  applies the ordinary sufficiency, decrease, unlimited-transition, warning,
+  and acknowledgement gates.
+
+Targets retain each child's native unit. No strategy adds or compares values
+across different units. A bundle result retains its selected location,
+normalized workload, strategy, complete constraint set, no-op children, and
+the deterministic accelerator-first order of non-no-op children.
+
+Plan schema `cqmgr.quota-request-plan/v1` has required top-level
+`kind: "single"|"bundle"` beside `schema`. `single` binds exactly one ordered
+child; `bundle` binds one or more ordered children. Exact-slice composition uses
+strategy `manual` and kind `single`; workload-derived composition uses kind
+`bundle` even when only one non-no-op child remains. Unknown kinds are rejected.
+Child records remain ordered and may gain additive fields within v1. Because
+v1 is being defined before the first release, these semantics supersede the
+earlier single-only planning text without creating v2; after release, an
+incompatible change requires a new plan-schema version.
+
+An Apply child disposition is exactly `accepted`, `failed`, `unknown`, or
+`unattempted`.
+These values describe durable non-atomic dispatch, not a transaction:
+
+- `accepted` proves that provider reconciliation found the bound child intent
+  at its deterministic preference identity;
+- `failed` identifies the first conclusively rejected or failed child and
+  includes its exact provider outcome;
+- `unknown` identifies the first dispatched child whose acceptance cannot be
+  proven after a transport or persistence ambiguity and requires
+  read-after-unknown reconciliation; and
+- `unattempted` identifies every later child that was not dispatched because
+  dispatch stopped.
+
+An aggregate result never relabels earlier accepted children as rolled back.
+It reaches the Apply boundary only when every non-no-op child is `accepted`.
+The exact failed or unknown child selects the aggregate nonzero exit class;
+accepted children and their reconciliation identities remain available for
+Watch and recovery. Verified no-op children remain in composition evidence but
+do not receive Apply dispositions.
 
 ## Quota request status
 
@@ -133,7 +204,11 @@ The envelope contract is:
   spelling or TUI location.
 - `resource_scope` is required for resource-scoped operations and uses the
   canonical provider resource name. It never comes from an unreported ambient
-  project.
+  project. Offline scope-selection results identify their locally validated
+  selected project and carry `data.identity_evidence:
+  "deferred-offline"`; they do not synthesize a principal or mark the result
+  incomplete. Provider-scoped operations replace that deferral with
+  Resource Manager canonicalization and explicit acting-principal evidence.
 - `boundary.condition` names the operation's promised condition;
   `boundary.reached` is authoritative for success.
 - `outcome.code` is a stable symbolic outcome. `outcome.exit_class` is the
@@ -145,9 +220,10 @@ The envelope contract is:
 - timestamps are UTC RFC 3339 values. Each independently sourced observation
   also carries its own observation or provider interval time; the envelope
   timestamp never substitutes for source freshness.
-- `data` contains the operation payload. Quota quantities and other provider
-  integers use base-10 strings with explicit units so JSON consumers do not
-  lose 64-bit precision.
+- `data` contains the operation payload. Single and bundle plan, Apply, and
+  Watch-related results retain their discriminators and ordered child records.
+  Quota quantities and other provider integers use base-10 strings with
+  explicit units so JSON consumers do not lose 64-bit precision.
 - `diagnostics` contains the ordered typed diagnostics for the operation.
 - `provenance` identifies authoritative sources, observation times, coverage,
   lifecycle or Preview status, and request identity where safe.
@@ -177,12 +253,20 @@ Presentation changes may not remove the facts needed to identify the resource sc
 interpret the operation boundary, or act safely. In particular:
 
 - every resource-scoped result identifies the canonical resource scope;
+- offline scope results state that acting-principal evidence was deferred,
+  while provider-scoped results show the resolved principal and impersonation
+  chain;
 - quota results preserve exact slice identity, dimensions, scope, native unit,
-  source times, and completeness;
+  source times, independent provider/location coverage, release-relative
+  catalog evidence, and completeness;
+- requirement results preserve every requested location and its compatibility,
+  native-unit requirement, exact constraints, coverage, and reasons;
 - quota request results preserve desired, granted, and effective values as separate
   facts and show all three status axes;
-- plan and Apply results preserve principal, plan digest, expiry, warnings,
-  acknowledgements, and provider identity without exposing the quota contact;
+- plan and Apply results preserve plan kind, target strategy, principal, plan
+  digest, expiry, warnings, acknowledgements, deterministic child order, child
+  dispositions, and every accepted provider identity without exposing the
+  quota contact;
 - Spot advice preserves its exact request configuration, coverage, Preview
   status, and observation or interval time; and
 - errors identify the operation, resource scope when known, stable symbolic code, safe
@@ -243,6 +327,23 @@ gate that requires the missing evidence. A fully unavailable operation returns
 the more specific authorization, precondition, timeout, conflict, or
 operational class when one is known instead of claiming partial data.
 
+Inventory results expose coverage for every queried provider independently,
+including every provider page, Compute scope warning or failure, Cloud TPU
+location and subsource result, catalog digest, and observation time. With no
+service or catalog-group filter, the queried-provider set contains both
+Compute and Cloud TPU. A filter prunes actual reads and rows and records the
+other provider as intentionally unqueried; it does not make that provider a
+coverage failure. Input service selectors `compute` and `tpu` normalize to
+`compute.googleapis.com` and `tpu.googleapis.com`, and only the full DNS names
+appear in query identity, output, persistence, audit, plans, or copied
+commands. An explicitly selected location may be complete when all evidence
+required for that location and its exact quota constraints is present even if
+unrelated locations failed. Conversely, an all-locations or release-relative
+exhaustive result is incomplete when any page, scope, location,
+accelerator-type list, machine-type list, or runtime-version list required for
+its declared queried-provider set was not exhausted. A successful location
+never implies global coverage.
+
 Expected provider coverage gaps are not incomplete observations. A supported
 Spot request whose live advice succeeds while historical GPU advice is
 documented as unsupported is complete when that unsupported coverage is
@@ -250,77 +351,117 @@ represented explicitly.
 
 ## Watch conditions
 
-A Watch always selects one condition and one deadline explicitly. An
-interactive surface may offer deadline presets, but it selects neither input
+A Watch always selects one condition and one deadline explicitly. Its subject
+is either one accepted request or one bundle with at least one accepted child.
+An interactive surface may offer deadline presets, but it selects neither input
 silently.
 
-| Condition | Reached when | Settled grant differs from target |
-| --- | --- | --- |
-| `granted` | Reconciliation is `settled` and granted equals the quota target. | Exit `7` when the settled grant differs from the target, including zero when the target is greater than zero. |
-| `fulfilled` | `granted` is reached and a fresh effective observation equals the target and granted values. | Exit `7` when the settled grant differs from the target, including zero when the target is greater than zero. |
+The initial Watch selects its durable Apply record through the shared
+`--intent-id INTENT_ID` input for both single and bundle subjects. There is no
+separate plan-ID or bundle-ID selector. `subject.kind` and the durable record
+identified by the intent ID determine whether the subject is `single` or
+`bundle`; resume uses the authenticated token instead of accepting a second
+subject selector.
 
-Provider `failed` or `superseded` state terminates any condition it makes
-impossible with exit `7`. A transient or recoverable unknown observation stays
-visible and polling continues within the deadline. An irrecoverable local or
-provider observation failure exits under its applicable class.
+| Condition | One accepted child reaches it when | Bundle reaches it when | Conclusive mismatch |
+| --- | --- | --- | --- |
+| `granted` | Reconciliation is `settled` and granted equals the child's target. | Every accepted child reaches `granted`. | Exit `7` when any accepted child's settled grant differs from its target, including zero when the target is greater than zero. |
+| `fulfilled` | `granted` is reached and a fresh effective observation equals the child's target and granted values. | Every accepted child reaches `fulfilled`. | Exit `7` when any accepted child's settled grant differs from its target, including zero when the target is greater than zero. |
+
+Provider `failed` or `superseded` state for any accepted child terminates an
+aggregate condition it makes impossible with exit `7`. A transient or
+recoverable unknown child observation stays visible and polling continues
+within the deadline. An irrecoverable local or provider observation failure
+exits under its applicable class. Apply children with disposition `failed` or
+`unknown` or `unattempted` remain visible in the subject and aggregate summaries
+but are not polled as accepted requests. An `unknown` Apply child must first
+complete read-after-unknown reconciliation; it is never treated as an accepted
+Watch child merely because the target matches. A bundle with no accepted child
+is not watchable.
 
 ## Watch stream
 
 Structured Watch output is newline-delimited, versioned JSON. It emits one
-self-contained record for the initial authoritative observation, each material
-status or evidence change, and the terminal result. Unchanged polling ticks do
-not produce public events.
+self-contained record for the initial authoritative subject observation, each
+material child or aggregate change, and the terminal result. Unchanged polling
+ticks do not produce public events.
 
-Every record carries the same complete request identity. `request.resource_scope`
-contains the canonical project name. `request.provider_preference` contains the
-canonical preference resource name, service, quota ID, and complete dimension
-map. `request.target` and `request.unit` preserve the watched intent even when a
-preference is later amended or superseded. `request.intent_id` is the applied
-plan digest and must resolve to a durable local cqmgr Apply record for the same
-preference, target, and unit. V1 does not adopt an unrelated provider preference
-as a watchable intent. A producer may not emit an empty or provider-defined
-identity object in place of these fields.
+`cqmgr.watch-event/v1` has required `subject.kind` of `single` or `bundle`.
+Unknown kinds are rejected. `subject` binds the canonical resource scope,
+selected condition, shared `intent_id`, and a nonempty ordered `children`
+list. A `single` subject has exactly one child. A `bundle` subject retains
+every ordered Apply child and disposition and has one or more accepted
+children. Each child has a stable `child_id`, bound order, exact effective
+quota-slice identity, target, unit, disposition, and deterministic provider
+preference identity. Child records may gain additive fields within v1, but
+their order and identities are semantic. Because v1 is being defined before
+the first release, these semantics supersede the earlier single-request-only
+event shape without creating v2; after release, an incompatible subject or
+child change requires a new Watch schema version.
+
+The intent ID must resolve to one durable local cqmgr Apply record with the
+same subject kind, resource scope, order, child dispositions, preference
+identities, targets, and units. V1 does not adopt an unrelated provider
+preference or reconstruct a bundle from provider state. A producer may not emit
+an empty or provider-defined identity in place of the complete subject.
+
+A material child event names `child_id` and carries that child's complete
+orthogonal status. An aggregate event and every terminal result retain ordered
+child summaries and the aggregate condition state. Different native-unit
+values are never added into an aggregate amount.
 
 Every event also emits `resume`, an opaque `cqmgr.watch-resume/v1` token
-authenticated by the issuing installation. It binds the intent ID, selected
-condition, complete request identity, last observed provider etag and trace ID
-when present, and checkpoint sequence. It contains no credential or quota
-contact. Before an initial event, Watch verifies the current preference target
-and trace ID against the Apply record. When no stable trace ID exists, the current
-etag must equal the Apply response etag; otherwise lineage is unknown and Watch
-returns rejected-precondition rather than treating a same-target amendment as
-the original intent. Resume applies the same checks to its authenticated token
-and durable checkpoint, rejects any later local Apply for the same preference as
-superseded, and treats a changed provider trace ID as superseded. When no stable
-trace ID exists, an etag change across the observation gap is unknown lineage and
-rejects resume rather than guessing whether reconciliation or a same-target
-amendment occurred. Each material event carries a new token for its durable
-checkpoint.
+authenticated by the issuing installation. It binds the complete subject,
+selected condition, ordered accepted-child identities, each child's last
+observed provider etag and stable trace ID when present, the durable aggregate
+checkpoint, and the stream sequence. It contains no credential or quota
+contact. Before an initial event, Watch verifies every accepted child's current
+preference target and trace ID against its Apply record. When no stable trace
+ID exists, the current etag must equal that child's Apply response etag;
+otherwise lineage is unknown and Watch returns rejected-precondition rather
+than treating a same-target amendment as the original intent.
+
+Resume applies the same checks to the authenticated token and durable
+checkpoint. It rejects a subject when any child identity or disposition differs
+from the Apply record, any later local Apply superseded an accepted preference,
+or any provider trace ID changed. When a child has no stable trace ID, an etag
+change across the observation gap is unknown lineage and rejects the complete
+resume rather than guessing whether reconciliation or a same-target amendment
+occurred. Each material event carries a new token for its durable checkpoint.
 
 ```json
 {
   "schema": "cqmgr.watch-event/v1",
   "stream_id": "opaque-run-identity",
   "sequence": 4,
-  "event": "status-changed",
+  "event": "child-status-changed",
   "resume": "cqmgr.watch-resume/v1:opaque-authenticated-token",
   "observed_at": "2026-07-21T02:07:00Z",
-  "request": {
+  "subject": {
+    "kind": "bundle",
     "resource_scope": "projects/123456789",
     "condition": "fulfilled",
     "intent_id": "sha256:opaque-applied-plan-digest",
-    "target": "8",
-    "unit": "1",
-    "provider_preference": {
-      "name": "projects/123456789/locations/global/quotaPreferences/gpu-region",
-      "service": "compute.googleapis.com",
-      "quota_id": "GPUS-PER-GPU-FAMILY-per-project-region",
-      "dimensions": {
-        "gpu_family": "NVIDIA_H100",
-        "region": "us-central1"
+    "children": [
+      {
+        "child_id": "accelerator-region",
+        "order": 0,
+        "disposition": "accepted",
+        "target": "8",
+        "unit": "1",
+        "provider_preference": {
+          "name": "projects/123456789/locations/global/quotaPreferences/gpu-region",
+          "service": "compute.googleapis.com",
+          "quota_id": "GPUS-PER-GPU-FAMILY-per-project-region",
+          "dimensions": {
+            "gpu_family": "NVIDIA_H100",
+            "region": "us-central1"
+          }
+        }
       }
-    }
+    ]
   },
+  "child_id": "accelerator-region",
   "status": {
     "reconciliation": "reconciling",
     "grant_satisfaction": "unknown",
@@ -330,28 +471,42 @@ checkpoint.
     "effective": null,
     "unit": "1"
   },
+  "aggregate": {
+    "condition_reached": false,
+    "accepted_children": 1,
+    "children": [
+      {
+        "child_id": "accelerator-region",
+        "reconciliation": "reconciling",
+        "grant_satisfaction": "unknown",
+        "effective_confirmation": "unobserved"
+      }
+    ]
+  },
   "diagnostics": []
 }
 ```
 
 `sequence` increases within one stream. A resumed Watch creates a new stream,
-starts with the current authoritative observation, and retains the deterministic
-preference identity, intent ID, and selected condition from the verified resume
-token; it does not pretend that events missed while disconnected were observed.
+starts with the current authoritative observation of every accepted child, and
+retains the complete subject, intent ID, ordered children, and selected
+condition from the verified resume token. It does not pretend that events
+missed while disconnected were observed.
 
 The terminal event has `event: "terminal"` and carries the complete operation
 result. It is emitted when the selected condition is reached, a conclusive
-adverse state occurs, the deadline expires, or the stream is interrupted when
-there is enough process lifetime to serialize it.
+adverse child or aggregate state occurs, the deadline expires, or the stream is
+interrupted when there is enough process lifetime to serialize it.
 
 On timeout, the terminal result uses exit `8` and includes the selected
-condition, deadline, elapsed duration, last material observation, and
-latest resume token. Timeout describes the Watch operation, not the underlying
-quota request, and never relabels that request as failed.
+condition, deadline, elapsed duration, ordered child summaries, aggregate
+state, last material observation, and latest resume token. Timeout describes
+the Watch operation, not the underlying quota requests, and never relabels
+them as failed.
 
 On interruption, the manager emits a terminal interrupted event when possible,
-exits `130`, and leaves the provider preference unchanged. A later Watch can
-resume from the latest verified resume token.
+exits `130`, and leaves every provider preference unchanged. A later Watch can
+resume the complete subject from the latest verified resume token.
 
 ## Polling ownership
 
@@ -362,8 +517,9 @@ adaptive schedule that:
 - honors provider retry guidance and throttling;
 - applies bounded backoff and jitter to transient failures;
 - avoids synchronizing many watches against the same resource scope;
-- refreshes preference and effective quota independently at the freshness
-  required by the selected condition; and
+- refreshes every accepted child's preference and effective quota
+  independently at the freshness required by the selected condition, then
+  recomputes the aggregate condition; and
 - emits only material observations.
 
 The exact cadence, backoff constants, coalescing strategy, and client-library
@@ -372,12 +528,16 @@ the Watch contract or caller deadline.
 
 ## Audit correspondence
 
-Every preview and Apply result references its append-only audit record without
-exposing secret material. Watch observations that are retained in the audit log
-use the same operation, resource scope, preference identity, status axes, values,
-timestamps, outcome, and diagnostic codes as the public result.
+Every Preview and Apply result references its append-only audit record without
+exposing secret material. Bundle audit evidence preserves the intent ID,
+subject kind, bound order, every no-op or dispatch disposition, each
+deterministic preference identity, and the aggregate result. Watch observations
+that are retained in the audit log use the same operation, intent ID, resource
+scope, ordered child identities, status axes, values, timestamps, aggregate
+outcome, and diagnostic codes as the public result.
 
-Failure to persist and fsync the pre-Apply intent prevents the provider call and
-exits `9`. Failure to persist the result after a possible provider write emits
-a critical unknown outcome, exits `9`, and preserves the deterministic
-preference identity needed for reconciliation.
+Failure to persist and fsync the bundle pre-Apply intent prevents every
+provider call and exits `9`. Failure to persist a child result after a possible
+provider write emits a critical `unknown` outcome, stops later children, exits
+`9`, and preserves the deterministic preference identity needed for
+read-after-unknown reconciliation.
