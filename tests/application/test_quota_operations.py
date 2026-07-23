@@ -742,6 +742,10 @@ def test_resolve_gpu_retains_unrelated_catalog_failures() -> None:
         QuotaQuantity(8, UNIT),
         QuotaQuantity(8, UNIT),
     )
+    assert tuple(item.source_quantity for item in location.constraint_requirements) == (
+        8,
+        8,
+    )
     assert tuple(item.identity for item in location.assessments) == (
         global_.identity,
         regional.identity,
@@ -754,6 +758,36 @@ def test_resolve_gpu_retains_unrelated_catalog_failures() -> None:
     assert tpu_locations.calls == []
     assert tpu_accelerators.calls == []
     assert tpu_runtimes.calls == []
+
+
+def test_resolve_gpu_reports_oversized_native_quantity_without_raising() -> None:
+    """An oversized workload is a structured rejected precondition."""
+    regional, global_ = _gpu_quota_evidence()
+    operations = WorkloadResolutionOperations(
+        ScriptedReader((_complete(regional, global_),)),
+        ScriptedReader((_complete(_usage(regional, 0), _usage(global_, 0)),)),
+        ScriptedCatalogReader((_compute_accelerator_catalog_read(),)),
+        ScriptedCatalogReader((_gpu_catalog_read(),)),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+    requirement = replace(_gpu_requirement(), instance_count=2**63)
+
+    result = asyncio.run(
+        operations.resolve(QuotaResolveRequest(_context(), requirement))
+    )
+
+    assert result.outcome.exit_class is ExitClass.REJECTED_PRECONDITION
+    assert result.outcome.code == StableSymbol("unsupported-conversion")
+    assert result.completeness.is_complete
+    assert result.data is not None
+    location = result.data.locations[0]
+    assert location.failure_reason is not None
+    assert location.failure_reason.value == "unsupported-conversion"
+    assert location.constraint_requirements == ()
 
 
 @pytest.mark.parametrize(
@@ -850,6 +884,9 @@ def test_resolve_legacy_tpu_uses_only_selected_zone_tpu_catalogs() -> None:
     assert tuple(item.required for item in location.constraint_requirements) == (
         QuotaQuantity(8, QuotaUnit("core")),
     )
+    assert tuple(item.source_quantity for item in location.constraint_requirements) == (
+        8,
+    )
     assert compute.calls == []
     assert len(tpu_locations.calls) == 1
     assert len(tpu_accelerators.calls) == 1
@@ -943,6 +980,9 @@ def test_resolve_compute_tpu_uses_compute_catalog_and_owned_quota() -> None:
     assert location.owning_service == "compute.googleapis.com"
     assert tuple(item.required for item in location.constraint_requirements) == (
         QuotaQuantity(4, UNIT),
+    )
+    assert tuple(item.source_quantity for item in location.constraint_requirements) == (
+        4,
     )
     assert len(compute.calls) == 1
     assert tpu_locations.calls == []

@@ -127,6 +127,7 @@ def _compatible_location() -> ResolvedWorkloadLocation:
     )
     requirement = QuotaConstraintRequirement(
         identity,
+        8,
         QuotaQuantity(8, QuotaUnit("1")),
         conversion,
     )
@@ -563,6 +564,7 @@ def test_quota_constraints_reject_untyped_identity_and_conversion_evidence() -> 
     )
     requirement = QuotaConstraintRequirement(
         identity,
+        8,
         QuotaQuantity(8, QuotaUnit("1")),
         conversion,
     )
@@ -577,6 +579,8 @@ def test_quota_constraints_reject_untyped_identity_and_conversion_evidence() -> 
         replace(requirement, identity=cast("EffectiveQuotaSliceIdentity", "quota"))
     with pytest.raises(TypeError, match="must be QuotaQuantity"):
         replace(requirement, required=cast("QuotaQuantity", 8))
+    with pytest.raises(ValueError, match="positive integer"):
+        replace(requirement, source_quantity=0)
     with pytest.raises(TypeError, match="must be UnitConversionEvidence"):
         replace(
             requirement,
@@ -587,6 +591,8 @@ def test_quota_constraints_reject_untyped_identity_and_conversion_evidence() -> 
             requirement,
             required=QuotaQuantity(8, QuotaUnit("GiBy")),
         )
+    with pytest.raises(ValueError, match="source quantity times conversion"):
+        replace(requirement, required=QuotaQuantity(7, QuotaUnit("1")))
 
 
 def test_resolved_location_keeps_constraints_and_assessments_aligned() -> None:
@@ -609,6 +615,7 @@ def test_resolved_location_keeps_constraints_and_assessments_aligned() -> None:
         replace(location, constraint_requirements=())
     replacement = replace(
         location.constraint_requirements[0],
+        source_quantity=7,
         required=QuotaQuantity(7, QuotaUnit("1")),
     )
     with pytest.raises(ValueError, match="each exact constraint requirement"):

@@ -8,11 +8,13 @@ import pytest
 from cqmgr.domain.accelerator_overlay import (
     MAINTAINED_ACCELERATOR_OVERLAY,
     AmbiguousOverlayMatchError,
+    CompanionRequirementMapping,
     DimensionSelector,
     OverlayMapping,
     ProvisioningModel,
     QuotaSelector,
     SemanticAcceleratorOverlay,
+    WorkloadQuantityBasis,
 )
 from cqmgr.domain.catalog import (
     ACCELERATOR_CATALOG_SCHEMA,
@@ -60,7 +62,7 @@ def _mapping(accelerator: str) -> OverlayMapping:
         ),
         quota_pool="standard",
         conversion=UnitConversionEvidence("card", QuotaUnit("1"), 1, SOURCE),
-        companion_selectors=(),
+        companion_requirements=(),
         source_url=SOURCE,
         reviewed_on=REVIEW_DATE,
         provisioning_models=(ProvisioningModel.STANDARD,),
@@ -129,6 +131,69 @@ def test_overlay_identity_is_canonical_and_content_addressed() -> None:
     assert (
         compatibility_changed.metadata.content_digest != forward.metadata.content_digest
     )
+
+
+def test_companion_semantics_are_part_of_canonical_overlay_identity() -> None:
+    """A companion basis or conversion change produces a distinct overlay."""
+    mapping = next(
+        item
+        for item in MAINTAINED_ACCELERATOR_OVERLAY.mappings
+        if item.machine_types == ("a4-highgpu-8g",)
+    )
+    companion = mapping.companion_requirements[0]
+    basis_changed = replace(
+        companion,
+        quantity_basis=WorkloadQuantityBasis.INSTANCE_COUNT,
+        conversion=replace(companion.conversion, source_unit="instance"),
+    )
+    conversion_changed = replace(
+        companion,
+        conversion=replace(companion.conversion, quota_units_per_source=2),
+    )
+
+    original = SemanticAcceleratorOverlay((mapping,))
+    with_basis_change = SemanticAcceleratorOverlay(
+        (replace(mapping, companion_requirements=(basis_changed,)),)
+    )
+    with_conversion_change = SemanticAcceleratorOverlay(
+        (replace(mapping, companion_requirements=(conversion_changed,)),)
+    )
+
+    original_digest = original.metadata.content_digest
+    basis_digest = with_basis_change.metadata.content_digest
+    conversion_digest = with_conversion_change.metadata.content_digest
+    assert original_digest != basis_digest
+    assert original_digest != conversion_digest
+    assert basis_digest != conversion_digest
+
+
+def test_companion_requirements_reject_incompatible_semantics() -> None:
+    """Companion selectors, bases, and conversions fail closed as one contract."""
+    mapping = next(
+        item
+        for item in MAINTAINED_ACCELERATOR_OVERLAY.mappings
+        if item.machine_types == ("a4-highgpu-8g",)
+    )
+    companion = mapping.companion_requirements[0]
+
+    with pytest.raises(ValueError, match="selector native unit"):
+        CompanionRequirementMapping(
+            selector=replace(companion.selector, native_unit=QuotaUnit("core")),
+            quantity_basis=companion.quantity_basis,
+            conversion=companion.conversion,
+        )
+    with pytest.raises(ValueError, match="source unit must be instance"):
+        replace(
+            mapping,
+            companion_requirements=(
+                replace(
+                    companion,
+                    quantity_basis=WorkloadQuantityBasis.INSTANCE_COUNT,
+                ),
+            ),
+        )
+    with pytest.raises(ValueError, match="selectors must be unique"):
+        replace(mapping, companion_requirements=(companion, companion))
 
 
 def test_provisioning_models_are_distinct_from_quota_pools() -> None:

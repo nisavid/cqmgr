@@ -1,31 +1,42 @@
 """Workload-first specialized-hardware resolution contracts."""
 
+from datetime import date
+
 from cqmgr.domain.accelerator_overlay import (
     MAINTAINED_ACCELERATOR_OVERLAY,
     AllCompatibleLocations,
     CandidateLocations,
     CloudTpuSliceRequirement,
+    CompanionRequirementMapping,
     ComputeInstanceRequirement,
+    DimensionSelector,
+    OverlayMapping,
     ProvisioningModel,
+    QuotaSelector,
+    SemanticAcceleratorOverlay,
     SpecializedHardwareCatalog,
     SpecializedHardwareRecord,
     WorkloadCatalogEvidence,
     WorkloadLocationDisposition,
+    WorkloadQuantityBasis,
 )
 from cqmgr.domain.catalog import (
     AcceleratorAttachment,
     AcceleratorId,
     CatalogEvidenceSource,
+    CatalogGroupId,
     CatalogLifecycle,
     CatalogLocationCoverage,
     ComputeAcceleratorType,
     ComputeMachineType,
     LocationCoverageExpectation,
     LocationCoverageState,
+    ManagementPlane,
     TpuAcceleratorConfig,
     TpuAcceleratorType,
     TpuLocation,
     TpuRuntimeVersion,
+    UnitConversionEvidence,
     WorkloadConsumer,
 )
 from cqmgr.domain.diagnostics import (
@@ -190,6 +201,125 @@ def test_compute_instance_derives_attachment_consumers_and_each_candidate() -> N
     )
 
 
+def test_compute_instance_derives_an_independent_instance_count_companion() -> None:
+    """A companion uses its own workload basis and native-unit conversion."""
+    source = "https://docs.cloud.google.com/compute/resource-usage"
+    overlay = SemanticAcceleratorOverlay(
+        (
+            OverlayMapping(
+                group_id=CatalogGroupId.COMPUTE_ACCELERATORS,
+                accelerator_id=AcceleratorId("synthetic-gpu"),
+                management_plane=ManagementPlane.COMPUTE,
+                workload_consumers=(WorkloadConsumer.COMPUTE_ENGINE,),
+                selector=QuotaSelector(
+                    service="compute.googleapis.com",
+                    quota_id="SYNTHETIC-GPUS-per-project-region",
+                    quota_display_name=None,
+                    dimensions=(
+                        DimensionSelector("gpu_family", "SYNTHETIC"),
+                        DimensionSelector("region"),
+                    ),
+                    native_unit=QuotaUnit("1"),
+                    quota_scope=QuotaScope.REGIONAL,
+                    location_dimension="region",
+                ),
+                quota_pool="standard",
+                conversion=UnitConversionEvidence(
+                    "card",
+                    QuotaUnit("1"),
+                    1,
+                    source,
+                ),
+                companion_requirements=(
+                    CompanionRequirementMapping(
+                        selector=QuotaSelector(
+                            service="compute.googleapis.com",
+                            quota_id="SYNTHETIC-CPUS-per-project-region",
+                            quota_display_name=None,
+                            dimensions=(DimensionSelector("region"),),
+                            native_unit=QuotaUnit("1"),
+                            quota_scope=QuotaScope.REGIONAL,
+                            location_dimension="region",
+                        ),
+                        quantity_basis=WorkloadQuantityBasis.INSTANCE_COUNT,
+                        conversion=UnitConversionEvidence(
+                            "instance",
+                            QuotaUnit("1"),
+                            4,
+                            source,
+                        ),
+                    ),
+                ),
+                source_url=source,
+                reviewed_on=date(2026, 7, 23),
+                machine_types=("synthetic-gpu-2g",),
+                provider_accelerator_types=("synthetic-gpu",),
+            ),
+        )
+    )
+    requirement = ComputeInstanceRequirement(
+        machine_type="synthetic-gpu-2g",
+        instance_count=3,
+        provisioning_model=ProvisioningModel.STANDARD,
+        locations=CandidateLocations(("us-central1-a",)),
+    )
+    catalog = WorkloadCatalogEvidence(
+        compute_machine_types=(
+            ComputeMachineType(
+                "synthetic-gpu-2g",
+                "us-central1-a",
+                (AcceleratorAttachment("synthetic-gpu", 2),),
+                None,
+            ),
+        ),
+        tpu_locations=(),
+        tpu_accelerator_types=(),
+        tpu_runtime_versions=(),
+        coverage=(
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+                "us-central1-a",
+                LocationCoverageExpectation.REQUESTED,
+                LocationCoverageState.SUCCESS,
+            ),
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+                "us-central1-a",
+                LocationCoverageExpectation.REQUESTED,
+                LocationCoverageState.SUCCESS,
+            ),
+        ),
+        compute_accelerator_types=(
+            ComputeAcceleratorType("synthetic-gpu", "us-central1-a", None),
+        ),
+    )
+    quotas = (
+        _quota(
+            "SYNTHETIC-GPUS-per-project-region",
+            dimensions=(("gpu_family", "SYNTHETIC"), ("region", "us-central1")),
+            scope=QuotaScope.REGIONAL,
+        ),
+        _quota(
+            "SYNTHETIC-CPUS-per-project-region",
+            dimensions=(("region", "us-central1"),),
+            scope=QuotaScope.REGIONAL,
+        ),
+    )
+
+    result = overlay.resolve(requirement, quotas, catalog)
+
+    by_quota_id = {
+        item.identity.quota_id: item
+        for item in result.locations[0].constraint_requirements
+    }
+    primary = by_quota_id["SYNTHETIC-GPUS-per-project-region"]
+    companion = by_quota_id["SYNTHETIC-CPUS-per-project-region"]
+    assert (primary.source_quantity, primary.required.value) == (6, 6)
+    assert primary.conversion.source_unit == "card"
+    assert (companion.source_quantity, companion.required.value) == (3, 12)
+    assert companion.conversion.source_unit == "instance"
+
+
 def test_compute_instance_fails_closed_without_declared_accelerator() -> None:
     """A machine attachment alone does not invent provider catalog guidance."""
     requirement = ComputeInstanceRequirement(
@@ -233,6 +363,62 @@ def test_compute_instance_fails_closed_without_declared_accelerator() -> None:
     failure_reason = result.locations[0].failure_reason
     assert failure_reason is not None
     assert failure_reason.value == "unsupported-compatibility"
+
+
+def test_compute_instance_fails_closed_when_native_quantity_overflows() -> None:
+    """Oversized workload counts become a structured conversion failure."""
+    requirement = ComputeInstanceRequirement(
+        machine_type="a4-highgpu-8g",
+        instance_count=2**63,
+        provisioning_model=ProvisioningModel.STANDARD,
+        locations=CandidateLocations(("us-central1-a",)),
+    )
+    catalog = WorkloadCatalogEvidence(
+        compute_machine_types=(
+            ComputeMachineType(
+                "a4-highgpu-8g",
+                "us-central1-a",
+                (AcceleratorAttachment("nvidia-b200", 8),),
+                None,
+            ),
+        ),
+        tpu_locations=(),
+        tpu_accelerator_types=(),
+        tpu_runtime_versions=(),
+        coverage=(
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+                "us-central1-a",
+                LocationCoverageExpectation.REQUESTED,
+                LocationCoverageState.SUCCESS,
+            ),
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+                "us-central1-a",
+                LocationCoverageExpectation.REQUESTED,
+                LocationCoverageState.SUCCESS,
+            ),
+        ),
+        compute_accelerator_types=(
+            ComputeAcceleratorType("nvidia-b200", "us-central1-a", None),
+        ),
+    )
+    quotas = (
+        _quota(
+            "GPUS-PER-GPU-FAMILY-per-project-region",
+            dimensions=(("gpu_family", "NVIDIA_B200"), ("region", "us-central1")),
+            scope=QuotaScope.REGIONAL,
+        ),
+        _quota("GPUS-ALL-REGIONS-per-project", dimensions=(), scope=QuotaScope.GLOBAL),
+    )
+
+    result = MAINTAINED_ACCELERATOR_OVERLAY.resolve(requirement, quotas, catalog)
+
+    location = result.locations[0]
+    assert location.disposition is WorkloadLocationDisposition.INCOMPATIBLE
+    assert location.failure_reason is not None
+    assert location.failure_reason.value == "unsupported-conversion"
+    assert location.constraint_requirements == ()
 
 
 def test_cloud_tpu_slice_derives_native_quantity_from_catalog_shape() -> None:
@@ -513,6 +699,73 @@ def test_all_compatible_keeps_incomplete_locations_without_ranking() -> None:
         WorkloadLocationDisposition.COMPATIBLE,
         WorkloadLocationDisposition.INCOMPLETE,
     )
+    assert result.all_compatible_locations_exhaustive is False
+
+
+def test_compute_all_compatible_honors_global_accelerator_scan_failure() -> None:
+    """A failed global accelerator scan prevents an exhaustive location claim."""
+    gap = Diagnostic(
+        DiagnosticCode("accelerator-catalog-unscanned"),
+        Severity.ERROR,
+        DiagnosticPhase("provider-read"),
+        DiagnosticSource("compute"),
+        RetryDisposition.AFTER_REFRESH,
+        RedactedText("The accelerator catalog could not be scanned completely."),
+    )
+    requirement = ComputeInstanceRequirement(
+        machine_type="a4-highgpu-8g",
+        instance_count=1,
+        provisioning_model=ProvisioningModel.STANDARD,
+        locations=AllCompatibleLocations(),
+    )
+    catalog = WorkloadCatalogEvidence(
+        compute_machine_types=(
+            ComputeMachineType(
+                "a4-highgpu-8g",
+                "us-central1-a",
+                (AcceleratorAttachment("nvidia-b200", 8),),
+                None,
+            ),
+        ),
+        tpu_locations=(),
+        tpu_accelerator_types=(),
+        tpu_runtime_versions=(),
+        coverage=(
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+                "us-central1-a",
+                LocationCoverageExpectation.EXPECTED,
+                LocationCoverageState.SUCCESS,
+            ),
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+                "us-central1-a",
+                LocationCoverageExpectation.EXPECTED,
+                LocationCoverageState.SUCCESS,
+            ),
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+                "global",
+                LocationCoverageExpectation.EXPECTED,
+                LocationCoverageState.NOT_SCANNED,
+                (gap,),
+            ),
+        ),
+        compute_accelerator_types=(
+            ComputeAcceleratorType("nvidia-b200", "us-central1-a", None),
+        ),
+    )
+    quotas = (
+        _quota(
+            "GPUS-PER-GPU-FAMILY-per-project-region",
+            dimensions=(("gpu_family", "NVIDIA_B200"), ("region", "us-central1")),
+            scope=QuotaScope.REGIONAL,
+        ),
+        _quota("GPUS-ALL-REGIONS-per-project", dimensions=(), scope=QuotaScope.GLOBAL),
+    )
+
+    result = MAINTAINED_ACCELERATOR_OVERLAY.resolve(requirement, quotas, catalog)
+
     assert result.all_compatible_locations_exhaustive is False
 
 

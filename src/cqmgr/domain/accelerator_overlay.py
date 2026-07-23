@@ -58,6 +58,14 @@ class ProvisioningModel(StrEnum):
     RESERVATION_BOUND = "reservation-bound"
 
 
+class WorkloadQuantityBasis(StrEnum):
+    """Workload quantity independently converted for one quota constraint."""
+
+    ACCELERATOR_QUANTITY = "accelerator-quantity"
+    INSTANCE_COUNT = "instance-count"
+    SLICE_COUNT = "slice-count"
+
+
 class WorkloadKind(StrEnum):
     """Stable public discriminator for a workload-first input shape."""
 
@@ -277,6 +285,30 @@ class QuotaSelector:
 
 
 @dataclass(frozen=True, slots=True)
+class CompanionRequirementMapping:
+    """One companion selector with its own workload basis and conversion."""
+
+    selector: QuotaSelector
+    quantity_basis: WorkloadQuantityBasis
+    conversion: UnitConversionEvidence
+
+    def __post_init__(self) -> None:
+        """Require typed, native-unit-compatible companion evidence."""
+        if not isinstance(self.selector, QuotaSelector):
+            msg = "companion requirement selector must be a QuotaSelector"
+            raise TypeError(msg)
+        if not isinstance(self.quantity_basis, WorkloadQuantityBasis):
+            msg = "companion quantity_basis must be a WorkloadQuantityBasis"
+            raise TypeError(msg)
+        if not isinstance(self.conversion, UnitConversionEvidence):
+            msg = "companion conversion must be UnitConversionEvidence"
+            raise TypeError(msg)
+        if self.conversion.quota_unit != self.selector.native_unit:
+            msg = "companion conversion must use the selector native unit"
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True, slots=True)
 class WorkloadCatalogEvidence:
     """Provider-neutral live catalog and per-location coverage for resolution."""
 
@@ -450,14 +482,16 @@ class QuotaConstraintRequirement:
     """One exact limiting slice and its independently converted native demand."""
 
     identity: EffectiveQuotaSliceIdentity
+    source_quantity: int
     required: QuotaQuantity
     conversion: UnitConversionEvidence
 
     def __post_init__(self) -> None:
-        """Require the conversion and resulting quantity to share one unit."""
+        """Require demand to equal the declared source quantity and conversion."""
         if not isinstance(self.identity, EffectiveQuotaSliceIdentity):
             msg = "constraint requirement needs an exact slice identity"
             raise TypeError(msg)
+        _require_positive_count(self.source_quantity, "constraint source_quantity")
         if not isinstance(self.required, QuotaQuantity):
             msg = "constraint required amount must be QuotaQuantity"
             raise TypeError(msg)
@@ -466,6 +500,12 @@ class QuotaConstraintRequirement:
             raise TypeError(msg)
         if self.required.unit != self.conversion.quota_unit:
             msg = "constraint requirement and conversion must use one native unit"
+            raise ValueError(msg)
+        if (
+            self.required.value
+            != self.source_quantity * self.conversion.quota_units_per_source
+        ):
+            msg = "constraint requirement must equal source quantity times conversion"
             raise ValueError(msg)
 
 
@@ -628,7 +668,7 @@ class OverlayMapping:
     selector: QuotaSelector
     quota_pool: str
     conversion: UnitConversionEvidence | None
-    companion_selectors: tuple[QuotaSelector, ...]
+    companion_requirements: tuple[CompanionRequirementMapping, ...]
     source_url: str
     reviewed_on: date
     machine_types: tuple[str, ...] = ()
@@ -696,12 +736,52 @@ def _validate_mapping_conversion(mapping: OverlayMapping) -> None:
     ):
         msg = "mapping conversion must use the selector native unit"
         raise ValueError(msg)
-    if not isinstance(mapping.companion_selectors, tuple) or any(
-        not isinstance(selector, QuotaSelector)
-        for selector in mapping.companion_selectors
+    if not isinstance(mapping.companion_requirements, tuple) or any(
+        not isinstance(companion, CompanionRequirementMapping)
+        for companion in mapping.companion_requirements
     ):
-        msg = "companion_selectors must be QuotaSelector values"
+        msg = "companion_requirements must be CompanionRequirementMapping values"
         raise TypeError(msg)
+    companion_selector_bytes = tuple(
+        _selector_bytes(companion.selector)
+        for companion in mapping.companion_requirements
+    )
+    if len(set(companion_selector_bytes)) != len(companion_selector_bytes):
+        msg = "companion requirement selectors must be unique"
+        raise ValueError(msg)
+    if _selector_bytes(mapping.selector) in companion_selector_bytes:
+        msg = "companion requirement selector must differ from the primary selector"
+        raise ValueError(msg)
+    for companion in mapping.companion_requirements:
+        _validate_companion_quantity_basis(mapping, companion)
+
+
+def _validate_companion_quantity_basis(
+    mapping: OverlayMapping,
+    companion: CompanionRequirementMapping,
+) -> None:
+    basis = companion.quantity_basis
+    source_unit = companion.conversion.source_unit
+    if basis is WorkloadQuantityBasis.INSTANCE_COUNT:
+        if mapping.management_plane is not ManagementPlane.COMPUTE:
+            msg = "instance-count companions require the Compute management plane"
+            raise ValueError(msg)
+        if source_unit != "instance":
+            msg = "instance-count companion conversion source unit must be instance"
+            raise ValueError(msg)
+    elif basis is WorkloadQuantityBasis.SLICE_COUNT:
+        if mapping.management_plane is not ManagementPlane.TPU:
+            msg = "slice-count companions require the TPU management plane"
+            raise ValueError(msg)
+        if source_unit != "slice":
+            msg = "slice-count companion conversion source unit must be slice"
+            raise ValueError(msg)
+    elif mapping.conversion is None:
+        msg = "accelerator-quantity companions require a primary conversion"
+        raise ValueError(msg)
+    elif source_unit != mapping.conversion.source_unit:
+        msg = "accelerator-quantity companion must use the primary source unit"
+        raise ValueError(msg)
 
 
 def _validate_mapping_compatibility(mapping: OverlayMapping) -> None:
@@ -800,7 +880,8 @@ class SemanticAcceleratorOverlay:
             candidate
             for candidate in self.mappings
             if any(
-                selector.matches(evidence) for selector in candidate.companion_selectors
+                companion.selector.matches(evidence)
+                for companion in candidate.companion_requirements
             )
         )
         cataloged = mapping is not None or bool(companion_matches)
@@ -854,7 +935,8 @@ class SemanticAcceleratorOverlay:
         mapping = mappings[0]
         anchor_location = _selector_location(mapping.selector, anchor)
         identities = {anchor.identity}
-        for selector in mapping.companion_selectors:
+        for companion in mapping.companion_requirements:
+            selector = companion.selector
             companion_matches = tuple(
                 evidence
                 for evidence in evidences
@@ -1080,8 +1162,9 @@ class SemanticAcceleratorOverlay:
             constraint_requirements = _constraint_requirements(
                 constraint_set,
                 quota_evidences,
+                requirement,
+                mapping,
                 deployable_quantity,
-                mapping.conversion,
             )
         except WorkloadResolutionError as error:
             return _unresolved_location(location, coverage, error.reason)
@@ -1166,29 +1249,7 @@ def _all_compatible_coverage_complete(
     catalog: WorkloadCatalogEvidence,
 ) -> bool:
     if isinstance(requirement, ComputeInstanceRequirement):
-        machine_records = tuple(
-            item
-            for item in catalog.coverage
-            if item.source is CatalogEvidenceSource.COMPUTE_MACHINE_TYPES
-        )
-        if not machine_records or any(not item.complete for item in machine_records):
-            return False
-        locations = {
-            item.location for item in machine_records if item.location != "global"
-        }
-        return all(
-            len(
-                records := tuple(
-                    item
-                    for item in catalog.coverage
-                    if item.source is CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES
-                    and item.location == location
-                )
-            )
-            == 1
-            and records[0].complete
-            for location in locations
-        )
+        return _compute_all_compatible_coverage_complete(catalog)
 
     location_records = tuple(
         item
@@ -1218,6 +1279,38 @@ def _all_compatible_coverage_complete(
             if len(records) != 1 or not records[0].complete:
                 return False
     return True
+
+
+def _compute_all_compatible_coverage_complete(
+    catalog: WorkloadCatalogEvidence,
+) -> bool:
+    machine_records = tuple(
+        item
+        for item in catalog.coverage
+        if item.source is CatalogEvidenceSource.COMPUTE_MACHINE_TYPES
+    )
+    accelerator_records = tuple(
+        item
+        for item in catalog.coverage
+        if item.source is CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES
+    )
+    if (
+        not machine_records
+        or not accelerator_records
+        or any(not item.complete for item in (*machine_records, *accelerator_records))
+    ):
+        return False
+    locations = {item.location for item in machine_records if item.location != "global"}
+    return all(
+        len(
+            records := tuple(
+                item for item in accelerator_records if item.location == location
+            )
+        )
+        == 1
+        and records[0].complete
+        for location in locations
+    )
 
 
 def _location_coverage(
@@ -1412,8 +1505,9 @@ def _unresolved_location(
 def _constraint_requirements(
     constraint_set: AcceleratorConstraintSet,
     evidences: tuple[EffectiveQuotaEvidence, ...],
+    requirement: ModernWorkloadRequirement,
+    mapping: OverlayMapping,
     deployable_quantity: int,
-    conversion: UnitConversionEvidence,
 ) -> tuple[QuotaConstraintRequirement, ...]:
     """Convert every exact constraint independently or stop at a unit boundary."""
     result: list[QuotaConstraintRequirement] = []
@@ -1433,23 +1527,94 @@ def _constraint_requirements(
                 ResolutionFailureReason.PROVIDER_IDENTITY,
                 "One exact quota constraint lacks provider evidence.",
             )
-        unit = matches[0].effective_value.unit
+        evidence = matches[0]
+        rules: list[tuple[WorkloadQuantityBasis, UnitConversionEvidence]] = []
+        if mapping.selector.matches(evidence):
+            if mapping.conversion is None:
+                raise WorkloadResolutionError(
+                    ResolutionFailureReason.UNSUPPORTED_CONVERSION,
+                    "The primary constraint lacks native-unit conversion evidence.",
+                )
+            rules.append(
+                (
+                    WorkloadQuantityBasis.ACCELERATOR_QUANTITY,
+                    mapping.conversion,
+                )
+            )
+        rules.extend(
+            (companion.quantity_basis, companion.conversion)
+            for companion in mapping.companion_requirements
+            if companion.selector.matches(evidence)
+        )
+        if len(rules) > 1:
+            raise WorkloadResolutionError(
+                ResolutionFailureReason.AMBIGUOUS,
+                "One exact quota constraint matches multiple quantity mappings.",
+            )
+        if not rules:
+            raise WorkloadResolutionError(
+                ResolutionFailureReason.UNSUPPORTED_CONVERSION,
+                "One exact quota constraint lacks a quantity mapping.",
+            )
+        quantity_basis, conversion = rules[0]
+        unit = evidence.effective_value.unit
         if unit != conversion.quota_unit:
             raise WorkloadResolutionError(
                 ResolutionFailureReason.UNSUPPORTED_CONVERSION,
-                "A companion constraint requires independent native-unit evidence.",
+                (
+                    "A quota constraint does not match its native-unit "
+                    "conversion evidence."
+                ),
             )
+        source_quantity = _workload_source_quantity(
+            requirement,
+            quantity_basis,
+            deployable_quantity,
+        )
+        try:
+            required = QuotaQuantity(
+                source_quantity * conversion.quota_units_per_source,
+                unit,
+            )
+        except ValueError as error:
+            raise WorkloadResolutionError(
+                ResolutionFailureReason.UNSUPPORTED_CONVERSION,
+                (
+                    "The converted workload requirement exceeds the supported "
+                    "native quota range."
+                ),
+            ) from error
         result.append(
             QuotaConstraintRequirement(
                 reference.slice_identity,
-                QuotaQuantity(
-                    deployable_quantity * conversion.quota_units_per_source,
-                    unit,
-                ),
+                source_quantity,
+                required,
                 conversion,
             )
         )
     return tuple(result)
+
+
+def _workload_source_quantity(
+    requirement: ModernWorkloadRequirement,
+    basis: WorkloadQuantityBasis,
+    deployable_quantity: int,
+) -> int:
+    """Select the declared workload quantity for one independent conversion."""
+    if basis is WorkloadQuantityBasis.ACCELERATOR_QUANTITY:
+        return deployable_quantity
+    if basis is WorkloadQuantityBasis.INSTANCE_COUNT and isinstance(
+        requirement, ComputeInstanceRequirement
+    ):
+        return requirement.instance_count
+    if basis is WorkloadQuantityBasis.SLICE_COUNT and isinstance(
+        requirement, CloudTpuSliceRequirement
+    ):
+        return requirement.slice_count
+    raise WorkloadResolutionError(
+        ResolutionFailureReason.UNSUPPORTED_CONVERSION,
+        "A quota constraint quantity basis is incompatible with the workload kind.",
+    )
 
 
 def _unsupported_compatibility() -> None:
@@ -1513,22 +1678,7 @@ def _canonical_mapping_bytes(mapping: OverlayMapping) -> bytes:
     conversion = (
         _encode_field("conversion", b"none")
         if mapping.conversion is None
-        else _encode_field(
-            "conversion",
-            b"".join(
-                (
-                    _encode_text("source-unit", mapping.conversion.source_unit),
-                    _encode_text("quota-unit", mapping.conversion.quota_unit.symbol),
-                    _encode_text(
-                        "quota-units-per-source",
-                        str(mapping.conversion.quota_units_per_source),
-                    ),
-                    _encode_text(
-                        "source-reference", mapping.conversion.source_reference
-                    ),
-                )
-            ),
-        )
+        else _encode_field("conversion", _conversion_bytes(mapping.conversion))
     )
     return b"".join(
         (
@@ -1548,8 +1698,8 @@ def _canonical_mapping_bytes(mapping: OverlayMapping) -> bytes:
             _encode_sequence(
                 "companions",
                 tuple(
-                    _selector_bytes(selector)
-                    for selector in mapping.companion_selectors
+                    _companion_requirement_bytes(companion)
+                    for companion in mapping.companion_requirements
                 ),
             ),
             _encode_text("source-url", mapping.source_url),
@@ -1568,6 +1718,32 @@ def _canonical_mapping_bytes(mapping: OverlayMapping) -> bytes:
                 "provisioning-models",
                 tuple(model.value for model in mapping.provisioning_models),
             ),
+        )
+    )
+
+
+def _companion_requirement_bytes(
+    companion: CompanionRequirementMapping,
+) -> bytes:
+    return b"".join(
+        (
+            _encode_field("selector", _selector_bytes(companion.selector)),
+            _encode_text("quantity-basis", companion.quantity_basis.value),
+            _encode_field("conversion", _conversion_bytes(companion.conversion)),
+        )
+    )
+
+
+def _conversion_bytes(conversion: UnitConversionEvidence) -> bytes:
+    return b"".join(
+        (
+            _encode_text("source-unit", conversion.source_unit),
+            _encode_text("quota-unit", conversion.quota_unit.symbol),
+            _encode_text(
+                "quota-units-per-source",
+                str(conversion.quota_units_per_source),
+            ),
+            _encode_text("source-reference", conversion.source_reference),
         )
     )
 
@@ -1732,15 +1908,24 @@ _B200_A4_REGIONAL = OverlayMapping(
         quota_units_per_source=1,
         source_reference=_COMPUTE_QUOTA_SOURCE,
     ),
-    companion_selectors=(
-        QuotaSelector(
-            service="compute.googleapis.com",
-            quota_id="GPUS-ALL-REGIONS-per-project",
-            quota_display_name=None,
-            dimensions=(),
-            native_unit=QuotaUnit("1"),
-            quota_scope=QuotaScope.GLOBAL,
-            location_dimension=None,
+    companion_requirements=(
+        CompanionRequirementMapping(
+            selector=QuotaSelector(
+                service="compute.googleapis.com",
+                quota_id="GPUS-ALL-REGIONS-per-project",
+                quota_display_name=None,
+                dimensions=(),
+                native_unit=QuotaUnit("1"),
+                quota_scope=QuotaScope.GLOBAL,
+                location_dimension=None,
+            ),
+            quantity_basis=WorkloadQuantityBasis.ACCELERATOR_QUANTITY,
+            conversion=UnitConversionEvidence(
+                source_unit="card",
+                quota_unit=QuotaUnit("1"),
+                quota_units_per_source=1,
+                source_reference=_COMPUTE_QUOTA_SOURCE,
+            ),
         ),
     ),
     source_url=_COMPUTE_QUOTA_SOURCE,
@@ -1774,15 +1959,24 @@ _H100_REGIONAL = OverlayMapping(
         quota_units_per_source=1,
         source_reference=_COMPUTE_QUOTA_SOURCE,
     ),
-    companion_selectors=(
-        QuotaSelector(
-            service="compute.googleapis.com",
-            quota_id="GPUS-ALL-REGIONS-per-project",
-            quota_display_name=None,
-            dimensions=(),
-            native_unit=QuotaUnit("1"),
-            quota_scope=QuotaScope.GLOBAL,
-            location_dimension=None,
+    companion_requirements=(
+        CompanionRequirementMapping(
+            selector=QuotaSelector(
+                service="compute.googleapis.com",
+                quota_id="GPUS-ALL-REGIONS-per-project",
+                quota_display_name=None,
+                dimensions=(),
+                native_unit=QuotaUnit("1"),
+                quota_scope=QuotaScope.GLOBAL,
+                location_dimension=None,
+            ),
+            quantity_basis=WorkloadQuantityBasis.ACCELERATOR_QUANTITY,
+            conversion=UnitConversionEvidence(
+                source_unit="card",
+                quota_unit=QuotaUnit("1"),
+                quota_units_per_source=1,
+                source_reference=_COMPUTE_QUOTA_SOURCE,
+            ),
         ),
     ),
     source_url=_COMPUTE_QUOTA_SOURCE,
@@ -1816,7 +2010,7 @@ _COMPUTE_TPU_V6E_STANDARD = OverlayMapping(
         quota_units_per_source=1,
         source_reference=_COMPUTE_QUOTA_SOURCE,
     ),
-    companion_selectors=(),
+    companion_requirements=(),
     source_url=_COMPUTE_QUOTA_SOURCE,
     reviewed_on=_REVIEW_DATE,
     machine_types=("ct6e-standard-4t",),
@@ -1846,7 +2040,7 @@ _LEGACY_TPU_V6E_STANDARD = OverlayMapping(
         quota_units_per_source=1,
         source_reference=_TPU_QUOTA_SOURCE,
     ),
-    companion_selectors=(),
+    companion_requirements=(),
     source_url=_TPU_QUOTA_SOURCE,
     reviewed_on=_REVIEW_DATE,
     provider_accelerator_types=("v6e-8",),
