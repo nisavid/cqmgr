@@ -723,6 +723,8 @@ class CloudQuotaManagerApp(App[None]):
     def _set_active_workspace(self, workspace: str) -> None:
         if workspace not in {"quotas", "obtainability", "audit"}:
             return
+        if workspace == "audit":
+            self._claim_provider_view()
         self.active_workspace = workspace
         for name in ("quotas", "obtainability", "audit"):
             widget_id = "quota-workbench" if name == "quotas" else f"{name}-workspace"
