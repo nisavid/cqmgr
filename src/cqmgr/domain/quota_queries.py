@@ -273,21 +273,33 @@ class QuotaQueryFilters:
         ):
             msg = "accelerator filters must be AcceleratorId values"
             raise TypeError(msg)
+        object.__setattr__(
+            self,
+            "accelerators",
+            tuple(sorted(set(self.accelerators), key=lambda value: value.value)),
+        )
         if not isinstance(self.locations, tuple) or any(
             not _is_canonical_location(location) for location in self.locations
         ):
             msg = "location filters must be canonical location values"
             raise ValueError(msg)
+        object.__setattr__(self, "locations", tuple(sorted(set(self.locations))))
         if not isinstance(self.quota_scopes, tuple) or any(
             not isinstance(scope, QuotaScope) for scope in self.quota_scopes
         ):
             msg = "quota scope filters must be QuotaScope values"
             raise TypeError(msg)
+        object.__setattr__(
+            self,
+            "quota_scopes",
+            tuple(sorted(set(self.quota_scopes), key=lambda value: value.value)),
+        )
         if not isinstance(self.quota_pools, tuple) or any(
             not _is_stable_id(pool) for pool in self.quota_pools
         ):
             msg = "quota pool filters must be lowercase identifiers"
             raise ValueError(msg)
+        object.__setattr__(self, "quota_pools", tuple(sorted(set(self.quota_pools))))
         for name, value in (
             ("cataloged", self.cataloged),
             ("guided", self.guided),
@@ -307,6 +319,17 @@ class QuotaQueryFilters:
                 ),
             )
         )
+        for field_name in (
+            "reconciliations",
+            "grant_satisfactions",
+            "effective_confirmations",
+        ):
+            values = getattr(self, field_name)
+            object.__setattr__(
+                self,
+                field_name,
+                tuple(sorted(set(values), key=lambda value: value.value)),
+            )
         if self.text is not None and (
             not isinstance(self.text, str) or not normalize("NFC", self.text)
         ):

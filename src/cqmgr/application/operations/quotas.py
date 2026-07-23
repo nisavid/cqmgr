@@ -1801,7 +1801,10 @@ def _catalog_groups_for_evidence(
         mapping.group_id
         for mapping in getattr(overlay, "mappings", ())
         if mapping.selector.matches(evidence)
-        or any(selector.matches(evidence) for selector in mapping.companion_selectors)
+        or any(
+            companion.selector.matches(evidence)
+            for companion in mapping.companion_requirements
+        )
     }
     return tuple(sorted(groups, key=lambda group: group.value))
 

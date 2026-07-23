@@ -223,6 +223,48 @@ def test_repeatable_filter_values_are_or_and_distinct_facets_are_and() -> None:
     )
 
 
+def test_repeatable_filter_facets_have_one_canonical_query_identity() -> None:
+    """Order and duplicate OR alternatives cannot change cursor-bound identity."""
+    expected = QuotaQueryFilters(
+        accelerators=(AcceleratorId("nvidia-l4"), AcceleratorId("nvidia-h100")),
+        locations=("us-east1", "us-central1", "us-east1"),
+        quota_scopes=(QuotaScope.ZONAL, QuotaScope.GLOBAL, QuotaScope.ZONAL),
+        quota_pools=("spot", "standard", "spot"),
+        reconciliations=(
+            Reconciliation.FAILED,
+            Reconciliation.SETTLED,
+            Reconciliation.FAILED,
+        ),
+        grant_satisfactions=(
+            GrantSatisfaction.PARTIAL,
+            GrantSatisfaction.FULL,
+            GrantSatisfaction.PARTIAL,
+        ),
+        effective_confirmations=(
+            EffectiveConfirmation.CONFIRMED,
+            EffectiveConfirmation.UNOBSERVED,
+            EffectiveConfirmation.CONFIRMED,
+        ),
+    )
+    reordered = QuotaQueryFilters(
+        accelerators=(AcceleratorId("nvidia-h100"), AcceleratorId("nvidia-l4")),
+        locations=("us-central1", "us-east1"),
+        quota_scopes=(QuotaScope.GLOBAL, QuotaScope.ZONAL),
+        quota_pools=("standard", "spot"),
+        reconciliations=(Reconciliation.SETTLED, Reconciliation.FAILED),
+        grant_satisfactions=(
+            GrantSatisfaction.FULL,
+            GrantSatisfaction.PARTIAL,
+        ),
+        effective_confirmations=(
+            EffectiveConfirmation.UNOBSERVED,
+            EffectiveConfirmation.CONFIRMED,
+        ),
+    )
+
+    assert expected == reordered
+
+
 def _metadata(query: QuotaQuery, *, complete: bool = True) -> QuerySnapshotMetadata:
     coverage = tuple(
         (
