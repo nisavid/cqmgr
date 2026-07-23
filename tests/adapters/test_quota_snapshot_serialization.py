@@ -149,6 +149,39 @@ def quota_snapshot(*, complete: bool = True) -> QuotaQuerySnapshot:
     )
 
 
+def _legacy_snapshot_record(
+    schema: str,
+    *,
+    source_kind: str = "service",
+    source_value: str = "compute.googleapis.com",
+    filter_services: tuple[str, ...] | None = None,
+) -> bytes:
+    """Return canonical bytes matching the retained v1 or v2 release shape."""
+    document = json.loads(encode_snapshot_record(quota_snapshot()))
+    document["schema"] = schema
+    snapshot = document["snapshot"]
+    metadata = snapshot["metadata"]
+    metadata.pop("inventory_revision")
+    metadata.pop("source_coverage")
+    snapshot.pop("ordered_slice_identities")
+    query = metadata["query"]
+    query["source"] = {"kind": source_kind, "value": source_value}
+    query["filters"].pop("catalog_groups")
+    if filter_services is not None:
+        query["filters"]["services"] = list(filter_services)
+    for item in snapshot["items"]:
+        item.pop("catalog_groups")
+        if schema.endswith("/v1"):
+            constraint_sets = item.pop("constraint_sets")
+            item["constraint_set"] = (
+                constraint_sets[0] if len(constraint_sets) == 1 else None
+            )
+    return (
+        json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode()
+
+
 @pytest.mark.parametrize("complete", [True, False])
 def test_snapshot_record_round_trips_as_canonical_safe_json(
     complete: bool,  # noqa: FBT001
@@ -179,6 +212,93 @@ def test_snapshot_record_round_trips_as_canonical_safe_json(
         "native-keyring",
     ):
         assert forbidden not in encoded.decode()
+
+
+@pytest.mark.parametrize(
+    "schema",
+    ["cqmgr.quota-query-snapshot/v1", "cqmgr.quota-query-snapshot/v2"],
+)
+def test_snapshot_decoder_migrates_supported_legacy_snapshot(schema: str) -> None:
+    """Unexpired V1-provider snapshots remain usable after a schema upgrade."""
+    decoded = decode_snapshot_record(_legacy_snapshot_record(schema))
+
+    assert decoded.metadata.query.services == ("compute.googleapis.com",)
+    assert decoded.metadata.complete is True
+    assert decoded.metadata.source_coverage == (
+        ProviderSourceCoverage.complete(
+            "compute.googleapis.com",
+            pages_attempted=0,
+            pages_completed=0,
+            observed_at=decoded.metadata.observed_at,
+        ),
+        ProviderSourceCoverage.intentionally_unqueried("tpu.googleapis.com"),
+    )
+    assert decoded.items[0].constraint_sets == (decoded.items[0].constraint_set,)
+    migrated = json.loads(encode_snapshot_record(decoded))
+    assert migrated["schema"] == "cqmgr.quota-query-snapshot/v3"
+    assert migrated["snapshot"]["ordered_slice_identities"] == [
+        migrated["snapshot"]["items"][0]["identity"]
+    ]
+
+
+def test_snapshot_decoder_migrates_supported_legacy_catalog_group() -> None:
+    """A legacy group source becomes the equivalent fixed-inventory facet."""
+    decoded = decode_snapshot_record(
+        _legacy_snapshot_record(
+            "cqmgr.quota-query-snapshot/v2",
+            source_kind="catalog-group",
+            source_value=CatalogGroupId.COMPUTE_ACCELERATORS.value,
+        )
+    )
+
+    assert decoded.metadata.query.filters.catalog_groups == (
+        CatalogGroupId.COMPUTE_ACCELERATORS,
+    )
+    assert decoded.metadata.query.services == ("compute.googleapis.com",)
+    assert decoded.items[0].catalog_groups == (CatalogGroupId.COMPUTE_ACCELERATORS,)
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "source_value"),
+    [
+        ("service", "example.googleapis.com"),
+        ("catalog-group", "unknown-accelerators"),
+        ("unknown", "compute.googleapis.com"),
+    ],
+)
+def test_snapshot_decoder_rejects_incompatible_legacy_source(
+    source_kind: str,
+    source_value: str,
+) -> None:
+    """Legacy data migrates only when its source belongs to the fixed inventory."""
+    encoded = _legacy_snapshot_record(
+        "cqmgr.quota-query-snapshot/v2",
+        source_kind=source_kind,
+        source_value=source_value,
+    )
+
+    with pytest.raises(QuotaSnapshotStoredDataError, match="source"):
+        decode_snapshot_record(encoded)
+
+
+def test_snapshot_decoder_rejects_legacy_source_filter_conflict() -> None:
+    """A legacy source cannot be remapped to a different fixed provider."""
+    encoded = _legacy_snapshot_record(
+        "cqmgr.quota-query-snapshot/v2",
+        filter_services=("tpu.googleapis.com",),
+    )
+
+    with pytest.raises(QuotaSnapshotStoredDataError, match="conflicts"):
+        decode_snapshot_record(encoded)
+
+
+def test_snapshot_decoder_rejects_noncanonical_legacy_bytes() -> None:
+    """A supported legacy schema does not weaken canonical-byte validation."""
+    canonical = _legacy_snapshot_record("cqmgr.quota-query-snapshot/v2")
+    noncanonical = canonical.replace(b'"schema":', b'"schema": ')
+
+    with pytest.raises(QuotaSnapshotStoredDataError, match="not canonical"):
+        decode_snapshot_record(noncanonical)
 
 
 @pytest.mark.parametrize(
