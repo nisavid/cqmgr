@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -35,6 +35,9 @@ from cqmgr.domain.quotas import (
 )
 from cqmgr.domain.results import StableSymbol
 from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 NOW = datetime(2026, 7, 21, 12, tzinfo=UTC)
 SCOPE = ResourceScope(ResourceScopeKind.PROJECT, "projects/123456789")
@@ -205,37 +208,86 @@ def test_bundle_plan_encoding_binds_kind_order_and_child_derivations() -> None:
 
 
 @pytest.mark.parametrize(
-    ("field_name", "value", "message"),
+    ("invalid", "message"),
     [
-        ("child_id", "", "child_id"),
-        ("slice_identity", "slice", "slice identity"),
-        ("target", 8, "quantities"),
-        ("usage", QuotaQuantity(3, QuotaUnit("GiBy")), "native unit"),
-        ("preference_name", "", "preference_name"),
-        ("target_strategy", "minimum", "target_strategy"),
-        ("target_derivation", "formula", "target_derivation"),
-        ("direct_accelerator_rank", 2, "direct accelerator"),
-        ("scope_breadth_rank", 9, "scope breadth"),
-        ("warnings", ["warning"], "warnings"),
-        ("acknowledgements", (StableSymbol("unbound"),), "required"),
+        (lambda: replace(_bundle_child(), child_id=""), "child_id"),
         (
-            "evidence",
-            (
-                EvidenceBinding(StableSymbol("effective"), SHA256_A, NOW),
-                EvidenceBinding(StableSymbol("effective"), SHA256_B, NOW),
+            lambda: replace(
+                _bundle_child(),
+                slice_identity=cast("EffectiveQuotaSliceIdentity", "slice"),
+            ),
+            "slice identity",
+        ),
+        (
+            lambda: replace(
+                _bundle_child(),
+                target=cast("QuotaQuantity", 8),
+            ),
+            "quantities",
+        ),
+        (
+            lambda: replace(
+                _bundle_child(),
+                usage=QuotaQuantity(3, QuotaUnit("GiBy")),
+            ),
+            "native unit",
+        ),
+        (lambda: replace(_bundle_child(), preference_name=""), "preference_name"),
+        (
+            lambda: replace(
+                _bundle_child(),
+                target_strategy=cast("TargetStrategy", "minimum"),
+            ),
+            "target_strategy",
+        ),
+        (
+            lambda: replace(
+                _bundle_child(),
+                target_derivation=cast("StableSymbol", "formula"),
+            ),
+            "target_derivation",
+        ),
+        (
+            lambda: replace(_bundle_child(), direct_accelerator_rank=2),
+            "direct accelerator",
+        ),
+        (
+            lambda: replace(_bundle_child(), scope_breadth_rank=9),
+            "scope breadth",
+        ),
+        (
+            lambda: replace(
+                _bundle_child(),
+                warnings=cast("tuple[StableSymbol, ...]", ["warning"]),
+            ),
+            "warnings",
+        ),
+        (
+            lambda: replace(
+                _bundle_child(),
+                acknowledgements=(StableSymbol("unbound"),),
+            ),
+            "required",
+        ),
+        (
+            lambda: replace(
+                _bundle_child(),
+                evidence=(
+                    EvidenceBinding(StableSymbol("effective"), SHA256_A, NOW),
+                    EvidenceBinding(StableSymbol("effective"), SHA256_B, NOW),
+                ),
             ),
             "unique",
         ),
     ],
 )
 def test_bundle_child_rejects_unreviewable_bindings(
-    field_name: str,
-    value: object,
+    invalid: Callable[[], object],
     message: str,
 ) -> None:
     """Every child field remains exact, typed, and internally coherent."""
     with pytest.raises((TypeError, ValueError), match=message):
-        replace(_bundle_child(), **cast("Any", {field_name: value}))
+        invalid()
 
 
 def test_bundle_plan_rejects_inconsistent_subject_shapes() -> None:
@@ -249,34 +301,80 @@ def test_bundle_plan_rejects_inconsistent_subject_shapes() -> None:
         direct_accelerator_rank=1,
         scope_breadth_rank=3,
     )
-    invalid_values: tuple[tuple[str, object, str], ...] = (
-        ("resource_scope", "project", "resource_scope"),
-        ("kind", PlanKind.SINGLE, "kind"),
-        ("selected_location", "", "selected_location"),
-        ("target_strategy", "minimum", "target_strategy"),
-        ("normalized_workload", "", "normalized_workload"),
-        ("children", (), "non-empty"),
+    invalid_cases: tuple[tuple[Callable[[], object], str], ...] = (
         (
-            "children",
-            (_bundle_child(), _bundle_child()),
+            lambda: replace(
+                plan,
+                resource_scope=cast("ResourceScope", "project"),
+            ),
+            "resource_scope",
+        ),
+        (lambda: replace(plan, kind=PlanKind.SINGLE), "kind"),
+        (lambda: replace(plan, selected_location=""), "selected_location"),
+        (
+            lambda: replace(
+                plan,
+                target_strategy=cast("TargetStrategy", "minimum"),
+            ),
+            "target_strategy",
+        ),
+        (lambda: replace(plan, normalized_workload=""), "normalized_workload"),
+        (lambda: replace(plan, children=()), "non-empty"),
+        (
+            lambda: replace(
+                plan,
+                children=(_bundle_child(), _bundle_child()),
+            ),
             "IDs must be unique",
         ),
-        ("children", (later, _bundle_child()), "deterministic"),
         (
-            "children",
-            (replace(_bundle_child(), slice_identity=other_slice),),
+            lambda: replace(plan, children=(later, _bundle_child())),
+            "deterministic",
+        ),
+        (
+            lambda: replace(
+                plan,
+                children=(replace(_bundle_child(), slice_identity=other_slice),),
+            ),
             "resource scope",
         ),
-        ("constraints", ["slice"], "constraints"),
-        ("principal", "principal", "principal"),
-        ("contact_binding", "contact", "contact_binding"),
-        ("installation_id", "", "installation_id"),
-        ("issued_at", NOW.replace(tzinfo=None), "aware UTC"),
-        ("expires_at", NOW + timedelta(minutes=16), "15 minutes"),
+        (
+            lambda: replace(
+                plan,
+                constraints=cast(
+                    "tuple[ConstraintReference, ...]",
+                    ["slice"],
+                ),
+            ),
+            "constraints",
+        ),
+        (
+            lambda: replace(
+                plan,
+                principal=cast("PlanPrincipal", "principal"),
+            ),
+            "principal",
+        ),
+        (
+            lambda: replace(
+                plan,
+                contact_binding=cast("ContactBinding", "contact"),
+            ),
+            "contact_binding",
+        ),
+        (lambda: replace(plan, installation_id=""), "installation_id"),
+        (
+            lambda: replace(plan, issued_at=NOW.replace(tzinfo=None)),
+            "aware UTC",
+        ),
+        (
+            lambda: replace(plan, expires_at=NOW + timedelta(minutes=16)),
+            "15 minutes",
+        ),
     )
-    for field_name, value, message in invalid_values:
+    for invalid, message in invalid_cases:
         with pytest.raises((TypeError, ValueError), match=message):
-            replace(plan, **cast("Any", {field_name: value}))
+            invalid()
 
 
 def test_plan_decode_rejects_noncanonical_tampered_and_newer_schema_bytes() -> None:
@@ -523,31 +621,68 @@ def test_plan_rejects_cross_scope_unit_and_binding_inconsistency() -> None:
 
 
 @pytest.mark.parametrize(
-    ("field_name", "value", "message"),
+    ("invalid", "message"),
     [
         (
-            "target_strategy",
-            TargetStrategy.MINIMUM,
+            lambda: replace(
+                _plan(),
+                target_strategy=TargetStrategy.MINIMUM,
+            ),
             "manual target strategy",
         ),
-        ("target_derivation", "manual-absolute", "target_derivation"),
-        ("child_id", "", "child_id"),
-        ("usage", QuotaQuantity(3, QuotaUnit("GiBy")), "target unit"),
-        ("workload", "4", "target unit"),
-        ("prior_desired", QuotaQuantity(8, QuotaUnit("GiBy")), "target unit"),
-        ("granted", object(), "target unit"),
-        ("direct_accelerator_rank", 2, "direct accelerator rank"),
-        ("scope_breadth_rank", 5, "scope breadth rank"),
+        (
+            lambda: replace(
+                _plan(),
+                target_derivation=cast("StableSymbol", "manual-absolute"),
+            ),
+            "target_derivation",
+        ),
+        (lambda: replace(_plan(), child_id=""), "child_id"),
+        (
+            lambda: replace(
+                _plan(),
+                usage=QuotaQuantity(3, QuotaUnit("GiBy")),
+            ),
+            "target unit",
+        ),
+        (
+            lambda: replace(
+                _plan(),
+                workload=cast("QuotaQuantity | None", "4"),
+            ),
+            "target unit",
+        ),
+        (
+            lambda: replace(
+                _plan(),
+                prior_desired=QuotaQuantity(8, QuotaUnit("GiBy")),
+            ),
+            "target unit",
+        ),
+        (
+            lambda: replace(
+                _plan(),
+                granted=cast("QuotaQuantity | None", object()),
+            ),
+            "target unit",
+        ),
+        (
+            lambda: replace(_plan(), direct_accelerator_rank=2),
+            "direct accelerator rank",
+        ),
+        (
+            lambda: replace(_plan(), scope_breadth_rank=5),
+            "scope breadth rank",
+        ),
     ],
 )
 def test_single_plan_rejects_invalid_child_dispatch_bindings(
-    field_name: str,
-    value: object,
+    invalid: Callable[[], object],
     message: str,
 ) -> None:
     """A single plan retains the same exact child dispatch contract as a bundle."""
     with pytest.raises((TypeError, ValueError), match=message):
-        replace(_plan(), **cast("Any", {field_name: value}))
+        invalid()
 
 
 @pytest.mark.parametrize(
