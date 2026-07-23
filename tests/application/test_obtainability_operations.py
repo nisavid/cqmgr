@@ -1,12 +1,13 @@
 """Application contract for read-only Spot obtainability comparison."""
 
-# ruff: noqa: PLR2004
+from __future__ import annotations
 
+# ruff: noqa: PLR2004
 import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -19,9 +20,7 @@ from cqmgr.application.operations.obtainability import (
 from cqmgr.application.ports.coordination import CancellationToken
 from cqmgr.application.ports.obtainability import (
     CapacityAdviceReader,
-    CapacityAdviceReadRequest,
     CapacityHistoryReader,
-    CapacityHistoryReadRequest,
 )
 from cqmgr.application.ports.provider_reads import ProviderReadContext
 from cqmgr.domain.accelerator_overlay import (
@@ -77,6 +76,12 @@ from cqmgr.domain.redaction import RedactedText
 from cqmgr.domain.results import ExitClass
 from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 
+if TYPE_CHECKING:
+    from cqmgr.application.ports.obtainability import (
+        CapacityAdviceReadRequest,
+        CapacityHistoryReadRequest,
+    )
+
 NOW = datetime(2026, 7, 23, 12, tzinfo=UTC)
 
 
@@ -88,20 +93,20 @@ class MissingHistoryReader(CapacityHistoryReader):
     """Exercise the history port's fail-closed inherited default."""
 
 
+def _invalid_advice_request() -> CapacityAdviceReadRequest:
+    return cast("CapacityAdviceReadRequest", object())
+
+
+def _invalid_history_request() -> CapacityHistoryReadRequest:
+    return cast("CapacityHistoryReadRequest", object())
+
+
 def test_obtainability_reader_protocol_defaults_fail_closed() -> None:
     """Explicit implementations cannot silently inherit ellipsis results."""
     with pytest.raises(NotImplementedError):
-        asyncio.run(
-            MissingAdviceReader().read(
-                cast("CapacityAdviceReadRequest", object()),
-            )
-        )
+        asyncio.run(MissingAdviceReader().read(_invalid_advice_request()))
     with pytest.raises(NotImplementedError):
-        asyncio.run(
-            MissingHistoryReader().read(
-                cast("CapacityHistoryReadRequest", object()),
-            )
-        )
+        asyncio.run(MissingHistoryReader().read(_invalid_history_request()))
 
 
 def _context() -> ProviderReadContext:
@@ -400,8 +405,8 @@ def test_n1_attached_gpu_keeps_current_advice_and_exact_history_reason() -> None
     assert history.requests == []
 
 
-def test_permission_failure_retains_candidate_with_authorization_outcome() -> None:
-    """A missing advice permission is typed and never coerced into a score."""
+def test_advice_permission_failure_retains_independent_history() -> None:
+    """Missing advice permission does not suppress accessible history evidence."""
     candidate = ObtainabilityCandidate(
         "us-central1",
         (),
@@ -439,11 +444,12 @@ def test_permission_failure_retains_candidate_with_authorization_outcome() -> No
     assert result.outcome.exit_class is ExitClass.AUTHORIZATION
     assert not result.completeness.is_complete
     assert result.data.candidates[0].advice is None
+    assert result.data.candidates[0].history is not None
     assert result.data.candidates[0].unranked_reasons == (
         UnrankedReason.ADVICE_UNAVAILABLE,
-        UnrankedReason.HISTORY_UNAVAILABLE,
+        UnrankedReason.CURRENT_PRICE_UNAVAILABLE,
     )
-    assert history.requests == []
+    assert len(history.requests) == 1
 
 
 def test_incomplete_history_is_a_typed_evidence_failure() -> None:
