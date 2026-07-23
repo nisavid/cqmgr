@@ -1008,17 +1008,19 @@ def test_owned_sync_leader_retains_ownership_until_work_really_ends(
         return RedactedText("thread-result")
 
     async def exercise() -> None:
-        with pytest.raises(CoordinationDeadlineExceededError):
-            await asyncio.wait_for(
-                coalescer.run_sync(
-                    "threaded-read",
-                    sync_read,
-                    deadline=time.monotonic() + 0.05,
-                    cancellation=CancellationToken(),
-                ),
-                timeout=0.5,
+        leader = asyncio.create_task(
+            coalescer.run_sync(
+                "threaded-read",
+                sync_read,
+                deadline=time.monotonic() + 5,
+                cancellation=CancellationToken(),
             )
-        assert started.is_set()
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+        leader.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await leader
+
         with pytest.raises(CoordinationDeadlineExceededError):
             await coalescer.run_sync(
                 "threaded-read",
