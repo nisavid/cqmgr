@@ -222,6 +222,12 @@ scenarios include:
   and installation-trust failures stop before dispatch;
 - Apply freshly revalidates the complete bundle before the first write and then
   performs at most one provider write per child in the bound order;
+- a crash between consumption-marker creation and the ledger consumption
+  transition leaves the plan consumed and quarantined rather than reusable after
+  lease expiry;
+- recovery resumes only children without a persisted dispatch intent, while a
+  dispatch intent without a terminal outcome becomes durable `unknown` and is
+  never automatically re-dispatched;
 - a conclusively failed child stops dispatch, retains prior accepted children,
   marks later children unattempted, and performs no rollback;
 - an ambiguous dispatch is `unknown`, consumes and quarantines the plan, stops

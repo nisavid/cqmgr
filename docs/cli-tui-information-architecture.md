@@ -252,7 +252,13 @@ workload requirement in that slice's native unit. A child that already permits
 the workload is a verified no-op, never an automatic decrease.
 `preserve-headroom` proposes current effective quota plus the normalized
 workload requirement. `manual` requires repeatable
-`--target CHILD_ID=VALUE`, with one absolute target for every selected child.
+`--target CHILD_ID=VALUE`, with one absolute target for every selected
+constraint child before no-op classification. A manual target equal to the
+settled desired value is accepted as a verified no-op and cannot create a
+mutation child. Missing selected-child targets and targets for children outside
+the selected constraint set are usage errors. If every selected child is a
+verified no-op, Preview returns the complete no-op result without a plan or
+Apply capability.
 `minimum` never silently amends an existing provider intent: an equal or higher
 settled or reconciling desired state is preserved, while a lower conflicting
 intent requires an explicit manual target or a new Preview after settlement.
@@ -275,7 +281,11 @@ An initial `request watch` accepts one `--intent-id INTENT_ID`,
 `--condition granted|fulfilled`, and an absolute RFC 3339
 `--deadline TIMESTAMP`. The durable local intent and plan discriminators
 identify a single or bundle subject; the public CLI does not duplicate that
-fact in another flag. A resumed Watch uses `--resume TOKEN` instead of the
+fact in another flag. The identifier must resolve to a durable local cqmgr
+Apply record with at least one accepted child. Preview records, plans that have
+not been applied, unrelated provider preferences, missing or inconsistent child
+records, and Apply records with no accepted child are rejected before polling.
+A resumed Watch uses `--resume TOKEN` instead of the
 initial identity and condition options and requires a new absolute `--deadline`;
 shared presentation options remain available. `plan review` and `plan apply`
 accept exactly one of
@@ -510,11 +520,20 @@ principal, warnings, acknowledgements, expiry, authentication state,
 non-atomicity, and Apply capability. Apply never rebuilds, reorders, splits, or
 refreshes a different plan silently.
 
-Apply consumes the whole single-use plan before dispatch and processes children
-in the reviewed deterministic order: accelerator- or location-specific children
+Apply records and fsyncs the complete pre-intent, then crosses one fail-closed
+single-use barrier before dispatch: under the plan lock it creates the immutable
+consumption marker and commits the ledger consumption transition. Either half
+of a partially persisted barrier makes the plan consumed and quarantined; lease
+expiry never makes it reusable. Every consumed plan retains a durable Apply
+record even when no child was accepted. Apply then processes children in the
+reviewed deterministic order: accelerator- or location-specific children
 precede broader companion constraints, with canonical exact-slice identity as
-the final tie-breaker. Each child has at most one provider dispatch and its own
-durable pre-intent and terminal outcome. Apply stops at the first child whose
+the final tie-breaker. Before each provider call it fsyncs that child's dispatch
+intent. A terminal outcome is fsynced before the next child starts. Recovery may
+continue only with a child that has no persisted dispatch intent after all prior
+outcomes are terminal. A dispatch intent without a terminal outcome is durably
+`unknown`, stops later dispatch, and requires read-after-unknown reconciliation;
+it is never dispatched again automatically. Apply stops at the first child whose
 acceptance cannot be proven, marks every later child `unattempted`, and never
 attempts rollback. Each plan-child disposition is exactly `accepted`, `failed`,
 `unknown`, or `unattempted`. A transport-unknown dispatch is `unknown`, not

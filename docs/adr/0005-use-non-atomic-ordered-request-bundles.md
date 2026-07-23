@@ -23,7 +23,10 @@ that already permits the workload is a no-op; the strategy never auto-decreases
 quota or silently supersedes an existing provider intent. An equal or higher
 desired value is preserved; a lower conflicting intent requires an explicit
 manual target or a new Preview after settlement. `manual` remains subject to
-complete sufficiency and dangerous-decrease gates.
+complete sufficiency and dangerous-decrease gates. It accepts one target for
+every selected constraint child before no-op classification; a target equal to
+the settled desired value is retained as a verified no-op and never becomes a
+mutation child.
 Missing, stale, ambiguous, or incompatible usage, workload, conversion, or
 slice evidence prevents Preview. A target equal to the existing settled desired
 value is a verified child no-op and has no provider write.
@@ -40,7 +43,10 @@ top-level `kind` beside `schema`: `single` requires exactly one child and
 `bundle` permits one or more ordered children. Unknown kinds fail closed.
 An explicit exact-slice target is represented as strategy `manual` and kind
 `single`. A workload-derived constraint set is kind `bundle` even when exactly
-one child remains after verified no-ops are removed.
+one child remains after verified no-ops are removed. When no child remains,
+Preview returns the complete verified-no-op result without issuing a plan;
+`single` remains reserved for an explicit exact-slice target and Apply has no
+all-no-op input to consume.
 
 Apply is deliberately non-atomic. It freshly revalidates every child before the
 first provider write. It then dispatches non-no-op children in deterministic
@@ -60,13 +66,20 @@ The result preserves verified no-ops and every accepted, failed, unknown, and
 unattempted child with every available provider reconciliation identity.
 
 The bundle plan is one authenticated, expiring, single-use authorization. Apply
-acquires one exclusive bundle lease and creates the immutable consumption marker
-before dispatch. The durable ledger and append-only audit journal record the
-complete preflight, ordered pre-Apply intent, each dispatch decision and
-provider outcome, and the aggregate terminal result. Interruption, transport
-uncertainty, or persistence failure never makes the plan reusable and never
-causes a blind retry. Deterministic child preference identity and read-after-
-unknown reconciliation preserve accepted work and classify uncertainty.
+acquires one exclusive bundle lease, fsyncs the ordered pre-Apply intent, and
+crosses a fail-closed consumption barrier under the plan lock before dispatch:
+it creates the immutable consumption marker and commits the ledger consumption
+transition. Either half of a partially persisted barrier keeps the plan consumed
+and quarantined, so lease expiry never makes it reusable. Every consumed plan
+retains a durable Apply record. Each child dispatch intent is fsynced before the
+provider call and its terminal outcome is fsynced before the next child begins.
+Recovery may resume only a child with no persisted dispatch intent after every
+prior outcome is terminal. A dispatch intent without a terminal outcome becomes
+a durable `unknown`, stops later dispatch, and requires read-after-unknown
+reconciliation; it is never dispatched again automatically. Interruption,
+transport uncertainty, or persistence failure never causes a blind retry.
+Deterministic child preference identity preserves accepted work and classifies
+uncertainty.
 
 Watch observes the accepted children of one applied bundle. It retains each
 child's preference lineage, target, status axes, effective evidence, and resume
