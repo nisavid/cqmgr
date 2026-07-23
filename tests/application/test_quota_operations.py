@@ -62,7 +62,11 @@ from cqmgr.domain.diagnostics import (
     RetryDisposition,
     Severity,
 )
-from cqmgr.domain.identity import ADCIdentityEvidence, CredentialKind
+from cqmgr.domain.identity import (
+    ADCIdentityEvidence,
+    CredentialKind,
+    ProviderIdentityEvidence,
+)
 from cqmgr.domain.projects import CanonicalProject
 from cqmgr.domain.quota_queries import (
     OpaqueQueryCursor,
@@ -439,6 +443,23 @@ def _incomplete[ValueT](*values: ValueT) -> ProviderRead[ValueT]:
     return ProviderRead(
         tuple(values),
         ProviderReadCoverage(1, 1, page_cap_reached=True),
+        NOW,
+        (diagnostic,),
+    )
+
+
+def _stopped_read[ValueT](code: str, *values: ValueT) -> ProviderRead[ValueT]:
+    diagnostic = Diagnostic(
+        DiagnosticCode(code),
+        Severity.ERROR,
+        DiagnosticPhase("effective-quota-read"),
+        DiagnosticSource("cloud-quotas"),
+        RetryDisposition.AFTER_REFRESH,
+        RedactedText("The caller stopped the provider read."),
+    )
+    return ProviderRead(
+        tuple(values),
+        ProviderReadCoverage(1, 0),
         NOW,
         (diagnostic,),
     )
@@ -1021,6 +1042,45 @@ def test_resolve_stops_on_incomplete_required_quota_read() -> None:
     assert result.completeness.has_partial_data
 
 
+@pytest.mark.parametrize(
+    ("diagnostic_code", "exit_class", "outcome"),
+    [
+        (
+            "provider-read-deadline-exceeded",
+            ExitClass.TIMEOUT,
+            "operation-deadline-exceeded",
+        ),
+        ("provider-read-cancelled", ExitClass.INTERRUPTED, "operation-interrupted"),
+    ],
+)
+def test_resolve_preserves_provider_stop_outcomes(
+    diagnostic_code: str,
+    exit_class: ExitClass,
+    outcome: str,
+) -> None:
+    """Resolution retains global stop classification and partial evidence."""
+    operations = WorkloadResolutionOperations(
+        ScriptedReader((_stopped_read(diagnostic_code, *_gpu_quota_evidence()),)),
+        ScriptedReader((_complete(),)),
+        ScriptedCatalogReader((_compute_accelerator_catalog_read(),)),
+        ScriptedCatalogReader((_gpu_catalog_read(),)),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+
+    result = asyncio.run(
+        operations.resolve(QuotaResolveRequest(_context(), _gpu_requirement()))
+    )
+
+    assert result.outcome.exit_class is exit_class
+    assert result.outcome.code == StableSymbol(outcome)
+    assert result.data is None
+    assert result.completeness.has_partial_data
+
+
 def test_resolve_stops_on_failed_selected_location_catalog_evidence() -> None:
     """A failed selected catalog location is incomplete, never unsupported."""
     diagnostic = _catalog_diagnostic()
@@ -1162,6 +1222,9 @@ def test_browse_sorts_snapshots_and_resumes_without_provider_calls() -> None:
         mutable=False,
     )
     assert second.data.constraint_sets == (second.data.items[0].constraint_set,)
+    assert second.identity_evidence == ProviderIdentityEvidence.from_adc(
+        _context().identity
+    )
     assert calls == (
         len(fixture.effective.calls),
         len(fixture.preferences.calls),
@@ -1196,6 +1259,48 @@ def test_bare_browse_federates_both_v1_providers_with_bound_coverage() -> None:
     )
     snapshot = fixture.snapshots.snapshots[result.data.snapshot_id or ""]
     assert snapshot.metadata.source_coverage == result.data.source_coverage
+    assert result.data.catalog == snapshot.metadata.catalog
+    assert result.data.evidence_contract == snapshot.metadata.evidence_contract
+    assert result.data.inventory_revision == snapshot.metadata.inventory_revision
+    assert result.data.observed_at == snapshot.metadata.observed_at
+
+
+@pytest.mark.parametrize(
+    ("diagnostic_code", "exit_class", "outcome"),
+    [
+        (
+            "provider-read-deadline-exceeded",
+            ExitClass.TIMEOUT,
+            "operation-deadline-exceeded",
+        ),
+        ("provider-read-cancelled", ExitClass.INTERRUPTED, "operation-interrupted"),
+    ],
+)
+def test_browse_preserves_provider_stop_outcomes(
+    diagnostic_code: str,
+    exit_class: ExitClass,
+    outcome: str,
+) -> None:
+    """Provider stop evidence retains its global timeout or interruption class."""
+    evidence = _evidence("compute-quota")
+    fixture = _fixture((_stopped_read(diagnostic_code, evidence),))
+
+    result = asyncio.run(
+        fixture.operations.browse(
+            QuotaBrowseRequest(
+                _context(),
+                QuotaQuery(
+                    PROJECT,
+                    filters=QuotaQueryFilters(services=("compute",)),
+                ),
+            )
+        )
+    )
+
+    assert result.outcome.exit_class is exit_class
+    assert result.outcome.code == StableSymbol(outcome)
+    assert result.data.items
+    assert result.completeness.has_partial_data
 
 
 def test_preference_schema_failure_degrades_only_its_provider_coverage() -> None:
@@ -1460,6 +1565,23 @@ def test_incomplete_browse_with_no_filtered_rows_uses_incomplete_exit() -> None:
     assert not result.data.ordered
     assert result.data.total is None
     assert result.data.next_cursor is None
+
+
+def test_empty_complete_provider_plus_failed_provider_is_partial() -> None:
+    """Authoritative empty coverage remains usable when another provider fails."""
+    fixture = _fixture((_complete(), _incomplete()))
+
+    result = asyncio.run(
+        fixture.operations.browse(QuotaBrowseRequest(_context(), QuotaQuery(PROJECT)))
+    )
+
+    assert result.outcome.exit_class is ExitClass.INCOMPLETE_EVIDENCE
+    assert result.completeness.has_partial_data
+    assert result.data.items == ()
+    assert tuple(item.state for item in result.data.source_coverage) == (
+        ProviderSourceCoverageState.COMPLETE,
+        ProviderSourceCoverageState.INCOMPLETE,
+    )
 
 
 def test_empty_result_allows_requested_optional_sort() -> None:

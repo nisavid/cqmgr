@@ -7,8 +7,9 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import UTC, datetime
+from threading import Event
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from google.cloud import compute_v1, tpu_v2
@@ -21,6 +22,8 @@ from cqmgr.adapters.google.compute_catalog import (
     ComputeMachineTypesScope,
     GoogleComputeAcceleratorTypeReader,
     GoogleComputeMachineTypeReader,
+    OfficialComputeAcceleratorTypesPageClient,
+    OfficialComputeMachineTypesPageClient,
 )
 from cqmgr.adapters.google.read_policy import GoogleReadPolicy
 from cqmgr.adapters.google.tpu_catalog import (
@@ -77,6 +80,91 @@ class NoJitter:
     def apply(self, delay: float, *, attempt: int, identity: str) -> float:
         del attempt, identity
         return min(delay, 0.0)
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        OfficialComputeAcceleratorTypesPageClient,
+        OfficialComputeMachineTypesPageClient,
+    ],
+)
+def test_official_compute_page_clients_close_owned_transport(
+    wrapper: type[
+        OfficialComputeAcceleratorTypesPageClient
+        | OfficialComputeMachineTypesPageClient
+    ],
+) -> None:
+    """Every sync Compute wrapper exposes its generated transport shutdown."""
+    closed: list[bool] = []
+    client = SimpleNamespace(
+        transport=SimpleNamespace(close=lambda: closed.append(True))
+    )
+
+    page_client = wrapper(cast("Any", client))
+    asyncio.run(page_client.close())
+
+    assert closed == [True]
+
+
+def test_compute_close_waits_for_shielded_sync_worker_after_cancellation() -> None:
+    """Transport shutdown follows real completion of a cancelled sync page read."""
+    started = Event()
+    release = Event()
+    finished = Event()
+    closed_after_finish: list[bool] = []
+
+    class BlockingGeneratedClient:
+        transport = SimpleNamespace(
+            close=lambda: closed_after_finish.append(finished.is_set())
+        )
+
+        def aggregated_list(self, **kwargs: object) -> object:
+            del kwargs
+            started.set()
+            release.wait()
+            finished.set()
+            response = SimpleNamespace(
+                items={},
+                next_page_token="",
+                unreachables=(),
+                warning=None,
+            )
+            return SimpleNamespace(pages=iter((response,)))
+
+    async def exercise() -> None:
+        page_client = OfficialComputeMachineTypesPageClient(
+            cast("Any", BlockingGeneratedClient())
+        )
+        read_task = asyncio.create_task(
+            page_client.machine_types(
+                project="fixture-project",
+                max_results=1,
+                page_token="",
+                return_partial_success=True,
+                timeout_seconds=1.0,
+            )
+        )
+        await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=0.5)
+        read_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await read_task
+
+        try:
+            close_task = asyncio.create_task(page_client.close())
+            await asyncio.sleep(0.01)
+            assert not close_task.done()
+            assert closed_after_finish == []
+        finally:
+            release.set()
+        await asyncio.wait_for(close_task, timeout=0.5)
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release.set()
+
+    assert closed_after_finish == [True]
 
 
 class ComputePages:
@@ -612,9 +700,17 @@ def test_tpu_readers_reject_items_outside_the_requested_parent() -> None:
 def test_official_tpu_wrapper_builds_exact_requests_without_generated_retries() -> None:
     """Official TPU calls retain explicit parent, pagination, timeout, and no retry."""
 
+    class Transport:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
     class Client:
         def __init__(self) -> None:
             self.calls: list[tuple[str, object, object, object]] = []
+            self.transport = Transport()
 
         async def list_locations(
             self, *, request: object, retry: object, timeout: object
@@ -664,6 +760,7 @@ def test_official_tpu_wrapper_builds_exact_requests_without_generated_retries() 
         )
 
     pages = asyncio.run(read_pages())
+    asyncio.run(wrapper.close())
     location_request = cast("locations_pb2.ListLocationsRequest", client.calls[0][1])
     accelerator_request = cast("tpu_v2.ListAcceleratorTypesRequest", client.calls[1][1])
     runtime_request = cast("tpu_v2.ListRuntimeVersionsRequest", client.calls[2][1])
@@ -673,6 +770,7 @@ def test_official_tpu_wrapper_builds_exact_requests_without_generated_retries() 
         17,
     )
     assert location_request.page_token == "locations-page"
+    assert client.transport.closed
     assert (accelerator_request.parent, accelerator_request.page_size) == (
         "projects/123456789/locations/us-central1-b",
         18,

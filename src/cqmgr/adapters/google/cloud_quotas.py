@@ -87,6 +87,10 @@ class OfficialCloudQuotasPageClient:
         """Bind one shared-credential official async client."""
         self._client = client
 
+    async def close(self) -> None:
+        """Close the owned generated async client."""
+        await self._client.transport.close()
+
     async def quota_infos(
         self,
         *,

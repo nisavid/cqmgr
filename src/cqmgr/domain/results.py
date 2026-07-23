@@ -8,6 +8,7 @@ from enum import IntEnum
 from typing import TYPE_CHECKING
 
 from cqmgr.domain.diagnostics import Diagnostic
+from cqmgr.domain.identity import ProviderIdentityEvidence
 from cqmgr.domain.quotas import EffectiveQuotaSliceIdentity, QuotaQuantity
 from cqmgr.domain.redaction import RedactedText
 from cqmgr.domain.schemas import OPERATION_RESULT_SCHEMA, WATCH_EVENT_SCHEMA
@@ -227,6 +228,7 @@ class OperationResult[DataT]:
     data: DataT
     diagnostics: tuple[Diagnostic, ...] = ()
     provenance: tuple[Provenance, ...] = ()
+    identity_evidence: ProviderIdentityEvidence | None = None
     schema: str = field(default=OPERATION_RESULT_SCHEMA, init=False)
 
     def _validate_types(self) -> None:
@@ -258,6 +260,11 @@ class OperationResult[DataT]:
         ):
             msg = "provenance must be a tuple of Provenance values"
             raise TypeError(msg)
+        if self.identity_evidence is not None and not isinstance(
+            self.identity_evidence, ProviderIdentityEvidence
+        ):
+            msg = "identity_evidence must be ProviderIdentityEvidence or None"
+            raise TypeError(msg)
 
     def __post_init__(self) -> None:
         """Enforce types, timestamps, boundary, completeness, and exit invariants."""
@@ -279,8 +286,16 @@ class OperationResult[DataT]:
             not self.completeness.is_complete and self.completeness.has_partial_data
         )
         uses_incomplete_exit = self.outcome.exit_class is ExitClass.INCOMPLETE_EVIDENCE
-        if partial_evidence != uses_incomplete_exit:
-            msg = "exit class 6 must exactly identify usable incomplete evidence"
+        retains_partial_evidence = self.outcome.exit_class in (
+            ExitClass.INCOMPLETE_EVIDENCE,
+            ExitClass.TIMEOUT,
+            ExitClass.INTERRUPTED,
+        )
+        if uses_incomplete_exit and not partial_evidence:
+            msg = "exit class 6 requires usable incomplete evidence"
+            raise ValueError(msg)
+        if partial_evidence and not retains_partial_evidence:
+            msg = "partial evidence requires exit class 6, 8, or 130"
             raise ValueError(msg)
 
     @property

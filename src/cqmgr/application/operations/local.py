@@ -58,6 +58,7 @@ class ScopeOperationData:
     resolution_source: str | None
     selected_profile: str | None
     direct_resource_scope: ResourceScope | None
+    identity_evidence: str = "deferred-offline"
     reason: str | None = None
 
 

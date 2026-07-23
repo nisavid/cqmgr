@@ -15,6 +15,7 @@ from cqmgr.application.ports.coordination import (
     BudgetRequest,
     CoordinationCancelledError,
     CoordinationDeadlineExceededError,
+    CoordinationUnavailableError,
     JitterSource,
 )
 from cqmgr.domain.diagnostics import (
@@ -131,6 +132,7 @@ class GoogleReadPolicy:
                 BudgetCommitUnknownError,
                 CoordinationCancelledError,
                 CoordinationDeadlineExceededError,
+                CoordinationUnavailableError,
             ) as error:
                 return ProviderCallResult(
                     None,
@@ -287,7 +289,8 @@ def _budget_failure(
     provider: str,
     error: BudgetCommitUnknownError
     | CoordinationCancelledError
-    | CoordinationDeadlineExceededError,
+    | CoordinationDeadlineExceededError
+    | CoordinationUnavailableError,
 ) -> Diagnostic:
     if isinstance(error, CoordinationCancelledError):
         return _diagnostic(
@@ -303,6 +306,14 @@ def _budget_failure(
             provider,
             "provider-read-deadline-exceeded",
             "The provider read exceeded its caller-controlled deadline.",
+            RetryDisposition.AFTER_REFRESH,
+        )
+    if isinstance(error, CoordinationUnavailableError):
+        return _diagnostic(
+            phase,
+            provider,
+            "provider-read-budget-unavailable",
+            "The shared read budget is unavailable.",
             RetryDisposition.AFTER_REFRESH,
         )
     return _diagnostic(

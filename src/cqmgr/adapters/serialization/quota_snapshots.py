@@ -19,6 +19,12 @@ from cqmgr.domain.catalog import (
     CatalogPredicates,
 )
 from cqmgr.domain.diagnostics import DiagnosticCode
+from cqmgr.domain.identity import (
+    CredentialKind,
+    PrincipalIdentity,
+    PrincipalVerification,
+    ProviderIdentityEvidence,
+)
 from cqmgr.domain.quota_queries import (
     V1_PROVIDER_SERVICES,
     ProviderSourceCoverage,
@@ -47,12 +53,13 @@ from cqmgr.domain.status import (
     Reconciliation,
 )
 
-QUOTA_QUERY_SNAPSHOT_SCHEMA = "cqmgr.quota-query-snapshot/v3"
+QUOTA_QUERY_SNAPSHOT_SCHEMA = "cqmgr.quota-query-snapshot/v4"
 QUOTA_QUERY_CURSOR_SCHEMA = "cqmgr.quota-query-cursor/v1"
 _LEGACY_SNAPSHOT_SCHEMAS = frozenset(
     {
         "cqmgr.quota-query-snapshot/v1",
         "cqmgr.quota-query-snapshot/v2",
+        "cqmgr.quota-query-snapshot/v3",
     }
 )
 _LEGACY_CATALOG_GROUP_SERVICES = {
@@ -71,7 +78,7 @@ _CREDENTIAL_MARKERS = (
     "ya29.",
 )
 _DIMENSION_PAIR_SIZE = 2
-_LATEST_SNAPSHOT_SCHEMA_VERSION = 3
+_LATEST_SNAPSHOT_SCHEMA_VERSION = 4
 _LATEST_CURSOR_SCHEMA_VERSION = 1
 
 
@@ -106,7 +113,7 @@ def _encode_canonical_document(document: dict[str, object]) -> bytes:
     ).encode()
 
 
-def decode_snapshot_record(data: bytes) -> QuotaQuerySnapshot:
+def decode_snapshot_record(data: bytes) -> QuotaQuerySnapshot:  # noqa: C901
     """Decode one exact supported schema or fail closed."""
     if not isinstance(data, bytes):
         msg = "stored quota snapshot must be bytes"
@@ -139,6 +146,12 @@ def decode_snapshot_record(data: bytes) -> QuotaQuerySnapshot:
         if schema == QUOTA_QUERY_SNAPSHOT_SCHEMA:
             snapshot = _decode_snapshot(document["snapshot"])
             canonical = _encode_snapshot_record(snapshot, cast("str", schema))
+        elif schema == "cqmgr.quota-query-snapshot/v3":
+            snapshot = _decode_snapshot(
+                document["snapshot"],
+                includes_identity=False,
+            )
+            canonical = _encode_canonical_document(document)
         else:
             snapshot = _decode_legacy_snapshot(
                 document["snapshot"],
@@ -232,6 +245,7 @@ def _snapshot(snapshot: QuotaQuerySnapshot) -> dict[str, object]:
             "observed_at": _timestamp(metadata.observed_at),
             "expires_at": _timestamp(metadata.expires_at),
             "complete": metadata.complete,
+            "identity_evidence": _provider_identity(metadata.identity_evidence),
         },
         "ordered_slice_identities": [
             _identity(item.identity) for item in snapshot.items
@@ -324,6 +338,66 @@ def _source_coverage(value: ProviderSourceCoverage) -> dict[str, object]:
     }
 
 
+def _provider_identity(
+    value: ProviderIdentityEvidence | None,
+) -> dict[str, object] | None:
+    if value is None:
+        return None
+    return {
+        "credential_kind": value.credential_kind.value,
+        "verification": value.verification.value,
+        "acting_principal": (
+            None if value.acting_principal is None else value.acting_principal.value
+        ),
+        "impersonation_chain": [
+            principal.value for principal in value.impersonation_chain
+        ],
+    }
+
+
+def _decode_provider_identity(value: object) -> ProviderIdentityEvidence | None:
+    if value is None:
+        return None
+    table = _exact_object(
+        value,
+        {
+            "credential_kind",
+            "verification",
+            "acting_principal",
+            "impersonation_chain",
+        },
+        "identity_evidence",
+    )
+    acting_principal = _optional_string(
+        table["acting_principal"],
+        "identity_evidence.acting_principal",
+    )
+    return ProviderIdentityEvidence(
+        credential_kind=CredentialKind(
+            _string(
+                table["credential_kind"],
+                "identity_evidence.credential_kind",
+            )
+        ),
+        verification=PrincipalVerification(
+            _string(
+                table["verification"],
+                "identity_evidence.verification",
+            )
+        ),
+        acting_principal=(
+            None if acting_principal is None else PrincipalIdentity(acting_principal)
+        ),
+        impersonation_chain=tuple(
+            PrincipalIdentity(principal)
+            for principal in _strings(
+                table["impersonation_chain"],
+                "identity_evidence.impersonation_chain",
+            )
+        ),
+    )
+
+
 def _constraint_set(
     value: AcceleratorConstraintSet | None,
 ) -> dict[str, object] | None:
@@ -355,27 +429,30 @@ def _scope(scope: ResourceScope) -> dict[str, str]:
     return {"kind": scope.kind.value, "name": scope.canonical_name}
 
 
-def _decode_snapshot(value: object) -> QuotaQuerySnapshot:
+def _decode_snapshot(
+    value: object,
+    *,
+    includes_identity: bool = True,
+) -> QuotaQuerySnapshot:
     table = _exact_object(
         value,
         {"metadata", "ordered_slice_identities", "items"},
         "snapshot",
     )
-    metadata = _exact_object(
-        table["metadata"],
-        {
-            "snapshot_id",
-            "query",
-            "catalog",
-            "evidence_contract",
-            "inventory_revision",
-            "source_coverage",
-            "observed_at",
-            "expires_at",
-            "complete",
-        },
-        "metadata",
-    )
+    metadata_keys = {
+        "snapshot_id",
+        "query",
+        "catalog",
+        "evidence_contract",
+        "inventory_revision",
+        "source_coverage",
+        "observed_at",
+        "expires_at",
+        "complete",
+    }
+    if includes_identity:
+        metadata_keys.add("identity_evidence")
+    metadata = _exact_object(table["metadata"], metadata_keys, "metadata")
     catalog = _exact_object(
         metadata["catalog"], {"schema", "revision", "content_digest"}, "catalog"
     )
@@ -401,6 +478,11 @@ def _decode_snapshot(value: object) -> QuotaQuerySnapshot:
             observed_at=_datetime(metadata["observed_at"], "observed_at"),
             expires_at=_datetime(metadata["expires_at"], "expires_at"),
             complete=_bool(metadata["complete"], "complete"),
+            identity_evidence=(
+                _decode_provider_identity(metadata["identity_evidence"])
+                if includes_identity
+                else None
+            ),
         ),
         items=tuple(_decode_item(item) for item in _list(table["items"], "items")),
     )
@@ -968,20 +1050,47 @@ def _optional_bool(value: object, location: str) -> bool | None:
     return None if value is None else _bool(value, location)
 
 
-def _contains_unsafe_evidence_text(value: object) -> bool:
+_PROVIDER_IDENTITY_KEYS = {
+    "credential_kind",
+    "verification",
+    "acting_principal",
+    "impersonation_chain",
+}
+
+
+def _contains_unsafe_evidence_text(
+    value: object,
+    *,
+    allow_principal_contact: bool = False,
+) -> bool:
     if isinstance(value, dict):
+        if set(value) == _PROVIDER_IDENTITY_KEYS:
+            return any(
+                _contains_unsafe_evidence_text(
+                    item,
+                    allow_principal_contact=key
+                    in {"acting_principal", "impersonation_chain"},
+                )
+                for key, item in value.items()
+            )
         return any(
             _contains_unsafe_evidence_text(key) or _contains_unsafe_evidence_text(item)
             for key, item in value.items()
         )
     if isinstance(value, list):
-        return any(_contains_unsafe_evidence_text(item) for item in value)
+        return any(
+            _contains_unsafe_evidence_text(
+                item,
+                allow_principal_contact=allow_principal_contact,
+            )
+            for item in value
+        )
     if not isinstance(value, str):
         return False
     lowered = value.casefold()
     return (
         value.startswith(("/", "~/", "\\\\"))
         or _ABSOLUTE_WINDOWS_PATH.match(value) is not None
-        or _CONTACT.search(value) is not None
+        or (not allow_principal_contact and _CONTACT.search(value) is not None)
         or any(marker in lowered for marker in _CREDENTIAL_MARKERS)
     )

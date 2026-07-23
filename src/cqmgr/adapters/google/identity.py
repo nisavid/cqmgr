@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import re
+import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from threading import Thread
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import google.auth
 from google.auth import external_account, impersonated_credentials
@@ -24,7 +27,7 @@ from cqmgr.domain.identity import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
 ADC_IDENTITY_SCOPES = (
     "https://www.googleapis.com/auth/cloud-platform",
@@ -33,6 +36,29 @@ ADC_IDENTITY_SCOPES = (
 )
 _USERINFO_ENDPOINT = "https://openidconnect.googleapis.com/v1/userinfo"
 _SUBJECT = re.compile(r"[A-Za-z0-9._~-]+\Z")
+
+
+class _DeadlineClampedRequest:
+    """Clamp every google-auth transport call to one remaining timeout."""
+
+    def __init__(self, timeout_seconds: float) -> None:
+        """Create one supported requests transport with a finite ceiling."""
+        self._timeout_seconds = timeout_seconds
+        self._request = Request()
+
+    def __call__(
+        self,
+        *args: object,
+        timeout: float | None = None,
+        **kwargs: object,
+    ) -> Any:  # noqa: ANN401 - mirrors google-auth's transport callable
+        """Dispatch with the smaller caller or invocation transport timeout."""
+        bounded_timeout = (
+            self._timeout_seconds
+            if timeout is None
+            else min(float(timeout), self._timeout_seconds)
+        )
+        return self._request(*args, timeout=bounded_timeout, **kwargs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,17 +84,25 @@ class ADCRuntime(Protocol):
         *,
         scopes: Sequence[str],
         quota_project_id: str | None,
+        timeout_seconds: float = 10.0,
     ) -> ADCCredentialSnapshot:
         """Load one ADC context with the requested scopes and override."""
         ...
 
-    def refresh(self, snapshot: ADCCredentialSnapshot) -> None:
+    def refresh(
+        self,
+        snapshot: ADCCredentialSnapshot,
+        *,
+        timeout_seconds: float = 10.0,
+    ) -> None:
         """Refresh the exact loaded credential without retaining its token."""
         ...
 
     def fetch_user_info(
         self,
         snapshot: ADCCredentialSnapshot,
+        *,
+        timeout_seconds: float = 10.0,
     ) -> Mapping[str, object]:
         """Fetch authoritative OpenID UserInfo for direct-user credentials."""
         ...
@@ -97,30 +131,42 @@ class GoogleAuthRuntime:
         *,
         scopes: Sequence[str],
         quota_project_id: str | None,
+        timeout_seconds: float = 10.0,
     ) -> ADCCredentialSnapshot:
         """Load ADC once without reading or reporting an ambient active project."""
         credential, discovered_project_id = google.auth.default(
             scopes=scopes,
             quota_project_id=quota_project_id,
+            request=_DeadlineClampedRequest(timeout_seconds),
         )
         return self._snapshot(credential, discovered_project_id)
 
-    def refresh(self, snapshot: ADCCredentialSnapshot) -> None:
+    def refresh(
+        self,
+        snapshot: ADCCredentialSnapshot,
+        *,
+        timeout_seconds: float = 10.0,
+    ) -> None:
         """Refresh in memory through google-auth's supported transport."""
         refresh = getattr(snapshot.credential, "refresh", None)
         if not callable(refresh):
             msg = "loaded ADC credential has no refresh operation"
             raise TypeError(msg)
-        refresh(Request())
+        refresh(_DeadlineClampedRequest(timeout_seconds))
 
     def fetch_user_info(
         self,
         snapshot: ADCCredentialSnapshot,
+        *,
+        timeout_seconds: float = 10.0,
     ) -> Mapping[str, object]:
         """Read the OpenID UserInfo response without exposing the access token."""
         session = AuthorizedSession(snapshot.credential)  # type: ignore[arg-type]
         try:
-            response = session.get(_USERINFO_ENDPOINT, timeout=10.0)
+            response = session.get(
+                _USERINFO_ENDPOINT,
+                timeout=min(10.0, timeout_seconds),
+            )
             response.raise_for_status()
             payload = response.json()
             if not isinstance(payload, dict):
@@ -190,26 +236,44 @@ class GoogleAuthRuntime:
 class GoogleADCIdentityProvider:
     """Resolve ADC identity without mutation, switching, or token retention."""
 
-    def __init__(self, runtime: ADCRuntime) -> None:
+    def __init__(
+        self,
+        runtime: ADCRuntime,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
         """Require explicit ADC composition, including federation support policy."""
         self._runtime = runtime
+        self._monotonic = monotonic
 
     async def resolve(
         self,
         *,
         adc_quota_project: ADCQuotaProject | None = None,
+        timeout_seconds: float = 10.0,
     ) -> ADCIdentityEvidence:
         """Return safe refreshed identity and explicit operation capabilities."""
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            msg = "ADC timeout_seconds must be positive and finite"
+            raise ValueError(msg)
+        finish_by = self._monotonic() + float(timeout_seconds)
         override = (
             adc_quota_project.google_auth_value
             if adc_quota_project is not None
             else None
         )
         try:
-            snapshot = await asyncio.to_thread(
-                self._runtime.load,
-                scopes=ADC_IDENTITY_SCOPES,
-                quota_project_id=override,
+            snapshot = await _run_abandonable_sync(
+                lambda: self._runtime.load(
+                    scopes=ADC_IDENTITY_SCOPES,
+                    quota_project_id=override,
+                    timeout_seconds=_remaining(finish_by, self._monotonic),
+                )
             )
         except Exception:  # noqa: BLE001  # text is intentionally discarded
             return ADCIdentityEvidence.unavailable(
@@ -234,7 +298,12 @@ class GoogleADCIdentityProvider:
                 )
 
         try:
-            await asyncio.to_thread(self._runtime.refresh, snapshot)
+            await _run_abandonable_sync(
+                lambda: self._runtime.refresh(
+                    snapshot,
+                    timeout_seconds=_remaining(finish_by, self._monotonic),
+                )
+            )
         except Exception:  # noqa: BLE001  # text is intentionally discarded
             return ADCIdentityEvidence.unavailable(
                 credential_kind=snapshot.kind,
@@ -245,23 +314,36 @@ class GoogleADCIdentityProvider:
                 ),
             )
 
-        return await self._resolve_snapshot(snapshot, quota_project=quota_project)
+        return await self._resolve_snapshot(
+            snapshot,
+            quota_project=quota_project,
+            finish_by=finish_by,
+        )
 
     async def _resolve_snapshot(
         self,
         snapshot: ADCCredentialSnapshot,
         *,
         quota_project: ADCQuotaProject | None,
+        finish_by: float,
     ) -> ADCIdentityEvidence:
         if snapshot.kind is CredentialKind.DIRECT_USER:
-            return await self._resolve_direct_user(snapshot, quota_project)
+            return await self._resolve_direct_user(
+                snapshot,
+                quota_project,
+                finish_by=finish_by,
+            )
         if snapshot.kind is CredentialKind.SERVICE_ACCOUNT:
             principal = _service_account_principal(snapshot.service_account_email)
             if principal is None:
                 return _principal_unverified(snapshot.kind, quota_project)
             return _verified(snapshot.kind, principal, quota_project=quota_project)
         if snapshot.kind is CredentialKind.IMPERSONATED:
-            return await self._resolve_impersonated(snapshot, quota_project)
+            return await self._resolve_impersonated(
+                snapshot,
+                quota_project,
+                finish_by=finish_by,
+            )
         if snapshot.kind is CredentialKind.FEDERATED:
             return _resolve_federated(snapshot, quota_project)
         return _principal_unverified(snapshot.kind, quota_project)
@@ -270,11 +352,15 @@ class GoogleADCIdentityProvider:
         self,
         snapshot: ADCCredentialSnapshot,
         quota_project: ADCQuotaProject | None,
+        *,
+        finish_by: float,
     ) -> ADCIdentityEvidence:
         try:
-            user_info = await asyncio.to_thread(
-                self._runtime.fetch_user_info,
-                snapshot,
+            user_info = await _run_abandonable_sync(
+                lambda: self._runtime.fetch_user_info(
+                    snapshot,
+                    timeout_seconds=_remaining(finish_by, self._monotonic),
+                )
             )
         except Exception:  # noqa: BLE001  # text is intentionally discarded
             return _principal_unverified(
@@ -316,11 +402,17 @@ class GoogleADCIdentityProvider:
         self,
         snapshot: ADCCredentialSnapshot,
         quota_project: ADCQuotaProject | None,
+        *,
+        finish_by: float,
     ) -> ADCIdentityEvidence:
         target = _service_account_principal(snapshot.service_account_email)
         if snapshot.source is None or target is None:
             return _principal_unverified(snapshot.kind, quota_project)
-        source = await self._resolve_snapshot(snapshot.source, quota_project=None)
+        source = await self._resolve_snapshot(
+            snapshot.source,
+            quota_project=None,
+            finish_by=finish_by,
+        )
         if not source.preview_apply_capability or source.stable_principal is None:
             return _principal_unverified(snapshot.kind, quota_project)
         delegates = tuple(
@@ -425,3 +517,65 @@ def _string_tuple(value: object) -> tuple[str, ...]:
     ):
         return ()
     return tuple(value)
+
+
+def _remaining(deadline: float, monotonic: Callable[[], float]) -> float:
+    """Return positive remaining setup time for a cooperative sync transport."""
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    return remaining
+
+
+async def _run_abandonable_sync[ValueT](
+    operation: Callable[[], ValueT],
+) -> ValueT:
+    """Run sync auth work without making event-loop shutdown join a hung call.
+
+    Cancellation abandons a daemon worker whose late result is discarded. Production
+    Google transports receive a finite timeout, while this fence also protects the
+    application from a runtime implementation that does not cooperate.
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[ValueT] = loop.create_future()
+
+    def run() -> None:
+        try:
+            value = operation()
+        except Exception as error:  # noqa: BLE001 - publish through async boundary
+            try:
+                loop.call_soon_threadsafe(
+                    _set_worker_exception,
+                    cast("asyncio.Future[object]", future),
+                    error,
+                )
+            except RuntimeError:
+                return
+        else:
+            try:
+                loop.call_soon_threadsafe(_set_worker_result, future, value)
+            except RuntimeError:
+                return
+
+    Thread(
+        target=run,
+        name="cqmgr-adc-worker",
+        daemon=True,
+    ).start()
+    return await future
+
+
+def _set_worker_result[ValueT](
+    future: asyncio.Future[ValueT],
+    value: object,
+) -> None:
+    if not future.done():
+        future.set_result(cast("ValueT", value))
+
+
+def _set_worker_exception(
+    future: asyncio.Future[object],
+    error: object,
+) -> None:
+    if not future.done():
+        future.set_exception(cast("BaseException", error))

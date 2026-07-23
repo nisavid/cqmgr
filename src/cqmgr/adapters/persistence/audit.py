@@ -75,6 +75,97 @@ _RAW_PROVIDER_BODY_PATTERN: Final = re.compile(r"(?s)(?:\{.*\}|\[.*\])")
 _GOOGLE_ACCESS_TOKEN_PATTERN: Final = re.compile(r"(?<!\w)ya29\.[A-Za-z0-9._~-]+")
 
 
+class _AuditJournalUnavailableError(OSError):
+    """Installation-local audit storage could not be opened."""
+
+
+class UnavailableAuditJournal:
+    """Audit port used when installation-local storage cannot be opened."""
+
+    def append(  # pragma: no cover - read-only fallback never appends
+        self,
+        draft: AuditRecordDraft,
+        *,
+        sensitive_values: tuple[str, ...] = (),
+        machine_paths: tuple[str, ...] = (),
+    ) -> Never:
+        """Report unavailable storage through the application result boundary."""
+        del draft, sensitive_values, machine_paths
+        raise _AuditJournalUnavailableError
+
+    def query(self, query: AuditQuery) -> Never:
+        """Report unavailable storage through the application result boundary."""
+        del query
+        raise _AuditJournalUnavailableError
+
+    def inspect(self, record_id: str) -> Never:
+        """Report unavailable storage through the application result boundary."""
+        del record_id
+        raise _AuditJournalUnavailableError
+
+    def verify(
+        self,
+        *,
+        from_record_id: str | None = None,
+        through_record_id: str | None = None,
+    ) -> Never:
+        """Report unavailable storage through the application result boundary."""
+        del from_record_id, through_record_id
+        raise _AuditJournalUnavailableError
+
+
+class EmptyAuditJournal:
+    """Non-creating read view for an audit journal that does not yet exist."""
+
+    def append(  # pragma: no cover - read-only composition never appends
+        self,
+        draft: AuditRecordDraft,
+        *,
+        sensitive_values: tuple[str, ...] = (),
+        machine_paths: tuple[str, ...] = (),
+    ) -> Never:
+        """Reject writes through the deliberately read-only empty view."""
+        del draft, sensitive_values, machine_paths
+        raise _AuditJournalUnavailableError
+
+    def query(self, query: AuditQuery) -> AuditQueryPage:
+        """Return an empty page while preserving cursor validation."""
+        if query.cursor is not None:
+            msg = "audit cursor is invalid or does not match the query"
+            raise ValueError(msg)
+        return AuditQueryPage(records=(), next_cursor=None)
+
+    def inspect(self, record_id: str) -> AuditRecord | None:
+        """Report that an exact record is absent."""
+        del record_id
+
+    def verify(
+        self,
+        *,
+        from_record_id: str | None = None,
+        through_record_id: str | None = None,
+    ) -> AuditVerification:
+        """Verify an empty chain or report an explicitly missing endpoint."""
+        missing = from_record_id or through_record_id
+        if missing is not None:
+            return AuditVerification(
+                valid=False,
+                verified_from=None,
+                verified_through=None,
+                failure=AuditVerificationFailure(
+                    AuditFailureCode.RECORD_NOT_FOUND,
+                    0,
+                    None,
+                    missing,
+                ),
+            )
+        return AuditVerification(
+            valid=True,
+            verified_from=None,
+            verified_through=None,
+        )
+
+
 class FilesystemAuditJournal:
     """Append-only JSON-lines journal with a canonical SHA-256 chain."""
 

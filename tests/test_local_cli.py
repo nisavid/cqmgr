@@ -12,6 +12,7 @@ import pytest
 from click.testing import CliRunner
 
 import cqmgr.cli as cli_module
+import cqmgr.tui as tui_module
 from cqmgr.bootstrap import InvocationKind, classify_invocation
 
 main = cli_module.main
@@ -26,12 +27,19 @@ OPERATIONAL_FAILURE_EXIT = 9
         ((), False, False, InvocationKind.HELP),
         ((), True, True, InvocationKind.TUI),
         (("--version",), False, False, InvocationKind.HELP),
-        (("quo", "--help"), False, False, InvocationKind.HELP),
-        (("sco", "sho"), False, False, InvocationKind.LOCAL),
-        (("pro", "lis"), False, False, InvocationKind.LOCAL),
-        (("con", "get", "interface.no-color"), False, False, InvocationKind.LOCAL),
+        (("q", "--help"), False, False, InvocationKind.HELP),
+        (("sc", "sh"), False, False, InvocationKind.LOCAL),
+        (("pf", "l"), False, False, InvocationKind.LOCAL),
+        (("cfg", "get", "interface.no-color"), False, False, InvocationKind.LOCAL),
         (("tui",), True, True, InvocationKind.TUI),
-        (("quo", "lis"), False, False, InvocationKind.PROVIDER),
+        (("q", "l"), False, False, InvocationKind.PROVIDER),
+        (("sco",), False, False, InvocationKind.INVALID),
+        (("pro",), False, False, InvocationKind.INVALID),
+        (("con",), False, False, InvocationKind.INVALID),
+        (("quo", "--help"), False, False, InvocationKind.INVALID),
+        (("obt",), False, False, InvocationKind.INVALID),
+        (("pla",), False, False, InvocationKind.INVALID),
+        (("p",), False, False, InvocationKind.INVALID),
         (("unknown",), False, False, InvocationKind.INVALID),
     ],
 )
@@ -57,7 +65,7 @@ def test_invocation_is_classified_before_optional_runtime_imports(
     "arguments",
     [
         ("scope", "--help"),
-        ("sco", "show", "--help"),
+        ("sc", "show", "--help"),
         ("tui", "--help"),
     ],
 )
@@ -106,8 +114,8 @@ def test_scope_commands_and_aliases_preserve_resolution_source(tmp_path: Path) -
     selected = runner.invoke(
         main,
         [
-            "sco",
-            "sel",
+            "sc",
+            "se",
             "--resource-scope",
             "projects/123",
             "--output",
@@ -129,6 +137,7 @@ def test_scope_commands_and_aliases_preserve_resolution_source(tmp_path: Path) -
         "name": "projects/123",
     }
     assert payload["data"]["resolution_source"] == "direct-selection"
+    assert payload["data"]["identity_evidence"] == "deferred-offline"
 
 
 def test_folder_selection_is_rejected_without_replacing_project(tmp_path: Path) -> None:
@@ -209,16 +218,16 @@ def test_profile_and_config_commands_use_separate_files(tmp_path: Path) -> None:
     original = config_path.read_bytes()
     runner = CliRunner()
 
-    selected = runner.invoke(main, ["pro", "sel", "primary"], env=environment)
+    selected = runner.invoke(main, ["pf", "s", "primary"], env=environment)
     after_profile_selection = config_path.read_bytes()
     scope = runner.invoke(
         main,
-        ["sco", "sho", "--output", "json"],
+        ["sc", "sh", "--output", "json"],
         env=environment,
     )
     configured = runner.invoke(
         main,
-        ["con", "set", "interface.nerd-font", "true"],
+        ["cfg", "s", "interface.nerd-font", "true"],
         env=environment,
     )
 
@@ -334,7 +343,9 @@ def test_no_color_and_quiet_preserve_required_human_result_facts(
 
     assert selected.exit_code == 0, selected.output
     assert selected.stdout == (
-        "Resource scope: projects/123\nResolution source: direct-selection\n"
+        "Resource scope: projects/123\n"
+        "Resolution source: direct-selection\n"
+        "Acting principal: deferred (offline)\n"
     )
 
     rejected = CliRunner().invoke(
@@ -487,3 +498,20 @@ def test_noninteractive_entry_points_fail_before_textual_import() -> None:
     assert bare.stdout.startswith("Usage: ")
     assert explicit.exit_code == click.UsageError.exit_code
     assert "requires interactive input and output" in explicit.output
+
+
+def test_interactive_entry_points_dispatch_the_tui_through_the_safe_seam(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bare and explicit interactive entry points dispatch without real rendering."""
+    calls: list[str] = []
+    monkeypatch.setattr(cli_module, "_interactive_streams", lambda: (True, True))
+    monkeypatch.setattr(tui_module, "run", lambda: calls.append("run"))
+    runner = CliRunner()
+
+    bare = runner.invoke(main, [])
+    explicit = runner.invoke(main, ["tui"])
+
+    assert bare.exit_code == 0, bare.output
+    assert explicit.exit_code == 0, explicit.output
+    assert calls == ["run", "run"]

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, cast, override
 
 import pytest
 from google.auth import external_account, identity_pool, impersonated_credentials
@@ -33,7 +34,9 @@ PUBLIC_FIXTURE_TOKEN = "public-fixture-token"  # noqa: S105
 TOKEN_URI = "https://oauth2.googleapis.com/token"  # noqa: S105
 SUBJECT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:jwt"  # noqa: S105
 STS_TOKEN_URL = "https://sts.googleapis.com/v1/token"  # noqa: S105
-USERINFO_TIMEOUT_SECONDS = 10.0
+USERINFO_TIMEOUT_SECONDS = 0.25
+COOPERATIVE_TIMEOUT_SECONDS = 0.01
+COOPERATIVE_GUARD_SECONDS = 0.2
 
 
 class FakeADCRuntime:
@@ -58,15 +61,23 @@ class FakeADCRuntime:
         *,
         scopes: Sequence[str],
         quota_project_id: str | None,
+        timeout_seconds: float = 10.0,
     ) -> ADCCredentialSnapshot:
         """Record exact scope and quota-project inputs without ambient state."""
+        del timeout_seconds
         self.load_calls.append((tuple(scopes), quota_project_id))
         if isinstance(self.snapshot, BaseException):
             raise self.snapshot
         return self.snapshot
 
-    def refresh(self, snapshot: ADCCredentialSnapshot) -> None:
+    def refresh(
+        self,
+        snapshot: ADCCredentialSnapshot,
+        *,
+        timeout_seconds: float = 10.0,
+    ) -> None:
         """Record one refresh or inject a safe test failure."""
+        del timeout_seconds
         self.refreshed.append(snapshot)
         if self.refresh_error is not None:
             raise self.refresh_error
@@ -74,8 +85,11 @@ class FakeADCRuntime:
     def fetch_user_info(
         self,
         snapshot: ADCCredentialSnapshot,
+        *,
+        timeout_seconds: float = 10.0,
     ) -> Mapping[str, object]:
         """Return a public OpenID UserInfo fixture without making a request."""
+        del timeout_seconds
         assert snapshot.kind is CredentialKind.DIRECT_USER
         if isinstance(self.user_info, BaseException):
             raise self.user_info
@@ -442,6 +456,107 @@ def test_google_auth_runtime_refresh_requires_a_credential_operation() -> None:
         runtime.refresh(snapshot)
 
 
+def test_google_auth_runtime_clamps_default_discovery_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADC metadata discovery uses the caller's remaining transport ceiling."""
+    timeouts: list[float] = []
+
+    class FakeRequest:
+        def __call__(
+            self,
+            *,
+            timeout: float,
+            **_kwargs: object,
+        ) -> None:
+            timeouts.append(timeout)
+
+    def fake_default(**kwargs: object) -> tuple[object, None]:
+        request = cast("FakeRequest", kwargs["request"])
+        request(url="https://metadata.example.test", timeout=30.0)
+        return object(), None
+
+    monkeypatch.setattr("cqmgr.adapters.google.identity.Request", FakeRequest)
+    monkeypatch.setattr(
+        "cqmgr.adapters.google.identity.google.auth.default",
+        fake_default,
+    )
+
+    GoogleAuthRuntime(FakeFederatedSubjectResolver()).load(
+        scopes=ADC_IDENTITY_SCOPES,
+        quota_project_id=None,
+        timeout_seconds=USERINFO_TIMEOUT_SECONDS,
+    )
+
+    assert timeouts == [USERINFO_TIMEOUT_SECONDS]
+
+
+def test_google_auth_runtime_clamps_credential_refresh_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Credential refresh cannot request transport time past remaining setup."""
+    timeouts: list[float] = []
+
+    class FakeRequest:
+        def __call__(
+            self,
+            *,
+            timeout: float,
+            **_kwargs: object,
+        ) -> None:
+            timeouts.append(timeout)
+
+    class FakeCredential:
+        def refresh(self, request: object) -> None:
+            cast("FakeRequest", request)(url="https://example.test", timeout=30.0)
+
+    monkeypatch.setattr("cqmgr.adapters.google.identity.Request", FakeRequest)
+    snapshot = ADCCredentialSnapshot(CredentialKind.UNKNOWN, FakeCredential())
+
+    GoogleAuthRuntime(FakeFederatedSubjectResolver()).refresh(
+        snapshot,
+        timeout_seconds=0.25,
+    )
+
+    assert timeouts == [0.25]
+
+
+def test_identity_provider_cooperatively_bounds_refresh_worker() -> None:
+    """A cooperative sync refresh cannot extend CLI shutdown past its ceiling."""
+    snapshot = ADCCredentialSnapshot(CredentialKind.UNKNOWN, object())
+
+    class CooperativeTimeoutRuntime(FakeADCRuntime):
+        def __init__(self) -> None:
+            super().__init__(snapshot)
+            self.timeout: float | None = None
+
+        @override
+        def refresh(
+            self,
+            snapshot: ADCCredentialSnapshot,
+            *,
+            timeout_seconds: float = 10.0,
+        ) -> None:
+            del snapshot
+            self.timeout = timeout_seconds
+            time.sleep(timeout_seconds)
+            raise TimeoutError
+
+    runtime = CooperativeTimeoutRuntime()
+    started = time.monotonic()
+
+    evidence = asyncio.run(
+        GoogleADCIdentityProvider(runtime).resolve(
+            timeout_seconds=COOPERATIVE_TIMEOUT_SECONDS
+        )
+    )
+
+    assert time.monotonic() - started < COOPERATIVE_GUARD_SECONDS
+    assert runtime.timeout is not None
+    assert runtime.timeout <= COOPERATIVE_TIMEOUT_SECONDS
+    assert evidence.diagnostics[0].code.value == "adc-refresh-failed"
+
+
 def test_google_auth_runtime_userinfo_closes_session_and_validates_object(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -474,5 +589,8 @@ def test_google_auth_runtime_userinfo_closes_session_and_validates_object(
     snapshot = ADCCredentialSnapshot(CredentialKind.DIRECT_USER, object())
 
     with pytest.raises(TypeError, match="must be an object"):
-        GoogleAuthRuntime(FakeFederatedSubjectResolver()).fetch_user_info(snapshot)
+        GoogleAuthRuntime(FakeFederatedSubjectResolver()).fetch_user_info(
+            snapshot,
+            timeout_seconds=USERINFO_TIMEOUT_SECONDS,
+        )
     assert closed == [True]

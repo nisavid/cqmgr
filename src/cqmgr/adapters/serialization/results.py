@@ -9,7 +9,15 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from cqmgr.application.configuration import QuotaContactKeyringReference
+from cqmgr.application.operations.quotas import QuotaInspectData
 from cqmgr.domain.diagnostics import DiagnosticCode, DiagnosticPhase, DiagnosticSource
+from cqmgr.domain.identity import PrincipalIdentity
+from cqmgr.domain.quotas import (
+    MonitoringValue,
+    MonitoringValueKind,
+    QuotaPreferenceEvidence,
+    QuotaQuantity,
+)
 from cqmgr.domain.redaction import RedactedText
 from cqmgr.domain.scopes import ResourceScope
 
@@ -17,16 +25,25 @@ if TYPE_CHECKING:
     from cqmgr.domain.results import OperationResult
 
 
-def _value(value: object) -> object:  # noqa: PLR0911
+def _value(value: object) -> object:  # noqa: C901, PLR0911
     if isinstance(value, ResourceScope):
         return {"type": value.kind.value, "name": value.canonical_name}
+    if isinstance(value, QuotaQuantity):
+        return {"value": value.base10, "unit": value.unit.symbol}
+    if isinstance(value, MonitoringValue):
+        provider_value = (
+            str(value.value) if value.kind is MonitoringValueKind.INT64 else value.value
+        )
+        return {"kind": value.kind.value, "value": provider_value}
+    if isinstance(value, (QuotaInspectData, QuotaPreferenceEvidence)):
+        return _quota_evidence_value(value)
     if isinstance(value, QuotaContactKeyringReference):
         return {
             "backend": value.backend,
             "service": value.service,
             "account": value.account,
         }
-    if isinstance(value, RedactedText):
+    if isinstance(value, (PrincipalIdentity, RedactedText)):
         return value.value
     if isinstance(value, (DiagnosticCode, DiagnosticPhase, DiagnosticSource)):
         return value.value
@@ -45,9 +62,67 @@ def _value(value: object) -> object:  # noqa: PLR0911
     return value
 
 
+def _quota_evidence_value(
+    value: QuotaInspectData | QuotaPreferenceEvidence,
+) -> dict[str, object]:
+    if isinstance(value, QuotaPreferenceEvidence):
+        return _preference_value(value, None)
+    unit = (
+        _inspect_native_unit(value)
+        if value.preference is None or value.preference.identity == value.identity
+        else None
+    )
+    return {
+        field.name: (
+            _preference_value(value.preference, unit)
+            if field.name == "preference" and value.preference is not None
+            else _value(getattr(value, field.name))
+        )
+        for field in fields(value)
+    }
+
+
+def _inspect_native_unit(value: QuotaInspectData) -> str | None:
+    """Return one authoritative exact-slice unit or explicit unavailability."""
+    units = {
+        quantity.unit.symbol
+        for identity, quantity in (
+            (
+                None if value.evidence is None else value.evidence.identity,
+                None if value.evidence is None else value.evidence.effective_value,
+            ),
+            (
+                None if value.item is None else value.item.identity,
+                None if value.item is None else value.item.effective_value,
+            ),
+        )
+        if identity == value.identity and quantity is not None
+    }
+    return next(iter(units)) if len(units) == 1 else None
+
+
+def _preference_value(
+    value: QuotaPreferenceEvidence,
+    unit: str | None,
+) -> dict[str, object]:
+    mapping = {
+        field.name: _value(getattr(value, field.name)) for field in fields(value)
+    }
+    mapping["preferred_value"] = {
+        "value": str(value.preferred_value),
+        "unit": unit,
+    }
+    mapping["granted_value"] = (
+        None
+        if value.granted_value is None
+        else {"value": str(value.granted_value), "unit": unit}
+    )
+    return mapping
+
+
 def operation_result_mapping(result: OperationResult[Any]) -> dict[str, object]:
     """Serialize one result with the exact stable top-level envelope."""
-    return {
+    mapping = {
         "schema": result.schema,
         "operation": result.operation.value,
         "resource_scope": _value(result.resource_scope),
@@ -66,3 +141,6 @@ def operation_result_mapping(result: OperationResult[Any]) -> dict[str, object]:
         "diagnostics": _value(result.diagnostics),
         "provenance": _value(result.provenance),
     }
+    if result.identity_evidence is not None:
+        mapping["identity_evidence"] = _value(result.identity_evidence)
+    return mapping

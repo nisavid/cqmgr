@@ -64,6 +64,10 @@ class OfficialMonitoringPageClient:
         """Bind one shared-credential official async client."""
         self._client = client
 
+    async def close(self) -> None:
+        """Close the owned generated async client."""
+        await self._client.transport.close()
+
     async def time_series(  # noqa: PLR0913
         self,
         *,
