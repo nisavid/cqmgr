@@ -1301,6 +1301,9 @@ def test_browse_preserves_provider_stop_outcomes(
     assert result.outcome.code == StableSymbol(outcome)
     assert result.data.items
     assert result.completeness.has_partial_data
+    assert result.identity_evidence == ProviderIdentityEvidence.from_adc(
+        _context().identity
+    )
 
 
 def test_preference_schema_failure_degrades_only_its_provider_coverage() -> None:
@@ -1521,6 +1524,9 @@ def test_complete_browse_rejects_duplicate_effective_slice_as_provider_failure()
     assert result.outcome.exit_class is ExitClass.OPERATIONAL_FAILURE
     assert result.outcome.code == StableSymbol("duplicate-effective-slice")
     assert result.data.reason == "duplicate-effective-slice"
+    assert result.identity_evidence == ProviderIdentityEvidence.from_adc(
+        _context().identity
+    )
     assert fixture.snapshots.snapshots == {}
 
 
@@ -1538,6 +1544,9 @@ def test_incomplete_browse_retains_filtered_items_without_order_or_cursor() -> N
     assert result.data.total is None
     assert result.data.next_cursor is None
     assert result.data.snapshot_id is None
+    assert result.identity_evidence == ProviderIdentityEvidence.from_adc(
+        _context().identity
+    )
     assert tuple(item.state for item in result.data.source_coverage) == (
         ProviderSourceCoverageState.INCOMPLETE,
         ProviderSourceCoverageState.INTENTIONALLY_UNQUERIED,
