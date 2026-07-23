@@ -187,15 +187,30 @@ class FailingAuditJournal(MemoryAuditJournal):
         raise OSError(msg)
 
 
+def _as_plan_repository(value: object) -> PlanRepository:
+    """Treat a deliberately partial test double as the complete storage port."""
+    return cast("PlanRepository", value)
+
+
+def _as_audit_journal(value: object) -> AuditJournal:
+    """Treat a deliberately partial test double as the complete audit port."""
+    return cast("AuditJournal", value)
+
+
+def _as_plan_codec(value: object) -> PlanCodecPort:
+    """Bind the concrete codec through its application port."""
+    return cast("PlanCodecPort", value)
+
+
 def _operations(
     repository: MemoryPlanRepository,
     audit: MemoryAuditJournal,
 ) -> RequestPlanOperations:
     """Bind hermetic doubles through their public port contracts."""
     return RequestPlanOperations(
-        repository=cast("PlanRepository", repository),
-        audit=cast("AuditJournal", audit),
-        codec=cast("PlanCodecPort", PlanCodec()),
+        repository=_as_plan_repository(repository),
+        audit=_as_audit_journal(audit),
+        codec=_as_plan_codec(PlanCodec()),
     )
 
 
@@ -942,12 +957,12 @@ def test_preview_local_failure_matrix_remains_no_write_and_incapable(
     """Every local durability and integrity failure blocks Apply capability."""
     child = _preview_child()
     repository = MemoryPlanRepository()
-    codec = cast("PlanCodecPort", PlanCodec())
+    codec = _as_plan_codec(PlanCodec())
     cases: list[tuple[RequestPlanOperations, PreviewRequest, str]] = [
         (
             RequestPlanOperations(
-                repository=cast("PlanRepository", repository),
-                audit=cast("AuditJournal", MemoryAuditJournal()),
+                repository=_as_plan_repository(repository),
+                audit=_as_audit_journal(MemoryAuditJournal()),
                 codec=codec,
             ),
             _preview_request(replace(child, observed_at=None)),
@@ -955,7 +970,7 @@ def test_preview_local_failure_matrix_remains_no_write_and_incapable(
         ),
         (
             RequestPlanOperations(
-                repository=cast("PlanRepository", repository),
+                repository=_as_plan_repository(repository),
                 audit=None,
                 codec=codec,
             ),
@@ -964,8 +979,8 @@ def test_preview_local_failure_matrix_remains_no_write_and_incapable(
         ),
         (
             RequestPlanOperations(
-                repository=cast("PlanRepository", repository),
-                audit=cast("AuditJournal", FailingAuditJournal()),
+                repository=_as_plan_repository(repository),
+                audit=_as_audit_journal(FailingAuditJournal()),
                 codec=codec,
             ),
             _preview_request(child),
@@ -974,7 +989,7 @@ def test_preview_local_failure_matrix_remains_no_write_and_incapable(
         (
             RequestPlanOperations(
                 repository=None,
-                audit=cast("AuditJournal", MemoryAuditJournal()),
+                audit=_as_audit_journal(MemoryAuditJournal()),
                 codec=codec,
             ),
             _preview_request(child),
@@ -982,8 +997,8 @@ def test_preview_local_failure_matrix_remains_no_write_and_incapable(
         ),
         (
             RequestPlanOperations(
-                repository=cast("PlanRepository", repository),
-                audit=cast("AuditJournal", MemoryAuditJournal()),
+                repository=_as_plan_repository(repository),
+                audit=_as_audit_journal(MemoryAuditJournal()),
                 codec=None,
             ),
             _preview_request(child),
@@ -1064,7 +1079,7 @@ def test_plan_review_rejects_invalid_selectors_bytes_and_digest() -> None:
         )
     )
     no_codec = RequestPlanOperations(
-        repository=cast("PlanRepository", repository),
+        repository=_as_plan_repository(repository),
         audit=None,
         codec=None,
     ).review(PlanReviewRequest(digest=digest, path=None, **common))
