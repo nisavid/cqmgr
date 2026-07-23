@@ -28,7 +28,7 @@ fulfilled.
 | Preview plan | A locally portable, integrity-protected single or bundle quota request plan is produced, or every child is freshly verified as a no-op. V1 Apply capability is bound to the issuing installation. | Plan subject kind; bound resource scope; exact-slice `manual` input for `single`, or selected location, strategy, normalized workload, and complete constraint set for `bundle`; ordered non-no-op children; per-child evidence, identity, intent, principal, warnings, and acknowledgements; plan expiry, digest, issuing-installation trust, and Apply capability when a plan is produced, otherwise every no-op reason. |
 | Review plan | Canonical plan bytes and their digest are verified and all trustworthy bound evidence is presented without applying it. Expiry, foreign issuer, prior consumption, or unresolved acknowledgements remove Apply capability but do not make safe inspection fail. | Every bound plan fact, canonical and digest verification state, expiry, issuer and consumption state, unresolved acknowledgements, Apply capability, and exact incapability reasons. |
 | Apply plan | Every non-no-op child in the bound deterministic accelerator-first order is proven accepted. Apply is non-atomic; the first conclusively failed or transport-unknown child stops dispatch and accepted children are never rolled back. A verified all-no-op Preview has no Apply capability. | Plan digest and subject kind; resource scope; bound child order; every child's exact slice, target, unit, disposition, provider preference identity, etag and trace when present, submitted observation, and audit reference; aggregate boundary and outcome. |
-| Watch request | The explicitly selected Watch condition is reached for one accepted request or for every accepted child of a bundle. | Single or bundle subject identity; selected condition; durable Apply record; ordered children and dispositions; per-accepted-child preference identity, orthogonal status, target, granted, effective, and lineage values; aggregate state; all material observations and final outcome. |
+| Watch request | The explicitly selected Watch condition is reached for one watched request or for every child in a bundle's accepted Watch set. | Single or bundle subject identity; selected condition; durable Apply record; ordered children, immutable dispositions, and unknown dispatch resolutions; per-watched-child preference identity, orthogonal status, target, granted, effective, and lineage values; aggregate state; all material observations and final outcome. |
 | Inspect audit | The requested bounded audit query is read completely. | Query and record identities; canonical resource scopes; observation times; continuity metadata. |
 | Verify audit | The requested records and rotation checkpoints form a valid chain. | Verified range and checkpoints, or the exact first continuity failure and affected range. |
 
@@ -43,8 +43,10 @@ intent receives disposition `accepted`. A conclusive rejection or failure is
 Either stops dispatch, preceding accepted children remain accepted, later
 children are `unattempted`, and the aggregate Apply boundary is not reached.
 An unknown child is consumed and quarantined until read-after-unknown
-reconciliation proves its outcome. A verified preflight no-op is a composition
-fact, not a dispatch disposition.
+reconciliation proves its outcome. That proof is appended as an authenticated
+unknown dispatch resolution and never rewrites the durable `unknown` Apply
+disposition. A verified preflight no-op is a composition fact, not a dispatch
+disposition.
 
 An intentionally bounded page with a continuation identity is complete for
 that page. A failed required page, source, or refresh is an incomplete
@@ -122,6 +124,14 @@ The exact failed or unknown child selects the aggregate nonzero exit class;
 accepted children and their reconciliation identities remain available for
 Watch and recovery. Verified no-op children remain in composition evidence but
 do not receive Apply dispositions.
+
+An unknown dispatch resolution is separate append-only evidence for an
+`unknown` child. It is exactly `accepted` when the deterministic provider
+identity proves the bound intent was accepted or `failed` when provider evidence
+proves it was rejected. The original Apply disposition remains `unknown`.
+Resolution is single-assignment; conflicting evidence fails closed as an
+integrity error. Missing or inconclusive evidence leaves the child unresolved
+and quarantined.
 
 ## Quota request status
 
@@ -352,7 +362,7 @@ represented explicitly.
 ## Watch conditions
 
 A Watch always selects one condition and one deadline explicitly. Its subject
-is either one accepted request or one bundle with at least one accepted child.
+is either one watched request or one bundle with a nonempty accepted Watch set.
 An interactive surface may offer deadline presets, but it selects neither input
 silently.
 
@@ -365,19 +375,20 @@ subject selector.
 
 | Condition | One accepted child reaches it when | Bundle reaches it when | Conclusive mismatch |
 | --- | --- | --- | --- |
-| `granted` | Reconciliation is `settled` and granted equals the child's target. | Every accepted child reaches `granted`. | Exit `7` when any accepted child's settled grant differs from its target, including zero when the target is greater than zero. |
-| `fulfilled` | `granted` is reached and a fresh effective observation equals the child's target and granted values. | Every accepted child reaches `fulfilled`. | Exit `7` when any accepted child's settled grant differs from its target, including zero when the target is greater than zero. |
+| `granted` | Reconciliation is `settled` and granted equals the child's target. | Every child in the accepted Watch set reaches `granted`. | Exit `7` when any watched child's settled grant differs from its target, including zero when the target is greater than zero. |
+| `fulfilled` | `granted` is reached and a fresh effective observation equals the child's target and granted values. | Every child in the accepted Watch set reaches `fulfilled`. | Exit `7` when any watched child's settled grant differs from its target, including zero when the target is greater than zero. |
 
-Provider `failed` or `superseded` state for any accepted child terminates an
+Provider `failed` or `superseded` state for any watched child terminates an
 aggregate condition it makes impossible with exit `7`. A transient or
 recoverable unknown child observation stays visible and polling continues
 within the deadline. An irrecoverable local or provider observation failure
-exits under its applicable class. Apply children with disposition `failed` or
-`unknown` or `unattempted` remain visible in the subject and aggregate summaries
-but are not polled as accepted requests. An `unknown` Apply child must first
-complete read-after-unknown reconciliation; it is never treated as an accepted
-Watch child merely because the target matches. A bundle with no accepted child
-is not watchable.
+exits under its applicable class. Apply children with disposition `failed`,
+`unknown`, or `unattempted` remain visible in the subject and aggregate
+summaries. Failed and unattempted children are not polled. An `unknown` Apply
+child enters the accepted Watch set only when authenticated read-after-unknown
+resolution evidence is `accepted`; a matching target alone is insufficient.
+Resolution `failed` leaves it non-watchable. A bundle with an empty accepted
+Watch set is not watchable.
 
 ## Watch stream
 
@@ -390,20 +401,23 @@ ticks do not produce public events.
 Unknown kinds are rejected. `subject` binds the canonical resource scope,
 selected condition, shared `intent_id`, and a nonempty ordered `children`
 list. A `single` subject has exactly one child. A `bundle` subject retains
-every ordered Apply child and disposition and has one or more accepted
-children. Each child has a stable `child_id`, bound order, exact effective
-quota-slice identity, target, unit, disposition, and deterministic provider
-preference identity. Child records may gain additive fields within v1, but
-their order and identities are semantic. Because v1 is being defined before
-the first release, these semantics supersede the earlier single-request-only
-event shape without creating v2; after release, an incompatible subject or
-child change requires a new Watch schema version.
+every ordered Apply child and immutable disposition and has a nonempty accepted
+Watch set. Each child has a stable `child_id`, bound order, exact effective
+quota-slice identity, target, unit, disposition, deterministic provider
+preference identity, and optional unknown dispatch resolution plus its local
+evidence reference. Child records may gain additive fields within v1, but their
+order and identities are semantic. Because v1 is being defined before the first
+release, these semantics supersede the earlier single-request-only event shape
+without creating v2; after release, an incompatible subject or child change
+requires a new Watch schema version.
 
 The intent ID must resolve to one durable local cqmgr Apply record with the
-same subject kind, resource scope, order, child dispositions, preference
-identities, targets, and units. V1 does not adopt an unrelated provider
-preference or reconstruct a bundle from provider state. A producer may not emit
-an empty or provider-defined identity in place of the complete subject.
+same subject kind, resource scope, order, immutable child dispositions,
+preference identities, targets, and units. Every unknown dispatch resolution
+must extend that Apply record through its authenticated append-only resolution
+journal. V1 does not adopt an unrelated provider preference or reconstruct a
+bundle from provider state. A producer may not emit an empty or provider-defined
+identity in place of the complete subject.
 
 A material child event names `child_id` and carries that child's complete
 orthogonal status. An aggregate event and every terminal result retain ordered
@@ -412,22 +426,30 @@ values are never added into an aggregate amount.
 
 Every event also emits `resume`, an opaque `cqmgr.watch-resume/v1` token
 authenticated by the issuing installation. It binds the complete subject,
-selected condition, ordered accepted-child identities, each child's last
-observed provider etag and stable trace ID when present, the durable aggregate
+selected condition, ordered accepted Watch set, authenticated
+unknown-resolution journal checkpoint, each watched child's last observed
+provider etag and stable trace ID when present, the durable aggregate
 checkpoint, and the stream sequence. It contains no credential or quota
-contact. Before an initial event, Watch verifies every accepted child's current
-preference target and trace ID against its Apply record. When no stable trace
-ID exists, the current etag must equal that child's Apply response etag;
+contact. Before an initial event, Watch verifies every child in the accepted
+Watch set against its immutable Apply record and, when applicable, accepted
+unknown-resolution evidence. It then verifies the child's current preference
+target and trace ID. When no stable trace ID exists, the current etag must equal
+the Apply response etag or the etag captured by the accepted resolution;
 otherwise lineage is unknown and Watch returns rejected-precondition rather
 than treating a same-target amendment as the original intent.
 
 Resume applies the same checks to the authenticated token and durable
 checkpoint. It rejects a subject when any child identity or disposition differs
-from the Apply record, any later local Apply superseded an accepted preference,
-or any provider trace ID changed. When a child has no stable trace ID, an etag
-change across the observation gap is unknown lineage and rejects the complete
-resume rather than guessing whether reconciliation or a same-target amendment
-occurred. Each material event carries a new token for its durable checkpoint.
+from the immutable Apply record, the resolution chain through the token's
+checkpoint is invalid or conflicts, any later local Apply superseded a watched
+preference, or any provider trace ID changed. Authenticated resolution records
+appended after the token checkpoint are a permitted monotonic extension. Watch
+replays them in order, emits a material child event and a replacement token
+before polling a newly accepted child, and never rewrites the child's
+`unknown` disposition. When a child has no stable trace ID, an etag change
+across the observation gap that is not exactly justified by an appended
+accepted resolution is unknown lineage and rejects the complete resume. Each
+material event carries a new token for its durable checkpoint.
 
 ```json
 {
@@ -488,7 +510,7 @@ occurred. Each material event carries a new token for its durable checkpoint.
 ```
 
 `sequence` increases within one stream. A resumed Watch creates a new stream,
-starts with the current authoritative observation of every accepted child, and
+starts with the current authoritative observation of every watched child, and
 retains the complete subject, intent ID, ordered children, and selected
 condition from the verified resume token. It does not pretend that events
 missed while disconnected were observed.
@@ -517,7 +539,7 @@ adaptive schedule that:
 - honors provider retry guidance and throttling;
 - applies bounded backoff and jitter to transient failures;
 - avoids synchronizing many watches against the same resource scope;
-- refreshes every accepted child's preference and effective quota
+- refreshes every watched child's preference and effective quota
   independently at the freshness required by the selected condition, then
   recomputes the aggregate condition; and
 - emits only material observations.

@@ -233,12 +233,16 @@ scenarios include:
 - an ambiguous dispatch is `unknown`, consumes and quarantines the plan, stops
   later dispatch, and requires read-after-unknown reconciliation at the
   deterministic preference identity;
+- accepted or failed read-after-unknown proof is appended as authenticated
+  single-assignment resolution evidence without rewriting the durable
+  `unknown` disposition, and conflicting evidence fails closed;
 - every dispatched child has one durable pre-intent and one durable terminal
   outcome or critical unknown record; and
 - Watch selects both single and bundle Apply records through the shared
   `intent_id`, emits one initial authoritative subject observation followed only
   by material child or aggregate changes, reaches a bundle condition only when
-  every accepted child does, and emits exactly one terminal operation result.
+  every child in the accepted Watch set does, and emits exactly one terminal
+  operation result.
 
 ### Provider adapter contracts
 

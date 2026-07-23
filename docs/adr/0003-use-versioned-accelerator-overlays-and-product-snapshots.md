@@ -5,6 +5,9 @@ superseded_by: 0004-use-a-versioned-federated-provider-inventory
 
 # Use versioned accelerator overlays and bounded product snapshots
 
+This historical decision is superseded by ADR 0004. Use ADR 0004 for the
+federated provider inventory and bare-query behavior.
+
 Cloud Quota Manager will expose two stable V1 accelerator catalog groups:
 `compute-accelerators` for Compute-owned NVIDIA GPU and Compute/GKE TPU
 evidence, and `cloud-tpu-legacy` for the legacy Cloud TPU API management

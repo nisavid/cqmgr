@@ -61,7 +61,7 @@ Showing, selecting, or clearing resource scope remains a local offline
 operation. It does not initialize ADC, contact Resource Manager, verify provider
 access, or claim an acting principal. Acting-principal and impersonation-chain
 evidence appears only after a provider-scoped operation observes it; until then
-the TUI says `principal not observed`.
+the TUI says `acting principal deferred (offline)`.
 
 The inspector federates the versioned Compute and legacy Cloud TPU V1 inventory
 by default. With no service or catalog-group filters it queries both providers.
@@ -135,8 +135,10 @@ The operator chooses one target strategy for the selected constraint set:
 
 - `minimum` is the default. For each deficient child it proposes fresh observed
   usage plus the normalized workload requirement in that slice's native unit.
-  A child that already permits the workload is a verified no-op, never an
-  automatic decrease.
+  A child is a verified no-op only when its effective quota permits the workload
+  and no settled or reconciling desired target is below the required target. A
+  lower conflicting intent requires explicit manual handling or a new Preview
+  after settlement; it is never hidden by current effective quota.
 - `preserve-headroom` proposes current effective quota plus the normalized
   workload requirement for each child.
 - `manual` requires one explicit absolute target for every selected child.
@@ -175,18 +177,24 @@ acknowledgements follow the safety and quota request contract independently for
 each child; the workflow does not weaken those gates for convenience.
 
 Apply requires an explicit confirmation of the canonical resource scope. It
-revalidates every child and consumes the whole single-use plan before the first
-dispatch. Children run in the reviewed deterministic accelerator-first order:
-accelerator- or location-specific slices precede broader companion constraints,
-and canonical exact-slice identity breaks ties. Each child has one durable
-pre-intent and at most one provider dispatch. Apply stops at the first child
-whose acceptance cannot be proven, marks later children `unattempted`, and never
-attempts rollback. Each plan-child disposition is exactly `accepted`, `failed`,
-`unknown`, or `unattempted`. A transport-unknown dispatch is `unknown`, not
-`failed`; a failed child preserves its exact unchanged, conflicting, or other
-conclusive failure outcome. Verified Preview no-ops remain separate explicit
-facts. A stale or drifted plan returns to reviewable evidence instead of
-silently rebuilding, reordering, or applying a different intent.
+revalidates every child before consumption or provider access. Failed
+revalidation invalidates the plan under its lock, persists a terminal no-write
+result, and requires a new Preview. Only successful revalidation writes the
+complete pre-intent and consumes the whole single-use plan before the first
+dispatch. Children use the exact comparator
+`(direct_accelerator_rank, scope_breadth_rank, exact_slice_identity)`: direct
+accelerator quantity precedes companion quota; scope breadth orders zone,
+region, multi-region/all-regions/global, then broader provider scope; canonical
+exact-slice identity breaks remaining ties. A child that cannot map to one rank
+pair fails during Preview. Each child has one durable pre-intent and at most one
+provider dispatch. Apply stops at the first child whose acceptance cannot be
+proven, marks later children `unattempted`, and never attempts rollback. Each
+plan-child disposition is exactly `accepted`, `failed`, `unknown`, or
+`unattempted`. A transport-unknown dispatch is `unknown`, not `failed`; a failed
+child preserves its exact unchanged, conflicting, or other conclusive failure
+outcome. Verified Preview no-ops remain separate explicit facts. A stale or
+drifted plan returns to reviewable evidence instead of silently rebuilding,
+reordering, or applying a different intent.
 
 Apply is the sole workflow that may reach a quota-preference write port. This
 contract does not authorize a live quota mutation; live execution requires
@@ -205,10 +213,13 @@ appears as an effective quota change.
 The inspector updates lifecycle observations inline and offers a focused Watch
 operation for longer-running reconciliation. A Watch subject declares
 `kind: single|bundle` and retains every ordered plan child with its Apply
-disposition; a single subject has exactly one child. Watch polls only the
-accepted subset. An Apply with no accepted child is not watchable. Material
-child events name their `child_id`, and one aggregate terminal event retains
-ordered summaries for every subject child.
+disposition; a single subject has exactly one child. Read-after-unknown
+reconciliation appends a separate accepted or failed resolution without
+rewriting an `unknown` disposition. Watch polls the accepted Watch set: children
+accepted during Apply plus unknown children with authenticated accepted
+resolution evidence. An Apply with an empty accepted Watch set is not watchable.
+Material child events name their `child_id`, and one aggregate terminal event
+retains ordered summaries for every subject child.
 
 Aggregate `granted` requires every accepted subject child to settle at its
 target. Aggregate `fulfilled` additionally requires fresh effective quota
@@ -221,7 +232,9 @@ reservation, workload, or physical-capacity state.
 
 Transport failures enter an explicit reconciliation result. The workflow reads
 each deterministic preference identity and classifies it as accepted,
-unchanged, conflicting, or unknown; it never offers a blind retry.
+failed, conflicting, or unresolved; it never offers a blind retry. A proven
+result is appended once as unknown dispatch resolution evidence. Conflicting
+later evidence fails closed instead of replacing history.
 
 ## Spot capacity advice
 

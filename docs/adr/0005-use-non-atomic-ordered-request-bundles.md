@@ -50,15 +50,21 @@ Preview returns the complete verified-no-op result without issuing a plan;
 all-no-op input to consume.
 
 Apply is deliberately non-atomic. It freshly revalidates every child before the
-consumption barrier and before any provider write. A failed revalidation appends
-and fsyncs a terminal no-write Apply result, crosses no consumption barrier, and
-leaves the plan unused but inapplicable; a new Preview is required. Apply then
+consumption barrier and before any provider write. Under the plan lock, a failed
+revalidation persists a terminal invalidated-plan state and appends and fsyncs a
+terminal no-write Apply result before returning. It crosses no consumption
+barrier and makes no provider call; every later Apply rejects the invalidated
+plan and a new Preview is required. Apply then
 dispatches non-no-op children in one canonical order. The comparator first ranks
-accelerator- or location-specific constraints before broader companion
-constraints, then orders by the canonical exact-slice identity tuple of resource
-scope, canonical service DNS name, quota ID, location, quota scope, and sorted
-dimension key/value pairs. No-op composition evidence is outside this dispatch
-order. Apply uses the exact order bound into the plan and stops at the first
+each child by `(direct_accelerator_rank, scope_breadth_rank)`. Direct quota for
+the normalized deployable accelerator quantity has rank 0 and companion quota
+has rank 1. Scope breadth ranks exact zone 0, region 1,
+multi-region/all-regions/global 2, and any broader provider scope 3. A child must
+map to exactly one pair or Preview fails instead of guessing. Ties order by the
+canonical exact-slice identity tuple of resource scope, canonical service DNS
+name, quota ID, location, quota scope, and sorted dimension key/value pairs.
+No-op composition evidence is outside this dispatch order. Preview binds this
+exact order and Apply uses it unchanged, stopping at the first
 conclusively failed child or any `unknown` child and never attempts later
 children; transport uncertainty is one possible cause of `unknown`. Each
 dispatched child receives one
@@ -81,30 +87,47 @@ it creates the immutable consumption marker and commits the ledger consumption
 transition. Either half of a partially persisted barrier keeps the plan consumed
 and quarantined, so lease expiry never makes it reusable. Every consumed plan
 retains a durable Apply record. Each child dispatch intent is fsynced before the
-provider call and its terminal outcome is fsynced before the next child begins.
-Recovery may resume only a child with no persisted dispatch intent after every
-prior outcome is durably `accepted`. A prior `failed` or `unknown` outcome stops
-that Apply and leaves every later child `unattempted`. A dispatch intent without
-a terminal outcome becomes
+provider call. The intent binds the deterministic provider-visible
+QuotaPreference resource identity used by the adapter for create or amend and
+read-after-unknown reconciliation; the adapter accepts that bound identity and
+never invents a different key at dispatch time. Its terminal outcome is fsynced
+before the next child begins. Recovery may resume only a child with no persisted
+dispatch intent after every prior outcome is durably `accepted`. A prior
+`failed` or `unknown` outcome stops that Apply and leaves every later child
+`unattempted`. A dispatch intent without a terminal outcome becomes
 a durable `unknown`, stops later dispatch, and requires read-after-unknown
 reconciliation; it is never dispatched again automatically. Interruption,
 transport uncertainty, or persistence failure never causes a blind retry.
 Deterministic child preference identity preserves accepted work and classifies
 uncertainty.
 
-Watch observes the accepted children of one applied bundle, including a
-partially applied bundle whose aggregate Apply failed. It retains every ordered
-plan child, disposition, provider reconciliation identity, target, status
-evidence, and resume checkpoint, while polling only accepted children. Verified
-Preview no-ops remain composition evidence outside the Watch subject. Failed,
-unknown, and unattempted children are not Watch targets; an unknown child first
-requires read-after-unknown reconciliation, and a bundle with no accepted child
-is not watchable. The aggregate `granted` or `fulfilled` condition is
-reached only when every accepted child reaches that condition. A conclusive
-unmet accepted child terminates the aggregate condition without flattening
-other child states. Timeout and interruption preserve the latest material
-observation and a locally authenticated resume token bound to the bundle and all
-accepted children.
+Watch observes the accepted Watch set of one applied bundle, including a
+partially applied bundle whose aggregate Apply failed. That set contains every
+child whose immutable Apply disposition is `accepted` plus every `unknown`
+child with an authenticated unknown dispatch resolution of `accepted`. Watch
+retains every ordered plan child, immutable disposition, unknown dispatch
+resolution when present, provider reconciliation identity, target, status
+evidence, and resume checkpoint, while polling only the accepted Watch set.
+Verified Preview no-ops remain composition evidence outside the Watch subject.
+Failed and unattempted children are not Watch targets. An unresolved `unknown`
+child is not a Watch target, and a bundle with an empty accepted Watch set is
+not watchable. The aggregate `granted` or `fulfilled` condition is reached only
+when every child in the accepted Watch set reaches that condition. A conclusive
+unmet watched child terminates the aggregate condition without flattening other
+child states. Timeout and interruption preserve the latest material observation
+and a locally authenticated resume token bound to the bundle, the accepted
+Watch set, and the unknown-resolution journal checkpoint.
+
+Read-after-unknown reconciliation appends authenticated resolution evidence
+without erasing the original `unknown` disposition. Proven provider acceptance
+records resolution `accepted` and adds the child to the accepted Watch set;
+proven rejection records resolution `failed` and leaves it non-watchable;
+unresolved evidence appends no terminal resolution and preserves quarantine.
+Resolution is single-assignment and fail-closed: a conflicting later result is
+an integrity error, not a replacement. A running or resumed Watch can advance
+from its authenticated resolution-journal checkpoint through a valid monotonic
+append. It emits the child's material resolution evidence and a new resume token
+bound to the expanded accepted Watch set before polling a newly accepted child.
 Every unreleased `cqmgr.watch-event/v1` record has a required `subject.kind` of
 `single` or `bundle`. The subject binds resource scope, condition, plan or
 intent digest, and an ordered nonempty array of complete child identities;

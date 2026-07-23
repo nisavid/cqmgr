@@ -61,6 +61,13 @@ failed the dispatch, `unknown` when acceptance cannot be established safely, or
 `unattempted` when an earlier child failed or became unknown.
 _Avoid_: Rolled back, partially successful transaction
 
+**Unknown dispatch resolution**:
+Append-only authenticated evidence that later proves an `unknown` Apply child
+was accepted or failed. It never rewrites the child's durable Apply disposition.
+An accepted resolution can add the child to Watch; a failed resolution leaves it
+non-watchable.
+_Avoid_: Effective disposition, retried dispatch
+
 **Quota preference**:
 The Google Cloud `QuotaPreference` resource that stores the provider identity, requested target, granted value, etag, and reconciliation evidence for a quota request. Use this term only for provider-resource detail and structured provenance.
 _Avoid_: Product-facing request, quota target
@@ -118,8 +125,10 @@ _Avoid_: Poll result, repeated snapshot
 The explicitly selected lifecycle observation a watch promises to reach. For one
 request, a granted condition requires the grant to equal the quota target and a
 fulfilled condition additionally requires fresh effective quota to equal both.
-For a bundle, the condition is reached only when every accepted child reaches
-it. A child fails the condition when its settled grant differs from its target,
+For a bundle, the condition is reached only when every child in the accepted
+Watch set reaches it. That set includes children accepted during Apply and
+`unknown` children with authenticated accepted resolution evidence. A watched
+child fails the condition when its settled grant differs from its target,
 including zero when the target is greater than zero. Watch times out at its
 caller-controlled deadline when required evidence remains inconclusive.
 _Avoid_: Polling duration, success
