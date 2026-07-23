@@ -279,6 +279,26 @@ class BlockForbiddenImports:
             raise AssertionError(f"forbidden metadata-command import: {fullname}")
         return None
 
+def is_windows_asyncio_socketpair(event, arguments):
+    if os.name != "nt" or event != "socket.connect" or len(arguments) < 2:
+        return False
+    address = arguments[1]
+    if (
+        not isinstance(address, tuple)
+        or not address
+        or address[0] not in {"127.0.0.1", "::1"}
+    ):
+        return False
+    frame = sys._getframe()
+    while frame is not None:
+        if (
+            frame.f_code.co_name == "_fallback_socketpair"
+            and frame.f_globals.get("__name__") == "socket"
+        ):
+            return True
+        frame = frame.f_back
+    return False
+
 def block_network(event, arguments):
     forbidden = {
         "socket.connect",
@@ -287,7 +307,7 @@ def block_network(event, arguments):
         "socket.gethostbyaddr",
         "socket.gethostbyname",
     }
-    if event in forbidden:
+    if event in forbidden and not is_windows_asyncio_socketpair(event, arguments):
         raise AssertionError(f"forbidden metadata-command network access: {event}")
 
 sys.meta_path.insert(0, BlockForbiddenImports())
