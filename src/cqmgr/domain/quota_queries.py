@@ -15,6 +15,7 @@ from cqmgr.domain.catalog import (
     CatalogMetadata,
     CatalogPredicates,
 )
+from cqmgr.domain.diagnostics import DiagnosticCode
 from cqmgr.domain.quotas import (
     ConstraintReference,
     EffectiveQuotaSliceIdentity,
@@ -31,6 +32,15 @@ from cqmgr.domain.time import require_utc
 
 _MINIMUM_DNS_LABELS = 2
 QUOTA_QUERY_EVIDENCE_CONTRACT = "cqmgr.quota-query-evidence/v1"
+PROVIDER_INVENTORY_REVISION = "cqmgr.provider-inventory/v1"
+V1_PROVIDER_SERVICES = (
+    "compute.googleapis.com",
+    "tpu.googleapis.com",
+)
+_SERVICE_SHORTHANDS = {
+    "compute": "compute.googleapis.com",
+    "tpu": "tpu.googleapis.com",
+}
 _CATALOG_GROUP_SERVICES = {
     CatalogGroupId.COMPUTE_ACCELERATORS: frozenset({"compute.googleapis.com"}),
     CatalogGroupId.CLOUD_TPU_LEGACY: frozenset({"tpu.googleapis.com"}),
@@ -89,30 +99,132 @@ class QuotaSort:
             raise TypeError(msg)
 
 
+class ProviderSourceCoverageState(StrEnum):
+    """Collection disposition for one fixed V1 provider source."""
+
+    COMPLETE = "complete"
+    INCOMPLETE = "incomplete"
+    INTENTIONALLY_UNQUERIED = "intentionally-unqueried"
+
+
 @dataclass(frozen=True, slots=True)
-class ServiceSource:
-    """One exact canonical provider service selected as a query source."""
+class ProviderSourceCoverage:
+    """Page coverage and observation time for one fixed provider source."""
 
     service: str
+    state: ProviderSourceCoverageState
+    pages_attempted: int
+    pages_completed: int
+    observed_at: datetime | None
+    page_cap_reached: bool = False
+    diagnostic_codes: tuple[DiagnosticCode, ...] = ()
 
-    def __post_init__(self) -> None:
-        """Reject display names and noncanonical service text."""
-        if not _is_canonical_service_dns(self.service):
-            msg = "service source must be a lowercase canonical service DNS name"
+    def __post_init__(self) -> None:  # noqa: C901
+        """Keep queried evidence distinct from intentional provider pruning."""
+        if self.service not in V1_PROVIDER_SERVICES:
+            msg = "source coverage service must be a supported V1 provider"
+            raise ValueError(msg)
+        if not isinstance(self.state, ProviderSourceCoverageState):
+            msg = "source coverage state must be ProviderSourceCoverageState"
+            raise TypeError(msg)
+        counts = (self.pages_attempted, self.pages_completed)
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) for value in counts
+        ):
+            msg = "source coverage page counts must be integers"
+            raise TypeError(msg)
+        if not 0 <= self.pages_completed <= self.pages_attempted:
+            msg = "source coverage pages must satisfy completed <= attempted"
+            raise ValueError(msg)
+        if self.state is ProviderSourceCoverageState.INTENTIONALLY_UNQUERIED:
+            if (
+                counts != (0, 0)
+                or self.observed_at is not None
+                or self.page_cap_reached
+                or self.diagnostic_codes
+            ):
+                msg = "intentionally unqueried source must contain no read evidence"
+                raise ValueError(msg)
+        elif self.observed_at is None:
+            msg = "queried source coverage requires an observation time"
+            raise ValueError(msg)
+        else:
+            require_utc(self.observed_at, "source coverage observed_at")
+        if self.state is ProviderSourceCoverageState.COMPLETE and (
+            self.pages_attempted != self.pages_completed
+            or self.page_cap_reached
+            or self.diagnostic_codes
+        ):
+            msg = "complete source coverage cannot retain evidence gaps"
+            raise ValueError(msg)
+        if not isinstance(self.page_cap_reached, bool):
+            msg = "source coverage page_cap_reached must be bool"
+            raise TypeError(msg)
+        if not isinstance(self.diagnostic_codes, tuple) or any(
+            not isinstance(code, DiagnosticCode) for code in self.diagnostic_codes
+        ):
+            msg = "source coverage diagnostic codes must be typed"
+            raise TypeError(msg)
+        if tuple(sorted(set(self.diagnostic_codes), key=lambda code: code.value)) != (
+            self.diagnostic_codes
+        ):
+            msg = "source coverage diagnostic codes must be unique canonical values"
             raise ValueError(msg)
 
+    @classmethod
+    def complete(  # noqa: PLR0913
+        cls,
+        service: str,
+        *,
+        pages_attempted: int,
+        pages_completed: int,
+        observed_at: datetime,
+        page_cap_reached: bool = False,
+        diagnostic_codes: tuple[DiagnosticCode, ...] = (),
+    ) -> ProviderSourceCoverage:
+        """Construct complete queried-provider coverage."""
+        return cls(
+            service,
+            ProviderSourceCoverageState.COMPLETE,
+            pages_attempted,
+            pages_completed,
+            observed_at,
+            page_cap_reached,
+            diagnostic_codes,
+        )
 
-@dataclass(frozen=True, slots=True)
-class CatalogGroupSource:
-    """One stable accelerator catalog group selected as a query source."""
+    @classmethod
+    def incomplete(  # noqa: PLR0913
+        cls,
+        service: str,
+        *,
+        pages_attempted: int,
+        pages_completed: int,
+        observed_at: datetime,
+        page_cap_reached: bool = False,
+        diagnostic_codes: tuple[DiagnosticCode, ...] = (),
+    ) -> ProviderSourceCoverage:
+        """Construct incomplete but usable queried-provider coverage."""
+        return cls(
+            service,
+            ProviderSourceCoverageState.INCOMPLETE,
+            pages_attempted,
+            pages_completed,
+            observed_at,
+            page_cap_reached,
+            diagnostic_codes,
+        )
 
-    group_id: CatalogGroupId
-
-    def __post_init__(self) -> None:
-        """Accept only the fixed public catalog-group identity."""
-        if not isinstance(self.group_id, CatalogGroupId):
-            msg = "group_id must be a CatalogGroupId"
-            raise TypeError(msg)
+    @classmethod
+    def intentionally_unqueried(cls, service: str) -> ProviderSourceCoverage:
+        """Construct explicit evidence that a fixed provider was pruned."""
+        return cls(
+            service,
+            ProviderSourceCoverageState.INTENTIONALLY_UNQUERIED,
+            0,
+            0,
+            None,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +232,7 @@ class QuotaQueryFilters:
     """Repeatable query facets whose values are OR alternatives."""
 
     services: tuple[str, ...] = ()
+    catalog_groups: tuple[CatalogGroupId, ...] = ()
     accelerators: tuple[AcceleratorId, ...] = ()
     locations: tuple[str, ...] = ()
     quota_scopes: tuple[QuotaScope, ...] = ()
@@ -132,13 +245,28 @@ class QuotaQueryFilters:
     effective_confirmations: tuple[EffectiveConfirmation, ...] = ()
     text: str | None = None
 
-    def __post_init__(self) -> None:
-        """Require canonical service facets without changing their order."""
-        if not isinstance(self.services, tuple) or any(
-            not _is_canonical_service_dns(service) for service in self.services
+    def __post_init__(self) -> None:  # noqa: C901
+        """Normalize repeatable OR alternatives into one durable query identity."""
+        if not isinstance(self.services, tuple):
+            msg = "service filters must be a tuple"
+            raise TypeError(msg)
+        object.__setattr__(
+            self,
+            "services",
+            tuple(
+                sorted({_canonical_service_selector(value) for value in self.services})
+            ),
+        )
+        if not isinstance(self.catalog_groups, tuple) or any(
+            not isinstance(group, CatalogGroupId) for group in self.catalog_groups
         ):
-            msg = "service filters must be canonical service DNS names"
-            raise ValueError(msg)
+            msg = "catalog group filters must contain CatalogGroupId values"
+            raise TypeError(msg)
+        object.__setattr__(
+            self,
+            "catalog_groups",
+            tuple(sorted(set(self.catalog_groups), key=lambda value: value.value)),
+        )
         if not isinstance(self.accelerators, tuple) or any(
             not isinstance(accelerator, AcceleratorId)
             for accelerator in self.accelerators
@@ -184,6 +312,8 @@ class QuotaQueryFilters:
         ):
             msg = "text filter must be non-empty Unicode text"
             raise ValueError(msg)
+        if self.text is not None:
+            object.__setattr__(self, "text", normalize("NFC", self.text))
 
     def matches(self, item: QuotaQueryItem) -> bool:
         """Combine OR alternatives within facets and AND across facets."""
@@ -192,6 +322,8 @@ class QuotaQueryFilters:
             raise TypeError(msg)
         checks = (
             not self.services or item.identity.service in self.services,
+            not self.catalog_groups
+            or bool(set(self.catalog_groups).intersection(item.catalog_groups)),
             not self.accelerators
             or bool(set(self.accelerators).intersection(_item_accelerator_ids(item))),
             not self.locations or item.location in self.locations,
@@ -238,6 +370,7 @@ class QuotaQueryItem:
     evidence_observed_at: datetime | None = None
     constraint_sets: tuple[AcceleratorConstraintSet, ...] = ()
     constraint_set: AcceleratorConstraintSet | None = None
+    catalog_groups: tuple[CatalogGroupId, ...] = ()
 
     def __post_init__(self) -> None:
         """Keep optional product metadata separate from canonical slice identity."""
@@ -283,6 +416,15 @@ class QuotaQueryItem:
         )
         if self.evidence_observed_at is not None:
             require_utc(self.evidence_observed_at, "evidence_observed_at")
+        if not isinstance(self.catalog_groups, tuple) or any(
+            not isinstance(group, CatalogGroupId) for group in self.catalog_groups
+        ):
+            msg = "catalog_groups must contain CatalogGroupId values"
+            raise TypeError(msg)
+        canonical_groups = tuple(
+            sorted(set(self.catalog_groups), key=lambda group: group.value)
+        )
+        object.__setattr__(self, "catalog_groups", canonical_groups)
         constraint_sets = _normalize_constraint_sets(
             self.identity,
             self.accelerator_id,
@@ -385,20 +527,16 @@ def _constraint_set_key(value: AcceleratorConstraintSet) -> tuple[object, ...]:
 
 @dataclass(frozen=True, slots=True)
 class QuotaQuery:
-    """One resource scope, one source, and independent local product filters."""
+    """One resource scope over the fixed V1 inventory with normalized filters."""
 
     resource_scope: ResourceScope
-    source: ServiceSource | CatalogGroupSource
     filters: QuotaQueryFilters = field(default_factory=QuotaQueryFilters)
     sort: tuple[QuotaSort, ...] = ()
 
     def __post_init__(self) -> None:
-        """Require exactly one typed source rather than inferring from facets."""
+        """Infer the provider subset only from source-selecting query filters."""
         if not isinstance(self.resource_scope, ResourceScope):
             msg = "resource_scope must be a ResourceScope"
-            raise TypeError(msg)
-        if not isinstance(self.source, (ServiceSource, CatalogGroupSource)):
-            msg = "source must be a ServiceSource or CatalogGroupSource"
             raise TypeError(msg)
         if not isinstance(self.filters, QuotaQueryFilters):
             msg = "filters must be QuotaQueryFilters"
@@ -411,26 +549,20 @@ class QuotaQuery:
         if len({sort.field for sort in self.sort}) != len(self.sort):
             msg = "sort fields must not be repeated"
             raise ValueError(msg)
-        selected_services = (
-            frozenset({self.source.service})
-            if isinstance(self.source, ServiceSource)
-            else _CATALOG_GROUP_SERVICES[self.source.group_id]
-        )
-        if any(service not in selected_services for service in self.filters.services):
-            source_kind = (
-                "service source"
-                if isinstance(self.source, ServiceSource)
-                else "catalog group"
-            )
-            msg = f"service filters must remain within the selected {source_kind}"
-            raise ValueError(msg)
 
     @property
     def services(self) -> tuple[str, ...]:
-        """Return the stable provider services required by the selected source."""
-        if isinstance(self.source, ServiceSource):
-            return (self.source.service,)
-        return tuple(sorted(_CATALOG_GROUP_SERVICES[self.source.group_id]))
+        """Return providers that can satisfy every source-selecting facet."""
+        selected = set(V1_PROVIDER_SERVICES)
+        if self.filters.services:
+            selected.intersection_update(self.filters.services)
+        if self.filters.catalog_groups:
+            selected.intersection_update(
+                service
+                for group in self.filters.catalog_groups
+                for service in _CATALOG_GROUP_SERVICES[group]
+            )
+        return tuple(service for service in V1_PROVIDER_SERVICES if service in selected)
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,8 +576,10 @@ class QuerySnapshotMetadata:
     observed_at: datetime
     expires_at: datetime
     complete: bool
+    inventory_revision: str = PROVIDER_INVENTORY_REVISION
+    source_coverage: tuple[ProviderSourceCoverage, ...] = ()
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: C901
         """Bind source, filters, sort, and catalog revision to one snapshot ID."""
         if not isinstance(self.snapshot_id, str) or not self.snapshot_id:
             msg = "snapshot_id must be non-empty"
@@ -467,6 +601,40 @@ class QuerySnapshotMetadata:
         if not isinstance(self.complete, bool):
             msg = "snapshot complete must be bool"
             raise TypeError(msg)
+        if self.inventory_revision != PROVIDER_INVENTORY_REVISION:
+            msg = (
+                f"unsupported provider inventory revision: {self.inventory_revision!r}"
+            )
+            raise ValueError(msg)
+        coverage = self.source_coverage
+        if (
+            not isinstance(coverage, tuple)
+            or tuple(item.service for item in coverage) != V1_PROVIDER_SERVICES
+            or len(set(coverage)) != len(coverage)
+        ):
+            msg = "snapshot coverage must contain each fixed V1 provider in order"
+            raise ValueError(msg)
+        queried = tuple(
+            item.service
+            for item in coverage
+            if item.state is not ProviderSourceCoverageState.INTENTIONALLY_UNQUERIED
+        )
+        if queried != self.query.services:
+            msg = "snapshot coverage must match the inferred queried provider subset"
+            raise ValueError(msg)
+        coverage_complete = all(
+            item.state is ProviderSourceCoverageState.COMPLETE
+            for item in coverage
+            if item.service in queried
+        )
+        if self.complete is not coverage_complete:
+            msg = "snapshot completeness must match queried-provider coverage"
+            raise ValueError(msg)
+
+    @property
+    def queried_services(self) -> tuple[str, ...]:
+        """Return the exact provider subset bound into this snapshot."""
+        return self.query.services
 
 
 @dataclass(frozen=True, slots=True)
@@ -688,3 +856,15 @@ def _is_canonical_service_dns(service: object) -> bool:
         and all(character in allowed for character in label)
         for label in labels
     )
+
+
+def _canonical_service_selector(service: object) -> str:
+    """Normalize supported CLI shorthand and reject providers outside V1."""
+    if not isinstance(service, str):
+        msg = "service selector must be text"
+        raise TypeError(msg)
+    canonical = _SERVICE_SHORTHANDS.get(service, service)
+    if canonical not in V1_PROVIDER_SERVICES:
+        msg = "service selector must name a supported V1 provider"
+        raise ValueError(msg)
+    return canonical

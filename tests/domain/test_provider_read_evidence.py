@@ -1,9 +1,19 @@
 """Provider-neutral read evidence contracts."""
 
+from dataclasses import replace
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 
+from cqmgr.domain.diagnostics import (
+    Diagnostic,
+    DiagnosticCode,
+    DiagnosticPhase,
+    DiagnosticSource,
+    RetryDisposition,
+    Severity,
+)
 from cqmgr.domain.quotas import (
     MonitoringPoint,
     MonitoringValue,
@@ -11,6 +21,20 @@ from cqmgr.domain.quotas import (
     ProviderRead,
     ProviderReadCoverage,
 )
+from cqmgr.domain.redaction import RedactedText
+
+NOW = datetime(2026, 7, 22, tzinfo=UTC)
+
+
+def _diagnostic() -> Diagnostic:
+    return Diagnostic(
+        DiagnosticCode("provider-schema-invalid"),
+        Severity.ERROR,
+        DiagnosticPhase("quota-preference-read"),
+        DiagnosticSource("cloud-quotas"),
+        RetryDisposition.AFTER_UPGRADE,
+        RedactedText("The provider returned malformed preference evidence."),
+    )
 
 
 def test_complete_read_requires_all_pages() -> None:
@@ -29,6 +53,70 @@ def test_complete_read_requires_all_pages() -> None:
 
     assert not read.complete
     assert read.values == ("usable-first-page",)
+
+
+def test_read_diagnostics_can_be_attributed_to_one_logical_service() -> None:
+    """One global read can retain independent logical service completeness."""
+    read = ProviderRead(
+        values=(),
+        coverage=ProviderReadCoverage(1, 1),
+        observed_at=NOW,
+        diagnostics=(_diagnostic(),),
+        diagnostic_services=("tpu.googleapis.com",),
+    )
+
+    assert read.complete_for("compute.googleapis.com")
+    assert not read.complete_for("tpu.googleapis.com")
+    assert read.diagnostics_for("compute.googleapis.com") == ()
+    assert read.diagnostics_for("tpu.googleapis.com") == (_diagnostic(),)
+
+
+def test_unattributed_read_diagnostic_is_shared_by_every_service() -> None:
+    """Pagination and unassignable schema failures remain globally incomplete."""
+    read = ProviderRead(
+        values=(),
+        coverage=ProviderReadCoverage(1, 1),
+        observed_at=NOW,
+        diagnostics=(_diagnostic(),),
+        diagnostic_services=(None,),
+    )
+
+    assert not read.complete_for("compute.googleapis.com")
+    assert not read.complete_for("tpu.googleapis.com")
+
+
+def test_read_rejects_misaligned_diagnostic_attribution() -> None:
+    """Diagnostic attribution cannot silently omit a retained failure."""
+    with pytest.raises(ValueError, match="align"):
+        ProviderRead(
+            values=(),
+            coverage=ProviderReadCoverage(1, 1),
+            observed_at=NOW,
+            diagnostics=(_diagnostic(),),
+            diagnostic_services=(None, "tpu.googleapis.com"),
+        )
+
+
+def test_read_rejects_untyped_evidence_and_diagnostic_attribution() -> None:
+    """Provider evidence cannot bypass immutable typed read boundaries."""
+    read = ProviderRead(
+        values=(),
+        coverage=ProviderReadCoverage(1, 1),
+        observed_at=NOW,
+        diagnostics=(_diagnostic(),),
+    )
+
+    with pytest.raises(TypeError, match="values"):
+        replace(read, values=cast("tuple[object, ...]", []))
+    with pytest.raises(TypeError, match="coverage"):
+        replace(read, coverage=cast("ProviderReadCoverage", object()))
+    with pytest.raises(TypeError, match="diagnostics"):
+        replace(read, diagnostics=cast("tuple[Diagnostic, ...]", (object(),)))
+    with pytest.raises(TypeError, match="diagnostic services"):
+        replace(read, diagnostic_services=("Compute.GoogleApis.com",))
+    with pytest.raises(ValueError, match="diagnostic service"):
+        read.diagnostics_for("Compute.GoogleApis.com")
+    assert read.diagnostics_for("compute.googleapis.com") == (_diagnostic(),)
 
 
 def test_monitoring_point_preserves_interval_and_typed_value() -> None:

@@ -16,6 +16,7 @@ from cqmgr.adapters.google.read_policy import (
 )
 from cqmgr.application.ports.catalog_reads import (
     CatalogRead,
+    ComputeAcceleratorTypeReadRequest,
     ComputeMachineTypeReadRequest,
 )
 from cqmgr.domain.catalog import (
@@ -23,6 +24,7 @@ from cqmgr.domain.catalog import (
     CatalogEvidenceSource,
     CatalogLifecycle,
     CatalogLocationCoverage,
+    ComputeAcceleratorType,
     ComputeMachineType,
     LocationCoverageExpectation,
     LocationCoverageState,
@@ -41,6 +43,125 @@ from cqmgr.domain.schemas import ProviderSymbol
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+
+@dataclass(frozen=True, slots=True)
+class ComputeAcceleratorTypesScope:
+    """Adapter-internal materialized Compute accelerator-type scope."""
+
+    scope: str
+    accelerator_types: tuple[compute_v1.AcceleratorType, ...]
+    warning_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ComputeAcceleratorTypesPage:
+    """Adapter-internal materialized aggregated accelerator-type page."""
+
+    scopes: tuple[ComputeAcceleratorTypesScope, ...]
+    next_page_token: str
+    unreachable_scopes: tuple[str, ...] = ()
+    warning_code: str | None = None
+
+
+class ComputeAcceleratorTypesPageClient(Protocol):
+    """Materialize one official Compute accelerator-types page asynchronously."""
+
+    async def accelerator_types(
+        self,
+        *,
+        project: str,
+        max_results: int,
+        page_token: str,
+        return_partial_success: bool,
+        timeout_seconds: float,
+    ) -> ComputeAcceleratorTypesPage:
+        """Return one materialized aggregated-list page."""
+        ...
+
+
+class OfficialComputeAcceleratorTypesPageClient:
+    """Fence the sync-only official Compute accelerator client."""
+
+    def __init__(
+        self,
+        client: compute_v1.AcceleratorTypesClient,
+        *,
+        maximum_workers: int = 4,
+    ) -> None:
+        """Bind one client and cap concurrent default-executor dispatches."""
+        _require_positive(maximum_workers, "Compute catalog maximum_workers")
+        self._client = client
+        self._worker_slots = asyncio.Semaphore(maximum_workers)
+
+    async def accelerator_types(
+        self,
+        *,
+        project: str,
+        max_results: int,
+        page_token: str,
+        return_partial_success: bool,
+        timeout_seconds: float,
+    ) -> ComputeAcceleratorTypesPage:
+        """Run exactly one sync generated-client page in a bounded worker."""
+        await self._worker_slots.acquire()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                self._accelerator_types,
+                project=project,
+                max_results=max_results,
+                page_token=page_token,
+                return_partial_success=return_partial_success,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+        worker.add_done_callback(self._release_worker_slot)
+        return await asyncio.shield(worker)
+
+    def _release_worker_slot(
+        self,
+        worker: asyncio.Task[ComputeAcceleratorTypesPage],
+    ) -> None:
+        """Release concurrency only after the uncancellable sync call stops."""
+        self._worker_slots.release()
+        if not worker.cancelled():
+            worker.exception()
+
+    def _accelerator_types(
+        self,
+        *,
+        project: str,
+        max_results: int,
+        page_token: str,
+        return_partial_success: bool,
+        timeout_seconds: float,
+    ) -> ComputeAcceleratorTypesPage:
+        request = compute_v1.AggregatedListAcceleratorTypesRequest(
+            project=project,
+            max_results=max_results,
+            page_token=page_token,
+            return_partial_success=return_partial_success,
+        )
+        pager = self._client.aggregated_list(
+            request=request,
+            retry=None,
+            timeout=timeout_seconds,
+        )
+        response = next(pager.pages)
+        scopes = tuple(
+            ComputeAcceleratorTypesScope(
+                scope=scope,
+                accelerator_types=tuple(scoped.accelerator_types),
+                warning_code=_warning_code(scoped.warning),
+            )
+            for scope, scoped in sorted(response.items.items())
+        )
+        return ComputeAcceleratorTypesPage(
+            scopes=scopes,
+            next_page_token=response.next_page_token,
+            unreachable_scopes=tuple(response.unreachables),
+            warning_code=_warning_code(response.warning),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +291,150 @@ def _warning_code(warning: object) -> str | None:
     return name if isinstance(name, str) and name else str(code)
 
 
+class GoogleComputeAcceleratorTypeReader:
+    """Read every project-visible Compute accelerator declaration."""
+
+    def __init__(
+        self,
+        client: ComputeAcceleratorTypesPageClient,
+        policy: GoogleReadPolicy,
+        *,
+        page_size: int = 100,
+        maximum_pages: int = 100,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        """Bind bounded pagination, retry policy, and observation clock."""
+        _require_positive(page_size, "Compute accelerator catalog page_size")
+        _require_positive(maximum_pages, "Compute accelerator catalog maximum_pages")
+        self._client = client
+        self._policy = policy
+        self._page_size = page_size
+        self._maximum_pages = maximum_pages
+        self._now = now
+
+    async def read(  # noqa: C901, PLR0912 - preserves every scoped coverage outcome
+        self,
+        request: ComputeAcceleratorTypeReadRequest,
+    ) -> CatalogRead[ComputeAcceleratorType]:
+        """Return bounded declarations with explicit empty and failed coverage."""
+        if not isinstance(request, ComputeAcceleratorTypeReadRequest):
+            msg = (
+                "Compute accelerator reader requires ComputeAcceleratorTypeReadRequest"
+            )
+            raise TypeError(msg)
+        project = request.context.project.project_id
+        token = ""
+        attempted = 0
+        completed = 0
+        cap = False
+        values: list[ComputeAcceleratorType] = []
+        diagnostics: list[Diagnostic] = []
+        location_coverage: list[CatalogLocationCoverage] = []
+        while attempted < self._maximum_pages:
+            attempted += 1
+            result = await self._policy.call(
+                request.context,
+                provider="compute",
+                phase="compute-accelerator-types-read",
+                identity=f"compute-accelerator-types:{project}:{token}",
+                dispatch=lambda timeout, page_token=token: (
+                    self._client.accelerator_types(
+                        project=project,
+                        max_results=self._page_size,
+                        page_token=page_token,
+                        return_partial_success=True,
+                        timeout_seconds=timeout,
+                    )
+                ),
+            )
+            if result.diagnostic is not None:
+                diagnostics.append(result.diagnostic)
+                location_coverage.append(
+                    _accelerator_coverage(
+                        "global",
+                        LocationCoverageState.FAILED,
+                        result.diagnostic,
+                    )
+                )
+                break
+            page = result.value
+            if page is None:
+                msg = "successful Compute accelerator page call must contain a page"
+                raise RuntimeError(msg)
+            completed += 1
+            for scoped in page.scopes:
+                _consume_accelerator_scope(
+                    scoped,
+                    project,
+                    values,
+                    diagnostics,
+                    location_coverage,
+                )
+            for unreachable in page.unreachable_scopes:
+                diagnostic = _accelerator_coverage_diagnostic(
+                    "compute-accelerator-catalog-location-unreachable"
+                )
+                diagnostics.append(diagnostic)
+                try:
+                    location = _scope_location(unreachable)
+                except ValueError:
+                    location = "global"
+                location_coverage.append(
+                    _accelerator_coverage(
+                        location,
+                        LocationCoverageState.FAILED,
+                        diagnostic,
+                    )
+                )
+            if page.warning_code is not None:
+                if page.warning_code == "NO_RESULTS_ON_PAGE":
+                    location_coverage.append(
+                        _accelerator_coverage(
+                            "global",
+                            LocationCoverageState.EMPTY,
+                        )
+                    )
+                else:
+                    diagnostic = _accelerator_coverage_diagnostic(
+                        "compute-accelerator-catalog-page-warning"
+                    )
+                    diagnostics.append(diagnostic)
+                    location_coverage.append(
+                        _accelerator_coverage(
+                            "global",
+                            LocationCoverageState.FAILED,
+                            diagnostic,
+                        )
+                    )
+            token = page.next_page_token
+            if not token:
+                break
+        else:
+            cap = bool(token)
+        if cap:
+            diagnostic = page_cap_diagnostic(
+                "compute-accelerator-types-read",
+                "compute",
+            )
+            diagnostics.append(diagnostic)
+            location_coverage.append(
+                CatalogLocationCoverage(
+                    source=CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+                    location="global",
+                    expectation=LocationCoverageExpectation.EXPECTED,
+                    state=LocationCoverageState.NOT_SCANNED,
+                    diagnostics=(diagnostic,),
+                )
+            )
+        read = ProviderRead(
+            values=tuple(values),
+            coverage=ProviderReadCoverage(attempted, completed, cap),
+            observed_at=self._now(),
+            diagnostics=tuple(diagnostics),
+        )
+        return CatalogRead(read, tuple(location_coverage))
+
+
 class GoogleComputeMachineTypeReader:
     """Read project-visible machine types without inferring machine semantics."""
 
@@ -288,6 +553,136 @@ class GoogleComputeMachineTypeReader:
             diagnostics=tuple(diagnostics),
         )
         return CatalogRead(read, tuple(location_coverage))
+
+
+def _consume_accelerator_scope(
+    scoped: ComputeAcceleratorTypesScope,
+    project: str,
+    values: list[ComputeAcceleratorType],
+    diagnostics: list[Diagnostic],
+    coverage: list[CatalogLocationCoverage],
+) -> None:
+    try:
+        location = _scope_location(scoped.scope)
+    except ValueError:
+        diagnostic = schema_diagnostic("compute-accelerator-types-read", "compute")
+        diagnostics.append(diagnostic)
+        coverage.append(
+            _accelerator_coverage(
+                "global",
+                LocationCoverageState.FAILED,
+                diagnostic,
+            )
+        )
+        return
+    scope_failed = False
+    for item in scoped.accelerator_types:
+        try:
+            values.append(_map_accelerator_type(item, project, location))
+        except (TypeError, ValueError, OverflowError):
+            diagnostic = schema_diagnostic(
+                "compute-accelerator-types-read",
+                "compute",
+            )
+            diagnostics.append(diagnostic)
+            scope_failed = True
+    if scoped.warning_code is not None and scoped.warning_code != "NO_RESULTS_ON_PAGE":
+        diagnostic = _accelerator_coverage_diagnostic(
+            "compute-accelerator-catalog-scope-warning"
+        )
+        diagnostics.append(diagnostic)
+        coverage.append(
+            _accelerator_coverage(
+                location,
+                LocationCoverageState.FAILED,
+                diagnostic,
+            )
+        )
+    elif scope_failed:
+        diagnostic = _accelerator_coverage_diagnostic(
+            "compute-accelerator-catalog-scope-invalid"
+        )
+        diagnostics.append(diagnostic)
+        coverage.append(
+            _accelerator_coverage(
+                location,
+                LocationCoverageState.FAILED,
+                diagnostic,
+            )
+        )
+    else:
+        coverage.append(
+            _accelerator_coverage(
+                location,
+                (
+                    LocationCoverageState.SUCCESS
+                    if scoped.accelerator_types
+                    else LocationCoverageState.EMPTY
+                ),
+            )
+        )
+
+
+def _map_accelerator_type(
+    item: compute_v1.AcceleratorType,
+    project: str,
+    zone: str,
+) -> ComputeAcceleratorType:
+    _verify_accelerator_type_identity(item, project, zone)
+    lifecycle = (
+        ProviderSymbol(item.deprecated.state, CatalogLifecycle)
+        if item.deprecated.state
+        else None
+    )
+    return ComputeAcceleratorType(
+        name=item.name,
+        zone=zone,
+        lifecycle=lifecycle,
+    )
+
+
+def _verify_accelerator_type_identity(
+    item: compute_v1.AcceleratorType,
+    project: str,
+    zone: str,
+) -> None:
+    expected_zone_link = (
+        f"https://www.googleapis.com/compute/v1/projects/{project}/zones/{zone}"
+    )
+    expected_self_link = f"{expected_zone_link}/acceleratorTypes/{item.name}"
+    if item.zone != zone:
+        msg = "Compute accelerator type zone must match its project and scope"
+        raise ValueError(msg)
+    if item.self_link != expected_self_link:
+        msg = "Compute accelerator type self link must match its identity"
+        raise ValueError(msg)
+
+
+def _accelerator_coverage(
+    location: str,
+    state: LocationCoverageState,
+    diagnostic: Diagnostic | None = None,
+) -> CatalogLocationCoverage:
+    return CatalogLocationCoverage(
+        source=CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+        location=location,
+        expectation=LocationCoverageExpectation.EXPECTED,
+        state=state,
+        diagnostics=(diagnostic,) if diagnostic is not None else (),
+    )
+
+
+def _accelerator_coverage_diagnostic(code: str) -> Diagnostic:
+    return Diagnostic(
+        code=DiagnosticCode(code),
+        severity=Severity.WARNING,
+        phase=DiagnosticPhase("compute-accelerator-types-read"),
+        source=DiagnosticSource("compute"),
+        retry=RetryDisposition.AFTER_REFRESH,
+        message=RedactedText(
+            "Compute returned incomplete accelerator-type evidence for one location."
+        ),
+    )
 
 
 def _consume_scope(

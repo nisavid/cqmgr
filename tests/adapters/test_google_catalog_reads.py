@@ -18,9 +18,13 @@ from google.cloud import compute_v1, tpu_v2
 from google.cloud.location import locations_pb2
 
 from cqmgr.adapters.google.compute_catalog import (
+    ComputeAcceleratorTypesPage,
+    ComputeAcceleratorTypesScope,
     ComputeMachineTypesPage,
     ComputeMachineTypesScope,
+    GoogleComputeAcceleratorTypeReader,
     GoogleComputeMachineTypeReader,
+    OfficialComputeAcceleratorTypesPageClient,
     OfficialComputeMachineTypesPageClient,
 )
 from cqmgr.adapters.google.read_policy import GoogleReadPolicy
@@ -33,6 +37,7 @@ from cqmgr.adapters.google.tpu_catalog import (
     TpuRuntimeVersionsPage,
 )
 from cqmgr.application.ports.catalog_reads import (
+    ComputeAcceleratorTypeReadRequest,
     ComputeMachineTypeReadRequest,
     TpuAcceleratorTypeReadRequest,
     TpuLocationReadRequest,
@@ -60,6 +65,7 @@ FIXTURES = Path(__file__).parents[1] / "fixtures" / "google"
 NOW = datetime(2026, 7, 22, 8, tzinfo=UTC)
 GPU_COUNT = 8
 EXPECTED_CANCEL_RACE_CALLS = 2
+OFFICIAL_PAGE_SIZE = 17
 
 
 class RecordingBudget:
@@ -110,6 +116,39 @@ class FakeComputePages:
     ) -> ComputeMachineTypesPage:
         self.calls.append(
             (project, max_results, page_token, return_partial_success, timeout_seconds)
+        )
+        page = self.pages.pop(0)
+        if isinstance(page, BaseException):
+            raise page
+        return page
+
+
+class FakeComputeAcceleratorPages:
+    """Scripted Compute accelerator-type page client."""
+
+    def __init__(
+        self, pages: Sequence[ComputeAcceleratorTypesPage | BaseException]
+    ) -> None:
+        self.pages = list(pages)
+        self.calls: list[tuple[str, int, str, bool, float]] = []
+
+    async def accelerator_types(
+        self,
+        *,
+        project: str,
+        max_results: int,
+        page_token: str,
+        return_partial_success: bool,
+        timeout_seconds: float,
+    ) -> ComputeAcceleratorTypesPage:
+        self.calls.append(
+            (
+                project,
+                max_results,
+                page_token,
+                return_partial_success,
+                timeout_seconds,
+            )
         )
         page = self.pages.pop(0)
         if isinstance(page, BaseException):
@@ -254,6 +293,58 @@ def _compute_pages() -> list[ComputeMachineTypesPage]:
     return result
 
 
+def _compute_accelerator_pages() -> list[ComputeAcceleratorTypesPage]:
+    pages = cast(
+        "list[Mapping[str, object]]",
+        _json("compute-accelerator-types-pages.json")["pages"],
+    )
+    result = []
+    for raw_page in pages:
+        scopes = []
+        for scope, raw_scope in cast(
+            "Mapping[str, Mapping[str, object]]", raw_page["items"]
+        ).items():
+            accelerator_types = []
+            for raw in cast(
+                "list[Mapping[str, object]]",
+                raw_scope.get("acceleratorTypes", []),
+            ):
+                deprecated = raw.get("deprecated")
+                accelerator_types.append(
+                    compute_v1.AcceleratorType(
+                        name=raw["name"],
+                        zone=raw.get("zone"),
+                        self_link=raw.get("selfLink"),
+                        deprecated=(
+                            compute_v1.DeprecationStatus(
+                                state=cast("Mapping[str, object]", deprecated)["state"]
+                            )
+                            if deprecated is not None
+                            else None
+                        ),
+                    )
+                )
+            warning = cast("Mapping[str, object] | None", raw_scope.get("warning"))
+            scopes.append(
+                ComputeAcceleratorTypesScope(
+                    scope=scope,
+                    accelerator_types=tuple(accelerator_types),
+                    warning_code=cast(
+                        "str | None", warning.get("code") if warning else None
+                    ),
+                )
+            )
+        result.append(
+            ComputeAcceleratorTypesPage(
+                scopes=tuple(scopes),
+                next_page_token=cast("str", raw_page["nextPageToken"]),
+                unreachable_scopes=tuple(cast("list[str]", raw_page["unreachables"])),
+                warning_code=None,
+            )
+        )
+    return result
+
+
 def _tpu_pages() -> tuple[
     list[TpuLocationsPage], list[TpuAcceleratorTypesPage], list[TpuRuntimeVersionsPage]
 ]:
@@ -310,6 +401,55 @@ def _tpu_pages() -> tuple[
         for page in runtime_raw
     ]
     return location_pages, accelerator_pages, runtime_pages
+
+
+def test_compute_accelerator_reader_preserves_identity_lifecycle_and_coverage() -> None:
+    """Compute accelerator discovery retains provider truth and partial failures."""
+    client = FakeComputeAcceleratorPages(_compute_accelerator_pages())
+    result = asyncio.run(
+        GoogleComputeAcceleratorTypeReader(
+            client, _policy(), page_size=1, now=lambda: NOW
+        ).read(ComputeAcceleratorTypeReadRequest(_context()))
+    )
+
+    assert [(item.name, item.zone) for item in result.values] == [
+        ("nvidia-b200", "us-central1-a"),
+        ("provider-next-x", "us-central1-b"),
+    ]
+    assert result.values[0].lifecycle is not None
+    assert result.values[0].lifecycle.known is CatalogLifecycle.DEPRECATED
+    assert result.values[1].lifecycle is not None
+    assert result.values[1].lifecycle.raw == "PROVIDER_FUTURE_STATE"
+    assert result.values[1].lifecycle.known is None
+    assert [item.state for item in result.location_coverage] == [
+        LocationCoverageState.SUCCESS,
+        LocationCoverageState.SUCCESS,
+        LocationCoverageState.EMPTY,
+        LocationCoverageState.FAILED,
+    ]
+    assert {item.source for item in result.location_coverage} == {
+        CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES
+    }
+    assert not result.complete
+    assert all(call[0] == "public-schema-project" for call in client.calls)
+    assert all(call[3] is True for call in client.calls)
+
+
+def test_compute_accelerator_page_cap_retains_discovery_as_incomplete() -> None:
+    """Unscanned accelerator pages retain values without an exhaustive claim."""
+    result = asyncio.run(
+        GoogleComputeAcceleratorTypeReader(
+            FakeComputeAcceleratorPages(_compute_accelerator_pages()),
+            _policy(),
+            maximum_pages=1,
+            now=lambda: NOW,
+        ).read(ComputeAcceleratorTypeReadRequest(_context()))
+    )
+
+    assert [item.name for item in result.values] == ["nvidia-b200"]
+    assert result.read.coverage.page_cap_reached
+    assert result.location_coverage[-1].state is LocationCoverageState.NOT_SCANNED
+    assert not result.complete
 
 
 def test_compute_reader_preserves_scopes_lifecycle_accelerators_and_warnings() -> None:
@@ -541,6 +681,58 @@ def test_official_compute_wrapper_uses_partial_success_without_retry() -> None:
     assert result.next_page_token == "public-next"
     assert result.warning_code == "NO_RESULTS_ON_PAGE"
     assert result.scopes[0].warning_code == "NO_RESULTS_ON_PAGE"
+
+
+def test_official_compute_accelerator_wrapper_uses_aggregated_partial_success() -> None:
+    """The generated accelerator client receives one exact bounded read request."""
+    page = compute_v1.AcceleratorTypeAggregatedList(
+        next_page_token="public-next",
+        warning=compute_v1.Warning(code="NO_RESULTS_ON_PAGE"),
+        items={
+            "zones/us-central1-a": compute_v1.AcceleratorTypesScopedList(
+                accelerator_types=(compute_v1.AcceleratorType(name="nvidia-b200"),)
+            )
+        },
+    )
+
+    class Pager:
+        pages = iter((page,))
+
+    class Client:
+        def __init__(self) -> None:
+            self.call: tuple[object, object, object] | None = None
+
+        def aggregated_list(
+            self, *, request: object, retry: object, timeout: object
+        ) -> Pager:
+            self.call = (request, retry, timeout)
+            return Pager()
+
+    client = Client()
+    result = asyncio.run(
+        OfficialComputeAcceleratorTypesPageClient(
+            cast("compute_v1.AcceleratorTypesClient", client)
+        ).accelerator_types(
+            project="public-project",
+            max_results=OFFICIAL_PAGE_SIZE,
+            page_token="public-page",
+            return_partial_success=True,
+            timeout_seconds=2.5,
+        )
+    )
+
+    request = cast(
+        "compute_v1.AggregatedListAcceleratorTypesRequest",
+        cast("tuple[object, object, object]", client.call)[0],
+    )
+    assert request.project == "public-project"
+    assert request.max_results == OFFICIAL_PAGE_SIZE
+    assert request.page_token == "public-page"
+    assert request.return_partial_success
+    assert cast("tuple[object, object, object]", client.call)[1:] == (None, 2.5)
+    assert result.next_page_token == "public-next"
+    assert result.warning_code == "NO_RESULTS_ON_PAGE"
+    assert result.scopes[0].accelerator_types[0].name == "nvidia-b200"
 
 
 def test_official_compute_wrapper_bounds_sync_dispatch_concurrency() -> None:

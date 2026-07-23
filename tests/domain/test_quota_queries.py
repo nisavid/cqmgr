@@ -2,7 +2,6 @@
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from typing import cast
 
 import pytest
 
@@ -15,10 +14,13 @@ from cqmgr.domain.catalog import (
     CatalogPredicates,
 )
 from cqmgr.domain.quota_queries import (
-    CatalogGroupSource,
+    PROVIDER_INVENTORY_REVISION,
+    V1_PROVIDER_SERVICES,
     IncompatibleSortUnitsError,
     IncompleteQuerySnapshotError,
     OpaqueQueryCursor,
+    ProviderSourceCoverage,
+    ProviderSourceCoverageState,
     QuerySnapshotMetadata,
     QuotaQuery,
     QuotaQueryFilters,
@@ -26,7 +28,6 @@ from cqmgr.domain.quota_queries import (
     QuotaQuerySnapshot,
     QuotaSort,
     QuotaSortField,
-    ServiceSource,
     SortDirection,
 )
 from cqmgr.domain.quotas import (
@@ -52,51 +53,83 @@ def _scope() -> ResourceScope:
     return ResourceScope(ResourceScopeKind.PROJECT, "projects/123")
 
 
-def test_query_has_exactly_one_typed_service_or_catalog_group_source() -> None:
-    """Source selection stays independent from repeatable service filters."""
+def test_bare_query_uses_the_fixed_v1_provider_inventory() -> None:
+    """An absent source-selecting filter federates both V1 providers."""
+    query = QuotaQuery(resource_scope=_scope())
+
+    assert query.services == V1_PROVIDER_SERVICES
+
+
+def test_service_and_catalog_group_filters_normalize_and_infer_sources() -> None:
+    """Input shorthand is accepted while durable query identity stays canonical."""
     generic = QuotaQuery(
         resource_scope=_scope(),
-        source=ServiceSource("compute.googleapis.com"),
-        filters=QuotaQueryFilters(services=("compute.googleapis.com",)),
+        filters=QuotaQueryFilters(services=("compute", "compute.googleapis.com")),
     )
     grouped = QuotaQuery(
         resource_scope=_scope(),
-        source=CatalogGroupSource(CatalogGroupId.COMPUTE_ACCELERATORS),
-        filters=QuotaQueryFilters(services=("compute.googleapis.com",)),
+        filters=QuotaQueryFilters(catalog_groups=(CatalogGroupId.CLOUD_TPU_LEGACY,)),
     )
 
-    assert generic.source == ServiceSource("compute.googleapis.com")
-    assert grouped.source == CatalogGroupSource(CatalogGroupId.COMPUTE_ACCELERATORS)
-    assert grouped.filters.services == ("compute.googleapis.com",)
+    assert grouped.filters.catalog_groups == (CatalogGroupId.CLOUD_TPU_LEGACY,)
+    assert generic.filters.services == ("compute.googleapis.com",)
     assert generic.services == ("compute.googleapis.com",)
-    assert grouped.services == ("compute.googleapis.com",)
+    assert grouped.services == ("tpu.googleapis.com",)
 
 
-def test_query_rejects_untyped_or_noncanonical_source() -> None:
-    """A query never infers a source from filters or arbitrary text."""
-    with pytest.raises(ValueError, match="canonical service DNS"):
-        ServiceSource("Compute.GoogleApis.com")
-    with pytest.raises(TypeError, match="ServiceSource or CatalogGroupSource"):
-        QuotaQuery(
-            resource_scope=_scope(),
-            source=cast("ServiceSource", "compute.googleapis.com"),
-        )
+def test_query_rejects_services_outside_the_fixed_inventory() -> None:
+    """An arbitrary service cannot broaden the fixed provider inventory."""
+    with pytest.raises(ValueError, match="supported V1 provider"):
+        QuotaQueryFilters(services=("container.googleapis.com",))
 
 
-def test_query_rejects_filters_outside_the_selected_source() -> None:
-    """A source cannot silently broaden into another provider or catalog group."""
-    with pytest.raises(ValueError, match="selected service source"):
-        QuotaQuery(
-            resource_scope=_scope(),
-            source=ServiceSource("compute.googleapis.com"),
-            filters=QuotaQueryFilters(services=("tpu.googleapis.com",)),
-        )
-    with pytest.raises(ValueError, match="selected catalog group"):
-        QuotaQuery(
-            resource_scope=_scope(),
-            source=CatalogGroupSource(CatalogGroupId.COMPUTE_ACCELERATORS),
-            filters=QuotaQueryFilters(services=("tpu.googleapis.com",)),
-        )
+def test_intersecting_source_facets_may_prune_every_provider() -> None:
+    """Contradictory source facets are a complete empty query, not guessed input."""
+    query = QuotaQuery(
+        resource_scope=_scope(),
+        filters=QuotaQueryFilters(
+            services=("compute",),
+            catalog_groups=(CatalogGroupId.CLOUD_TPU_LEGACY,),
+        ),
+    )
+
+    assert query.services == ()
+
+
+def test_snapshot_metadata_binds_inventory_and_per_source_coverage() -> None:
+    """Coverage distinguishes failed queried evidence from intentional pruning."""
+    query = QuotaQuery(
+        _scope(),
+        filters=QuotaQueryFilters(services=("compute",)),
+    )
+    metadata = QuerySnapshotMetadata(
+        snapshot_id="snapshot-coverage",
+        query=query,
+        catalog=CatalogMetadata(
+            ACCELERATOR_CATALOG_SCHEMA,
+            "2026-07-22",
+            "sha256:" + "b" * 64,
+        ),
+        evidence_contract="cqmgr.quota-query-evidence/v1",
+        observed_at=OBSERVED_AT,
+        expires_at=OBSERVED_AT + timedelta(minutes=15),
+        complete=True,
+        inventory_revision=PROVIDER_INVENTORY_REVISION,
+        source_coverage=(
+            ProviderSourceCoverage.complete(
+                "compute.googleapis.com",
+                pages_attempted=2,
+                pages_completed=2,
+                observed_at=OBSERVED_AT,
+            ),
+            ProviderSourceCoverage.intentionally_unqueried("tpu.googleapis.com"),
+        ),
+    )
+
+    assert metadata.queried_services == ("compute.googleapis.com",)
+    assert metadata.source_coverage[1].state is (
+        ProviderSourceCoverageState.INTENTIONALLY_UNQUERIED
+    )
 
 
 def test_query_rejects_noncanonical_locations() -> None:
@@ -121,6 +154,7 @@ def _item(  # noqa: PLR0913
     grant_satisfaction: GrantSatisfaction = GrantSatisfaction.UNKNOWN,
     effective_confirmation: EffectiveConfirmation = EffectiveConfirmation.UNOBSERVED,
     evidence_observed_at: datetime = OBSERVED_AT,
+    catalog_groups: tuple[CatalogGroupId, ...] = (),
 ) -> QuotaQueryItem:
     quota_unit = QuotaUnit(unit)
     return QuotaQueryItem(
@@ -151,6 +185,7 @@ def _item(  # noqa: PLR0913
         grant_satisfaction=grant_satisfaction,
         effective_confirmation=effective_confirmation,
         evidence_observed_at=evidence_observed_at,
+        catalog_groups=catalog_groups,
     )
 
 
@@ -189,6 +224,26 @@ def test_repeatable_filter_values_are_or_and_distinct_facets_are_and() -> None:
 
 
 def _metadata(query: QuotaQuery, *, complete: bool = True) -> QuerySnapshotMetadata:
+    coverage = tuple(
+        (
+            ProviderSourceCoverage.complete(
+                service,
+                pages_attempted=1,
+                pages_completed=1,
+                observed_at=OBSERVED_AT,
+            )
+            if complete
+            else ProviderSourceCoverage.incomplete(
+                service,
+                pages_attempted=1,
+                pages_completed=0,
+                observed_at=OBSERVED_AT,
+            )
+        )
+        if service in query.services
+        else ProviderSourceCoverage.intentionally_unqueried(service)
+        for service in V1_PROVIDER_SERVICES
+    )
     return QuerySnapshotMetadata(
         snapshot_id="snapshot-opaque-1",
         query=query,
@@ -201,12 +256,13 @@ def _metadata(query: QuotaQuery, *, complete: bool = True) -> QuerySnapshotMetad
         observed_at=OBSERVED_AT,
         expires_at=OBSERVED_AT + timedelta(minutes=15),
         complete=complete,
+        source_coverage=coverage,
     )
 
 
 def test_snapshot_metadata_binds_evidence_contract_and_bounded_lifetime() -> None:
     """A product cursor cannot outlive or silently change its evidence contract."""
-    query = QuotaQuery(_scope(), ServiceSource("compute.googleapis.com"))
+    query = QuotaQuery(_scope(), filters=QuotaQueryFilters(services=("compute",)))
     metadata = _metadata(query)
 
     assert metadata.evidence_contract == "cqmgr.quota-query-evidence/v1"
@@ -220,6 +276,7 @@ def test_snapshot_metadata_binds_evidence_contract_and_bounded_lifetime() -> Non
             observed_at=metadata.observed_at,
             expires_at=metadata.observed_at,
             complete=True,
+            source_coverage=metadata.source_coverage,
         )
 
 
@@ -227,7 +284,7 @@ def test_sort_requires_complete_snapshot_and_uses_deterministic_text_ties() -> N
     """NFC/casefold text ordering falls back to raw text then exact identity."""
     query = QuotaQuery(
         resource_scope=_scope(),
-        source=ServiceSource("compute.googleapis.com"),
+        filters=QuotaQueryFilters(services=("compute",)),
         sort=(QuotaSort(QuotaSortField.DISPLAY_NAME, SortDirection.ASC),),
     )
     rows = (
@@ -248,7 +305,7 @@ def test_descending_sort_keeps_missing_values_last() -> None:
     """Direction changes known-value order without promoting missing evidence."""
     query = QuotaQuery(
         resource_scope=_scope(),
-        source=ServiceSource("compute.googleapis.com"),
+        filters=QuotaQueryFilters(services=("compute",)),
         sort=(QuotaSort(QuotaSortField.EFFECTIVE, SortDirection.DESC),),
     )
     rows = (
@@ -284,7 +341,9 @@ def test_numeric_sort_rejects_comparison_across_native_units() -> None:
     """A global sort never orders core, chip, or card counts as one quantity."""
     query = QuotaQuery(
         resource_scope=_scope(),
-        source=CatalogGroupSource(CatalogGroupId.COMPUTE_ACCELERATORS),
+        filters=QuotaQueryFilters(
+            catalog_groups=(CatalogGroupId.COMPUTE_ACCELERATORS,)
+        ),
         sort=(QuotaSort(QuotaSortField.EFFECTIVE, SortDirection.DESC),),
     )
     snapshot = QuotaQuerySnapshot(
@@ -296,6 +355,7 @@ def test_numeric_sort_rejects_comparison_across_native_units() -> None:
                 accelerator=None,
                 location="us-central1",
                 unit="card",
+                catalog_groups=(CatalogGroupId.COMPUTE_ACCELERATORS,),
             ),
             _item(
                 "tpu",
@@ -303,6 +363,7 @@ def test_numeric_sort_rejects_comparison_across_native_units() -> None:
                 accelerator=None,
                 location="us-central1",
                 unit="chip",
+                catalog_groups=(CatalogGroupId.COMPUTE_ACCELERATORS,),
             ),
         ),
     )
@@ -320,7 +381,6 @@ def test_status_filters_and_all_public_sort_fields_share_the_query_contract() ->
     )
     query = QuotaQuery(
         resource_scope=_scope(),
-        source=ServiceSource("compute.googleapis.com"),
         filters=filters,
         sort=(
             QuotaSort(QuotaSortField.USAGE, SortDirection.DESC),
@@ -361,7 +421,7 @@ def test_evidence_age_sorts_older_evidence_after_fresher_evidence() -> None:
     """Evidence age uses the snapshot observation time and keeps unknown age last."""
     query = QuotaQuery(
         resource_scope=_scope(),
-        source=ServiceSource("compute.googleapis.com"),
+        filters=QuotaQueryFilters(services=("compute",)),
         sort=(QuotaSort(QuotaSortField.EVIDENCE_AGE),),
     )
     fresh = _item(

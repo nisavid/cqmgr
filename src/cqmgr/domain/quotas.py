@@ -363,6 +363,7 @@ class ProviderRead[ReadT]:
     coverage: ProviderReadCoverage
     observed_at: datetime
     diagnostics: tuple[Diagnostic, ...] = ()
+    diagnostic_services: tuple[str | None, ...] = ()
 
     def __post_init__(self) -> None:
         """Require immutable values, typed coverage, and UTC observation time."""
@@ -378,11 +379,43 @@ class ProviderRead[ReadT]:
         ):
             msg = "provider read diagnostics must be a tuple of Diagnostic"
             raise TypeError(msg)
+        if not isinstance(self.diagnostic_services, tuple) or any(
+            service is not None and not _is_canonical_service_dns(service)
+            for service in self.diagnostic_services
+        ):
+            msg = "provider diagnostic services must be canonical or shared"
+            raise TypeError(msg)
+        if self.diagnostic_services and len(self.diagnostic_services) != len(
+            self.diagnostics
+        ):
+            msg = "provider diagnostic services must align with diagnostics"
+            raise ValueError(msg)
 
     @property
     def complete(self) -> bool:
         """Whether evidence can participate in a later mutation gate."""
         return self.coverage.complete and not self.diagnostics
+
+    def diagnostics_for(self, service: str) -> tuple[Diagnostic, ...]:
+        """Return shared and explicitly service-attributed diagnostics."""
+        if not _is_canonical_service_dns(service):
+            msg = "diagnostic service must be a canonical service DNS name"
+            raise ValueError(msg)
+        if not self.diagnostic_services:
+            return self.diagnostics
+        return tuple(
+            diagnostic
+            for diagnostic, attributed_service in zip(
+                self.diagnostics,
+                self.diagnostic_services,
+                strict=True,
+            )
+            if attributed_service is None or attributed_service == service
+        )
+
+    def complete_for(self, service: str) -> bool:
+        """Whether one logical service partition is complete."""
+        return self.coverage.complete and not self.diagnostics_for(service)
 
 
 @dataclass(frozen=True, slots=True)

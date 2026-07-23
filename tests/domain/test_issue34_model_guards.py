@@ -39,8 +39,9 @@ from cqmgr.domain.diagnostics import (
 )
 from cqmgr.domain.quota_queries import (
     QUOTA_QUERY_EVIDENCE_CONTRACT,
-    CatalogGroupSource,
+    V1_PROVIDER_SERVICES,
     OpaqueQueryCursor,
+    ProviderSourceCoverage,
     QuerySnapshotMetadata,
     QuotaQuery,
     QuotaQueryFilters,
@@ -48,7 +49,6 @@ from cqmgr.domain.quota_queries import (
     QuotaQuerySnapshot,
     QuotaSort,
     QuotaSortField,
-    ServiceSource,
     SortDirection,
 )
 from cqmgr.domain.quotas import (
@@ -139,9 +139,12 @@ def _item(**changes: object) -> QuotaQueryItem:
 
 
 def _metadata(query: QuotaQuery | None = None) -> QuerySnapshotMetadata:
+    query = query or QuotaQuery(
+        _scope(), filters=QuotaQueryFilters(services=("compute",))
+    )
     return QuerySnapshotMetadata(
         snapshot_id="snapshot-1",
-        query=query or QuotaQuery(_scope(), ServiceSource("compute.googleapis.com")),
+        query=query,
         catalog=CatalogMetadata(
             ACCELERATOR_CATALOG_SCHEMA,
             "2026-07-22",
@@ -151,6 +154,17 @@ def _metadata(query: QuotaQuery | None = None) -> QuerySnapshotMetadata:
         observed_at=OBSERVED_AT,
         expires_at=OBSERVED_AT + timedelta(minutes=15),
         complete=True,
+        source_coverage=tuple(
+            ProviderSourceCoverage.complete(
+                service,
+                pages_attempted=1,
+                pages_completed=1,
+                observed_at=OBSERVED_AT,
+            )
+            if service in query.services
+            else ProviderSourceCoverage.intentionally_unqueried(service)
+            for service in V1_PROVIDER_SERVICES
+        ),
     )
 
 
@@ -291,20 +305,18 @@ def test_catalog_coverage_requires_typed_outcomes_and_failure_reasons() -> None:
     ).complete
 
 
-def test_query_sort_sources_and_filters_require_public_typed_values() -> None:
+def test_query_sort_and_filters_require_public_typed_values() -> None:
     """Query options reject display text, coercion, and cross-domain values."""
     with pytest.raises(TypeError, match="sort field"):
         QuotaSort(cast("QuotaSortField", "service"))
     with pytest.raises(TypeError, match="sort direction"):
         QuotaSort(QuotaSortField.SERVICE, cast("SortDirection", "asc"))
-    with pytest.raises(TypeError, match="CatalogGroupId"):
-        CatalogGroupSource(cast("CatalogGroupId", "compute-accelerators"))
-    for service in ("compute", "-compute.googleapis.com", "compute_.googleapis.com"):
-        with pytest.raises(ValueError, match="canonical service DNS"):
-            ServiceSource(service)
+    with pytest.raises(ValueError, match="supported V1 provider"):
+        QuotaQueryFilters(services=("storage.googleapis.com",))
 
     invalid_filters = (
         {"services": ["compute.googleapis.com"]},
+        {"catalog_groups": ("compute-accelerators",)},
         {"accelerators": ("nvidia-h100",)},
         {"locations": ("us-central1-",)},
         {"quota_scopes": ("regional",)},
@@ -355,7 +367,7 @@ def test_query_item_rejects_untrusted_product_evidence() -> None:
 
 def test_query_snapshot_binding_rejects_ambiguous_state() -> None:
     """Snapshot identity, lifetime, cursor position, and item types fail closed."""
-    query = QuotaQuery(_scope(), ServiceSource("compute.googleapis.com"))
+    query = QuotaQuery(_scope(), filters=QuotaQueryFilters(services=("compute",)))
     with pytest.raises(TypeError, match="resource_scope"):
         replace(query, resource_scope=cast("ResourceScope", "projects/123"))
     with pytest.raises(TypeError, match="filters"):
@@ -438,7 +450,7 @@ def test_snapshot_sorting_covers_equal_missing_text_and_identity_ties() -> None:
     """Sorting is stable for equal values and retains missing evidence last."""
     query = QuotaQuery(
         _scope(),
-        ServiceSource("compute.googleapis.com"),
+        filters=QuotaQueryFilters(services=("compute",)),
         sort=(QuotaSort(QuotaSortField.DISPLAY_NAME),),
     )
     left = _item(identity=_identity("A"), display_name="Same")

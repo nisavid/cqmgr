@@ -27,7 +27,8 @@ from cqmgr.domain.catalog import (
 )
 from cqmgr.domain.quota_queries import (
     QUOTA_QUERY_EVIDENCE_CONTRACT,
-    CatalogGroupSource,
+    V1_PROVIDER_SERVICES,
+    ProviderSourceCoverage,
     QuerySnapshotMetadata,
     QuotaQuery,
     QuotaQueryFilters,
@@ -35,7 +36,6 @@ from cqmgr.domain.quota_queries import (
     QuotaQuerySnapshot,
     QuotaSort,
     QuotaSortField,
-    ServiceSource,
     SortDirection,
 )
 from cqmgr.domain.quotas import (
@@ -59,9 +59,9 @@ def quota_snapshot(*, complete: bool = True) -> QuotaQuerySnapshot:
     scope = ResourceScope(ResourceScopeKind.PROJECT, "projects/123")
     query = QuotaQuery(
         resource_scope=scope,
-        source=ServiceSource("compute.googleapis.com"),
         filters=QuotaQueryFilters(
             services=("compute.googleapis.com",),
+            catalog_groups=(CatalogGroupId.COMPUTE_ACCELERATORS,),
             accelerators=(AcceleratorId("nvidia-h100"),),
             locations=("us-central1",),
             quota_scopes=(QuotaScope.REGIONAL,),
@@ -91,6 +91,7 @@ def quota_snapshot(*, complete: bool = True) -> QuotaQuerySnapshot:
         accelerator_id=AcceleratorId("nvidia-h100"),
         location="us-central1",
         quota_pool="standard",
+        catalog_groups=(CatalogGroupId.COMPUTE_ACCELERATORS,),
         predicates=CatalogPredicates(
             discovered=True,
             cataloged=True,
@@ -123,6 +124,26 @@ def quota_snapshot(*, complete: bool = True) -> QuotaQuerySnapshot:
             observed_at=datetime(2026, 7, 22, 8, tzinfo=UTC),
             expires_at=datetime(2026, 7, 22, 9, tzinfo=UTC),
             complete=complete,
+            source_coverage=tuple(
+                (
+                    ProviderSourceCoverage.complete(
+                        service,
+                        pages_attempted=2,
+                        pages_completed=2,
+                        observed_at=datetime(2026, 7, 22, 8, tzinfo=UTC),
+                    )
+                    if complete
+                    else ProviderSourceCoverage.incomplete(
+                        service,
+                        pages_attempted=2,
+                        pages_completed=1,
+                        observed_at=datetime(2026, 7, 22, 8, tzinfo=UTC),
+                    )
+                )
+                if service == "compute.googleapis.com"
+                else ProviderSourceCoverage.intentionally_unqueried(service)
+                for service in V1_PROVIDER_SERVICES
+            ),
         ),
         items=(item,),
     )
@@ -141,7 +162,13 @@ def test_snapshot_record_round_trips_as_canonical_safe_json(
     assert encoded == encode_snapshot_record(decode_snapshot_record(encoded))
     assert decode_snapshot_record(encoded) == snapshot
     document = json.loads(encoded)
-    assert document["schema"] == "cqmgr.quota-query-snapshot/v2"
+    assert document["schema"] == "cqmgr.quota-query-snapshot/v3"
+    assert document["snapshot"]["metadata"]["inventory_revision"] == (
+        "cqmgr.provider-inventory/v1"
+    )
+    assert document["snapshot"]["ordered_slice_identities"] == [
+        document["snapshot"]["items"][0]["identity"]
+    ]
     assert "constraint_sets" in document["snapshot"]["items"][0]
     assert "constraint_set" not in document["snapshot"]["items"][0]
     for forbidden in (
@@ -157,7 +184,7 @@ def test_snapshot_record_round_trips_as_canonical_safe_json(
 @pytest.mark.parametrize(
     "document",
     [
-        b'{"schema":"cqmgr.quota-query-snapshot/v3"}\n',
+        b'{"schema":"cqmgr.quota-query-snapshot/v4"}\n',
         b'{"schema":"cqmgr.quota-query-snapshot/v0","snapshot":{}}\n',
         b'{"schema":"cqmgr.quota-query-snapshot/v1","unknown":true}\n',
         b"not-json\n",
@@ -169,7 +196,7 @@ def test_snapshot_decoder_rejects_newer_unknown_and_corrupt_state(
     """Stored schema drift and corruption fail closed without partial evidence."""
     expected = (
         UnsupportedQuotaSnapshotSchemaError
-        if b"/v3" in document
+        if b"/v4" in document
         else QuotaSnapshotStoredDataError
     )
     with pytest.raises(expected):
@@ -185,17 +212,11 @@ def test_snapshot_decoder_rejects_noncanonical_bytes() -> None:
         decode_snapshot_record(noncanonical)
 
 
-@pytest.mark.parametrize(
-    "schema", ["cqmgr.quota-query-snapshot/v1", "cqmgr.quota-query-snapshot/v2"]
-)
-def test_snapshot_decoder_rejects_negative_retained_usage(schema: str) -> None:
-    """No supported snapshot generation can restore impossible quota usage."""
+def test_snapshot_decoder_rejects_negative_retained_usage() -> None:
+    """The current snapshot generation cannot restore impossible quota usage."""
     document = json.loads(encode_snapshot_record(quota_snapshot()))
     item = document["snapshot"]["items"][0]
     item["usage_value"]["value"] = "-1"
-    document["schema"] = schema
-    if schema.endswith("/v1"):
-        item["constraint_set"] = item.pop("constraint_sets")[0]
     encoded = (
         json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         + "\n"
@@ -241,7 +262,10 @@ def test_snapshot_codec_round_trips_catalog_group_and_constraint_references() ->
             snapshot.metadata,
             query=replace(
                 snapshot.metadata.query,
-                source=CatalogGroupSource(CatalogGroupId.COMPUTE_ACCELERATORS),
+                filters=replace(
+                    snapshot.metadata.query.filters,
+                    catalog_groups=(CatalogGroupId.COMPUTE_ACCELERATORS,),
+                ),
             ),
         ),
         items=(constrained,),
@@ -255,21 +279,18 @@ def test_snapshot_codec_round_trips_catalog_group_and_constraint_references() ->
     )
 
 
-def test_snapshot_codec_migrates_unambiguous_legacy_constraint_set() -> None:
-    """A v1 singular relationship remains readable as one plural relationship."""
-    snapshot = quota_snapshot()
-    document = json.loads(encode_snapshot_record(snapshot))
-    item = document["snapshot"]["items"][0]
-    item["constraint_set"] = item.pop("constraint_sets")[0]
-    document["schema"] = "cqmgr.quota-query-snapshot/v1"
+@pytest.mark.parametrize("schema", ["v1", "v2"])
+def test_snapshot_codec_rejects_superseded_source_bound_schemas(schema: str) -> None:
+    """Pre-federation query snapshots fail closed instead of gaining new meaning."""
+    document = json.loads(encode_snapshot_record(quota_snapshot()))
+    document["schema"] = f"cqmgr.quota-query-snapshot/{schema}"
     encoded = (
         json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         + "\n"
     ).encode()
 
-    decoded = decode_snapshot_record(encoded)
-
-    assert decoded.items[0].constraint_sets == (decoded.items[0].constraint_set,)
+    with pytest.raises(QuotaSnapshotStoredDataError):
+        decode_snapshot_record(encoded)
 
 
 def test_codec_entrypoints_reject_wrong_types_and_invalid_cursor_values() -> None:
@@ -318,7 +339,7 @@ def test_cursor_binding_decoder_rejects_untrusted_state(
 @pytest.mark.parametrize(
     ("path", "value"),
     [
-        (("snapshot", "metadata", "query", "source", "kind"), "unknown"),
+        (("snapshot", "metadata", "query", "filters", "services"), ["unknown"]),
         (("snapshot", "metadata", "observed_at"), "2026-07-22T08:00:00+01:00"),
         (("snapshot", "items", 0, "identity", "dimensions"), [["region"]]),
         (("snapshot", "items", 0, "effective_value", "value"), "01"),

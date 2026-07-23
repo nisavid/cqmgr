@@ -9,16 +9,23 @@ import pytest
 
 from cqmgr.application.ports.catalog_reads import (
     CatalogRead,
+    ComputeAcceleratorTypeReadRequest,
     ComputeMachineTypeReadRequest,
     TpuAcceleratorTypeReadRequest,
     TpuLocationReadRequest,
     TpuRuntimeVersionReadRequest,
 )
 from cqmgr.application.ports.coordination import CancellationToken
-from cqmgr.application.ports.provider_reads import ProviderReadContext, UsageReadRequest
+from cqmgr.application.ports.provider_reads import (
+    ProviderReadContext,
+    QuotaPreferenceReadRequest,
+    UsageReadRequest,
+)
+from cqmgr.domain.catalog import CatalogLifecycle, ComputeAcceleratorType
 from cqmgr.domain.identity import ADCIdentityEvidence, ADCQuotaProject, CredentialKind
 from cqmgr.domain.projects import CanonicalProject
 from cqmgr.domain.quotas import ProviderRead, ProviderReadCoverage
+from cqmgr.domain.schemas import ProviderSymbol
 from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 
 if TYPE_CHECKING:
@@ -84,6 +91,31 @@ def test_usage_reads_require_canonical_service_and_bounded_utc_interval(
         replace(valid, interval_start=valid.interval_end)
 
 
+def test_preference_read_partitions_require_unique_canonical_services() -> None:
+    """One global preference scan binds only explicit logical service partitions."""
+    request = QuotaPreferenceReadRequest(
+        _context(),
+        ("compute.googleapis.com", "tpu.googleapis.com"),
+    )
+
+    assert request.services == (
+        "compute.googleapis.com",
+        "tpu.googleapis.com",
+    )
+    with pytest.raises(TypeError, match="tuple"):
+        QuotaPreferenceReadRequest(
+            _context(),
+            cast("tuple[str, ...]", ["compute.googleapis.com"]),
+        )
+    with pytest.raises(ValueError, match="canonical"):
+        replace(request, services=("Compute.GoogleApis.com",))
+    with pytest.raises(ValueError, match="unique"):
+        replace(
+            request,
+            services=("compute.googleapis.com", "compute.googleapis.com"),
+        )
+
+
 def test_catalog_read_preserves_values_and_explicit_completeness() -> None:
     """Catalog values never hide page or location coverage from callers."""
     provider_read = ProviderRead(
@@ -110,8 +142,11 @@ def test_catalog_read_preserves_values_and_explicit_completeness() -> None:
 def test_catalog_requests_require_context_and_canonical_zone() -> None:
     """Each catalog read is bound to an explicit context and exact location ID."""
     context = _context()
+    assert ComputeAcceleratorTypeReadRequest(context).context is context
     assert ComputeMachineTypeReadRequest(context).context is context
     assert TpuLocationReadRequest(context).context is context
+    with pytest.raises(TypeError, match="Compute accelerator catalog"):
+        ComputeAcceleratorTypeReadRequest(cast("ProviderReadContext", object()))
     with pytest.raises(TypeError, match="Compute catalog"):
         ComputeMachineTypeReadRequest(cast("ProviderReadContext", object()))
     with pytest.raises(TypeError, match="TPU location"):
@@ -130,3 +165,20 @@ def test_catalog_requests_require_context_and_canonical_zone() -> None:
         ):
             with pytest.raises(ValueError, match="canonical location ID"):
                 request_type(context, zone)
+
+
+def test_compute_accelerator_evidence_preserves_open_lifecycle_text() -> None:
+    """Provider declarations retain exact identity without closing future states."""
+    evidence = ComputeAcceleratorType(
+        "provider-next-x",
+        "us-central1-a",
+        ProviderSymbol("PROVIDER_FUTURE_STATE", CatalogLifecycle),
+    )
+
+    assert evidence.lifecycle is not None
+    assert evidence.lifecycle.raw == "PROVIDER_FUTURE_STATE"
+    assert evidence.lifecycle.known is None
+    with pytest.raises(ValueError, match="zone"):
+        replace(evidence, zone="zones/us-central1-a")
+    with pytest.raises(TypeError, match="CatalogLifecycle"):
+        replace(evidence, lifecycle=cast("ProviderSymbol[CatalogLifecycle]", object()))

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from cqmgr.application.ports.catalog_reads import (
+    ComputeAcceleratorTypeReadRequest,
     ComputeMachineTypeReadRequest,
     TpuAcceleratorTypeReadRequest,
     TpuLocationReadRequest,
@@ -25,22 +26,33 @@ from cqmgr.application.ports.quota_snapshots import (
     QuotaSnapshotRepositoryError,
 )
 from cqmgr.domain.accelerator_overlay import (
-    GpuWorkloadRequirement,
+    AllCompatibleLocations,
+    CandidateLocations,
+    CloudTpuSliceRequirement,
+    ComputeInstanceRequirement,
     QuotaConstraintAssessment,
     ResolutionFailureReason,
-    ResolvedQuotaRequirement,
-    TpuWorkloadRequirement,
+    ResolvedWorkloadLocation,
+    ResolvedWorkloadRequirement,
     WorkloadCatalogEvidence,
+    WorkloadLocationDisposition,
     WorkloadResolutionError,
 )
 from cqmgr.domain.catalog import (
     AcceleratorConstraintSet,
     CatalogEvidenceSource,
-    ManagementPlane,
+    CatalogGroupId,
+    CatalogLocationCoverage,
+    LocationCoverageExpectation,
+    LocationCoverageState,
 )
 from cqmgr.domain.quota_queries import (
+    PROVIDER_INVENTORY_REVISION,
     QUOTA_QUERY_EVIDENCE_CONTRACT,
+    V1_PROVIDER_SERVICES,
     IncompatibleSortUnitsError,
+    ProviderSourceCoverage,
+    ProviderSourceCoverageState,
     QuerySnapshotMetadata,
     QuotaQuery,
     QuotaQueryItem,
@@ -80,6 +92,8 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from cqmgr.application.ports.catalog_reads import (
+        CatalogRead,
+        ComputeAcceleratorTypeReader,
         ComputeMachineTypeReader,
         TpuAcceleratorTypeReader,
         TpuLocationReader,
@@ -96,7 +110,7 @@ if TYPE_CHECKING:
         QuotaQuerySnapshotRepository,
     )
     from cqmgr.domain.accelerator_overlay import SemanticAcceleratorOverlay
-    from cqmgr.domain.catalog import CatalogLocationCoverage
+    from cqmgr.domain.catalog import TpuLocation
     from cqmgr.domain.diagnostics import Diagnostic
 
 
@@ -108,7 +122,7 @@ class QuotaResolveRequest:
     """Resolve one typed workload against one explicit project context."""
 
     context: ProviderReadContext
-    requirement: GpuWorkloadRequirement | TpuWorkloadRequirement
+    requirement: ComputeInstanceRequirement | CloudTpuSliceRequirement
 
     def __post_init__(self) -> None:
         """Require explicit provider context and a typed workload shape."""
@@ -116,9 +130,12 @@ class QuotaResolveRequest:
             msg = "quota resolution requires ProviderReadContext"
             raise TypeError(msg)
         if not isinstance(
-            self.requirement, (GpuWorkloadRequirement, TpuWorkloadRequirement)
+            self.requirement, (ComputeInstanceRequirement, CloudTpuSliceRequirement)
         ):
-            msg = "quota resolution requires a typed GPU or TPU workload"
+            msg = (
+                "quota resolution requires a compute-instance or "
+                "cloud-tpu-slice workload"
+            )
             raise TypeError(msg)
 
 
@@ -129,6 +146,7 @@ class WorkloadResolutionOperations:
         self,
         effective: EffectiveQuotaReader,
         usage: UsageReader,
+        compute_accelerator_types: ComputeAcceleratorTypeReader,
         compute_machine_types: ComputeMachineTypeReader,
         tpu_locations: TpuLocationReader,
         tpu_accelerator_types: TpuAcceleratorTypeReader,
@@ -141,6 +159,7 @@ class WorkloadResolutionOperations:
         """Inject every provider-neutral evidence boundary and the semantic overlay."""
         self._effective = effective
         self._usage = usage
+        self._compute_accelerator_types = compute_accelerator_types
         self._compute_machine_types = compute_machine_types
         self._tpu_locations = tpu_locations
         self._tpu_accelerator_types = tpu_accelerator_types
@@ -152,7 +171,7 @@ class WorkloadResolutionOperations:
     async def resolve(  # noqa: PLR0911
         self,
         request: QuotaResolveRequest,
-    ) -> OperationResult[ResolvedQuotaRequirement | None]:
+    ) -> OperationResult[ResolvedWorkloadRequirement | None]:
         """Resolve one exact workload without making a capacity claim."""
         started_at = self._clock.now()
         effective_read, usage_read, catalog, diagnostics = await self._read_evidence(
@@ -208,27 +227,6 @@ class WorkloadResolutionOperations:
                 data=None,
                 diagnostics=diagnostics,
             )
-        catalog_gaps = _required_catalog_gaps(request.requirement, catalog)
-        if catalog_gaps:
-            has_partial_data = bool(effective_read.values)
-            return self._result(
-                request,
-                started_at,
-                reached=False,
-                outcome=ResolutionFailureReason.MISSING_LOCATION_EVIDENCE.value,
-                exit_class=(
-                    ExitClass.INCOMPLETE_EVIDENCE
-                    if has_partial_data
-                    else ExitClass.OPERATIONAL_FAILURE
-                ),
-                completeness=(
-                    Completeness.incomplete(*catalog_gaps)
-                    if has_partial_data
-                    else Completeness.unavailable(*catalog_gaps)
-                ),
-                data=None,
-                diagnostics=diagnostics,
-            )
         try:
             resolved = self._overlay.resolve(
                 request.requirement,
@@ -277,13 +275,10 @@ class WorkloadResolutionOperations:
                 diagnostics=diagnostics,
             )
         try:
-            assessed = replace(
+            assessed = _assess_resolved_workload(
                 resolved,
-                assessments=_quota_constraint_assessments(
-                    resolved,
-                    effective_read.values,
-                    usage_read.values,
-                ),
+                effective_read.values,
+                usage_read.values,
             )
         except _AmbiguousEvidenceError:
             gap = EvidenceGap(
@@ -298,6 +293,51 @@ class WorkloadResolutionOperations:
                 exit_class=ExitClass.INCOMPLETE_EVIDENCE,
                 completeness=Completeness.incomplete(gap),
                 data=None,
+                diagnostics=diagnostics,
+            )
+        catalog_gaps = _required_catalog_gaps(request.requirement, catalog)
+        incomplete_locations = tuple(
+            location
+            for location in assessed.locations
+            if location.disposition is WorkloadLocationDisposition.INCOMPLETE
+        )
+        all_compatible_incomplete = (
+            assessed.all_compatible_locations_exhaustive is False
+        )
+        if incomplete_locations or all_compatible_incomplete:
+            gaps = catalog_gaps or _catalog_coverage_gaps(catalog)
+            return self._result(
+                request,
+                started_at,
+                reached=False,
+                outcome=ResolutionFailureReason.MISSING_LOCATION_EVIDENCE.value,
+                exit_class=ExitClass.INCOMPLETE_EVIDENCE,
+                completeness=Completeness.incomplete(*gaps),
+                data=assessed,
+                diagnostics=diagnostics,
+            )
+        compatible_locations = tuple(
+            location
+            for location in assessed.locations
+            if location.disposition is WorkloadLocationDisposition.COMPATIBLE
+        )
+        if not compatible_locations:
+            reason = next(
+                (
+                    location.failure_reason
+                    for location in assessed.locations
+                    if location.failure_reason is not None
+                ),
+                ResolutionFailureReason.UNSUPPORTED_COMPATIBILITY,
+            )
+            return self._result(
+                request,
+                started_at,
+                reached=False,
+                outcome=reason.value,
+                exit_class=ExitClass.REJECTED_PRECONDITION,
+                completeness=Completeness.complete(),
+                data=assessed,
                 diagnostics=diagnostics,
             )
         return self._result(
@@ -322,15 +362,11 @@ class WorkloadResolutionOperations:
         tuple[Diagnostic, ...],
     ]:
         requirement = request.requirement
-        uses_compute = isinstance(requirement, GpuWorkloadRequirement) or (
-            isinstance(requirement, TpuWorkloadRequirement)
-            and requirement.management_plane is ManagementPlane.COMPUTE
-        )
-        if uses_compute:
+        if isinstance(requirement, ComputeInstanceRequirement):
             return await self._read_compute_evidence(request.context, observed_at)
-        return await self._read_legacy_tpu_evidence(
+        return await self._read_cloud_tpu_evidence(
             request.context,
-            requirement.zone,
+            requirement,
             observed_at,
         )
 
@@ -344,7 +380,12 @@ class WorkloadResolutionOperations:
         WorkloadCatalogEvidence,
         tuple[Diagnostic, ...],
     ]:
-        effective_read, usage_read, machine_read = await asyncio.gather(
+        (
+            effective_read,
+            usage_read,
+            accelerator_read,
+            machine_read,
+        ) = await asyncio.gather(
             self._effective.read(
                 EffectiveQuotaReadRequest(context, "compute.googleapis.com")
             ),
@@ -356,12 +397,22 @@ class WorkloadResolutionOperations:
                     observed_at,
                 )
             ),
+            self._compute_accelerator_types.read(
+                ComputeAcceleratorTypeReadRequest(context)
+            ),
             self._compute_machine_types.read(ComputeMachineTypeReadRequest(context)),
+        )
+        coverage = (
+            *accelerator_read.location_coverage,
+            *machine_read.location_coverage,
         )
         diagnostics = _resolution_diagnostics(
             (*effective_read.diagnostics, *usage_read.diagnostics),
-            machine_read.read.diagnostics,
-            machine_read.location_coverage,
+            (
+                *accelerator_read.read.diagnostics,
+                *machine_read.read.diagnostics,
+            ),
+            coverage,
         )
         return (
             effective_read,
@@ -371,15 +422,16 @@ class WorkloadResolutionOperations:
                 tpu_locations=(),
                 tpu_accelerator_types=(),
                 tpu_runtime_versions=(),
-                coverage=machine_read.location_coverage,
+                coverage=coverage,
+                compute_accelerator_types=accelerator_read.values,
             ),
             diagnostics,
         )
 
-    async def _read_legacy_tpu_evidence(
+    async def _read_cloud_tpu_evidence(
         self,
         context: ProviderReadContext,
-        zone: str,
+        requirement: CloudTpuSliceRequirement,
         observed_at: datetime,
     ) -> tuple[
         ProviderRead[EffectiveQuotaEvidence],
@@ -387,16 +439,12 @@ class WorkloadResolutionOperations:
         WorkloadCatalogEvidence,
         tuple[Diagnostic, ...],
     ]:
-        (
-            effective_read,
-            usage_read,
-            location_read,
-            accelerator_read,
-            runtime_read,
-        ) = await asyncio.gather(
+        effective_task = asyncio.create_task(
             self._effective.read(
                 EffectiveQuotaReadRequest(context, "tpu.googleapis.com")
-            ),
+            )
+        )
+        usage_task = asyncio.create_task(
             self._usage.read(
                 UsageReadRequest(
                     context,
@@ -404,27 +452,57 @@ class WorkloadResolutionOperations:
                     observed_at - self._usage_window,
                     observed_at,
                 )
-            ),
-            self._tpu_locations.read(TpuLocationReadRequest(context)),
-            self._tpu_accelerator_types.read(
-                TpuAcceleratorTypeReadRequest(context, zone)
-            ),
-            self._tpu_runtime_versions.read(
-                TpuRuntimeVersionReadRequest(context, zone)
+            )
+        )
+        location_read = await self._tpu_locations.read(TpuLocationReadRequest(context))
+        zones = (
+            requirement.locations.values
+            if isinstance(requirement.locations, CandidateLocations)
+            else tuple(location.location_id for location in location_read.values)
+        )
+        accelerator_reads = await asyncio.gather(
+            *(
+                self._tpu_accelerator_types.read(
+                    TpuAcceleratorTypeReadRequest(context, zone)
+                )
+                for zone in zones
             ),
         )
+        runtime_reads = await asyncio.gather(
+            *(
+                self._tpu_runtime_versions.read(
+                    TpuRuntimeVersionReadRequest(context, zone)
+                )
+                for zone in zones
+            ),
+        )
+        effective_read, usage_read = await asyncio.gather(
+            effective_task,
+            usage_task,
+        )
+        location_coverage = _selected_tpu_location_coverage(
+            requirement,
+            location_read,
+        )
         coverage = (
-            *location_read.location_coverage,
-            *accelerator_read.location_coverage,
-            *runtime_read.location_coverage,
+            *location_coverage,
+            *(
+                item
+                for read in (*accelerator_reads, *runtime_reads)
+                for item in read.location_coverage
+            ),
+        )
+        catalog_diagnostics = (
+            *location_read.read.diagnostics,
+            *(
+                diagnostic
+                for read in (*accelerator_reads, *runtime_reads)
+                for diagnostic in read.read.diagnostics
+            ),
         )
         diagnostics = _resolution_diagnostics(
             (*effective_read.diagnostics, *usage_read.diagnostics),
-            (
-                *location_read.read.diagnostics,
-                *accelerator_read.read.diagnostics,
-                *runtime_read.read.diagnostics,
-            ),
+            catalog_diagnostics,
             coverage,
         )
         return (
@@ -433,8 +511,12 @@ class WorkloadResolutionOperations:
             WorkloadCatalogEvidence(
                 compute_machine_types=(),
                 tpu_locations=location_read.values,
-                tpu_accelerator_types=accelerator_read.values,
-                tpu_runtime_versions=runtime_read.values,
+                tpu_accelerator_types=tuple(
+                    value for read in accelerator_reads for value in read.values
+                ),
+                tpu_runtime_versions=tuple(
+                    value for read in runtime_reads for value in read.values
+                ),
                 coverage=coverage,
             ),
             diagnostics,
@@ -465,6 +547,49 @@ class WorkloadResolutionOperations:
             data=data,
             diagnostics=diagnostics,
         )
+
+
+def _selected_tpu_location_coverage(
+    requirement: CloudTpuSliceRequirement,
+    location_read: CatalogRead[TpuLocation],
+) -> tuple[CatalogLocationCoverage, ...]:
+    """Bind explicit candidates to the authoritative bounded location inventory."""
+    if isinstance(requirement.locations, AllCompatibleLocations):
+        return location_read.location_coverage
+    by_location = {
+        item.location: item
+        for item in location_read.location_coverage
+        if item.source is CatalogEvidenceSource.TPU_LOCATIONS
+        and item.location != "global"
+    }
+    inventory_complete = location_read.complete
+    incomplete_diagnostics = tuple(
+        dict.fromkeys(
+            (
+                *location_read.read.diagnostics,
+                *(
+                    diagnostic
+                    for coverage in location_read.location_coverage
+                    for diagnostic in coverage.diagnostics
+                ),
+            )
+        )
+    )
+    return tuple(
+        by_location.get(zone)
+        or CatalogLocationCoverage(
+            CatalogEvidenceSource.TPU_LOCATIONS,
+            zone,
+            LocationCoverageExpectation.REQUESTED,
+            (
+                LocationCoverageState.EMPTY
+                if inventory_complete
+                else LocationCoverageState.NOT_SCANNED
+            ),
+            () if inventory_complete else incomplete_diagnostics,
+        )
+        for zone in requirement.locations.values
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -517,6 +642,7 @@ class QuotaBrowseData:
     next_cursor: str | None
     snapshot_id: str | None
     reason: str | None = None
+    source_coverage: tuple[ProviderSourceCoverage, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -630,16 +756,48 @@ class QuotaOperations:
             return self._browse_rejection(
                 request, started_at, "resource-scope-mismatch"
             )
+        if not query.services:
+            coverage = tuple(
+                ProviderSourceCoverage.intentionally_unqueried(service)
+                for service in V1_PROVIDER_SERVICES
+            )
+            return self._complete_browse(
+                request,
+                query,
+                (),
+                coverage,
+                (),
+                started_at,
+            )
 
         reads = await self._read_query_sources(context, query)
         effective_reads, preference_read, usage_reads = reads
-        complete = all(
-            read.complete for read in (*effective_reads, preference_read, *usage_reads)
+        source_coverage = _source_coverage(
+            query,
+            effective_reads,
+            preference_read,
+            usage_reads,
         )
-        diagnostics = tuple(
-            diagnostic
-            for read in (*effective_reads, preference_read, *usage_reads)
-            for diagnostic in read.diagnostics
+        complete = all(
+            item.state is ProviderSourceCoverageState.COMPLETE
+            for item in source_coverage
+            if item.service in query.services
+        )
+        preference_diagnostics = tuple(
+            dict.fromkeys(
+                diagnostic
+                for service in query.services
+                for diagnostic in preference_read.diagnostics_for(service)
+            )
+        )
+        diagnostics = (
+            *(
+                diagnostic
+                for read in effective_reads
+                for diagnostic in read.diagnostics
+            ),
+            *preference_diagnostics,
+            *(diagnostic for read in usage_reads for diagnostic in read.diagnostics),
         )
         evidences = tuple(
             evidence for read in effective_reads for evidence in read.values
@@ -691,6 +849,7 @@ class QuotaOperations:
                 next_cursor=None,
                 snapshot_id=None,
                 reason="incomplete-provider-evidence",
+                source_coverage=source_coverage,
             )
             return self._incomplete_result(
                 "quota.list",
@@ -702,15 +861,35 @@ class QuotaOperations:
                 has_partial_data=bool(evidences),
             )
 
-        snapshot_id = self._snapshot_id_factory()
+        return self._complete_browse(
+            request,
+            query,
+            filtered,
+            source_coverage,
+            diagnostics,
+            started_at,
+        )
+
+    def _complete_browse(  # noqa: PLR0913
+        self,
+        request: QuotaBrowseRequest,
+        query: QuotaQuery,
+        filtered: tuple[QuotaQueryItem, ...],
+        source_coverage: tuple[ProviderSourceCoverage, ...],
+        diagnostics: tuple[Diagnostic, ...],
+        started_at: datetime,
+    ) -> OperationResult[QuotaBrowseData]:
+        """Sort and retain one complete fixed-inventory collection."""
         metadata = QuerySnapshotMetadata(
-            snapshot_id=snapshot_id,
+            snapshot_id=self._snapshot_id_factory(),
             query=query,
             catalog=self._overlay.metadata,
             evidence_contract=QUOTA_QUERY_EVIDENCE_CONTRACT,
             observed_at=started_at,
             expires_at=started_at + self._snapshot_ttl,
             complete=True,
+            inventory_revision=PROVIDER_INVENTORY_REVISION,
+            source_coverage=source_coverage,
         )
         snapshot = QuotaQuerySnapshot(metadata, filtered)
         try:
@@ -745,7 +924,12 @@ class QuotaOperations:
             self._effective.read(
                 EffectiveQuotaReadRequest(request.context, request.identity.service)
             ),
-            self._preferences.read(QuotaPreferenceReadRequest(request.context)),
+            self._preferences.read(
+                QuotaPreferenceReadRequest(
+                    request.context,
+                    (request.identity.service,),
+                )
+            ),
             self._usage.read(
                 UsageReadRequest(
                     request.context,
@@ -755,10 +939,18 @@ class QuotaOperations:
                 )
             ),
         )
-        reads = (effective_read, preference_read, usage_read)
-        complete = all(read.complete for read in reads)
-        diagnostics = tuple(
-            diagnostic for read in reads for diagnostic in read.diagnostics
+        preference_diagnostics = preference_read.diagnostics_for(
+            request.identity.service
+        )
+        complete = (
+            effective_read.complete
+            and preference_read.complete_for(request.identity.service)
+            and usage_read.complete
+        )
+        diagnostics = (
+            *effective_read.diagnostics,
+            *preference_diagnostics,
+            *usage_read.diagnostics,
         )
         matches = tuple(
             evidence
@@ -890,7 +1082,7 @@ class QuotaOperations:
             for service in query.services
         )
         preference_task = asyncio.create_task(
-            self._preferences.read(QuotaPreferenceReadRequest(context))
+            self._preferences.read(QuotaPreferenceReadRequest(context, query.services))
         )
         usage_tasks = tuple(
             asyncio.create_task(
@@ -951,6 +1143,10 @@ class QuotaOperations:
         item = self._overlay.classify(
             evidence,
             freshly_validated_mutable=mutable,
+        )
+        item = replace(
+            item,
+            catalog_groups=_catalog_groups_for_evidence(self._overlay, evidence),
         )
         constraint_sets = self._overlay.constraint_sets(evidence, evidences)
         preference = _one_exact_preference(evidence, preferences)
@@ -1033,6 +1229,7 @@ class QuotaOperations:
                 next_cursor=None,
                 snapshot_id=snapshot.metadata.snapshot_id,
                 reason="cursor-issue-failed",
+                source_coverage=snapshot.metadata.source_coverage,
             )
             return self._result(
                 operation="quota.list",
@@ -1053,6 +1250,7 @@ class QuotaOperations:
             total=len(snapshot.items),
             next_cursor=next_cursor,
             snapshot_id=snapshot.metadata.snapshot_id,
+            source_coverage=snapshot.metadata.source_coverage,
         )
         return self._result(
             operation="quota.list",
@@ -1371,18 +1569,44 @@ def _joined_usage_value(
         return None
 
 
+def _assess_resolved_workload(
+    resolved: ResolvedWorkloadRequirement,
+    evidences: tuple[EffectiveQuotaEvidence, ...],
+    usages: tuple[UsageObservation, ...],
+) -> ResolvedWorkloadRequirement:
+    """Attach exact native-unit usage assessments to compatible locations."""
+    return replace(
+        resolved,
+        locations=tuple(
+            (
+                replace(
+                    location,
+                    assessments=_quota_constraint_assessments(
+                        location,
+                        evidences,
+                        usages,
+                    ),
+                )
+                if location.disposition is WorkloadLocationDisposition.COMPATIBLE
+                else location
+            )
+            for location in resolved.locations
+        ),
+    )
+
+
 def _quota_constraint_assessments(
-    resolved: ResolvedQuotaRequirement,
+    resolved: ResolvedWorkloadLocation,
     evidences: tuple[EffectiveQuotaEvidence, ...],
     usages: tuple[UsageObservation, ...],
 ) -> tuple[QuotaConstraintAssessment, ...]:
     """Assess every exact limiting slice from authoritative native-unit usage."""
     assessments = []
-    for reference in resolved.constraint_set.references:
+    for requirement in resolved.constraint_requirements:
         matches = tuple(
             evidence
             for evidence in evidences
-            if evidence.identity == reference.slice_identity
+            if evidence.identity == requirement.identity
         )
         if len(matches) != 1:
             msg = "constraint assessment requires one exact effective quota slice"
@@ -1393,10 +1617,10 @@ def _quota_constraint_assessments(
             msg = "constraint assessment requires exact authoritative usage"
             raise _AmbiguousEvidenceError(msg)
         effective = evidence.effective_value
-        required = resolved.required_amount
+        required = requirement.required
         assessments.append(
             QuotaConstraintAssessment(
-                reference.slice_identity,
+                requirement.identity,
                 effective,
                 usage,
                 required,
@@ -1492,6 +1716,96 @@ def _has_duplicate_effective_identities(
     return len(set(identities)) != len(identities)
 
 
+def _source_coverage(
+    query: QuotaQuery,
+    effective_reads: tuple[ProviderRead[EffectiveQuotaEvidence], ...],
+    preference_read: ProviderRead[QuotaPreferenceEvidence],
+    usage_reads: tuple[ProviderRead[UsageObservation], ...],
+) -> tuple[ProviderSourceCoverage, ...]:
+    """Bind every fixed provider to queried evidence or intentional pruning."""
+    queried = {
+        service: (effective_read, usage_read)
+        for service, effective_read, usage_read in zip(
+            query.services,
+            effective_reads,
+            usage_reads,
+            strict=True,
+        )
+    }
+    coverage: list[ProviderSourceCoverage] = []
+    for service in V1_PROVIDER_SERVICES:
+        reads = queried.get(service)
+        if reads is None:
+            coverage.append(ProviderSourceCoverage.intentionally_unqueried(service))
+            continue
+        effective_read, usage_read = reads
+        preference_diagnostics = preference_read.diagnostics_for(service)
+        complete = (
+            effective_read.complete
+            and usage_read.complete
+            and preference_read.complete_for(service)
+        )
+        diagnostic_codes = tuple(
+            sorted(
+                {
+                    diagnostic.code
+                    for diagnostic in (
+                        *effective_read.diagnostics,
+                        *usage_read.diagnostics,
+                        *preference_diagnostics,
+                    )
+                },
+                key=lambda code: code.value,
+            )
+        )
+        constructor = (
+            ProviderSourceCoverage.complete
+            if complete
+            else ProviderSourceCoverage.incomplete
+        )
+        coverage.append(
+            constructor(
+                service,
+                pages_attempted=(
+                    effective_read.coverage.pages_attempted
+                    + usage_read.coverage.pages_attempted
+                    + preference_read.coverage.pages_attempted
+                ),
+                pages_completed=(
+                    effective_read.coverage.pages_completed
+                    + usage_read.coverage.pages_completed
+                    + preference_read.coverage.pages_completed
+                ),
+                observed_at=max(
+                    effective_read.observed_at,
+                    usage_read.observed_at,
+                    preference_read.observed_at,
+                ),
+                page_cap_reached=(
+                    effective_read.coverage.page_cap_reached
+                    or usage_read.coverage.page_cap_reached
+                    or preference_read.coverage.page_cap_reached
+                ),
+                diagnostic_codes=diagnostic_codes,
+            )
+        )
+    return tuple(coverage)
+
+
+def _catalog_groups_for_evidence(
+    overlay: SemanticAcceleratorOverlay,
+    evidence: EffectiveQuotaEvidence,
+) -> tuple[CatalogGroupId, ...]:
+    """Return maintained groups whose exact selectors match one live slice."""
+    groups = {
+        mapping.group_id
+        for mapping in getattr(overlay, "mappings", ())
+        if mapping.selector.matches(evidence)
+        or any(selector.matches(evidence) for selector in mapping.companion_selectors)
+    }
+    return tuple(sorted(groups, key=lambda group: group.value))
+
+
 def _constraint_sets(
     items: tuple[QuotaQueryItem, ...],
 ) -> tuple[AcceleratorConstraintSet, ...]:
@@ -1521,17 +1835,36 @@ def _resolution_diagnostics(
 
 
 def _required_catalog_gaps(
-    requirement: GpuWorkloadRequirement | TpuWorkloadRequirement,
+    requirement: ComputeInstanceRequirement | CloudTpuSliceRequirement,
     catalog: WorkloadCatalogEvidence,
 ) -> tuple[EvidenceGap, ...]:
     """Identify only missing selected-location catalog evidence as blocking."""
-    if isinstance(requirement, GpuWorkloadRequirement) or (
-        requirement.management_plane is ManagementPlane.COMPUTE
-    ):
-        required = ((CatalogEvidenceSource.COMPUTE_MACHINE_TYPES, requirement.zone),)
+    selected_locations = (
+        requirement.locations.values
+        if isinstance(requirement.locations, CandidateLocations)
+        else tuple(
+            sorted(
+                {
+                    item.location
+                    for item in catalog.coverage
+                    if item.location != "global"
+                }
+            )
+        )
+    )
+    if isinstance(requirement, ComputeInstanceRequirement):
+        required = tuple(
+            (source, location)
+            for location in selected_locations
+            for source in (
+                CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+                CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+            )
+        )
     else:
         required = tuple(
-            (source, requirement.zone)
+            (source, location)
+            for location in selected_locations
             for source in (
                 CatalogEvidenceSource.TPU_LOCATIONS,
                 CatalogEvidenceSource.TPU_ACCELERATOR_TYPES,
@@ -1553,4 +1886,24 @@ def _required_catalog_gaps(
         )
         != 1
         or not records[0].complete
+    )
+
+
+def _catalog_coverage_gaps(
+    catalog: WorkloadCatalogEvidence,
+) -> tuple[EvidenceGap, ...]:
+    """Describe incomplete catalog sources without discarding usable locations."""
+    gaps = tuple(
+        EvidenceGap(
+            StableSymbol(item.source.value),
+            StableSymbol(ResolutionFailureReason.MISSING_LOCATION_EVIDENCE.value),
+        )
+        for item in catalog.coverage
+        if not item.complete
+    )
+    return gaps or (
+        EvidenceGap(
+            StableSymbol("accelerator-catalog"),
+            StableSymbol(ResolutionFailureReason.MISSING_LOCATION_EVIDENCE.value),
+        ),
     )

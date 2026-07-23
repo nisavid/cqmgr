@@ -61,9 +61,22 @@ class EffectiveQuotaReadRequest:
 
 @dataclass(frozen=True, slots=True)
 class QuotaPreferenceReadRequest:
-    """Read existing quota preferences for one explicit project."""
+    """Read existing preferences for selected services in one explicit project."""
 
     context: ProviderReadContext
+    services: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Bind logical partitions while retaining one project-global API read."""
+        if not isinstance(self.services, tuple):
+            msg = "preference services must be a tuple"
+            raise TypeError(msg)
+        if any(not _is_service(service) for service in self.services):
+            msg = "preference services must be canonical lowercase DNS names"
+            raise ValueError(msg)
+        if len(set(self.services)) != len(self.services):
+            msg = "preference services must be unique"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,25 +99,28 @@ class UsageReadRequest:
 
 
 def _require_service(service: object) -> None:
+    if not _is_service(service):
+        msg = "usage service must be a canonical lowercase DNS name"
+        raise ValueError(msg)
+
+
+def _is_service(service: object) -> bool:
     if (
         not isinstance(service, str)
         or not service.isascii()
         or service != service.lower()
     ):
-        msg = "usage service must be a canonical lowercase DNS name"
-        raise ValueError(msg)
+        return False
     labels = service.split(".")
     allowed = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
     minimum_labels = 2
-    if len(labels) < minimum_labels or any(
+    return len(labels) >= minimum_labels and not any(
         not label
         or label.startswith("-")
         or label.endswith("-")
         or any(character not in allowed for character in label)
         for label in labels
-    ):
-        msg = "usage service must be a canonical lowercase DNS name"
-        raise ValueError(msg)
+    )
 
 
 class EffectiveQuotaReader(Protocol):
