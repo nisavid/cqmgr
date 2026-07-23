@@ -28,6 +28,7 @@ from cqmgr.domain.accelerator_overlay import (
     ProvisioningModel,
 )
 from cqmgr.domain.catalog import CatalogGroupId
+from cqmgr.domain.obtainability import DistributionShape, GpuAttachment
 from cqmgr.domain.quota_queries import QuotaQueryFilters, QuotaSort, QuotaSortField
 from cqmgr.domain.quotas import NormalizedDimensions
 from cqmgr.domain.results import (
@@ -89,6 +90,7 @@ class RecordingReadOnlyOperations:
         self.browse_calls: list[tuple[object, dict[str, object]]] = []
         self.inspect_calls: list[tuple[object, dict[str, object]]] = []
         self.resolve_calls: list[tuple[object, dict[str, object]]] = []
+        self.obtainability_calls: list[tuple[object, dict[str, object]]] = []
         self.usage_calls: list[tuple[str, str]] = []
         self.close_calls = 0
 
@@ -119,6 +121,24 @@ class RecordingReadOnlyOperations:
         self.resolve_calls.append((requirement, kwargs))
         return _result("quota.resolve")
 
+    async def compare_obtainability(
+        self,
+        candidates: object,
+        **kwargs: object,
+    ) -> OperationResult[object]:
+        """Record one exact Spot advice comparison."""
+        self.obtainability_calls.append((candidates, kwargs))
+        return _result("obtainability.compare")
+
+    async def compare_obtainability_all_compatible(
+        self,
+        requirement: object,
+        **kwargs: object,
+    ) -> OperationResult[object]:
+        """Record one resolver-backed Spot advice comparison."""
+        self.obtainability_calls.append((requirement, kwargs))
+        return _result("obtainability.compare")
+
     async def browse_usage_failure(self, reason: str) -> OperationResult[object]:
         """Record one typed quota-list usage failure."""
         self.usage_calls.append(("quota.list", reason))
@@ -133,6 +153,14 @@ class RecordingReadOnlyOperations:
         """Record one typed quota-resolve usage failure."""
         self.usage_calls.append(("quota.resolve", reason))
         return _result("quota.resolve", exit_class=ExitClass.USAGE)
+
+    async def compare_obtainability_usage_failure(
+        self,
+        reason: str,
+    ) -> OperationResult[object]:
+        """Record one typed obtainability usage failure."""
+        self.usage_calls.append(("obtainability.compare", reason))
+        return _result("obtainability.compare", exit_class=ExitClass.USAGE)
 
 
 def test_quota_command_tree_and_exact_aliases_are_registered() -> None:
@@ -158,6 +186,94 @@ def test_quota_command_tree_and_exact_aliases_are_registered() -> None:
     assert runner.invoke(main, ["quo", "--help"]).exit_code == USAGE_EXIT
     assert runner.invoke(main, ["q", "lis", "--help"]).exit_code == USAGE_EXIT
     assert runner.invoke(main, ["q", "r", "com", "--help"]).exit_code == USAGE_EXIT
+
+
+def test_obtainability_command_preserves_exact_candidates_and_request_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The canonical command and alias delegate one full immutable comparison."""
+    operations = RecordingReadOnlyOperations()
+    monkeypatch.setattr(
+        cli_module,
+        "build_read_only_operations",
+        lambda: operations,
+    )
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "ob",
+            "c",
+            "--resource-scope",
+            "projects/123",
+            "--machine-type",
+            "n1-standard-16",
+            "--gpu-type",
+            "nvidia-tesla-t4",
+            "--gpu-count",
+            "2",
+            "--vm-count",
+            "3",
+            "--distribution-shape",
+            "any-single-zone",
+            "--candidate",
+            "us-central1=us-central1-a,us-central1-b",
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    candidates, options = operations.obtainability_calls[0]
+    candidate = candidates[0]  # type: ignore[index]
+    assert candidate.endpoint_region == "us-central1"
+    assert candidate.zones == ("us-central1-a", "us-central1-b")
+    assert candidate.machine.gpu == GpuAttachment("nvidia-tesla-t4", 2)
+    assert candidate.distribution_shape is DistributionShape.ANY_SINGLE_ZONE
+    assert options["support"].current_advice_supported is True  # type: ignore[union-attr]
+    assert operations.close_calls == 1
+
+
+def test_obtainability_all_compatible_delegates_a_spot_workload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exhaustive mode delegates a normalized Spot compute workload."""
+    operations = RecordingReadOnlyOperations()
+    monkeypatch.setattr(
+        cli_module,
+        "build_read_only_operations",
+        lambda: operations,
+    )
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "ob",
+            "c",
+            "--resource-scope",
+            "projects/123",
+            "--machine-type",
+            "a3-highgpu-8g",
+            "--vm-count",
+            "2",
+            "--distribution-shape",
+            "any-single-zone",
+            "--all-compatible-locations",
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    requirement, options = operations.obtainability_calls[0]
+    assert requirement == ComputeInstanceRequirement(
+        "a3-highgpu-8g",
+        2,
+        ProvisioningModel.SPOT,
+        AllCompatibleLocations(),
+    )
+    assert options["machine"].machine_type == "a3-highgpu-8g"  # type: ignore[union-attr]
+    assert options["distribution_shape"] is DistributionShape.ANY_SINGLE_ZONE
 
 
 def test_quota_list_help_exposes_the_complete_v1_query_surface() -> None:

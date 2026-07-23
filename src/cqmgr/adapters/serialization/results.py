@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
     from cqmgr.domain.results import OperationResult
 
 
-def _value(value: object) -> object:  # noqa: C901, PLR0911
+def _value(value: object) -> object:  # noqa: C901, PLR0911, PLR0912
     if isinstance(value, ResourceScope):
         return {"type": value.kind.value, "name": value.canonical_name}
     if isinstance(value, QuotaQuantity):
@@ -51,6 +52,8 @@ def _value(value: object) -> object:  # noqa: C901, PLR0911
         return value.value
     if isinstance(value, datetime):
         return value.isoformat().replace("+00:00", "Z")
+    if isinstance(value, Decimal):
+        return str(value)
     if is_dataclass(value) and not isinstance(value, type):
         return {
             field.name: _value(getattr(value, field.name)) for field in fields(value)

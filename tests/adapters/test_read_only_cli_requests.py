@@ -8,6 +8,7 @@ from cqmgr.adapters.cli.read_only_requests import (
     parse_cloud_tpu_slice_requirement,
     parse_compute_instance_requirement,
     parse_dimensions,
+    parse_obtainability_candidates,
     parse_quota_query,
     parse_read_only_quota_query,
 )
@@ -17,6 +18,7 @@ from cqmgr.domain.accelerator_overlay import (
     ProvisioningModel,
 )
 from cqmgr.domain.catalog import CatalogGroupId
+from cqmgr.domain.obtainability import DistributionShape, GpuAttachment
 from cqmgr.domain.quota_queries import QuotaSortField, SortDirection
 from cqmgr.domain.quotas import QuotaScope
 from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
@@ -195,4 +197,50 @@ def test_query_and_workload_parsers_reject_noncanonical_primitives() -> None:
             provisioning_model="standard",
             locations=("us-central1-a",),
             all_compatible=object(),  # type: ignore[arg-type]
+        )
+
+
+def test_obtainability_parser_preserves_full_shape_and_candidate_boundaries() -> None:
+    """Each REGION=ZONE list becomes one immutable complete request snapshot."""
+    parsed = parse_obtainability_candidates(
+        machine_type="n1-standard-16",
+        gpu_type="nvidia-tesla-t4",
+        gpu_count="2",
+        vm_count="3",
+        distribution_shape="any-single-zone",
+        candidates=(
+            "us-central1=us-central1-a,us-central1-b",
+            "us-east1",
+        ),
+    )
+
+    assert len(parsed) == EXPECTED_INSTANCE_COUNT
+    assert parsed[0].endpoint_region == "us-central1"
+    assert parsed[0].zones == ("us-central1-a", "us-central1-b")
+    assert parsed[0].machine.gpu == GpuAttachment("nvidia-tesla-t4", 2)
+    assert parsed[0].distribution_shape is DistributionShape.ANY_SINGLE_ZONE
+    assert parsed[1].endpoint_region == "us-east1"
+    assert parsed[1].zones == ()
+
+
+@pytest.mark.parametrize(
+    ("gpu_type", "gpu_count"),
+    [
+        ("nvidia-tesla-t4", None),
+        (None, "2"),
+    ],
+)
+def test_obtainability_parser_rejects_partial_gpu_identity(
+    gpu_type: str | None,
+    gpu_count: str | None,
+) -> None:
+    """GPU type and count never become independently optional request facts."""
+    with pytest.raises(ValueError, match="GPU type and count"):
+        parse_obtainability_candidates(
+            machine_type="n1-standard-16",
+            gpu_type=gpu_type,
+            gpu_count=gpu_count,
+            vm_count="3",
+            distribution_shape="any",
+            candidates=("us-central1",),
         )

@@ -17,6 +17,7 @@ from cqmgr.adapters.google.identity import (
 )
 from cqmgr.adapters.persistence.coordination import SharedBudgetCoordinator
 from cqmgr.application.configuration import ConfigSnapshot, Profile, SelectionState
+from cqmgr.application.operations.obtainability import AdviceSupport
 from cqmgr.application.operations.quotas import (
     QuotaBrowseData,
     QuotaInspectData,
@@ -37,11 +38,23 @@ from cqmgr.application.ports.coordination import (
     CancellationToken,
 )
 from cqmgr.domain.accelerator_overlay import (
+    AllCompatibleLocations,
     CandidateLocations,
     ComputeInstanceRequirement,
     ProvisioningModel,
+    QuotaConstraintRequirement,
+    ResolvedWorkloadLocation,
+    ResolvedWorkloadRequirement,
+    WorkloadLocationDisposition,
 )
-from cqmgr.domain.catalog import CatalogPredicates
+from cqmgr.domain.catalog import (
+    AcceleratorConstraintSet,
+    AcceleratorId,
+    CatalogPredicates,
+    ManagementPlane,
+    UnitConversionEvidence,
+    WorkloadConsumer,
+)
 from cqmgr.domain.diagnostics import (
     Diagnostic,
     DiagnosticCode,
@@ -58,6 +71,11 @@ from cqmgr.domain.identity import (
     PrincipalVerification,
     ProviderIdentityEvidence,
 )
+from cqmgr.domain.obtainability import (
+    DistributionShape,
+    ObtainabilityComparison,
+    SpotMachineConfiguration,
+)
 from cqmgr.domain.projects import CanonicalProject, ProjectReference, ProjectResolution
 from cqmgr.domain.quota_queries import (
     V1_PROVIDER_SERVICES,
@@ -65,9 +83,12 @@ from cqmgr.domain.quota_queries import (
     QuotaQueryItem,
 )
 from cqmgr.domain.quotas import (
+    ConstraintReference,
     EffectiveQuotaSliceIdentity,
     NormalizedDimensions,
+    QuotaQuantity,
     QuotaScope,
+    QuotaUnit,
 )
 from cqmgr.domain.redaction import RedactedText
 from cqmgr.domain.results import (
@@ -280,15 +301,35 @@ class UnusedWorkloadOperations:
 class RecordingWorkloadOperations:
     """Record one typed workload-resolution request."""
 
-    def __init__(self, scripted: OperationResult[None]) -> None:
+    def __init__(self, scripted: OperationResult[object]) -> None:
         """Retain the scripted operation result."""
         self.scripted = scripted
         self.requests: list[object] = []
 
-    async def resolve(self, request: object) -> OperationResult[None]:
+    async def resolve(self, request: object) -> OperationResult[object]:
         """Record and return one workload result."""
         self.requests.append(request)
         return self.scripted
+
+
+class RecordingObtainabilityOperations:
+    """Record one resolver-expanded comparison request."""
+
+    def __init__(self) -> None:
+        """Initialize the request ledger."""
+        self.requests: list[object] = []
+
+    async def compare(
+        self,
+        request: object,
+    ) -> OperationResult[ObtainabilityComparison]:
+        """Record the request and return its resolver-backed candidates."""
+        self.requests.append(request)
+        return result(
+            "obtainability.compare",
+            ObtainabilityComparison(()),
+            resource_scope=scope("123456789"),
+        )
 
 
 def scope(identifier: str) -> ResourceScope:
@@ -367,6 +408,7 @@ def service(  # noqa: PLR0913 - explicit fixture dependencies stay independent
     adc_identity: ADCIdentityEvidence | None = None,
     quotas: RecordingQuotaOperations | None = None,
     workloads: RecordingWorkloadOperations | None = None,
+    obtainability: RecordingObtainabilityOperations | None = None,
 ) -> tuple[
     ReadOnlyOperations,
     MemoryRepository[ConfigSnapshot],
@@ -394,6 +436,7 @@ def service(  # noqa: PLR0913 - explicit fixture dependencies stay independent
         workloads or UnusedWorkloadOperations(),  # type: ignore[arg-type]
         FixedClock(),
         monotonic=lambda: 0.0,
+        obtainability=obtainability,  # type: ignore[arg-type]
     )
     return (
         facade,
@@ -404,6 +447,95 @@ def service(  # noqa: PLR0913 - explicit fixture dependencies stay independent
         quota_operations,
         workloads,
     )
+
+
+def _resolved_spot_workload() -> ResolvedWorkloadRequirement:
+    """Build one exact compatible resolver result for facade composition."""
+    requirement = ComputeInstanceRequirement(
+        "a3-highgpu-8g",
+        2,
+        ProvisioningModel.SPOT,
+        AllCompatibleLocations(),
+    )
+    identity_value = EffectiveQuotaSliceIdentity(
+        scope("123456789"),
+        "compute.googleapis.com",
+        "GPUS-PER-GPU-FAMILY-per-project-region",
+        NormalizedDimensions(
+            (("gpu_family", "NVIDIA_H100"), ("region", "us-central1"))
+        ),
+        QuotaScope.REGIONAL,
+    )
+    conversion = UnitConversionEvidence(
+        "card",
+        QuotaUnit("1"),
+        1,
+        "https://docs.cloud.google.com/compute/resource-usage",
+    )
+    constraint_set = AcceleratorConstraintSet(
+        AcceleratorId("nvidia-h100"),
+        (ConstraintReference(identity_value),),
+    )
+    location = ResolvedWorkloadLocation(
+        "us-central1-a",
+        WorkloadLocationDisposition.COMPATIBLE,
+        AcceleratorId("nvidia-h100"),
+        "compute.googleapis.com",
+        ManagementPlane.COMPUTE,
+        (WorkloadConsumer.COMPUTE_ENGINE,),
+        "preemptible",
+        8,
+        constraint_set,
+        (
+            QuotaConstraintRequirement(
+                identity_value,
+                8,
+                QuotaQuantity(8, QuotaUnit("1")),
+                conversion,
+            ),
+        ),
+        (),
+    )
+    return ResolvedWorkloadRequirement(
+        requirement,
+        (location,),
+        all_compatible_locations_exhaustive=True,
+    )
+
+
+def test_all_compatible_obtainability_reuses_provider_context_and_resolver() -> None:
+    """The facade resolves and compares within one provider-scoped invocation."""
+    resolved = _resolved_spot_workload()
+    assert isinstance(resolved.requirement, ComputeInstanceRequirement)
+    workload_operations = RecordingWorkloadOperations(
+        result(
+            "quota.resolve",
+            resolved,
+            resource_scope=scope("123456789"),
+        )
+    )
+    obtainability = RecordingObtainabilityOperations()
+    facade, *_ = service(
+        selection=SelectionState(direct_resource_scope=scope("123456789")),
+        workloads=workload_operations,
+        obtainability=obtainability,
+    )
+
+    returned = asyncio.run(
+        facade.compare_obtainability_all_compatible(
+            resolved.requirement,
+            machine=SpotMachineConfiguration("a3-highgpu-8g"),
+            distribution_shape=DistributionShape.ANY_SINGLE_ZONE,
+            deadline=42.5,
+            support=AdviceSupport(),
+        )
+    )
+
+    assert returned.outcome.exit_class is ExitClass.SUCCESS
+    assert len(workload_operations.requests) == 1
+    comparison_request = obtainability.requests[0]
+    assert comparison_request.candidates[0].zones == ("us-central1-a",)  # type: ignore[attr-defined]
+    assert comparison_request.resolver_provenance is resolved  # type: ignore[attr-defined]
 
 
 def test_browse_resolves_selected_project_and_builds_bounded_provider_context() -> None:

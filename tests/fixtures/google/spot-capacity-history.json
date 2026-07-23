@@ -1,0 +1,46 @@
+{
+  "machineType": "a3-highgpu-8g",
+  "location": "regions/us-central1",
+  "preemptionHistory": [
+    {"interval": {"startTime": "2026-06-23T00:00:00Z", "endTime": "2026-06-24T00:00:00Z"}, "preemptionRate": 0.01},
+    {"interval": {"startTime": "2026-06-24T00:00:00Z", "endTime": "2026-06-25T00:00:00Z"}, "preemptionRate": 0.02},
+    {"interval": {"startTime": "2026-06-25T00:00:00Z", "endTime": "2026-06-26T00:00:00Z"}, "preemptionRate": 0.03},
+    {"interval": {"startTime": "2026-06-26T00:00:00Z", "endTime": "2026-06-27T00:00:00Z"}, "preemptionRate": 0.04},
+    {"interval": {"startTime": "2026-06-27T00:00:00Z", "endTime": "2026-06-28T00:00:00Z"}, "preemptionRate": 0.05},
+    {"interval": {"startTime": "2026-06-28T00:00:00Z", "endTime": "2026-06-29T00:00:00Z"}, "preemptionRate": 0.06},
+    {"interval": {"startTime": "2026-06-29T00:00:00Z", "endTime": "2026-06-30T00:00:00Z"}, "preemptionRate": 0.07},
+    {"interval": {"startTime": "2026-06-30T00:00:00Z", "endTime": "2026-07-01T00:00:00Z"}, "preemptionRate": 0.08},
+    {"interval": {"startTime": "2026-07-01T00:00:00Z", "endTime": "2026-07-02T00:00:00Z"}, "preemptionRate": 0.09},
+    {"interval": {"startTime": "2026-07-02T00:00:00Z", "endTime": "2026-07-03T00:00:00Z"}, "preemptionRate": 0.10},
+    {"interval": {"startTime": "2026-07-03T00:00:00Z", "endTime": "2026-07-04T00:00:00Z"}, "preemptionRate": 0.11},
+    {"interval": {"startTime": "2026-07-04T00:00:00Z", "endTime": "2026-07-05T00:00:00Z"}, "preemptionRate": 0.12},
+    {"interval": {"startTime": "2026-07-05T00:00:00Z", "endTime": "2026-07-06T00:00:00Z"}, "preemptionRate": 0.13},
+    {"interval": {"startTime": "2026-07-06T00:00:00Z", "endTime": "2026-07-07T00:00:00Z"}, "preemptionRate": 0.14},
+    {"interval": {"startTime": "2026-07-07T00:00:00Z", "endTime": "2026-07-08T00:00:00Z"}, "preemptionRate": 0.15},
+    {"interval": {"startTime": "2026-07-08T00:00:00Z", "endTime": "2026-07-09T00:00:00Z"}, "preemptionRate": 0.16},
+    {"interval": {"startTime": "2026-07-09T00:00:00Z", "endTime": "2026-07-10T00:00:00Z"}, "preemptionRate": 0.17},
+    {"interval": {"startTime": "2026-07-10T00:00:00Z", "endTime": "2026-07-11T00:00:00Z"}, "preemptionRate": 0.18},
+    {"interval": {"startTime": "2026-07-11T00:00:00Z", "endTime": "2026-07-12T00:00:00Z"}, "preemptionRate": 0.19},
+    {"interval": {"startTime": "2026-07-12T00:00:00Z", "endTime": "2026-07-13T00:00:00Z"}, "preemptionRate": 0.20},
+    {"interval": {"startTime": "2026-07-13T00:00:00Z", "endTime": "2026-07-14T00:00:00Z"}, "preemptionRate": 0.21},
+    {"interval": {"startTime": "2026-07-14T00:00:00Z", "endTime": "2026-07-15T00:00:00Z"}, "preemptionRate": 0.22},
+    {"interval": {"startTime": "2026-07-15T00:00:00Z", "endTime": "2026-07-16T00:00:00Z"}, "preemptionRate": 0.23},
+    {"interval": {"startTime": "2026-07-16T00:00:00Z", "endTime": "2026-07-17T00:00:00Z"}, "preemptionRate": 0.24},
+    {"interval": {"startTime": "2026-07-17T00:00:00Z", "endTime": "2026-07-18T00:00:00Z"}, "preemptionRate": 0.25},
+    {"interval": {"startTime": "2026-07-18T00:00:00Z", "endTime": "2026-07-19T00:00:00Z"}, "preemptionRate": 0.26},
+    {"interval": {"startTime": "2026-07-19T00:00:00Z", "endTime": "2026-07-20T00:00:00Z"}, "preemptionRate": 0.27},
+    {"interval": {"startTime": "2026-07-20T00:00:00Z", "endTime": "2026-07-21T00:00:00Z"}, "preemptionRate": 0.28},
+    {"interval": {"startTime": "2026-07-21T00:00:00Z", "endTime": "2026-07-22T00:00:00Z"}, "preemptionRate": 0.29},
+    {"interval": {"startTime": "2026-07-22T00:00:00Z", "endTime": "2026-07-23T00:00:00Z"}, "preemptionRate": 0.30}
+  ],
+  "priceHistory": [
+    {
+      "interval": {"startTime": "2026-06-01T00:00:00Z", "endTime": "2026-07-01T00:00:00Z"},
+      "listPrice": {"currencyCode": "USD", "units": "1", "nanos": 250000000}
+    },
+    {
+      "interval": {"startTime": "2026-07-01T00:00:00Z", "endTime": "2026-08-01T00:00:00Z"},
+      "listPrice": {"currencyCode": "USD", "units": "1", "nanos": 500000000}
+    }
+  ]
+}

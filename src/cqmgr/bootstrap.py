@@ -256,6 +256,12 @@ def build_read_only_operations(  # noqa: PLR0915 - explicit composition root
         ResourceManagerProjectResolver,
     )
     from cqmgr.adapters.google.read_policy import GoogleReadPolicy  # noqa: PLC0415
+    from cqmgr.adapters.google.spot_advice import (  # noqa: PLC0415
+        CapacityAdviceJsonClient,
+        GoogleCapacityAdviceReader,
+        GoogleCapacityHistoryReader,
+        OfficialCapacityAdviceJsonClient,
+    )
     from cqmgr.adapters.google.tpu_catalog import (  # noqa: PLC0415
         GoogleTpuAcceleratorTypeReader,
         GoogleTpuLocationReader,
@@ -274,6 +280,9 @@ def build_read_only_operations(  # noqa: PLR0915 - explicit composition root
     )
     from cqmgr.adapters.persistence.quota_snapshots import (  # noqa: PLC0415
         FilesystemQuotaQuerySnapshots,
+    )
+    from cqmgr.application.operations.obtainability import (  # noqa: PLC0415
+        ObtainabilityOperations,
     )
     from cqmgr.application.operations.quotas import (  # noqa: PLC0415
         QuotaOperations,
@@ -376,6 +385,14 @@ def build_read_only_operations(  # noqa: PLR0915 - explicit composition root
         "TpuCatalogPageClient",
         tpu_catalog_client,
     )
+    spot_advice_client = LazyClientProxy(
+        lambda: OfficialCapacityAdviceJsonClient(adc.credential()),
+        closer=lambda client: client.close(),
+    )
+    spot_advice = cast(
+        "CapacityAdviceJsonClient",
+        spot_advice_client,
+    )
     owned_clients = OwnedClientPool(
         projects_client,
         cloud_quotas_client,
@@ -383,6 +400,7 @@ def build_read_only_operations(  # noqa: PLR0915 - explicit composition root
         compute_accelerators_client,
         compute_machine_types_client,
         tpu_catalog_client,
+        spot_advice_client,
     )
 
     # These installation-local ceilings are intentionally lower than common
@@ -417,6 +435,11 @@ def build_read_only_operations(  # noqa: PLR0915 - explicit composition root
     tpu_locations = GoogleTpuLocationReader(tpu_catalog, policy)
     tpu_accelerators = GoogleTpuAcceleratorTypeReader(tpu_catalog, policy)
     tpu_runtime_versions = GoogleTpuRuntimeVersionReader(tpu_catalog, policy)
+    obtainability = ObtainabilityOperations(
+        GoogleCapacityAdviceReader(spot_advice, policy, clock=clock.now),
+        GoogleCapacityHistoryReader(spot_advice, policy, clock=clock.now),
+        clock=clock.now,
+    )
 
     quotas = QuotaOperations(
         effective,
@@ -448,4 +471,5 @@ def build_read_only_operations(  # noqa: PLR0915 - explicit composition root
         clock,
         shutdown=owned_clients.aclose,
         budget=budget,
+        obtainability=obtainability,
     )

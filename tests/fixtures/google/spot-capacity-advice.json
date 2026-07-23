@@ -1,0 +1,18 @@
+{
+  "recommendations": [
+    {
+      "scores": {
+        "obtainability": 0.8,
+        "estimatedUptime": "3600s"
+      },
+      "shards": [
+        {
+          "zone": "us-central1-a",
+          "machineType": "n1-standard-16",
+          "instanceCount": 3,
+          "provisioningModel": "SPOT"
+        }
+      ]
+    }
+  ]
+}

@@ -17,6 +17,10 @@ from cqmgr.application.configuration import (
     UnsupportedResourceScopeError,
     resolve_resource_scope,
 )
+from cqmgr.application.operations.obtainability import (
+    ObtainabilityCompareRequest,
+    candidates_from_resolved_workload,
+)
 from cqmgr.application.operations.quotas import (
     MAX_BROWSE_LIMIT,
     QuotaBrowseRequest,
@@ -37,6 +41,10 @@ from cqmgr.application.ports.coordination import (
     CoordinationUnavailableError,
 )
 from cqmgr.application.ports.provider_reads import ProviderReadContext
+from cqmgr.domain.accelerator_overlay import (
+    ComputeInstanceRequirement,
+    ResolvedWorkloadRequirement,
+)
 from cqmgr.domain.diagnostics import (
     Diagnostic,
     DiagnosticCode,
@@ -46,6 +54,7 @@ from cqmgr.domain.diagnostics import (
     Severity,
 )
 from cqmgr.domain.identity import ADCQuotaProject, ProviderIdentityEvidence
+from cqmgr.domain.obtainability import ObtainabilityComparison
 from cqmgr.domain.projects import ProjectReference
 from cqmgr.domain.quota_queries import (
     ProviderSourceCoverage,
@@ -71,6 +80,10 @@ from cqmgr.domain.scopes import ResourceScope
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from cqmgr.application.operations.obtainability import (
+        AdviceSupport,
+        ObtainabilityOperations,
+    )
     from cqmgr.application.operations.quotas import (
         QuotaBrowseData,
         QuotaInspectData,
@@ -86,8 +99,12 @@ if TYPE_CHECKING:
     from cqmgr.application.ports.identity import IdentityProvider, ProjectResolver
     from cqmgr.domain.accelerator_overlay import (
         CloudTpuSliceRequirement,
-        ComputeInstanceRequirement,
-        ResolvedWorkloadRequirement,
+    )
+    from cqmgr.domain.obtainability import (
+        DistributionShape,
+        ObtainabilityCandidate,
+        ObtainabilityProductCoverage,
+        SpotMachineConfiguration,
     )
     from cqmgr.domain.quotas import EffectiveQuotaSliceIdentity
 
@@ -216,6 +233,7 @@ class ReadOnlyOperations:
         monotonic: Callable[[], float] = time.monotonic,
         shutdown: Callable[[], Awaitable[None]] | None = None,
         budget: BudgetCoordinator | None = None,
+        obtainability: ObtainabilityOperations | None = None,
     ) -> None:
         """Inject local state, provider setup, and existing read operations."""
         self._configuration = configuration
@@ -228,6 +246,7 @@ class ReadOnlyOperations:
         self._monotonic = monotonic
         self._shutdown = shutdown
         self._budget = budget
+        self._obtainability = obtainability
 
     async def aclose(self) -> None:
         """Release invocation-scoped provider clients once."""
@@ -295,6 +314,95 @@ class ReadOnlyOperations:
                     query.sort,
                 ),
                 limit=limit,
+            )
+        )
+        return _with_provider_identity(delegated, context)
+
+    async def compare_obtainability_all_compatible(  # noqa: PLR0913
+        self,
+        requirement: ComputeInstanceRequirement,
+        *,
+        machine: SpotMachineConfiguration,
+        distribution_shape: DistributionShape,
+        deadline: float,
+        support: AdviceSupport,
+        catalog_coverage: tuple[ObtainabilityProductCoverage, ...] = (),
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = _DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[ObtainabilityComparison | ReadOnlyFailureData]:
+        """Resolve all compatible locations, then compare the exact expansion."""
+        prepared = await self._provider_context(
+            operation="obtainability.compare",
+            boundary="spot-advice-assessed",
+            deadline=deadline,
+            cancellation=cancellation,
+            scope_input=scope_input,
+        )
+        if isinstance(prepared, OperationResult):
+            return prepared
+        context, _ = prepared
+        operations = self._obtainability
+        if operations is None:
+            return self._failure(
+                operation="obtainability.compare",
+                boundary="spot-advice-assessed",
+                outcome="spot-advice-unavailable",
+                exit_class=ExitClass.OPERATIONAL_FAILURE,
+                resource_scope=context.project.resource_scope,
+                identity_evidence=ProviderIdentityEvidence.from_adc(context.identity),
+            )
+        resolved_result = await self._workloads.resolve(
+            QuotaResolveRequest(context, requirement)
+        )
+        resolved = resolved_result.data
+        if not isinstance(resolved, ResolvedWorkloadRequirement):
+            return self._failure(
+                operation="obtainability.compare",
+                boundary="spot-advice-assessed",
+                outcome="spot-advice-resolution-failed",
+                exit_class=resolved_result.outcome.exit_class,
+                resource_scope=context.project.resource_scope,
+                completeness=resolved_result.completeness,
+                diagnostics=resolved_result.diagnostics,
+                reason="workload resolution did not produce compatible evidence",
+                identity_evidence=ProviderIdentityEvidence.from_adc(context.identity),
+            )
+        try:
+            candidates = candidates_from_resolved_workload(
+                resolved,
+                machine=machine,
+                distribution_shape=distribution_shape,
+            )
+        except ValueError:
+            return OperationResult(
+                operation=OperationName("obtainability.compare"),
+                resource_scope=context.project.resource_scope,
+                boundary=OperationBoundary(
+                    StableSymbol("spot-advice-assessed"),
+                    reached=False,
+                ),
+                outcome=Outcome(
+                    StableSymbol("spot-advice-no-compatible-locations"),
+                    ExitClass.REJECTED_PRECONDITION,
+                ),
+                completeness=resolved_result.completeness,
+                started_at=resolved_result.started_at,
+                finished_at=resolved_result.finished_at,
+                data=ObtainabilityComparison(
+                    (),
+                    resolver_provenance=resolved,
+                ),
+                diagnostics=resolved_result.diagnostics,
+                provenance=resolved_result.provenance,
+                identity_evidence=ProviderIdentityEvidence.from_adc(context.identity),
+            )
+        delegated = await operations.compare(
+            ObtainabilityCompareRequest(
+                context,
+                candidates,
+                support=support,
+                catalog_coverage=catalog_coverage,
+                resolver_provenance=resolved,
             )
         )
         return _with_provider_identity(delegated, context)
@@ -460,6 +568,59 @@ class ReadOnlyOperations:
             "quota.resolve",
             "workload-resolved",
             "invalid-workload-requirement",
+            reason,
+        )
+
+    async def compare_obtainability(  # noqa: PLR0913
+        self,
+        candidates: tuple[ObtainabilityCandidate, ...],
+        *,
+        deadline: float,
+        support: AdviceSupport,
+        catalog_coverage: tuple[ObtainabilityProductCoverage, ...] = (),
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = _DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[ObtainabilityComparison | ReadOnlyFailureData]:
+        """Compare exact Spot candidates after the shared provider setup gates."""
+        prepared = await self._provider_context(
+            operation="obtainability.compare",
+            boundary="spot-advice-assessed",
+            deadline=deadline,
+            cancellation=cancellation,
+            scope_input=scope_input,
+        )
+        if isinstance(prepared, OperationResult):
+            return prepared
+        context, _ = prepared
+        operations = self._obtainability
+        if operations is None:
+            return self._failure(
+                operation="obtainability.compare",
+                boundary="spot-advice-assessed",
+                outcome="spot-advice-unavailable",
+                exit_class=ExitClass.OPERATIONAL_FAILURE,
+                resource_scope=context.project.resource_scope,
+                identity_evidence=ProviderIdentityEvidence.from_adc(context.identity),
+            )
+        delegated = await operations.compare(
+            ObtainabilityCompareRequest(
+                context,
+                candidates,
+                support=support,
+                catalog_coverage=catalog_coverage,
+            )
+        )
+        return _with_provider_identity(delegated, context)
+
+    async def compare_obtainability_usage_failure(
+        self,
+        reason: str,
+    ) -> OperationResult[ReadOnlyFailureData]:
+        """Return a surface-neutral obtainability parse or usage failure."""
+        return self._usage_failure(
+            "obtainability.compare",
+            "spot-advice-assessed",
+            "invalid-obtainability-request",
             reason,
         )
 

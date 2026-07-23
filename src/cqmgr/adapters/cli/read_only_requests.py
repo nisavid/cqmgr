@@ -13,6 +13,12 @@ from cqmgr.domain.accelerator_overlay import (
     ProvisioningModel,
 )
 from cqmgr.domain.catalog import AcceleratorId, CatalogGroupId
+from cqmgr.domain.obtainability import (
+    DistributionShape,
+    GpuAttachment,
+    ObtainabilityCandidate,
+    SpotMachineConfiguration,
+)
 from cqmgr.domain.quota_queries import (
     QuotaQuery,
     QuotaQueryFilters,
@@ -159,6 +165,78 @@ def parse_dimensions(values: tuple[str, ...]) -> NormalizedDimensions:
             raise ValueError(msg)
         pairs.append((key, dimension_value))
     return NormalizedDimensions(pairs)
+
+
+def parse_obtainability_candidates(  # noqa: PLR0913
+    *,
+    machine_type: str,
+    gpu_type: str | None,
+    gpu_count: str | None,
+    vm_count: str,
+    distribution_shape: str,
+    candidates: tuple[str, ...],
+) -> tuple[ObtainabilityCandidate, ...]:
+    """Decode complete exact Spot request snapshots without broadening locations."""
+    machine, count, shape = parse_obtainability_shape(
+        machine_type=machine_type,
+        gpu_type=gpu_type,
+        gpu_count=gpu_count,
+        vm_count=vm_count,
+        distribution_shape=distribution_shape,
+    )
+    if not candidates:
+        msg = "at least one obtainability candidate is required"
+        raise ValueError(msg)
+    parsed = []
+    for value in candidates:
+        region, separator, zone_text = value.partition("=")
+        if not region or (separator and not zone_text):
+            msg = "candidate must use REGION or REGION=ZONE[,ZONE...]"
+            raise ValueError(msg)
+        zones = tuple(zone_text.split(",")) if separator else ()
+        if any(not zone for zone in zones):
+            msg = "candidate zones must be non-empty"
+            raise ValueError(msg)
+        parsed.append(
+            ObtainabilityCandidate(
+                region,
+                zones,
+                machine,
+                count,
+                shape,
+            )
+        )
+    result = tuple(parsed)
+    if len({item.candidate_id for item in result}) != len(result):
+        msg = "obtainability candidates must be unique"
+        raise ValueError(msg)
+    return result
+
+
+def parse_obtainability_shape(
+    *,
+    machine_type: str,
+    gpu_type: str | None,
+    gpu_count: str | None,
+    vm_count: str,
+    distribution_shape: str,
+) -> tuple[SpotMachineConfiguration, int, DistributionShape]:
+    """Decode the fixed machine, quantity, and distribution shared by candidates."""
+    if (gpu_type is None) != (gpu_count is None):
+        msg = "GPU type and count must be supplied together"
+        raise ValueError(msg)
+    gpu = (
+        None
+        if gpu_type is None or gpu_count is None
+        else GpuAttachment(
+            gpu_type,
+            _parse_positive_integer(gpu_count, "GPU count"),
+        )
+    )
+    machine = SpotMachineConfiguration(machine_type, gpu)
+    count = _parse_positive_integer(vm_count, "VM count")
+    shape = DistributionShape(distribution_shape)
+    return machine, count, shape
 
 
 def _parse_boolean(value: str | None, name: str) -> bool | None:
