@@ -31,7 +31,6 @@ from cqmgr.application.operations.read_only import (
     ReadOnlyQuotaQuery,
     ReadOnlyScopeInput,
 )
-from cqmgr.cli import main
 from cqmgr.domain.accelerator_overlay import (
     AllCompatibleLocations,
     CandidateLocations,
@@ -944,7 +943,7 @@ def test_tui_and_cli_consume_the_same_typed_query_and_result(
     )
 
     cli = CliRunner().invoke(
-        main,
+        cli_module.main,
         [
             "quota",
             "list",
