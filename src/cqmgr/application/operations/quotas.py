@@ -46,6 +46,14 @@ from cqmgr.domain.catalog import (
     LocationCoverageExpectation,
     LocationCoverageState,
 )
+from cqmgr.domain.diagnostics import (
+    Diagnostic,
+    DiagnosticCode,
+    DiagnosticPhase,
+    DiagnosticSource,
+    RetryDisposition,
+    Severity,
+)
 from cqmgr.domain.quota_queries import (
     PROVIDER_INVENTORY_REVISION,
     QUOTA_QUERY_EVIDENCE_CONTRACT,
@@ -69,6 +77,7 @@ from cqmgr.domain.quotas import (
     QuotaScope,
     UsageObservation,
 )
+from cqmgr.domain.redaction import RedactedText
 from cqmgr.domain.results import (
     Completeness,
     EvidenceGap,
@@ -111,7 +120,6 @@ if TYPE_CHECKING:
     )
     from cqmgr.domain.accelerator_overlay import SemanticAcceleratorOverlay
     from cqmgr.domain.catalog import TpuLocation
-    from cqmgr.domain.diagnostics import Diagnostic
 
 
 MAX_BROWSE_LIMIT = 1000
@@ -460,7 +468,11 @@ class WorkloadResolutionOperations:
                 TpuLocationReadRequest(context)
             )
             zones = (
-                requirement.locations.values
+                tuple(
+                    location
+                    for location in requirement.locations.values
+                    if _is_canonical_zone(location)
+                )
                 if isinstance(requirement.locations, CandidateLocations)
                 else tuple(location.location_id for location in location_read.values)
             )
@@ -562,12 +574,12 @@ def _selected_tpu_location_coverage(
     """Bind explicit candidates to the authoritative bounded location inventory."""
     if isinstance(requirement.locations, AllCompatibleLocations):
         return location_read.location_coverage
-    by_location = {
-        item.location: item
+    child_coverage = tuple(
+        item
         for item in location_read.location_coverage
         if item.source is CatalogEvidenceSource.TPU_LOCATIONS
         and item.location != "global"
-    }
+    )
     inventory_complete = location_read.complete
     incomplete_diagnostics = tuple(
         dict.fromkeys(
@@ -581,20 +593,80 @@ def _selected_tpu_location_coverage(
             )
         )
     )
-    return tuple(
-        by_location.get(zone)
-        or CatalogLocationCoverage(
-            CatalogEvidenceSource.TPU_LOCATIONS,
-            zone,
-            LocationCoverageExpectation.REQUESTED,
-            (
-                LocationCoverageState.EMPTY
-                if inventory_complete
-                else LocationCoverageState.NOT_SCANNED
-            ),
-            () if inventory_complete else incomplete_diagnostics,
+    aggregate_coverage = tuple(
+        item
+        for item in location_read.location_coverage
+        if item.source is CatalogEvidenceSource.TPU_LOCATIONS
+        and item.location == "global"
+    )
+    selected: list[CatalogLocationCoverage] = []
+    inventory_zones = tuple(location.location_id for location in location_read.values)
+    for location in requirement.locations.values:
+        matching_zones = (
+            ((location,) if location in inventory_zones else ())
+            if _is_canonical_zone(location)
+            else tuple(
+                zone
+                for zone in inventory_zones
+                if _zone_belongs_to_region(zone, location)
+            )
         )
-        for zone in requirement.locations.values
+        matching_coverage = tuple(
+            coverage
+            for zone in matching_zones
+            for coverage in child_coverage
+            if coverage.location == zone
+        )
+        missing_coverage_zones = tuple(
+            zone
+            for zone in matching_zones
+            if not any(coverage.location == zone for coverage in child_coverage)
+        )
+        if matching_coverage or missing_coverage_zones:
+            selected.extend(matching_coverage)
+            selected.extend(
+                CatalogLocationCoverage(
+                    CatalogEvidenceSource.TPU_LOCATIONS,
+                    zone,
+                    LocationCoverageExpectation.REQUESTED,
+                    LocationCoverageState.NOT_SCANNED,
+                    incomplete_diagnostics
+                    or (_missing_tpu_location_coverage_diagnostic(),),
+                )
+                for zone in missing_coverage_zones
+            )
+            continue
+        selected.append(
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.TPU_LOCATIONS,
+                location,
+                LocationCoverageExpectation.REQUESTED,
+                (
+                    LocationCoverageState.EMPTY
+                    if inventory_complete and not matching_zones
+                    else LocationCoverageState.NOT_SCANNED
+                ),
+                (
+                    ()
+                    if inventory_complete and not matching_zones
+                    else incomplete_diagnostics
+                ),
+            )
+        )
+    return (*selected, *aggregate_coverage)
+
+
+def _missing_tpu_location_coverage_diagnostic() -> Diagnostic:
+    """Describe an internally incomplete location read without provider inference."""
+    return Diagnostic(
+        code=DiagnosticCode("tpu-location-coverage-missing"),
+        severity=Severity.WARNING,
+        phase=DiagnosticPhase("tpu-locations-read"),
+        source=DiagnosticSource("cloud-tpu"),
+        retry=RetryDisposition.AFTER_REFRESH,
+        message=RedactedText(
+            "A normalized TPU location lacked required coverage evidence."
+        ),
     )
 
 
@@ -1895,9 +1967,13 @@ def _required_catalog_gaps(
             (source, location)
             for location in selected_locations
             for source in (
-                CatalogEvidenceSource.TPU_LOCATIONS,
-                CatalogEvidenceSource.TPU_ACCELERATOR_TYPES,
-                CatalogEvidenceSource.TPU_RUNTIME_VERSIONS,
+                (
+                    CatalogEvidenceSource.TPU_LOCATIONS,
+                    CatalogEvidenceSource.TPU_ACCELERATOR_TYPES,
+                    CatalogEvidenceSource.TPU_RUNTIME_VERSIONS,
+                )
+                if _is_canonical_zone(location)
+                else (CatalogEvidenceSource.TPU_LOCATIONS,)
             )
         )
     return tuple(
@@ -1906,16 +1982,64 @@ def _required_catalog_gaps(
             StableSymbol(ResolutionFailureReason.MISSING_LOCATION_EVIDENCE.value),
         )
         for source, location in required
-        if len(
-            records := tuple(
-                coverage
-                for coverage in catalog.coverage
-                if coverage.source is source and coverage.location == location
-            )
+        if not _candidate_source_coverage_complete(
+            catalog,
+            source,
+            location,
         )
-        != 1
-        or not records[0].complete
     )
+
+
+def _candidate_source_coverage_complete(
+    catalog: WorkloadCatalogEvidence,
+    source: CatalogEvidenceSource,
+    location: str,
+) -> bool:
+    if _is_canonical_zone(location):
+        records = tuple(
+            coverage
+            for coverage in catalog.coverage
+            if coverage.source is source and coverage.location == location
+        )
+        return len(records) == 1 and records[0].complete
+    child_records = tuple(
+        coverage
+        for coverage in catalog.coverage
+        if coverage.source is source
+        and _zone_belongs_to_region(coverage.location, location)
+    )
+    global_or_exact_records = tuple(
+        coverage
+        for coverage in catalog.coverage
+        if coverage.source is source and coverage.location in {"global", location}
+    )
+    child_locations = {coverage.location for coverage in child_records}
+    return (
+        bool(child_records or global_or_exact_records)
+        and all(
+            sum(record.location == child for record in child_records) == 1
+            for child in child_locations
+        )
+        and all(
+            coverage.complete for coverage in (*child_records, *global_or_exact_records)
+        )
+    )
+
+
+def _is_canonical_zone(location: str) -> bool:
+    region, separator, suffix = location.rpartition("-")
+    return (
+        separator == "-"
+        and "-" in region
+        and all(region.split("-"))
+        and region[-1:].isdigit()
+        and len(suffix) == 1
+        and suffix.isalpha()
+    )
+
+
+def _zone_belongs_to_region(location: str, region: str) -> bool:
+    return _is_canonical_zone(location) and location.startswith(f"{region}-")
 
 
 def _catalog_coverage_gaps(

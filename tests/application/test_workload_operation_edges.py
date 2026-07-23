@@ -544,6 +544,227 @@ def test_resolve_rejects_a_candidate_absent_from_complete_tpu_inventory() -> Non
     assert len(runtime_reader.calls) == 1
 
 
+def test_resolve_tpu_region_candidate_never_calls_zone_only_child_endpoints() -> None:
+    """A TPU region remains one unsupported result without silently choosing a zone."""
+    location_read, _accelerator_read, _runtime_read = _legacy_tpu_catalog_reads()
+    operations, accelerator_reader, runtime_reader = _tpu_operations(location_read)
+    requirement = replace(
+        _legacy_tpu_requirement(),
+        locations=CandidateLocations(("us-central1",)),
+    )
+
+    result = asyncio.run(
+        operations.resolve(QuotaResolveRequest(_context(), requirement))
+    )
+
+    assert result.outcome.exit_class is ExitClass.REJECTED_PRECONDITION
+    assert result.outcome.code == StableSymbol("unsupported-compatibility")
+    assert result.completeness.is_complete
+    assert result.data is not None
+    assert tuple(item.location for item in result.data.locations) == ("us-central1",)
+    assert (
+        result.data.locations[0].disposition is WorkloadLocationDisposition.INCOMPATIBLE
+    )
+    assert accelerator_reader.calls == []
+    assert runtime_reader.calls == []
+
+
+def test_resolve_tpu_region_retains_partial_inventory_coverage() -> None:
+    """A matching child cannot hide aggregate TPU location pagination gaps."""
+    location_read, _accelerator_read, _runtime_read = _legacy_tpu_catalog_reads()
+    diagnostic = _catalog_diagnostic()
+    partial_location_read = CatalogRead(
+        location_read.read,
+        (
+            *location_read.location_coverage,
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.TPU_LOCATIONS,
+                "global",
+                LocationCoverageExpectation.EXPECTED,
+                LocationCoverageState.NOT_SCANNED,
+                (diagnostic,),
+            ),
+        ),
+    )
+    operations, accelerator_reader, runtime_reader = _tpu_operations(
+        partial_location_read
+    )
+    requirement = replace(
+        _legacy_tpu_requirement(),
+        locations=CandidateLocations(("us-central1",)),
+    )
+
+    result = asyncio.run(
+        operations.resolve(QuotaResolveRequest(_context(), requirement))
+    )
+
+    assert result.outcome.exit_class is ExitClass.INCOMPLETE_EVIDENCE
+    assert result.outcome.code == StableSymbol("missing-location-evidence")
+    assert result.data is not None
+    assert (
+        result.data.locations[0].disposition is WorkloadLocationDisposition.INCOMPLETE
+    )
+    assert tuple(coverage.state for coverage in result.data.locations[0].coverage) == (
+        LocationCoverageState.SUCCESS,
+        LocationCoverageState.NOT_SCANNED,
+    )
+    assert accelerator_reader.calls == []
+    assert runtime_reader.calls == []
+
+
+def test_resolve_tpu_region_preserves_conflicting_child_coverage() -> None:
+    """Duplicate child coverage cannot last-write-win into complete evidence."""
+    location_read, _accelerator_read, _runtime_read = _legacy_tpu_catalog_reads()
+    diagnostic = _catalog_diagnostic()
+    conflicting_location_read = CatalogRead(
+        location_read.read,
+        (
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.TPU_LOCATIONS,
+                "us-central1-b",
+                LocationCoverageExpectation.EXPECTED,
+                LocationCoverageState.NOT_SCANNED,
+                (diagnostic,),
+            ),
+            *location_read.location_coverage,
+        ),
+    )
+    operations, accelerator_reader, runtime_reader = _tpu_operations(
+        conflicting_location_read
+    )
+    requirement = replace(
+        _legacy_tpu_requirement(),
+        locations=CandidateLocations(("us-central1",)),
+    )
+
+    result = asyncio.run(
+        operations.resolve(QuotaResolveRequest(_context(), requirement))
+    )
+
+    assert result.outcome.exit_class is ExitClass.INCOMPLETE_EVIDENCE
+    assert result.outcome.code == StableSymbol("missing-location-evidence")
+    assert result.data is not None
+    location = result.data.locations[0]
+    assert location.disposition is WorkloadLocationDisposition.INCOMPLETE
+    assert tuple(coverage.state for coverage in location.coverage) == (
+        LocationCoverageState.NOT_SCANNED,
+        LocationCoverageState.SUCCESS,
+    )
+    assert accelerator_reader.calls == []
+    assert runtime_reader.calls == []
+
+
+def test_resolve_tpu_region_rejects_duplicate_terminal_child_coverage() -> None:
+    """Success and empty for one child remain contradictory missing evidence."""
+    location_read, _accelerator_read, _runtime_read = _legacy_tpu_catalog_reads()
+    conflicting_location_read = CatalogRead(
+        location_read.read,
+        (
+            *location_read.location_coverage,
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.TPU_LOCATIONS,
+                "us-central1-b",
+                LocationCoverageExpectation.EXPECTED,
+                LocationCoverageState.EMPTY,
+            ),
+        ),
+    )
+    operations, accelerator_reader, runtime_reader = _tpu_operations(
+        conflicting_location_read
+    )
+    requirement = replace(
+        _legacy_tpu_requirement(),
+        locations=CandidateLocations(("us-central1",)),
+    )
+
+    result = asyncio.run(
+        operations.resolve(QuotaResolveRequest(_context(), requirement))
+    )
+
+    assert result.outcome.exit_class is ExitClass.INCOMPLETE_EVIDENCE
+    assert result.outcome.code == StableSymbol("missing-location-evidence")
+    assert result.data is not None
+    location = result.data.locations[0]
+    assert location.disposition is WorkloadLocationDisposition.INCOMPLETE
+    assert tuple(coverage.state for coverage in location.coverage) == (
+        LocationCoverageState.SUCCESS,
+        LocationCoverageState.EMPTY,
+    )
+    assert accelerator_reader.calls == []
+    assert runtime_reader.calls == []
+
+
+def test_resolve_tpu_region_handles_value_without_location_coverage() -> None:
+    """A normalized location lacking coverage becomes typed incomplete evidence."""
+    location_read, _accelerator_read, _runtime_read = _legacy_tpu_catalog_reads()
+    inconsistent_location_read = CatalogRead(location_read.read, ())
+    operations, accelerator_reader, runtime_reader = _tpu_operations(
+        inconsistent_location_read
+    )
+    requirement = replace(
+        _legacy_tpu_requirement(),
+        locations=CandidateLocations(("us-central1",)),
+    )
+
+    result = asyncio.run(
+        operations.resolve(QuotaResolveRequest(_context(), requirement))
+    )
+
+    assert result.outcome.exit_class is ExitClass.INCOMPLETE_EVIDENCE
+    assert result.outcome.code == StableSymbol("missing-location-evidence")
+    assert result.data is not None
+    coverage = result.data.locations[0].coverage
+    assert len(coverage) == 1
+    assert coverage[0].location == "us-central1-b"
+    assert coverage[0].state is LocationCoverageState.NOT_SCANNED
+    assert coverage[0].diagnostics
+    assert accelerator_reader.calls == []
+    assert runtime_reader.calls == []
+
+
+def test_resolve_compute_region_attributes_only_incomplete_child_sources() -> None:
+    """Regional candidates do not demand synthetic exact-region catalog records."""
+    diagnostic = _catalog_diagnostic()
+    requirement = replace(
+        _gpu_requirement(),
+        locations=CandidateLocations(("us-central1",)),
+    )
+    accelerator_read = _compute_accelerator_catalog_read()
+    machine = _gpu_catalog_read().values[0]
+    machine_read = CatalogRead(
+        _complete(machine),
+        (
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+                "us-central1-a",
+                LocationCoverageExpectation.REQUESTED,
+                LocationCoverageState.NOT_SCANNED,
+                (diagnostic,),
+            ),
+        ),
+    )
+    operations = WorkloadResolutionOperations(
+        ScriptedReader((_complete(),)),
+        ScriptedReader((_complete(),)),
+        ScriptedCatalogReader((accelerator_read,)),
+        ScriptedCatalogReader((machine_read,)),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+
+    result = asyncio.run(
+        operations.resolve(QuotaResolveRequest(_context(), requirement))
+    )
+
+    assert result.outcome.exit_class is ExitClass.INCOMPLETE_EVIDENCE
+    assert tuple(gap.source.value for gap in result.completeness.gaps) == (
+        "compute-machine-types",
+    )
+
+
 def test_tpu_resolution_cancellation_joins_started_provider_reads() -> None:
     """Cancelling catalog discovery also stops owned quota and usage reads."""
 
