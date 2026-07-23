@@ -769,6 +769,57 @@ def test_compute_all_compatible_honors_global_accelerator_scan_failure() -> None
     assert result.all_compatible_locations_exhaustive is False
 
 
+def test_compute_all_compatible_honors_global_empty_accelerator_catalog() -> None:
+    """A complete global empty result proves no zone has an accelerator type."""
+    requirement = ComputeInstanceRequirement(
+        machine_type="a4-highgpu-8g",
+        instance_count=1,
+        provisioning_model=ProvisioningModel.STANDARD,
+        locations=AllCompatibleLocations(),
+    )
+    catalog = WorkloadCatalogEvidence(
+        compute_machine_types=(
+            ComputeMachineType(
+                "a4-highgpu-8g",
+                "us-central1-a",
+                (AcceleratorAttachment("nvidia-b200", 8),),
+                None,
+            ),
+        ),
+        tpu_locations=(),
+        tpu_accelerator_types=(),
+        tpu_runtime_versions=(),
+        coverage=(
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+                "us-central1-a",
+                LocationCoverageExpectation.EXPECTED,
+                LocationCoverageState.SUCCESS,
+            ),
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+                "global",
+                LocationCoverageExpectation.EXPECTED,
+                LocationCoverageState.EMPTY,
+            ),
+        ),
+        compute_accelerator_types=(),
+    )
+
+    result = MAINTAINED_ACCELERATOR_OVERLAY.resolve(requirement, (), catalog)
+
+    assert result.all_compatible_locations_exhaustive is True
+    assert tuple(item.location for item in result.locations) == ("us-central1-a",)
+    location = result.locations[0]
+    assert location.disposition is WorkloadLocationDisposition.INCOMPATIBLE
+    assert location.failure_reason is not None
+    assert location.failure_reason.value == "unsupported-compatibility"
+    assert tuple(item.location for item in location.coverage) == (
+        "us-central1-a",
+        "global",
+    )
+
+
 def test_cloud_tpu_all_compatible_requires_every_location_subsource() -> None:
     """TPU enumeration is not exhaustive when runtime coverage is incomplete."""
     gap = Diagnostic(
