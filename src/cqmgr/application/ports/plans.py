@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from cqmgr.application.ports.secrets import SecretValue
-    from cqmgr.domain.plans import PlanLedgerState
+    from cqmgr.domain.plans import PlanLedgerState, QuotaPlan
     from cqmgr.domain.results import StableSymbol
 
 
@@ -43,6 +43,31 @@ class EncodedPlan:
 
     bytes: bytes = field(repr=False)
     digest: str
+
+
+class DecodedPlan(Protocol):
+    """Digest-valid canonical plan exposed by a serialization adapter."""
+
+    plan: QuotaPlan
+    digest: str
+
+    def authenticate(self, key: bytes) -> bool:
+        """Verify the issuing installation authenticator."""
+        ...
+
+
+class PlanCodec(Protocol):
+    """Canonical plan serialization and integrity boundary."""
+
+    @staticmethod
+    def encode(plan: QuotaPlan, key: bytes) -> EncodedPlan:
+        """Encode one plan into canonical authenticated bytes."""
+        ...
+
+    @staticmethod
+    def decode(data: bytes) -> DecodedPlan:
+        """Verify canonical encoding and digest before returning contents."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
