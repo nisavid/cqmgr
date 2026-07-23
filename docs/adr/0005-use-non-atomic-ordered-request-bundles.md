@@ -49,11 +49,14 @@ Preview returns the complete verified-no-op result without issuing a plan;
 all-no-op input to consume.
 
 Apply is deliberately non-atomic. It freshly revalidates every child before the
-first provider write. It then dispatches non-no-op children in deterministic
-accelerator-first order, using canonical exact-slice identity as the final
-tie-breaker. It stops at the first conclusively failed child or any `unknown`
-child and never attempts later children; transport uncertainty is one possible
-cause of `unknown`. Each dispatched child receives one
+consumption barrier and before any provider write. A failed revalidation appends
+and fsyncs a terminal no-write Apply result, crosses no consumption barrier, and
+leaves the plan unused but inapplicable; a new Preview is required. Apply then
+dispatches non-no-op children in deterministic accelerator-first order, using
+canonical exact-slice identity as the final tie-breaker. It stops at the first
+conclusively failed child or any `unknown` child and never attempts later
+children; transport uncertainty is one possible cause of `unknown`. Each
+dispatched child receives one
 durable disposition:
 
 - `accepted` when the provider is proven to have accepted the bound intent;
@@ -84,13 +87,18 @@ transport uncertainty, or persistence failure never causes a blind retry.
 Deterministic child preference identity preserves accepted work and classifies
 uncertainty.
 
-Watch observes the accepted children of one applied bundle. It retains each
-child's preference lineage, target, status axes, effective evidence, and resume
-checkpoint. The aggregate `granted` or `fulfilled` condition is reached only
-when every accepted child reaches that condition. A conclusive unmet child
-terminates the aggregate condition without flattening other child states.
-Timeout and interruption preserve the latest material observation and a locally
-authenticated resume token bound to the bundle and all accepted children.
+Watch observes the accepted children of one applied bundle, including a
+partially applied bundle whose aggregate Apply failed. It retains every ordered
+child, verified no-op, disposition, provider reconciliation identity, target,
+status evidence, and resume checkpoint, while polling only accepted children.
+Failed, unknown, and unattempted children are not Watch targets; an unknown child
+first requires read-after-unknown reconciliation, and a bundle with no accepted
+child is not watchable. The aggregate `granted` or `fulfilled` condition is
+reached only when every accepted child reaches that condition. A conclusive
+unmet accepted child terminates the aggregate condition without flattening
+other child states. Timeout and interruption preserve the latest material
+observation and a locally authenticated resume token bound to the bundle and all
+accepted children.
 Every unreleased `cqmgr.watch-event/v1` record has a required `subject.kind` of
 `single` or `bundle`. The subject binds resource scope, condition, plan or
 intent digest, and an ordered nonempty array of complete child identities;
