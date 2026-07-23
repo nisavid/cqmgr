@@ -260,6 +260,28 @@ def test_identity_failures_return_static_redacted_diagnostics(stage: str) -> Non
         assert not evidence.read_capability
 
 
+@pytest.mark.parametrize("stage", ["load", "refresh", "userinfo"])
+def test_identity_deadlines_return_typed_retry_guidance(stage: str) -> None:
+    """Deadline exhaustion is distinct from broken or unverifiable ADC."""
+    snapshot = ADCCredentialSnapshot(
+        kind=CredentialKind.DIRECT_USER,
+        credential=object(),
+    )
+    runtime = FakeADCRuntime(
+        TimeoutError() if stage == "load" else snapshot,
+        user_info=TimeoutError() if stage == "userinfo" else _userinfo(),
+        refresh_error=TimeoutError() if stage == "refresh" else None,
+    )
+
+    evidence = asyncio.run(GoogleADCIdentityProvider(runtime).resolve())
+
+    assert not evidence.read_capability
+    assert evidence.diagnostics[0].code.value == "adc-deadline-exceeded"
+    assert str(evidence.diagnostics[0].message) == (
+        "Retry with a longer deadline for ADC resolution."
+    )
+
+
 def test_direct_user_requires_authoritative_subject_and_boolean_email_flag() -> None:
     """Typed email text alone is never accepted as principal proof."""
     runtime = FakeADCRuntime(
@@ -554,7 +576,7 @@ def test_identity_provider_cooperatively_bounds_refresh_worker() -> None:
     assert time.monotonic() - started < COOPERATIVE_GUARD_SECONDS
     assert runtime.timeout is not None
     assert runtime.timeout <= COOPERATIVE_TIMEOUT_SECONDS
-    assert evidence.diagnostics[0].code.value == "adc-refresh-failed"
+    assert evidence.diagnostics[0].code.value == "adc-deadline-exceeded"
 
 
 def test_google_auth_runtime_userinfo_closes_session_and_validates_object(

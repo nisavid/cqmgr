@@ -275,6 +275,8 @@ class GoogleADCIdentityProvider:
                     timeout_seconds=_remaining(finish_by, self._monotonic),
                 )
             )
+        except TimeoutError:
+            return _deadline_exceeded(CredentialKind.UNKNOWN)
         except Exception:  # noqa: BLE001  # text is intentionally discarded
             return ADCIdentityEvidence.unavailable(
                 credential_kind=CredentialKind.UNKNOWN,
@@ -304,6 +306,8 @@ class GoogleADCIdentityProvider:
                     timeout_seconds=_remaining(finish_by, self._monotonic),
                 )
             )
+        except TimeoutError:
+            return _deadline_exceeded(snapshot.kind)
         except Exception:  # noqa: BLE001  # text is intentionally discarded
             return ADCIdentityEvidence.unavailable(
                 credential_kind=snapshot.kind,
@@ -362,6 +366,8 @@ class GoogleADCIdentityProvider:
                     timeout_seconds=_remaining(finish_by, self._monotonic),
                 )
             )
+        except TimeoutError:
+            return _deadline_exceeded(snapshot.kind)
         except Exception:  # noqa: BLE001  # text is intentionally discarded
             return _principal_unverified(
                 snapshot.kind,
@@ -495,6 +501,15 @@ def _principal_unverified(
         credential_kind=kind,
         adc_quota_project=quota_project,
         guidance=guidance,
+    )
+
+
+def _deadline_exceeded(kind: CredentialKind) -> ADCIdentityEvidence:
+    """Keep exhausted ADC setup time distinct from credential repair failures."""
+    return ADCIdentityEvidence.unavailable(
+        credential_kind=kind,
+        code="adc-deadline-exceeded",
+        guidance="Retry with a longer deadline for ADC resolution.",
     )
 
 

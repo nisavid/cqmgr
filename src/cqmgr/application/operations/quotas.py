@@ -953,6 +953,7 @@ class QuotaOperations:
                     coverage.state is ProviderSourceCoverageState.COMPLETE
                     for coverage in source_coverage
                 ),
+                identity_evidence=_provider_identity_evidence(request.context),
             )
 
         return self._complete_browse(
@@ -1459,6 +1460,7 @@ class QuotaOperations:
             data=data,
             started_at=started_at,
             diagnostics=diagnostics,
+            identity_evidence=_provider_identity_evidence(request.context),
         )
 
     def _duplicate_browse_result(  # noqa: PLR0913
@@ -1503,6 +1505,7 @@ class QuotaOperations:
             has_partial_data=has_partial_data,
             gap_sources=("effective-quota",),
             gap_reason=reason,
+            identity_evidence=_provider_identity_evidence(request.context),
         )
 
     def _inspect_rejection(
@@ -1538,6 +1541,7 @@ class QuotaOperations:
         has_partial_data: bool,
         gap_sources: tuple[str, ...] = (),
         gap_reason: str = "provider-read-incomplete",
+        identity_evidence: ProviderIdentityEvidence | None = None,
     ) -> OperationResult[DataT]:
         gaps = tuple(
             EvidenceGap(StableSymbol(source), StableSymbol(gap_reason))
@@ -1572,6 +1576,7 @@ class QuotaOperations:
             data=data,
             started_at=started_at,
             diagnostics=diagnostics,
+            identity_evidence=identity_evidence,
         )
 
     def _result[DataT](  # noqa: PLR0913
@@ -1587,6 +1592,7 @@ class QuotaOperations:
         data: DataT,
         started_at: datetime,
         diagnostics: tuple[Diagnostic, ...] = (),
+        identity_evidence: ProviderIdentityEvidence | None = None,
     ) -> OperationResult[DataT]:
         if resource_scope is not None and not isinstance(resource_scope, ResourceScope):
             msg = "quota operation result requires ResourceScope or None"
@@ -1601,7 +1607,17 @@ class QuotaOperations:
             finished_at=self._clock.now(),
             data=data,
             diagnostics=diagnostics,
+            identity_evidence=identity_evidence,
         )
+
+
+def _provider_identity_evidence(
+    context: ProviderReadContext | None,
+) -> ProviderIdentityEvidence | None:
+    """Retain sanitized identity after provider-scoped read work begins."""
+    if context is None:
+        return None
+    return ProviderIdentityEvidence.from_adc(context.identity)
 
 
 def _provider_stop_outcome(
