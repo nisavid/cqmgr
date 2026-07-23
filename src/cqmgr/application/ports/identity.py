@@ -16,6 +16,7 @@ class IdentityProvider(Protocol):
         self,
         *,
         adc_quota_project: ADCQuotaProject | None = None,
+        timeout_seconds: float = 10.0,
     ) -> ADCIdentityEvidence:
         """Resolve identity without switching or brokering credentials."""
         ...

@@ -126,7 +126,7 @@ def test_repository_atomically_round_trips_private_canonical_snapshot(
     snapshot_files = list((root / "snapshots").glob("*.json"))
     assert len(snapshot_files) == 1
     assert json.loads(snapshot_files[0].read_bytes())["schema"] == (
-        "cqmgr.quota-query-snapshot/v3"
+        "cqmgr.quota-query-snapshot/v4"
     )
     assert list(root.rglob("*.tmp")) == []
     if os.name != "nt":
@@ -140,7 +140,7 @@ def test_repository_atomically_round_trips_private_canonical_snapshot(
 def test_repository_resolves_unexpired_cursor_bound_to_legacy_snapshot(
     tmp_path: Path,
 ) -> None:
-    """An opaque cursor survives an in-place upgrade from snapshot v2 to v3."""
+    """An opaque cursor survives an in-place upgrade from snapshot v2 to v4."""
     root = tmp_path / "quota-query-snapshots"
     repository = FilesystemQuotaQuerySnapshots(root, token_factory=lambda: TOKEN)
     snapshot = _snapshot()
@@ -151,6 +151,7 @@ def test_repository_resolves_unexpired_cursor_bound_to_legacy_snapshot(
     document["schema"] = "cqmgr.quota-query-snapshot/v2"
     retained = document["snapshot"]
     metadata = retained["metadata"]
+    metadata.pop("identity_evidence")
     metadata.pop("inventory_revision")
     metadata.pop("source_coverage")
     retained.pop("ordered_slice_identities")
@@ -548,7 +549,7 @@ def test_repository_rejects_newer_and_corrupt_snapshot_state(tmp_path: Path) -> 
     path = next((root / "snapshots").glob("*.json"))
 
     document = json.loads(path.read_bytes())
-    document["schema"] = "cqmgr.quota-query-snapshot/v4"
+    document["schema"] = "cqmgr.quota-query-snapshot/v5"
     path.write_text(json.dumps(document))
     with pytest.raises(UnsupportedQuotaSnapshotSchemaError):
         repository.load(snapshot.metadata.snapshot_id, now=NOW)

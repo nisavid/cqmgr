@@ -43,6 +43,7 @@ def _human_data_lines(result: OperationResult[Any]) -> list[str]:  # noqa: PLR09
         lines = [
             f"Resource scope: {_scope_name(result.resource_scope)}",
             f"Resolution source: {data.resolution_source or 'none'}",
+            "Acting principal: deferred (offline)",
         ]
         if data.reason is not None:
             lines.append(f"Reason: {data.reason}")

@@ -212,6 +212,49 @@ def test_completeness_rejects_ambiguous_flags_and_gap_collections() -> None:
     assert not Completeness.unavailable(GAP).has_partial_data
 
 
+@pytest.mark.parametrize(
+    "exit_class",
+    [ExitClass.INCOMPLETE_EVIDENCE, ExitClass.TIMEOUT, ExitClass.INTERRUPTED],
+)
+def test_partial_evidence_allows_incomplete_or_invocation_stop_exits(
+    exit_class: ExitClass,
+) -> None:
+    """A stopped invocation may retain usable evidence without becoming exit 6."""
+    result = OperationResult(
+        operation=OperationName("quota.list"),
+        resource_scope=SCOPE,
+        boundary=OperationBoundary(StableSymbol("logical-page-read"), reached=False),
+        outcome=Outcome(StableSymbol("operation-stopped"), exit_class),
+        completeness=Completeness.incomplete(GAP),
+        started_at=NOW,
+        finished_at=NOW,
+        data=None,
+    )
+
+    assert result.completeness.has_partial_data
+
+
+def test_partial_evidence_rejects_other_non_success_exits() -> None:
+    """Usable incomplete evidence cannot be mislabeled as an unrelated failure."""
+    with pytest.raises(ValueError, match="partial evidence"):
+        OperationResult(
+            operation=OperationName("quota.list"),
+            resource_scope=SCOPE,
+            boundary=OperationBoundary(
+                StableSymbol("logical-page-read"),
+                reached=False,
+            ),
+            outcome=Outcome(
+                StableSymbol("provider-failed"),
+                ExitClass.OPERATIONAL_FAILURE,
+            ),
+            completeness=Completeness.incomplete(GAP),
+            started_at=NOW,
+            finished_at=NOW,
+            data=None,
+        )
+
+
 def test_provenance_requires_typed_utc_safe_source_evidence() -> None:
     """Source intervals and provider text remain typed, ordered, and UTC."""
     with pytest.raises(TypeError, match="source and coverage"):

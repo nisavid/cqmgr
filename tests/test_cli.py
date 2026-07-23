@@ -95,9 +95,9 @@ def test_python_module_dispatch_is_covered(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_canonical_alias_group_resolves_only_reserved_alias() -> None:
-    """Canonical names retain exact, stable three-letter aliases."""
+    """Canonical names retain only their explicitly registered aliases."""
 
-    @click.group(cls=CanonicalAliasGroup)
+    @click.group(cls=CanonicalAliasGroup, aliases={"quota": "q"})
     def command_group() -> None:
         """Test command group."""
 
@@ -109,20 +109,43 @@ def test_canonical_alias_group_resolves_only_reserved_alias() -> None:
     runner = CliRunner()
 
     assert runner.invoke(command_group, ["quota"]).output == "quota\n"
-    assert runner.invoke(command_group, ["quo"]).output == "quota\n"
+    assert runner.invoke(command_group, ["q"]).output == "quota\n"
     assert runner.invoke(command_group, ["qu"]).exit_code == click.UsageError.exit_code
+    assert runner.invoke(command_group, ["quo"]).exit_code == click.UsageError.exit_code
+
+
+def test_alias_invocation_renders_only_the_canonical_help_path() -> None:
+    """Help and usage diagnostics never publish invocation-only aliases."""
+    runner = CliRunner()
+
+    help_result = runner.invoke(main, ["q", "l", "--help"])
+    invalid_result = runner.invoke(main, ["q", "lis", "--help"])
+
+    assert help_result.exit_code == 0
+    assert help_result.stdout.startswith("Usage: cqmgr quota list [OPTIONS]\n")
+    assert "Usage: cqmgr q l " not in help_result.output
+    assert invalid_result.exit_code == click.UsageError.exit_code
+    assert invalid_result.stderr.startswith(
+        "Usage: cqmgr quota [OPTIONS] COMMAND [ARGS]...\n"
+    )
+    assert "Usage: cqmgr q " not in invalid_result.output
 
 
 def test_canonical_alias_group_rejects_invalid_registrations() -> None:
-    """Every command has a canonical name and a unique reserved alias."""
-    command_group = CanonicalAliasGroup()
+    """Every command requires one exact non-colliding sibling alias."""
+    command_group = CanonicalAliasGroup(aliases={})
 
     with pytest.raises(TypeError, match="canonical command name"):
         command_group.add_command(click.Command(name=None))
 
-    command_group.add_command(click.Command(name="quota"))
-    with pytest.raises(TypeError, match="alias 'quo'"):
-        command_group.add_command(click.Command(name="quotation"))
+    with pytest.raises(TypeError, match="missing explicit alias"):
+        command_group.add_command(click.Command(name="quota"))
+
+    with pytest.raises(TypeError, match="duplicate alias"):
+        CanonicalAliasGroup(aliases={"quota": "q", "query": "q"})
+
+    with pytest.raises(TypeError, match="collides with canonical command"):
+        CanonicalAliasGroup(aliases={"quota": "q", "query": "quota"})
 
 
 @pytest.mark.parametrize("argument", ["--help", "--version"])

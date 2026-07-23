@@ -33,6 +33,7 @@ from cqmgr.application.ports.coordination import (
     CancellationToken,
     CoordinationCancelledError,
     CoordinationDeadlineExceededError,
+    CoordinationUnavailableError,
 )
 from cqmgr.domain.redaction import REDACTION_MARKER, RedactedText
 
@@ -508,7 +509,7 @@ def test_budget_state_corruption_fails_closed(tmp_path: Path) -> None:
     """Unreadable or newer shared accounting state never resets usage to zero."""
     coordinator = SharedBudgetCoordinator(tmp_path, _limits())
     (tmp_path / "budgets.json").write_bytes(b"not-json")
-    with pytest.raises(RuntimeError, match="unreadable"):
+    with pytest.raises(CoordinationUnavailableError):
         asyncio.run(
             coordinator.acquire(
                 _request(),
@@ -519,7 +520,7 @@ def test_budget_state_corruption_fails_closed(tmp_path: Path) -> None:
     (tmp_path / "budgets.json").write_text(
         json.dumps({"schema": "cqmgr.local-budget-state/v2", "entries": {}})
     )
-    with pytest.raises(RuntimeError, match="unsupported schema"):
+    with pytest.raises(CoordinationUnavailableError):
         asyncio.run(
             coordinator.acquire(
                 _request(),
@@ -602,7 +603,7 @@ def test_every_corrupt_budget_entry_fails_closed(
     (tmp_path / "budgets.json").write_text(json.dumps(state))
     coordinator = SharedBudgetCoordinator(tmp_path, _limits())
 
-    with pytest.raises((TypeError, RuntimeError), match="budget state"):
+    with pytest.raises(CoordinationUnavailableError):
         asyncio.run(
             coordinator.acquire(
                 _request(),

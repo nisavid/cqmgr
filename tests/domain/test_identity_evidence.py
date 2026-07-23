@@ -13,6 +13,7 @@ from cqmgr.domain.identity import (
     CredentialKind,
     PrincipalIdentity,
     PrincipalVerification,
+    ProviderIdentityEvidence,
     VerifiedDirectUserEmail,
 )
 
@@ -62,6 +63,45 @@ def test_unverified_principal_keeps_read_capability_and_fails_closed_for_writes(
     assert [item.code for item in evidence.diagnostics] == [
         DiagnosticCode("principal-unverified")
     ]
+
+
+def test_result_identity_evidence_discards_transport_and_contact_state() -> None:
+    """Durable principal evidence excludes ADC quota project and direct-user email."""
+    principal = PrincipalIdentity("principal://accounts.google.com/12345")
+    adc = ADCIdentityEvidence(
+        credential_kind=CredentialKind.DIRECT_USER,
+        acting_principal=principal,
+        stable_principal=principal,
+        verification=PrincipalVerification.VERIFIED,
+        adc_quota_project=ADCQuotaProject("billing-project"),
+        direct_user_email=VerifiedDirectUserEmail("fixture.user@example.com"),
+    )
+
+    retained = ProviderIdentityEvidence.from_adc(adc)
+
+    assert retained == ProviderIdentityEvidence(
+        credential_kind=CredentialKind.DIRECT_USER,
+        verification=PrincipalVerification.VERIFIED,
+        acting_principal=principal,
+    )
+    assert {field.name for field in fields(retained)} == {
+        "credential_kind",
+        "verification",
+        "acting_principal",
+        "impersonation_chain",
+    }
+    assert "billing-project" not in repr(retained)
+    assert "fixture.user@example.com" not in repr(retained)
+
+
+def test_verified_provider_identity_requires_an_acting_principal() -> None:
+    """Durable verified evidence cannot claim proof without its principal."""
+    with pytest.raises(ValueError, match="verified provider identity"):
+        ProviderIdentityEvidence(
+            credential_kind=CredentialKind.SERVICE_ACCOUNT,
+            verification=PrincipalVerification.VERIFIED,
+            acting_principal=None,
+        )
 
 
 def test_unavailable_adc_disables_all_provider_capabilities() -> None:

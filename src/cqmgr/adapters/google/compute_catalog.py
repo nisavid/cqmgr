@@ -93,6 +93,7 @@ class OfficialComputeAcceleratorTypesPageClient:
         _require_positive(maximum_workers, "Compute catalog maximum_workers")
         self._client = client
         self._worker_slots = asyncio.Semaphore(maximum_workers)
+        self._workers: set[asyncio.Task[ComputeAcceleratorTypesPage]] = set()
 
     async def accelerator_types(
         self,
@@ -115,14 +116,21 @@ class OfficialComputeAcceleratorTypesPageClient:
                 timeout_seconds=timeout_seconds,
             )
         )
+        self._workers.add(worker)
         worker.add_done_callback(self._release_worker_slot)
         return await asyncio.shield(worker)
+
+    async def close(self) -> None:
+        """Drain shielded sync calls before closing their shared transport."""
+        await asyncio.gather(*tuple(self._workers), return_exceptions=True)
+        self._client.transport.close()
 
     def _release_worker_slot(
         self,
         worker: asyncio.Task[ComputeAcceleratorTypesPage],
     ) -> None:
         """Release concurrency only after the uncancellable sync call stops."""
+        self._workers.discard(worker)
         self._worker_slots.release()
         if not worker.cancelled():
             worker.exception()
@@ -212,6 +220,7 @@ class OfficialComputeMachineTypesPageClient:
         _require_positive(maximum_workers, "Compute catalog maximum_workers")
         self._client = client
         self._worker_slots = asyncio.Semaphore(maximum_workers)
+        self._workers: set[asyncio.Task[ComputeMachineTypesPage]] = set()
 
     async def machine_types(
         self,
@@ -234,14 +243,21 @@ class OfficialComputeMachineTypesPageClient:
                 timeout_seconds=timeout_seconds,
             )
         )
+        self._workers.add(worker)
         worker.add_done_callback(self._release_worker_slot)
         return await asyncio.shield(worker)
+
+    async def close(self) -> None:
+        """Drain shielded sync calls before closing their shared transport."""
+        await asyncio.gather(*tuple(self._workers), return_exceptions=True)
+        self._client.transport.close()
 
     def _release_worker_slot(
         self,
         worker: asyncio.Task[ComputeMachineTypesPage],
     ) -> None:
         """Release concurrency only after the uncancellable sync call stops."""
+        self._workers.discard(worker)
         self._worker_slots.release()
         if not worker.cancelled():
             worker.exception()

@@ -30,12 +30,16 @@ from cqmgr.adapters.google.monitoring import (
     TimeSeriesPage,
 )
 from cqmgr.adapters.google.read_policy import GoogleReadPolicy
+from cqmgr.adapters.persistence.coordination import SharedBudgetCoordinator
 from cqmgr.application.ports.coordination import (
     BudgetGrant,
+    BudgetLimit,
     BudgetRequest,
+    BudgetScope,
     CancellationToken,
     CoordinationCancelledError,
     CoordinationDeadlineExceededError,
+    CoordinationUnavailableError,
 )
 from cqmgr.application.ports.provider_reads import (
     EffectiveQuotaReadRequest,
@@ -81,6 +85,18 @@ EXPECTED_USAGE_FILTER = (
 )
 
 
+class FakeAsyncTransport:
+    """Record generated async-client transport shutdown."""
+
+    def __init__(self) -> None:
+        """Create an open transport."""
+        self.closed = False
+
+    async def close(self) -> None:
+        """Record one transport shutdown."""
+        self.closed = True
+
+
 class OnePagePager:
     """Minimal generated-pager shape for official request tests."""
 
@@ -104,6 +120,7 @@ class FakeOfficialCloudQuotasClient:
     def __init__(self) -> None:
         """Create an empty request ledger."""
         self.calls: list[tuple[str, object, object, object]] = []
+        self.transport = FakeAsyncTransport()
 
     async def list_quota_infos(
         self,
@@ -138,6 +155,7 @@ class FakeOfficialMonitoringClient:
     def __init__(self) -> None:
         """Create an empty request ledger."""
         self.calls: list[tuple[object, object, object]] = []
+        self.transport = FakeAsyncTransport()
 
     async def list_time_series(
         self,
@@ -492,6 +510,7 @@ def test_official_cloud_quotas_wrapper_uses_one_page_and_disables_retry() -> Non
             timeout_seconds=4.5,
         )
     )
+    asyncio.run(wrapper.close())
 
     info_request = cast("cloudquotas_v1.ListQuotaInfosRequest", client.calls[0][1])
     assert info_request.page_size == INFO_PAGE_SIZE
@@ -499,6 +518,7 @@ def test_official_cloud_quotas_wrapper_uses_one_page_and_disables_retry() -> Non
     assert client.calls[0][2:] == (None, 3.5)
     assert info.next_page_token == "public-next-page"  # noqa: S105
     assert preference.items == ()
+    assert client.transport.closed
 
 
 def test_official_monitoring_wrapper_uses_full_view_and_disables_retry() -> None:
@@ -522,6 +542,7 @@ def test_official_monitoring_wrapper_uses_full_view_and_disables_retry() -> None
             timeout_seconds=2.5,
         )
     )
+    asyncio.run(wrapper.close())
 
     request = cast("monitoring_v3.ListTimeSeriesRequest", client.calls[0][0])
     assert request.name == "projects/1"
@@ -530,6 +551,7 @@ def test_official_monitoring_wrapper_uses_full_view_and_disables_retry() -> None
     assert request.page_size == MONITORING_PAGE_SIZE
     assert client.calls[0][1:] == (None, 2.5)
     assert page.items == ()
+    assert client.transport.closed
 
 
 def test_preference_reader_preserves_lifecycle_etag_and_timestamps() -> None:
@@ -921,6 +943,10 @@ def test_caller_deadline_interrupts_uncooperative_provider_dispatch() -> None:
             CoordinationDeadlineExceededError(),
             "provider-read-deadline-exceeded",
         ),
+        (
+            CoordinationUnavailableError(),
+            "provider-read-budget-unavailable",
+        ),
     ],
 )
 def test_budget_wait_preserves_typed_stop_outcome(
@@ -940,6 +966,32 @@ def test_budget_wait_preserves_typed_stop_outcome(
 
     assert not result.complete
     assert result.diagnostics[0].code.value == code
+    assert client.calls == []
+
+
+def test_corrupt_shared_budget_state_is_typed_before_provider_dispatch(
+    tmp_path: Path,
+) -> None:
+    """Persisted budget corruption becomes unavailable without resetting usage."""
+    (tmp_path / "budgets.json").write_bytes(b"not-json")
+    budget = SharedBudgetCoordinator(
+        tmp_path,
+        {scope: BudgetLimit(capacity=1, period_seconds=60.0) for scope in BudgetScope},
+    )
+    client = FakeCloudQuotasPages(info_pages=_quota_info_pages())
+    context = _context(deadline=time.monotonic() + 1.0)
+
+    result = asyncio.run(
+        GoogleEffectiveQuotaReader(
+            client,
+            GoogleReadPolicy(budget, NoJitter()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(EffectiveQuotaReadRequest(context, "compute.googleapis.com"))
+    )
+
+    assert not result.complete
+    assert result.diagnostics[0].code.value == "provider-read-budget-unavailable"
     assert client.calls == []
 
 

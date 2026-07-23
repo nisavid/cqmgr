@@ -16,6 +16,7 @@ from cqmgr.domain.catalog import (
     CatalogPredicates,
 )
 from cqmgr.domain.diagnostics import DiagnosticCode
+from cqmgr.domain.identity import ProviderIdentityEvidence
 from cqmgr.domain.quotas import (
     ConstraintReference,
     EffectiveQuotaSliceIdentity,
@@ -599,6 +600,7 @@ class QuerySnapshotMetadata:
     observed_at: datetime
     expires_at: datetime
     complete: bool
+    identity_evidence: ProviderIdentityEvidence | None = None
     inventory_revision: str = PROVIDER_INVENTORY_REVISION
     source_coverage: tuple[ProviderSourceCoverage, ...] = ()
 
@@ -623,6 +625,11 @@ class QuerySnapshotMetadata:
             raise ValueError(msg)
         if not isinstance(self.complete, bool):
             msg = "snapshot complete must be bool"
+            raise TypeError(msg)
+        if self.identity_evidence is not None and not isinstance(
+            self.identity_evidence, ProviderIdentityEvidence
+        ):
+            msg = "snapshot identity_evidence must use ProviderIdentityEvidence"
             raise TypeError(msg)
         if self.inventory_revision != PROVIDER_INVENTORY_REVISION:
             msg = (

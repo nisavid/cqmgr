@@ -54,6 +54,7 @@ from cqmgr.domain.diagnostics import (
     RetryDisposition,
     Severity,
 )
+from cqmgr.domain.identity import ProviderIdentityEvidence
 from cqmgr.domain.quota_queries import (
     PROVIDER_INVENTORY_REVISION,
     QUOTA_QUERY_EVIDENCE_CONTRACT,
@@ -119,7 +120,7 @@ if TYPE_CHECKING:
         QuotaQuerySnapshotRepository,
     )
     from cqmgr.domain.accelerator_overlay import SemanticAcceleratorOverlay
-    from cqmgr.domain.catalog import TpuLocation
+    from cqmgr.domain.catalog import CatalogMetadata, TpuLocation
 
 
 MAX_BROWSE_LIMIT = 1000
@@ -552,6 +553,9 @@ class WorkloadResolutionOperations:
         data: DataT,
         diagnostics: tuple[Diagnostic, ...],
     ) -> OperationResult[DataT]:
+        stop_outcome = _provider_stop_outcome(diagnostics)
+        if not reached and stop_outcome is not None:
+            outcome, exit_class = stop_outcome
         return OperationResult(
             operation=OperationName("quota.resolve"),
             resource_scope=request.context.project.resource_scope,
@@ -721,6 +725,10 @@ class QuotaBrowseData:
     snapshot_id: str | None
     reason: str | None = None
     source_coverage: tuple[ProviderSourceCoverage, ...] = ()
+    catalog: CatalogMetadata | None = None
+    evidence_contract: str | None = None
+    inventory_revision: str | None = None
+    observed_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -928,6 +936,10 @@ class QuotaOperations:
                 snapshot_id=None,
                 reason="incomplete-provider-evidence",
                 source_coverage=source_coverage,
+                catalog=self._overlay.metadata,
+                evidence_contract=QUOTA_QUERY_EVIDENCE_CONTRACT,
+                inventory_revision=PROVIDER_INVENTORY_REVISION,
+                observed_at=started_at,
             )
             return self._incomplete_result(
                 "quota.list",
@@ -936,7 +948,11 @@ class QuotaOperations:
                 data,
                 diagnostics,
                 started_at=started_at,
-                has_partial_data=bool(evidences),
+                has_partial_data=bool(evidences)
+                or any(
+                    coverage.state is ProviderSourceCoverageState.COMPLETE
+                    for coverage in source_coverage
+                ),
             )
 
         return self._complete_browse(
@@ -966,6 +982,11 @@ class QuotaOperations:
             observed_at=started_at,
             expires_at=started_at + self._snapshot_ttl,
             complete=True,
+            identity_evidence=(
+                None
+                if request.context is None
+                else ProviderIdentityEvidence.from_adc(request.context.identity)
+            ),
             inventory_revision=PROVIDER_INVENTORY_REVISION,
             source_coverage=source_coverage,
         )
@@ -1308,8 +1329,12 @@ class QuotaOperations:
                 snapshot_id=snapshot.metadata.snapshot_id,
                 reason="cursor-issue-failed",
                 source_coverage=snapshot.metadata.source_coverage,
+                catalog=snapshot.metadata.catalog,
+                evidence_contract=snapshot.metadata.evidence_contract,
+                inventory_revision=snapshot.metadata.inventory_revision,
+                observed_at=snapshot.metadata.observed_at,
             )
-            return self._result(
+            result = self._result(
                 operation="quota.list",
                 resource_scope=snapshot.metadata.query.resource_scope,
                 boundary="logical-page-read",
@@ -1320,6 +1345,10 @@ class QuotaOperations:
                 data=data,
                 started_at=started_at,
             )
+            return replace(
+                result,
+                identity_evidence=snapshot.metadata.identity_evidence,
+            )
         data = QuotaBrowseData(
             query=snapshot.metadata.query,
             items=items,
@@ -1329,8 +1358,12 @@ class QuotaOperations:
             next_cursor=next_cursor,
             snapshot_id=snapshot.metadata.snapshot_id,
             source_coverage=snapshot.metadata.source_coverage,
+            catalog=snapshot.metadata.catalog,
+            evidence_contract=snapshot.metadata.evidence_contract,
+            inventory_revision=snapshot.metadata.inventory_revision,
+            observed_at=snapshot.metadata.observed_at,
         )
-        return self._result(
+        result = self._result(
             operation="quota.list",
             resource_scope=snapshot.metadata.query.resource_scope,
             boundary="logical-page-read",
@@ -1340,6 +1373,10 @@ class QuotaOperations:
             completeness=Completeness.complete(),
             data=data,
             started_at=started_at,
+        )
+        return replace(
+            result,
+            identity_evidence=snapshot.metadata.identity_evidence,
         )
 
     def _browse_rejection(
@@ -1394,6 +1431,14 @@ class QuotaOperations:
             next_cursor=None,
             snapshot_id=None,
             reason=reason,
+            catalog=(self._overlay.metadata if request.query is not None else None),
+            evidence_contract=(
+                QUOTA_QUERY_EVIDENCE_CONTRACT if request.query is not None else None
+            ),
+            inventory_revision=(
+                PROVIDER_INVENTORY_REVISION if request.query is not None else None
+            ),
+            observed_at=(started_at if request.query is not None else None),
         )
         return self._result(
             operation="quota.list",
@@ -1443,6 +1488,10 @@ class QuotaOperations:
             next_cursor=None,
             snapshot_id=None,
             reason=reason,
+            catalog=self._overlay.metadata,
+            evidence_contract=QUOTA_QUERY_EVIDENCE_CONTRACT,
+            inventory_revision=PROVIDER_INVENTORY_REVISION,
+            observed_at=started_at,
         )
         return self._incomplete_result(
             "quota.list",
@@ -1503,17 +1552,22 @@ class QuotaOperations:
             if has_partial_data
             else Completeness.unavailable(*gaps)
         )
+        stop_outcome = _provider_stop_outcome(diagnostics)
+        outcome, exit_class = stop_outcome or (
+            "incomplete-evidence",
+            (
+                ExitClass.INCOMPLETE_EVIDENCE
+                if has_partial_data
+                else ExitClass.OPERATIONAL_FAILURE
+            ),
+        )
         return self._result(
             operation=operation,
             resource_scope=resource_scope,
             boundary=boundary,
             reached=False,
-            outcome="incomplete-evidence",
-            exit_class=(
-                ExitClass.INCOMPLETE_EVIDENCE
-                if has_partial_data
-                else ExitClass.OPERATIONAL_FAILURE
-            ),
+            outcome=outcome,
+            exit_class=exit_class,
             completeness=completeness,
             data=data,
             started_at=started_at,
@@ -1548,6 +1602,18 @@ class QuotaOperations:
             data=data,
             diagnostics=diagnostics,
         )
+
+
+def _provider_stop_outcome(
+    diagnostics: tuple[Diagnostic, ...],
+) -> tuple[str, ExitClass] | None:
+    """Preserve invocation-wide provider stop semantics in operation results."""
+    codes = {diagnostic.code.value for diagnostic in diagnostics}
+    if "provider-read-cancelled" in codes:
+        return "operation-interrupted", ExitClass.INTERRUPTED
+    if "provider-read-deadline-exceeded" in codes:
+        return "operation-deadline-exceeded", ExitClass.TIMEOUT
+    return None
 
 
 def _one_exact_preference(

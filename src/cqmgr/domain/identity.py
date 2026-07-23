@@ -6,6 +6,7 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Self
 
 from cqmgr.domain.diagnostics import (
     Diagnostic,
@@ -264,6 +265,60 @@ class ADCIdentityEvidence:
                     retry=RetryDisposition.AFTER_REFRESH,
                 ),
             ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderIdentityEvidence:
+    """Sanitized acting-principal evidence safe for durable operation results."""
+
+    credential_kind: CredentialKind
+    verification: PrincipalVerification
+    acting_principal: PrincipalIdentity | None
+    impersonation_chain: tuple[PrincipalIdentity, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Retain only coherent, explicitly namespaced public identity facts."""
+        if not isinstance(self.credential_kind, CredentialKind):
+            msg = "provider credential kind must use CredentialKind"
+            raise TypeError(msg)
+        if not isinstance(self.verification, PrincipalVerification):
+            msg = "provider verification must use PrincipalVerification"
+            raise TypeError(msg)
+        if self.acting_principal is not None and not isinstance(
+            self.acting_principal, PrincipalIdentity
+        ):
+            msg = "provider acting principal must use PrincipalIdentity"
+            raise TypeError(msg)
+        if (
+            self.verification is PrincipalVerification.VERIFIED
+            and self.acting_principal is None
+        ):
+            msg = "verified provider identity requires an acting principal"
+            raise ValueError(msg)
+        if not isinstance(self.impersonation_chain, tuple) or any(
+            not isinstance(item, PrincipalIdentity) for item in self.impersonation_chain
+        ):
+            msg = "provider impersonation chain must contain PrincipalIdentity values"
+            raise TypeError(msg)
+        if self.impersonation_chain and (
+            self.acting_principal is None
+            or self.impersonation_chain[-1] != self.acting_principal
+        ):
+            msg = "provider impersonation chain must end at the acting principal"
+            raise ValueError(msg)
+
+    @classmethod
+    def from_adc(cls, evidence: ADCIdentityEvidence) -> Self:
+        """Discard transport, contact, credential, and diagnostic state."""
+        if not isinstance(evidence, ADCIdentityEvidence):
+            msg = "provider identity evidence requires ADCIdentityEvidence"
+            raise TypeError(msg)
+        return cls(
+            credential_kind=evidence.credential_kind,
+            verification=evidence.verification,
+            acting_principal=evidence.acting_principal,
+            impersonation_chain=evidence.impersonation_chain,
         )
 
 

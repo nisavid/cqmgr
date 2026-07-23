@@ -25,6 +25,12 @@ from cqmgr.domain.catalog import (
     CatalogMetadata,
     CatalogPredicates,
 )
+from cqmgr.domain.identity import (
+    CredentialKind,
+    PrincipalIdentity,
+    PrincipalVerification,
+    ProviderIdentityEvidence,
+)
 from cqmgr.domain.quota_queries import (
     QUOTA_QUERY_EVIDENCE_CONTRACT,
     V1_PROVIDER_SERVICES,
@@ -124,6 +130,18 @@ def quota_snapshot(*, complete: bool = True) -> QuotaQuerySnapshot:
             observed_at=datetime(2026, 7, 22, 8, tzinfo=UTC),
             expires_at=datetime(2026, 7, 22, 9, tzinfo=UTC),
             complete=complete,
+            identity_evidence=ProviderIdentityEvidence(
+                credential_kind=CredentialKind.IMPERSONATED,
+                verification=PrincipalVerification.VERIFIED,
+                acting_principal=PrincipalIdentity(
+                    "serviceAccount:quota-reader@example.iam.gserviceaccount.com"
+                ),
+                impersonation_chain=(
+                    PrincipalIdentity(
+                        "serviceAccount:quota-reader@example.iam.gserviceaccount.com"
+                    ),
+                ),
+            ),
             source_coverage=tuple(
                 (
                     ProviderSourceCoverage.complete(
@@ -161,6 +179,7 @@ def _legacy_snapshot_record(
     document["schema"] = schema
     snapshot = document["snapshot"]
     metadata = snapshot["metadata"]
+    metadata.pop("identity_evidence")
     metadata.pop("inventory_revision")
     metadata.pop("source_coverage")
     snapshot.pop("ordered_slice_identities")
@@ -182,6 +201,17 @@ def _legacy_snapshot_record(
     ).encode()
 
 
+def _v3_snapshot_record() -> bytes:
+    """Return canonical bytes matching the retained v3 release shape."""
+    document = json.loads(encode_snapshot_record(quota_snapshot()))
+    document["schema"] = "cqmgr.quota-query-snapshot/v3"
+    document["snapshot"]["metadata"].pop("identity_evidence")
+    return (
+        json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode()
+
+
 @pytest.mark.parametrize("complete", [True, False])
 def test_snapshot_record_round_trips_as_canonical_safe_json(
     complete: bool,  # noqa: FBT001
@@ -195,7 +225,17 @@ def test_snapshot_record_round_trips_as_canonical_safe_json(
     assert encoded == encode_snapshot_record(decode_snapshot_record(encoded))
     assert decode_snapshot_record(encoded) == snapshot
     document = json.loads(encoded)
-    assert document["schema"] == "cqmgr.quota-query-snapshot/v3"
+    assert document["schema"] == "cqmgr.quota-query-snapshot/v4"
+    assert document["snapshot"]["metadata"]["identity_evidence"] == {
+        "acting_principal": (
+            "serviceAccount:quota-reader@example.iam.gserviceaccount.com"
+        ),
+        "credential_kind": "impersonated",
+        "impersonation_chain": [
+            "serviceAccount:quota-reader@example.iam.gserviceaccount.com"
+        ],
+        "verification": "verified",
+    }
     assert document["snapshot"]["metadata"]["inventory_revision"] == (
         "cqmgr.provider-inventory/v1"
     )
@@ -235,10 +275,36 @@ def test_snapshot_decoder_migrates_supported_legacy_snapshot(schema: str) -> Non
     )
     assert decoded.items[0].constraint_sets == (decoded.items[0].constraint_set,)
     migrated = json.loads(encode_snapshot_record(decoded))
-    assert migrated["schema"] == "cqmgr.quota-query-snapshot/v3"
+    assert migrated["schema"] == "cqmgr.quota-query-snapshot/v4"
     assert migrated["snapshot"]["ordered_slice_identities"] == [
         migrated["snapshot"]["items"][0]["identity"]
     ]
+
+
+def test_snapshot_decoder_migrates_supported_v3_snapshot() -> None:
+    """V3 snapshots remain usable without inventing identity evidence."""
+    decoded = decode_snapshot_record(_v3_snapshot_record())
+
+    assert decoded.metadata.identity_evidence is None
+    assert decoded.metadata.query.services == ("compute.googleapis.com",)
+    assert json.loads(encode_snapshot_record(decoded))["schema"] == (
+        "cqmgr.quota-query-snapshot/v4"
+    )
+
+
+def test_v4_snapshot_rejects_verified_identity_without_principal() -> None:
+    """Stored verified identity evidence fails closed when proof is absent."""
+    document = json.loads(encode_snapshot_record(quota_snapshot()))
+    identity_evidence = document["snapshot"]["metadata"]["identity_evidence"]
+    identity_evidence["acting_principal"] = None
+    identity_evidence["impersonation_chain"] = list[str]()
+    encoded = (
+        json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode()
+
+    with pytest.raises(QuotaSnapshotStoredDataError, match="malformed"):
+        decode_snapshot_record(encoded)
 
 
 def test_snapshot_decoder_migrates_supported_legacy_catalog_group() -> None:
@@ -324,7 +390,7 @@ def test_snapshot_decoder_rejects_noncanonical_legacy_bytes() -> None:
 @pytest.mark.parametrize(
     "document",
     [
-        b'{"schema":"cqmgr.quota-query-snapshot/v4"}\n',
+        b'{"schema":"cqmgr.quota-query-snapshot/v5"}\n',
         b'{"schema":"cqmgr.quota-query-snapshot/v0","snapshot":{}}\n',
         b'{"schema":"cqmgr.quota-query-snapshot/v1","unknown":true}\n',
         b"not-json\n",
@@ -336,7 +402,7 @@ def test_snapshot_decoder_rejects_newer_unknown_and_corrupt_state(
     """Stored schema drift and corruption fail closed without partial evidence."""
     expected = (
         UnsupportedQuotaSnapshotSchemaError
-        if b"/v4" in document
+        if b"/v5" in document
         else QuotaSnapshotStoredDataError
     )
     with pytest.raises(expected):

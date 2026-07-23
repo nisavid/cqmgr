@@ -15,7 +15,7 @@ import time
 from contextlib import suppress
 from pathlib import Path
 from threading import Event, Thread
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, Never
 
 from cqmgr.adapters.persistence.locking import InterprocessFileLock
 from cqmgr.application.ports.coordination import (
@@ -26,6 +26,7 @@ from cqmgr.application.ports.coordination import (
     BudgetScope,
     CancellationToken,
     CoordinationDeadlineExceededError,
+    CoordinationUnavailableError,
 )
 from cqmgr.domain.redaction import RedactedText
 
@@ -42,6 +43,21 @@ _BUDGET_KEY_PATTERN: Final = re.compile(
 _BUDGET_STATE_FIELDS: Final = frozenset({"schema", "entries"})
 _BUDGET_ENTRY_FIELDS: Final = frozenset({"window_started_at", "last_seen_at", "used"})
 _BACKGROUND_LEADERS: set[asyncio.Task[None]] = set()
+
+
+class UnavailableBudgetCoordinator:
+    """Budget port used when installation-local coordination cannot be opened."""
+
+    async def acquire(
+        self,
+        request: BudgetRequest,
+        *,
+        deadline: float,
+        cancellation: CancellationToken,
+    ) -> Never:
+        """Report unavailable storage before any provider dispatch."""
+        del request, deadline, cancellation
+        raise CoordinationUnavailableError
 
 
 class _AtomicWriteCommitUnknownError(OSError):
@@ -132,7 +148,10 @@ class SharedBudgetCoordinator:
                 cancellation.raise_if_cancelled()
                 if self._monotonic() >= deadline:
                     raise CoordinationDeadlineExceededError
-                state = self._read_state()
+                try:
+                    state = self._read_state()
+                except (OSError, TypeError, ValueError, RuntimeError) as error:
+                    raise CoordinationUnavailableError from error
                 now = self._wall_clock()
                 entries, wait = self._prospective_entries(state, request, now)
                 if wait is None:

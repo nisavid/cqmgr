@@ -7,20 +7,45 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from collections.abc import Callable
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, override
 
 import click
 
+from cqmgr.adapters.cli.audit import (
+    AuditPresentation,
+    emit_audit_result,
+    parse_audit_query,
+)
 from cqmgr.adapters.cli.group import CanonicalAliasGroup
 from cqmgr.adapters.cli.local import LocalPresentation, emit_local_result
+from cqmgr.adapters.cli.read_only import Presentation, emit_read_only_result
+from cqmgr.adapters.cli.read_only_requests import (
+    parse_cloud_tpu_slice_requirement,
+    parse_compute_instance_requirement,
+    parse_dimensions,
+    parse_read_only_quota_query,
+)
 from cqmgr.application.configuration import (
     InterfaceSettingKey,
     parse_resource_scope_name,
 )
+from cqmgr.application.operations.quotas import QuotaBrowseRequest
+from cqmgr.application.operations.read_only import (
+    QuotaInspectSelector,
+    ReadOnlyScopeInput,
+)
 from cqmgr.application.ports.configuration import ConfigurationRepositoryError
-from cqmgr.bootstrap import InvocationKind, build_local_operations, classify_invocation
+from cqmgr.bootstrap import (
+    InvocationKind,
+    build_audit_operations,
+    build_local_operations,
+    build_quota_cursor_operations,
+    build_read_only_operations,
+    classify_invocation,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Sequence
@@ -33,6 +58,7 @@ _OUTPUT_OPTION = click.option(
     default="human",
     show_default=True,
 )
+_PROVIDER_OPERATION_SECONDS = 60.0
 
 
 def _presentation_options[CommandT: Callable[..., Any]](
@@ -43,10 +69,23 @@ def _presentation_options[CommandT: Callable[..., Any]](
     return click.option("--no-color", is_flag=True)(decorated)
 
 
+def _scope_options[CommandT: Callable[..., Any]](
+    function: CommandT,
+) -> CommandT:
+    """Add explicit project/profile selection to one provider leaf."""
+    decorated = click.option("--profile")(function)
+    return click.option("--resource-scope")(decorated)
+
+
 _CURRENT_INVOCATION_KIND: ContextVar[InvocationKind | None] = ContextVar(
     "cqmgr_invocation_kind",
     default=None,
 )
+
+
+def _interactive_streams() -> tuple[bool, bool]:
+    """Expose one deterministic seam for terminal dispatch policy."""
+    return sys.stdin.isatty(), sys.stdout.isatty()
 
 
 class ClassifiedRootGroup(CanonicalAliasGroup):
@@ -64,10 +103,11 @@ class ClassifiedRootGroup(CanonicalAliasGroup):
     ) -> Any:
         """Preserve raw argv for bootstrap policy across Click dispatch."""
         raw_arguments = tuple(sys.argv[1:] if args is None else args)
+        stdin_is_tty, stdout_is_tty = _interactive_streams()
         invocation_kind = classify_invocation(
             raw_arguments,
-            stdin_is_tty=sys.stdin.isatty(),
-            stdout_is_tty=sys.stdout.isatty(),
+            stdin_is_tty=stdin_is_tty,
+            stdout_is_tty=stdout_is_tty,
         )
         token = _CURRENT_INVOCATION_KIND.set(invocation_kind)
         try:
@@ -108,6 +148,70 @@ def _run(
     asyncio.run(_run_async(operations, operation_name, callback, presentation))
 
 
+async def _run_audit_async(
+    callback: Callable[[], Awaitable[Any]],
+    presentation: AuditPresentation,
+) -> None:
+    """Emit one audit result at the shared async application boundary."""
+    result = await callback()
+    exit_class = emit_audit_result(result, presentation)
+    if exit_class:
+        raise click.exceptions.Exit(exit_class)
+
+
+def _run_audit(
+    callback: Callable[[], Awaitable[Any]],
+    presentation: AuditPresentation,
+) -> None:
+    """Enter the local audit application boundary from Click."""
+    asyncio.run(_run_audit_async(callback, presentation))
+
+
+async def _run_read_only_async(
+    callback: Callable[[], Awaitable[Any]],
+    presentation: Presentation,
+    shutdown: Callable[[], Awaitable[None]] | None = None,
+) -> None:
+    """Emit one read-only result at the shared async application boundary."""
+    try:
+        result = await callback()
+    finally:
+        if shutdown is not None:
+            await shutdown()
+    exit_class = emit_read_only_result(result, presentation)
+    if exit_class:
+        raise click.exceptions.Exit(exit_class)
+
+
+def _run_read_only(
+    callback: Callable[[], Awaitable[Any]],
+    presentation: Presentation,
+    shutdown: Callable[[], Awaitable[None]] | None = None,
+) -> None:
+    """Enter the provider-scoped read-only application boundary from Click."""
+    asyncio.run(_run_read_only_async(callback, presentation, shutdown))
+
+
+def _read_only_scope_input(
+    resource_scope: str | None,
+    profile: str | None,
+) -> ReadOnlyScopeInput:
+    """Decode only explicit scope inputs without consulting ambient state."""
+    return ReadOnlyScopeInput(
+        explicit_resource_scope=(
+            parse_resource_scope_name(resource_scope)
+            if resource_scope is not None
+            else None
+        ),
+        explicit_profile=profile,
+    )
+
+
+def _provider_deadline() -> float:
+    """Return one finite caller-controlled monotonic provider deadline."""
+    return time.monotonic() + _PROVIDER_OPERATION_SECONDS
+
+
 @click.group(
     cls=ClassifiedRootGroup,
     name="cqmgr",
@@ -137,7 +241,8 @@ def main(context: click.Context) -> None:
 @main.command()
 def tui() -> None:
     """Open the interactive quota inspector."""
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
+    stdin_is_tty, stdout_is_tty = _interactive_streams()
+    if not stdin_is_tty or not stdout_is_tty:
         message = "tui requires interactive input and output"
         raise click.UsageError(message)
     from cqmgr.tui import run  # noqa: PLC0415
@@ -307,4 +412,390 @@ def config_set(
             value=value == "true",
         ),
         LocalPresentation(output, no_color, quiet),
+    )
+
+
+@main.group(cls=CanonicalAliasGroup)
+def quota() -> None:
+    """Inspect effective quota and resolve workload requirements."""
+
+
+@quota.command(name="list")
+@_presentation_options
+@click.option("--cursor")
+@click.option("--limit", type=click.IntRange(1, 1000), default=100, show_default=True)
+@click.option("--sort", multiple=True)
+@click.option("--effective-confirmation", multiple=True)
+@click.option("--grant-satisfaction", multiple=True)
+@click.option("--reconciliation", multiple=True)
+@click.option("--mutable", type=click.Choice(("true", "false")))
+@click.option("--guided", type=click.Choice(("true", "false")))
+@click.option("--cataloged", type=click.Choice(("true", "false")))
+@click.option("--quota-pool", multiple=True)
+@click.option("--quota-scope", multiple=True)
+@click.option("--location", multiple=True)
+@click.option("--accelerator", multiple=True)
+@click.option("--catalog-group", multiple=True)
+@click.option("--service", multiple=True)
+@click.option("--text")
+@_scope_options
+@_OUTPUT_OPTION
+def quota_list(  # noqa: PLR0913
+    output: str,
+    resource_scope: str | None,
+    profile: str | None,
+    text: str | None,
+    service: tuple[str, ...],
+    catalog_group: tuple[str, ...],
+    accelerator: tuple[str, ...],
+    location: tuple[str, ...],
+    quota_scope: tuple[str, ...],
+    quota_pool: tuple[str, ...],
+    cataloged: str | None,
+    guided: str | None,
+    mutable: str | None,
+    reconciliation: tuple[str, ...],
+    grant_satisfaction: tuple[str, ...],
+    effective_confirmation: tuple[str, ...],
+    sort: tuple[str, ...],
+    limit: int,
+    cursor: str | None,
+    no_color: bool,
+    quiet: bool,
+) -> None:
+    """List one bounded logical query over the fixed V1 provider inventory."""
+    presentation = Presentation(output, no_color, quiet)
+    has_explicit_query = any(
+        (
+            resource_scope,
+            profile,
+            text,
+            service,
+            catalog_group,
+            accelerator,
+            location,
+            quota_scope,
+            quota_pool,
+            cataloged,
+            guided,
+            mutable,
+            reconciliation,
+            grant_satisfaction,
+            effective_confirmation,
+            sort,
+        )
+    )
+    if cursor is not None and not has_explicit_query:
+        cursor_operations = build_quota_cursor_operations()
+        _run_read_only(
+            lambda: cursor_operations.browse(
+                QuotaBrowseRequest(cursor=cursor, limit=limit)
+            ),
+            presentation,
+        )
+        return
+    operations = build_read_only_operations()
+    try:
+        scope_input = _read_only_scope_input(resource_scope, profile)
+        query = parse_read_only_quota_query(
+            services=service,
+            catalog_groups=catalog_group,
+            accelerators=accelerator,
+            locations=location,
+            quota_scopes=quota_scope,
+            quota_pools=quota_pool,
+            cataloged=cataloged,
+            guided=guided,
+            mutable=mutable,
+            reconciliations=reconciliation,
+            grant_satisfactions=grant_satisfaction,
+            effective_confirmations=effective_confirmation,
+            text=text,
+            sorts=sort,
+        )
+    except (TypeError, ValueError) as error:
+        reason = str(error)
+        _run_read_only(
+            lambda: operations.browse_usage_failure(reason),
+            presentation,
+            operations.aclose,
+        )
+        return
+    _run_read_only(
+        lambda: operations.browse(
+            query,
+            cursor=cursor,
+            limit=limit,
+            deadline=_provider_deadline(),
+            scope_input=scope_input,
+        ),
+        presentation,
+        operations.aclose,
+    )
+
+
+@quota.command(name="inspect")
+@_presentation_options
+@click.option("--dimension", multiple=True)
+@click.option("--location", required=True)
+@click.option("--quota-id", required=True)
+@click.option("--service", required=True)
+@_scope_options
+@_OUTPUT_OPTION
+def quota_inspect(  # noqa: PLR0913
+    output: str,
+    resource_scope: str | None,
+    profile: str | None,
+    service: str,
+    quota_id: str,
+    location: str,
+    dimension: tuple[str, ...],
+    no_color: bool,
+    quiet: bool,
+) -> None:
+    """Inspect one exact effective quota slice."""
+    operations = build_read_only_operations()
+    presentation = Presentation(output, no_color, quiet)
+    try:
+        scope_input = _read_only_scope_input(resource_scope, profile)
+        selector = QuotaInspectSelector(
+            service,
+            quota_id,
+            location,
+            parse_dimensions(dimension),
+        )
+    except (TypeError, ValueError) as error:
+        reason = str(error)
+        _run_read_only(
+            lambda: operations.inspect_usage_failure(reason),
+            presentation,
+            operations.aclose,
+        )
+        return
+    _run_read_only(
+        lambda: operations.inspect(
+            selector,
+            deadline=_provider_deadline(),
+            scope_input=scope_input,
+        ),
+        presentation,
+        operations.aclose,
+    )
+
+
+@quota.group(cls=CanonicalAliasGroup)
+def resolve() -> None:
+    """Resolve a complete workload shape to per-location quota constraints."""
+
+
+def _location_options[CommandT: Callable[..., Any]](
+    function: CommandT,
+) -> CommandT:
+    """Add the two mutually exclusive workload location modes."""
+    decorated = click.option("--all-compatible-locations", is_flag=True)(function)
+    return click.option("--candidate", multiple=True)(decorated)
+
+
+@resolve.command(name="compute-instance")
+@_presentation_options
+@_location_options
+@click.option(
+    "--provisioning-model",
+    required=True,
+    type=click.Choice(("standard", "spot", "flex-start", "reservation-bound")),
+)
+@click.option("--instance-count", required=True)
+@click.option("--machine-type", required=True)
+@_scope_options
+@_OUTPUT_OPTION
+def resolve_compute_instance(  # noqa: PLR0913
+    output: str,
+    resource_scope: str | None,
+    profile: str | None,
+    machine_type: str,
+    instance_count: str,
+    provisioning_model: str,
+    candidate: tuple[str, ...],
+    all_compatible_locations: bool,
+    no_color: bool,
+    quiet: bool,
+) -> None:
+    """Resolve one Compute instance shape without making a capacity claim."""
+    operations = build_read_only_operations()
+    presentation = Presentation(output, no_color, quiet)
+    try:
+        scope_input = _read_only_scope_input(resource_scope, profile)
+        requirement = parse_compute_instance_requirement(
+            machine_type=machine_type,
+            instance_count=instance_count,
+            provisioning_model=provisioning_model,
+            locations=candidate,
+            all_compatible=all_compatible_locations,
+        )
+    except (TypeError, ValueError) as error:
+        reason = str(error)
+        _run_read_only(
+            lambda: operations.resolve_usage_failure(reason),
+            presentation,
+            operations.aclose,
+        )
+        return
+    _run_read_only(
+        lambda: operations.resolve(
+            requirement,
+            deadline=_provider_deadline(),
+            scope_input=scope_input,
+        ),
+        presentation,
+        operations.aclose,
+    )
+
+
+@resolve.command(name="cloud-tpu-slice")
+@_presentation_options
+@_location_options
+@click.option(
+    "--provisioning-model",
+    required=True,
+    type=click.Choice(("standard", "spot", "flex-start", "reservation-bound")),
+)
+@click.option("--slice-count", required=True)
+@click.option("--runtime-version", required=True)
+@click.option("--topology", required=True)
+@click.option("--accelerator-type", required=True)
+@_scope_options
+@_OUTPUT_OPTION
+def resolve_cloud_tpu_slice(  # noqa: PLR0913
+    output: str,
+    resource_scope: str | None,
+    profile: str | None,
+    accelerator_type: str,
+    topology: str,
+    runtime_version: str,
+    slice_count: str,
+    provisioning_model: str,
+    candidate: tuple[str, ...],
+    all_compatible_locations: bool,
+    no_color: bool,
+    quiet: bool,
+) -> None:
+    """Resolve one legacy Cloud TPU slice without making a capacity claim."""
+    operations = build_read_only_operations()
+    presentation = Presentation(output, no_color, quiet)
+    try:
+        scope_input = _read_only_scope_input(resource_scope, profile)
+        requirement = parse_cloud_tpu_slice_requirement(
+            accelerator_type=accelerator_type,
+            topology=topology,
+            runtime_version=runtime_version,
+            slice_count=slice_count,
+            provisioning_model=provisioning_model,
+            locations=candidate,
+            all_compatible=all_compatible_locations,
+        )
+    except (TypeError, ValueError) as error:
+        reason = str(error)
+        _run_read_only(
+            lambda: operations.resolve_usage_failure(reason),
+            presentation,
+            operations.aclose,
+        )
+        return
+    _run_read_only(
+        lambda: operations.resolve(
+            requirement,
+            deadline=_provider_deadline(),
+            scope_input=scope_input,
+        ),
+        presentation,
+        operations.aclose,
+    )
+
+
+@main.group(cls=CanonicalAliasGroup)
+def audit() -> None:
+    """Read and verify installation-local retained audit evidence."""
+
+
+@audit.command(name="list")
+@_presentation_options
+@click.option("--cursor")
+@click.option("--limit", type=click.IntRange(1, 1000), default=100, show_default=True)
+@click.option("--until")
+@click.option("--since")
+@click.option("--outcome", multiple=True)
+@click.option("--operation", multiple=True)
+@_OUTPUT_OPTION
+def audit_list(  # noqa: PLR0913
+    output: str,
+    operation: tuple[str, ...],
+    outcome: tuple[str, ...],
+    since: str | None,
+    until: str | None,
+    limit: int,
+    cursor: str | None,
+    no_color: bool,
+    quiet: bool,
+) -> None:
+    """List one bounded page of local audit records."""
+    presentation = AuditPresentation(output, no_color, quiet)
+    try:
+        query = parse_audit_query(
+            operations=operation,
+            outcomes=outcome,
+            since=since,
+            until=until,
+            limit=limit,
+            cursor=cursor,
+        )
+    except (TypeError, ValueError) as error:
+        operations = build_audit_operations()
+        reason = str(error)
+        _run_audit(
+            lambda: operations.list_usage_failure(reason),
+            presentation,
+        )
+        return
+    operations = build_audit_operations()
+    _run_audit(lambda: operations.list(query), presentation)
+
+
+@audit.command(name="inspect")
+@_presentation_options
+@click.argument("record_id")
+@_OUTPUT_OPTION
+def audit_inspect(
+    output: str,
+    record_id: str,
+    no_color: bool,
+    quiet: bool,
+) -> None:
+    """Inspect one exact retained local audit record."""
+    operations = build_audit_operations()
+    _run_audit(
+        lambda: operations.inspect(record_id),
+        AuditPresentation(output, no_color, quiet),
+    )
+
+
+@audit.command(name="verify")
+@_presentation_options
+@click.option("--through", "through_record_id")
+@click.option("--from", "from_record_id")
+@_OUTPUT_OPTION
+def audit_verify(
+    output: str,
+    from_record_id: str | None,
+    through_record_id: str | None,
+    no_color: bool,
+    quiet: bool,
+) -> None:
+    """Verify the complete retained chain or one explicit range."""
+    operations = build_audit_operations()
+    _run_audit(
+        lambda: operations.verify(
+            from_record_id=from_record_id,
+            through_record_id=through_record_id,
+        ),
+        AuditPresentation(output, no_color, quiet),
     )

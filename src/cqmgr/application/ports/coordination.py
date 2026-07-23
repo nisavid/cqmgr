@@ -23,6 +23,10 @@ class CoordinationDeadlineExceededError(Exception):
     """The caller deadline cannot accommodate the requested local work."""
 
 
+class CoordinationUnavailableError(Exception):
+    """Installation-local coordination storage is unavailable."""
+
+
 class CancellationToken:
     """One explicit thread-safe cancellation signal shared by application work."""
 
