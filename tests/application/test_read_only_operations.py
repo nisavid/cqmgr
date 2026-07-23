@@ -358,6 +358,18 @@ def identity(*, available: bool = True) -> ADCIdentityEvidence:
     )
 
 
+def identity_diagnostic() -> Diagnostic:
+    """Build one safe non-fatal provider-context diagnostic."""
+    return Diagnostic(
+        DiagnosticCode("identity-principal-unverified"),
+        Severity.WARNING,
+        DiagnosticPhase("identity-resolution"),
+        DiagnosticSource("application-default-credentials"),
+        RetryDisposition.AFTER_REFRESH,
+        RedactedText("Refresh identity evidence to verify the principal."),
+    )
+
+
 def result[DataT](
     operation: str,
     data: DataT,
@@ -517,6 +529,7 @@ def test_all_compatible_obtainability_reuses_provider_context_and_resolver() -> 
     obtainability = RecordingObtainabilityOperations()
     facade, *_ = service(
         selection=SelectionState(direct_resource_scope=scope("123456789")),
+        adc_identity=replace(identity(), diagnostics=(identity_diagnostic(),)),
         workloads=workload_operations,
         obtainability=obtainability,
     )
@@ -532,10 +545,136 @@ def test_all_compatible_obtainability_reuses_provider_context_and_resolver() -> 
     )
 
     assert returned.outcome.exit_class is ExitClass.SUCCESS
+    assert tuple(item.code.value for item in returned.diagnostics) == (
+        "identity-principal-unverified",
+    )
     assert len(workload_operations.requests) == 1
     comparison_request = obtainability.requests[0]
     assert comparison_request.candidates[0].zones == ("us-central1-a",)  # type: ignore[attr-defined]
     assert comparison_request.resolver_provenance is resolved  # type: ignore[attr-defined]
+
+
+def test_all_compatible_unconfigured_result_preserves_context_diagnostics() -> None:
+    """An unavailable obtainability adapter retains provider-context evidence."""
+    resolved = _resolved_spot_workload()
+    assert isinstance(resolved.requirement, ComputeInstanceRequirement)
+    facade, *_ = service(
+        selection=SelectionState(direct_resource_scope=scope("123456789")),
+        adc_identity=replace(identity(), diagnostics=(identity_diagnostic(),)),
+    )
+
+    returned = asyncio.run(
+        facade.compare_obtainability_all_compatible(
+            resolved.requirement,
+            machine=SpotMachineConfiguration("a3-highgpu-8g"),
+            distribution_shape=DistributionShape.ANY,
+            deadline=42.5,
+            support=AdviceSupport(),
+        )
+    )
+
+    assert returned.outcome.code.value == "spot-advice-unavailable"
+    assert tuple(item.code.value for item in returned.diagnostics) == (
+        "identity-principal-unverified",
+    )
+
+
+def test_all_compatible_resolution_failure_merges_context_diagnostics() -> None:
+    """Resolver failures retain both provider-context and resolver diagnostics."""
+    resolved = _resolved_spot_workload()
+    assert isinstance(resolved.requirement, ComputeInstanceRequirement)
+    resolver_diagnostic = Diagnostic(
+        DiagnosticCode("catalog-incomplete"),
+        Severity.ERROR,
+        DiagnosticPhase("workload-resolution"),
+        DiagnosticSource("compute"),
+        RetryDisposition.AFTER_REFRESH,
+        RedactedText("Refresh the provider catalog and retry."),
+    )
+    failed = replace(
+        result("quota.resolve", None, resource_scope=scope("123456789")),
+        outcome=Outcome(
+            StableSymbol("incomplete-evidence"),
+            ExitClass.INCOMPLETE_EVIDENCE,
+        ),
+        boundary=OperationBoundary(
+            StableSymbol("workload-resolved"),
+            reached=False,
+        ),
+        completeness=Completeness.incomplete(
+            EvidenceGap(
+                StableSymbol("compute-catalog"),
+                StableSymbol("required-evidence-unavailable"),
+            )
+        ),
+        diagnostics=(resolver_diagnostic,),
+    )
+    facade, *_ = service(
+        selection=SelectionState(direct_resource_scope=scope("123456789")),
+        adc_identity=replace(identity(), diagnostics=(identity_diagnostic(),)),
+        workloads=RecordingWorkloadOperations(failed),
+        obtainability=RecordingObtainabilityOperations(),
+    )
+
+    returned = asyncio.run(
+        facade.compare_obtainability_all_compatible(
+            resolved.requirement,
+            machine=SpotMachineConfiguration("a3-highgpu-8g"),
+            distribution_shape=DistributionShape.ANY,
+            deadline=42.5,
+            support=AdviceSupport(),
+        )
+    )
+
+    assert tuple(item.code.value for item in returned.diagnostics) == (
+        "identity-principal-unverified",
+        "catalog-incomplete",
+    )
+
+
+def test_all_compatible_empty_expansion_merges_context_diagnostics() -> None:
+    """A complete empty expansion retains provider-context and resolver evidence."""
+    resolved = _resolved_spot_workload()
+    assert isinstance(resolved.requirement, ComputeInstanceRequirement)
+    empty = replace(resolved, locations=())
+    resolver_diagnostic = Diagnostic(
+        DiagnosticCode("no-compatible-locations"),
+        Severity.WARNING,
+        DiagnosticPhase("workload-resolution"),
+        DiagnosticSource("compute"),
+        RetryDisposition.NEVER,
+        RedactedText("No covered location matched the workload."),
+    )
+    resolved_result = replace(
+        result(
+            "quota.resolve",
+            empty,
+            resource_scope=scope("123456789"),
+        ),
+        diagnostics=(resolver_diagnostic,),
+    )
+    facade, *_ = service(
+        selection=SelectionState(direct_resource_scope=scope("123456789")),
+        adc_identity=replace(identity(), diagnostics=(identity_diagnostic(),)),
+        workloads=RecordingWorkloadOperations(resolved_result),
+        obtainability=RecordingObtainabilityOperations(),
+    )
+
+    returned = asyncio.run(
+        facade.compare_obtainability_all_compatible(
+            resolved.requirement,
+            machine=SpotMachineConfiguration("a3-highgpu-8g"),
+            distribution_shape=DistributionShape.ANY,
+            deadline=42.5,
+            support=AdviceSupport(),
+        )
+    )
+
+    assert returned.outcome.code.value == "spot-advice-no-compatible-locations"
+    assert tuple(item.code.value for item in returned.diagnostics) == (
+        "identity-principal-unverified",
+        "no-compatible-locations",
+    )
 
 
 def test_browse_resolves_selected_project_and_builds_bounded_provider_context() -> None:

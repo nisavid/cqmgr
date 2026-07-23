@@ -343,29 +343,33 @@ class ReadOnlyOperations:
         context, _ = prepared
         operations = self._obtainability
         if operations is None:
-            return self._failure(
-                operation="obtainability.compare",
-                boundary="spot-advice-assessed",
-                outcome="spot-advice-unavailable",
-                exit_class=ExitClass.OPERATIONAL_FAILURE,
-                resource_scope=context.project.resource_scope,
-                identity_evidence=ProviderIdentityEvidence.from_adc(context.identity),
+            return _with_provider_identity(
+                self._failure(
+                    operation="obtainability.compare",
+                    boundary="spot-advice-assessed",
+                    outcome="spot-advice-unavailable",
+                    exit_class=ExitClass.OPERATIONAL_FAILURE,
+                    resource_scope=context.project.resource_scope,
+                ),
+                context,
             )
         resolved_result = await self._workloads.resolve(
             QuotaResolveRequest(context, requirement)
         )
         resolved = resolved_result.data
         if not isinstance(resolved, ResolvedWorkloadRequirement):
-            return self._failure(
-                operation="obtainability.compare",
-                boundary="spot-advice-assessed",
-                outcome="spot-advice-resolution-failed",
-                exit_class=resolved_result.outcome.exit_class,
-                resource_scope=context.project.resource_scope,
-                completeness=resolved_result.completeness,
-                diagnostics=resolved_result.diagnostics,
-                reason="workload resolution did not produce compatible evidence",
-                identity_evidence=ProviderIdentityEvidence.from_adc(context.identity),
+            return _with_provider_identity(
+                self._failure(
+                    operation="obtainability.compare",
+                    boundary="spot-advice-assessed",
+                    outcome="spot-advice-resolution-failed",
+                    exit_class=resolved_result.outcome.exit_class,
+                    resource_scope=context.project.resource_scope,
+                    completeness=resolved_result.completeness,
+                    diagnostics=resolved_result.diagnostics,
+                    reason="workload resolution did not produce compatible evidence",
+                ),
+                context,
             )
         try:
             candidates = candidates_from_resolved_workload(
@@ -374,27 +378,29 @@ class ReadOnlyOperations:
                 distribution_shape=distribution_shape,
             )
         except ValueError:
-            return OperationResult(
-                operation=OperationName("obtainability.compare"),
-                resource_scope=context.project.resource_scope,
-                boundary=OperationBoundary(
-                    StableSymbol("spot-advice-assessed"),
-                    reached=False,
+            return _with_provider_identity(
+                OperationResult(
+                    operation=OperationName("obtainability.compare"),
+                    resource_scope=context.project.resource_scope,
+                    boundary=OperationBoundary(
+                        StableSymbol("spot-advice-assessed"),
+                        reached=False,
+                    ),
+                    outcome=Outcome(
+                        StableSymbol("spot-advice-no-compatible-locations"),
+                        ExitClass.REJECTED_PRECONDITION,
+                    ),
+                    completeness=resolved_result.completeness,
+                    started_at=resolved_result.started_at,
+                    finished_at=resolved_result.finished_at,
+                    data=ObtainabilityComparison(
+                        (),
+                        resolver_provenance=resolved,
+                    ),
+                    diagnostics=resolved_result.diagnostics,
+                    provenance=resolved_result.provenance,
                 ),
-                outcome=Outcome(
-                    StableSymbol("spot-advice-no-compatible-locations"),
-                    ExitClass.REJECTED_PRECONDITION,
-                ),
-                completeness=resolved_result.completeness,
-                started_at=resolved_result.started_at,
-                finished_at=resolved_result.finished_at,
-                data=ObtainabilityComparison(
-                    (),
-                    resolver_provenance=resolved,
-                ),
-                diagnostics=resolved_result.diagnostics,
-                provenance=resolved_result.provenance,
-                identity_evidence=ProviderIdentityEvidence.from_adc(context.identity),
+                context,
             )
         delegated = await operations.compare(
             ObtainabilityCompareRequest(

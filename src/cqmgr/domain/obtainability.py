@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
+from datetime import timedelta
 from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -371,7 +372,8 @@ class ObtainabilityProductCoverage:
         ):
             msg = "product coverage reasons must be non-empty strings"
             raise TypeError(msg)
-        if self.cataloged and not self.current_advice_supported and not self.reasons:
+        unsupported = not self.current_advice_supported or not self.history_supported
+        if self.cataloged and unsupported and not self.reasons:
             msg = "unsupported cataloged products require an exact coverage reason"
             raise ValueError(msg)
 
@@ -431,7 +433,7 @@ def rank_candidates(
     )
 
 
-def _assess(  # noqa: PLR0912 - each evidence gap remains independently visible
+def _assess(  # noqa: C901, PLR0912 - evidence gaps remain independently visible
     candidate: ObtainabilityCandidate,
     advice: CapacityAdvice | None,
     history: CapacityHistory | None,
@@ -445,14 +447,15 @@ def _assess(  # noqa: PLR0912 - each evidence gap remains independently visible
     p90: Decimal | None = None
     current_total: Decimal | None = None
     if candidate.machine.is_n1_attached_gpu:
-        reasons.append(UnrankedReason.HISTORY_UNSUPPORTED_N1_GPU)
+        if UnrankedReason.HISTORY_UNSUPPORTED_N1_GPU not in reasons:
+            reasons.append(UnrankedReason.HISTORY_UNSUPPORTED_N1_GPU)
     elif history is None:
         if UnrankedReason.HISTORY_UNSUPPORTED not in reasons:
             reasons.append(UnrankedReason.HISTORY_UNAVAILABLE)
     else:
         if not history.preemption_attributable:
             reasons.append(UnrankedReason.PREEMPTION_NON_ATTRIBUTABLE)
-        elif len(history.preemption) != _DAY_COUNT:
+        elif not _complete_preemption_window(history.preemption):
             reasons.append(UnrankedReason.PREEMPTION_WINDOW_INCOMPLETE)
         else:
             p90 = sorted(item.rate for item in history.preemption)[
@@ -495,6 +498,19 @@ def _band_weight(band: ObtainabilityBand | None) -> int:
         ObtainabilityBand.LOW: 1,
         None: 0,
     }[band]
+
+
+def _complete_preemption_window(
+    intervals: tuple[PreemptionInterval, ...],
+) -> bool:
+    """Require 30 ordered, exactly contiguous provider daily intervals."""
+    if len(intervals) != _DAY_COUNT:
+        return False
+    return all(
+        item.finished_at - item.started_at == timedelta(days=1)
+        and (index == 0 or intervals[index - 1].finished_at == item.started_at)
+        for index, item in enumerate(intervals)
+    )
 
 
 def _require_interval(started_at: datetime, finished_at: datetime) -> None:
