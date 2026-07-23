@@ -1,0 +1,14 @@
+layout=medium
+workspace=quotas
+scope=projects/123456789
+scope-lock=unlocked
+principal=unavailable
+outcome=provider-read-failed
+complete=no
+status=PROVIDER-READ-FAILED — exit 9; evidence incomplete
+coverage=Provider coverage: awaiting read
+detail=Quota inspector unavailable
+Reason: provider-read-failed
+ERROR provider-read-failed: The quota inventory could not be read; retry after backoff. (retry: after-backoff)
+No provider mutation was attempted.
+audit=Select a retained record to inspect its exact chain facts.

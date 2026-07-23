@@ -1,0 +1,19 @@
+layout=medium
+workspace=quotas
+scope=projects/123456789
+scope-lock=unlocked
+principal=unavailable
+outcome=succeeded
+complete=yes
+copy-cli=cqmgr quota resolve compute-instance --resource-scope projects/123456789 --machine-type a3-highgpu-8g --instance-count 1 --provisioning-model spot --candidate us-central1-a --output human
+status=COMPLETE — operation boundary reached
+coverage=Provider coverage:  compute.googleapis.com: complete (1/1 pages)  tpu.googleapis.com: complete (1/1 pages)  Aggregate completeness: complete
+detail=Workload resolution
+Outcome: succeeded
+Complete: yes
+Requirement: compute-instance
+Location: us-central1-a
+Disposition: incompatible
+Permits: unavailable
+Reason: unsupported-compatibility
+audit=Select a retained record to inspect its exact chain facts.
