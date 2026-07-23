@@ -63,7 +63,7 @@ class CapacityAdviceJsonClient(Protocol):
         timeout_seconds: float,
     ) -> Mapping[str, object]:
         """POST one current advice request."""
-        ...
+        raise NotImplementedError
 
     async def capacity_history(
         self,
@@ -74,7 +74,7 @@ class CapacityAdviceJsonClient(Protocol):
         timeout_seconds: float,
     ) -> Mapping[str, object]:
         """POST one history request."""
-        ...
+        raise NotImplementedError
 
 
 class JsonCapacityAdviceClient:

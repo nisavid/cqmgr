@@ -13,6 +13,7 @@ from requests import HTTPError
 
 from cqmgr.adapters.google.read_policy import GoogleReadPolicy
 from cqmgr.adapters.google.spot_advice import (
+    CapacityAdviceJsonClient,
     GoogleCapacityAdviceReader,
     GoogleCapacityHistoryReader,
     JsonCapacityAdviceClient,
@@ -40,6 +41,34 @@ from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "google"
 NOW = datetime(2026, 7, 23, 12, tzinfo=UTC)
+
+
+class MissingJsonClient(CapacityAdviceJsonClient):
+    """Exercise the protocol's fail-closed inherited defaults."""
+
+
+def test_json_client_protocol_defaults_fail_closed() -> None:
+    """An explicit implementation cannot silently inherit ellipsis results."""
+    client = MissingJsonClient()
+
+    with pytest.raises(NotImplementedError):
+        asyncio.run(
+            client.capacity(
+                project="public-schema-project",
+                region="us-central1",
+                body={},
+                timeout_seconds=1.0,
+            )
+        )
+    with pytest.raises(NotImplementedError):
+        asyncio.run(
+            client.capacity_history(
+                project="public-schema-project",
+                region="us-central1",
+                body={},
+                timeout_seconds=1.0,
+            )
+        )
 
 
 class RecordingBudget:

@@ -17,6 +17,12 @@ from cqmgr.application.operations.obtainability import (
     candidates_from_resolved_workload,
 )
 from cqmgr.application.ports.coordination import CancellationToken
+from cqmgr.application.ports.obtainability import (
+    CapacityAdviceReader,
+    CapacityAdviceReadRequest,
+    CapacityHistoryReader,
+    CapacityHistoryReadRequest,
+)
 from cqmgr.application.ports.provider_reads import ProviderReadContext
 from cqmgr.domain.accelerator_overlay import (
     AllCompatibleLocations,
@@ -72,6 +78,30 @@ from cqmgr.domain.results import ExitClass
 from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 
 NOW = datetime(2026, 7, 23, 12, tzinfo=UTC)
+
+
+class MissingAdviceReader(CapacityAdviceReader):
+    """Exercise the current-advice port's fail-closed inherited default."""
+
+
+class MissingHistoryReader(CapacityHistoryReader):
+    """Exercise the history port's fail-closed inherited default."""
+
+
+def test_obtainability_reader_protocol_defaults_fail_closed() -> None:
+    """Explicit implementations cannot silently inherit ellipsis results."""
+    with pytest.raises(NotImplementedError):
+        asyncio.run(
+            MissingAdviceReader().read(
+                cast("CapacityAdviceReadRequest", object()),
+            )
+        )
+    with pytest.raises(NotImplementedError):
+        asyncio.run(
+            MissingHistoryReader().read(
+                cast("CapacityHistoryReadRequest", object()),
+            )
+        )
 
 
 def _context() -> ProviderReadContext:

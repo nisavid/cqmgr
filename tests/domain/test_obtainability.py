@@ -1,7 +1,8 @@
 """Behavioral contract for transparent Spot obtainability comparisons."""
 
-# ruff: noqa: FBT003, PT007
+from __future__ import annotations
 
+# ruff: noqa: FBT003, PT007
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, cast
@@ -29,6 +30,14 @@ if TYPE_CHECKING:
     from cqmgr.domain.accelerator_overlay import ResolvedWorkloadRequirement
 
 _OBSERVED_AT = datetime(2026, 7, 23, 12, tzinfo=UTC)
+
+
+def _invalid_ranked_candidates() -> tuple[RankedCandidate, ...]:
+    return cast("tuple[RankedCandidate, ...]", ("bad",))
+
+
+def _invalid_resolver_provenance() -> ResolvedWorkloadRequirement:
+    return cast("ResolvedWorkloadRequirement", "bad")
 
 
 def test_rank_uses_band_nearest_rank_p90_and_current_total_request_price() -> None:
@@ -275,15 +284,13 @@ def test_missing_and_non_attributable_components_have_exact_unranked_reasons() -
             TypeError,
         ),
         (
-            lambda: ObtainabilityComparison(
-                cast("tuple[RankedCandidate, ...]", ("bad",))
-            ),
+            lambda: ObtainabilityComparison(_invalid_ranked_candidates()),
             TypeError,
         ),
         (
             lambda: ObtainabilityComparison(
                 (),
-                resolver_provenance=cast("ResolvedWorkloadRequirement", "bad"),
+                resolver_provenance=_invalid_resolver_provenance(),
             ),
             TypeError,
         ),
