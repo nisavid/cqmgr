@@ -346,3 +346,104 @@ def test_rank_retains_distinct_non_attributable_and_incomplete_price_reasons() -
         UnrankedReason.PREEMPTION_NON_ATTRIBUTABLE,
         UnrankedReason.PRICE_INCOMPLETE_MACHINE,
     )
+
+
+@pytest.mark.parametrize("mutation", ["gap", "overlap", "duplicate", "out-of-order"])
+def test_preemption_window_requires_ordered_exactly_contiguous_daily_intervals(
+    mutation: str,
+) -> None:
+    """Thirty rates are incomplete when their daily interval sequence is invalid."""
+    candidate = ObtainabilityCandidate(
+        "us-central1",
+        (),
+        SpotMachineConfiguration("n2-standard-4"),
+        1,
+        DistributionShape.ANY,
+    )
+    intervals = [
+        PreemptionInterval(
+            _OBSERVED_AT - timedelta(days=30 - index),
+            _OBSERVED_AT - timedelta(days=29 - index),
+            Decimal("0.1"),
+        )
+        for index in range(30)
+    ]
+    if mutation == "gap":
+        intervals[10] = PreemptionInterval(
+            intervals[10].started_at + timedelta(hours=1),
+            intervals[10].finished_at + timedelta(hours=1),
+            intervals[10].rate,
+        )
+    elif mutation == "overlap":
+        intervals[10] = PreemptionInterval(
+            intervals[10].started_at - timedelta(hours=1),
+            intervals[10].finished_at - timedelta(hours=1),
+            intervals[10].rate,
+        )
+    elif mutation == "duplicate":
+        intervals[10] = intervals[9]
+    else:
+        intervals[9], intervals[10] = intervals[10], intervals[9]
+    history = CapacityHistory(
+        "n2-standard-4",
+        "us-central1",
+        tuple(intervals),
+        (
+            PriceInterval(
+                _OBSERVED_AT - timedelta(days=1),
+                _OBSERVED_AT + timedelta(days=1),
+                Decimal(1),
+            ),
+        ),
+        _OBSERVED_AT,
+    )
+
+    ranked = rank_candidates(
+        (
+            (
+                candidate,
+                CapacityAdvice(Decimal("0.8"), "3600s", (), _OBSERVED_AT),
+                history,
+            ),
+        )
+    )
+
+    assert ranked[0].preemption_p90 is None
+    assert UnrankedReason.PREEMPTION_WINDOW_INCOMPLETE in ranked[0].unranked_reasons
+
+
+def test_cataloged_product_requires_reason_for_history_only_unsupported() -> None:
+    """Catalog visibility explains independently unsupported history evidence."""
+    with pytest.raises(ValueError, match="exact coverage reason"):
+        ObtainabilityProductCoverage(
+            "n1-attached-gpu",
+            "compute.googleapis.com",
+            cataloged=True,
+            current_advice_supported=True,
+            history_supported=False,
+        )
+
+
+def test_n1_gpu_forced_history_reason_is_not_duplicated() -> None:
+    """Automatic N1 coverage logic preserves one stable unranked reason."""
+    candidate = ObtainabilityCandidate(
+        "us-central1",
+        (),
+        SpotMachineConfiguration(
+            "n1-standard-16",
+            GpuAttachment("nvidia-tesla-t4", 1),
+        ),
+        1,
+        DistributionShape.ANY,
+    )
+
+    ranked = rank_candidates(
+        ((candidate, None, None),),
+        forced_reasons={
+            candidate.candidate_id: (UnrankedReason.HISTORY_UNSUPPORTED_N1_GPU,)
+        },
+    )
+
+    assert (
+        ranked[0].unranked_reasons.count(UnrankedReason.HISTORY_UNSUPPORTED_N1_GPU) == 1
+    )

@@ -125,4 +125,4 @@ def test_obtainability_json_output_preserves_exact_decimal_and_request_identity(
     assert candidate["advice"]["obtainability"] == "0.8"
     assert candidate["preemption_p90"] == "0.27"
     assert candidate["total_request_hourly_price_usd"] == "5.00"
-    assert candidate["no_capacity_guarantee"] is True
+    assert mapping["data"]["no_capacity_guarantee"] is True

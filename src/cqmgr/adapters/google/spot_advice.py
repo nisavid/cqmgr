@@ -8,7 +8,9 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Protocol, cast
 
+from google.api_core import exceptions as google_exceptions
 from google.auth.transport.requests import AuthorizedSession
+from requests import HTTPError
 
 from cqmgr.domain.diagnostics import (
     Diagnostic,
@@ -39,6 +41,8 @@ if TYPE_CHECKING:
     )
 
 _PROVIDER = "compute-spot-advice"
+_HTTP_UNAUTHORIZED = 401
+_HTTP_FORBIDDEN = 403
 _CAPACITY_SOURCE = (
     "https://cloud.google.com/compute/docs/reference/rest/beta/advice/capacity"
 )
@@ -133,7 +137,31 @@ class OfficialCapacityAdviceJsonClient:
     ) -> Mapping[str, object]:
         def dispatch() -> Mapping[str, object]:
             response = self._session.post(url, json=body, timeout=timeout_seconds)
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except HTTPError as error:
+                error_response = (
+                    error.response if error.response is not None else response
+                )
+                status_code = error_response.status_code
+                msg = f"Compute advice request failed with HTTP {status_code}."
+                if status_code == _HTTP_UNAUTHORIZED:
+                    translated = google_exceptions.Unauthenticated(
+                        msg,
+                        response=error_response,
+                    )
+                elif status_code == _HTTP_FORBIDDEN:
+                    translated = google_exceptions.PermissionDenied(
+                        msg,
+                        response=error_response,
+                    )
+                else:
+                    translated = google_exceptions.from_http_status(
+                        status_code,
+                        msg,
+                        response=error_response,
+                    )
+                raise translated from error
             value = response.json()
             if not isinstance(value, dict):
                 msg = "Compute advice response must contain a JSON object"

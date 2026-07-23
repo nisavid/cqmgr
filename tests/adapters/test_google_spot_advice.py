@@ -9,6 +9,7 @@ from typing import override
 
 import pytest
 from google.api_core import exceptions as google_exceptions
+from requests import HTTPError
 
 from cqmgr.adapters.google.read_policy import GoogleReadPolicy
 from cqmgr.adapters.google.spot_advice import (
@@ -421,8 +422,15 @@ def test_invalid_history_field_shapes_return_incomplete_evidence(
 class FakeResponse:
     """Expose one successful public JSON response."""
 
+    def __init__(self, status_code: int = 200) -> None:
+        """Retain one public HTTP status."""
+        self.status_code = status_code
+
     def raise_for_status(self) -> None:
-        """Model a successful HTTP status."""
+        """Raise requests' transport error for a non-success status."""
+        if self.status_code >= 400:
+            msg = f"HTTP {self.status_code}"
+            raise HTTPError(msg, response=self)  # type: ignore[arg-type]
 
     def json(self) -> dict[str, object]:
         """Return a minimal object response."""
@@ -432,10 +440,11 @@ class FakeResponse:
 class FakeSession:
     """Record official REST transport calls without network access."""
 
-    def __init__(self) -> None:
-        """Initialize the call ledger."""
+    def __init__(self, statuses: tuple[int, ...] = ()) -> None:
+        """Initialize the call ledger and scripted HTTP statuses."""
         self.calls: list[tuple[str, dict[str, object], float]] = []
         self.closed = False
+        self.statuses = list(statuses)
 
     def post(
         self,
@@ -446,7 +455,8 @@ class FakeSession:
     ) -> FakeResponse:
         """Record one finite-timeout POST."""
         self.calls.append((url, json, timeout))
-        return FakeResponse()
+        status = self.statuses.pop(0) if self.statuses else 200
+        return FakeResponse(status)
 
     def close(self) -> None:
         """Record transport cleanup."""
@@ -481,3 +491,38 @@ def test_official_json_client_uses_beta_routes_and_closes_session() -> None:
     assert session.calls[0][0].endswith("/advice/capacity")
     assert session.calls[1][0].endswith("/advice/capacityHistory")
     assert session.closed
+
+
+def test_official_permission_response_becomes_typed_advice_diagnostic() -> None:
+    """HTTP permission failure is normalized through the shared Google policy."""
+    client = object.__new__(OfficialCapacityAdviceJsonClient)
+    object.__setattr__(client, "_session", FakeSession((403,)))
+    reader = GoogleCapacityAdviceReader(client, _policy(), clock=lambda: NOW)
+
+    result = asyncio.run(
+        reader.read(CapacityAdviceReadRequest(_context(), _candidate()))
+    )
+
+    assert not result.complete
+    assert result.diagnostics[0].code.value == "provider-read-authorization-failed"
+
+
+def test_official_transient_response_becomes_typed_history_diagnostic() -> None:
+    """HTTP service failure is normalized through the shared Google policy."""
+    client = object.__new__(OfficialCapacityAdviceJsonClient)
+    object.__setattr__(client, "_session", FakeSession((503,)))
+    reader = GoogleCapacityHistoryReader(client, _policy(), clock=lambda: NOW)
+
+    result = asyncio.run(
+        reader.read(
+            CapacityHistoryReadRequest(
+                _context(),
+                _candidate(),
+                "us-central1",
+                include_price=True,
+            )
+        )
+    )
+
+    assert not result.complete
+    assert result.diagnostics[0].code.value == "provider-read-transient-failure"
