@@ -497,7 +497,7 @@ class ReadOnlyOperations:
             )
         return configuration, selection, resolution.resource_scope
 
-    async def _provider_context(  # noqa: PLR0911 - each typed setup gate returns
+    async def _provider_context(  # noqa: C901, PLR0911 - typed setup gates return
         self,
         *,
         operation: str,
@@ -534,11 +534,20 @@ class ReadOnlyOperations:
         if isinstance(local, OperationResult):
             return local
         configuration, selection, resource_scope = local
-        adc_quota_project = _adc_quota_project(
-            configuration,
-            selection,
-            scope_input,
-        )
+        try:
+            adc_quota_project = _adc_quota_project(
+                configuration,
+                selection,
+                scope_input,
+            )
+        except ConfigurationError as error:
+            return self._failure(
+                operation=operation,
+                boundary=boundary,
+                outcome=_configuration_outcome(error),
+                exit_class=ExitClass.REJECTED_PRECONDITION,
+                resource_scope=resource_scope,
+            )
         try:
             identity = await _await_provider_setup(
                 lambda: self._identity.resolve(
