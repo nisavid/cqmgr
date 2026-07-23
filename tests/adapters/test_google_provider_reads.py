@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Thread
@@ -41,6 +42,23 @@ from cqmgr.application.ports.provider_reads import (
     ProviderReadContext,
     QuotaPreferenceReadRequest,
     UsageReadRequest,
+)
+from cqmgr.domain.accelerator_overlay import (
+    MAINTAINED_ACCELERATOR_OVERLAY,
+    CandidateLocations,
+    ComputeInstanceRequirement,
+    ProvisioningModel,
+    WorkloadCatalogEvidence,
+    WorkloadLocationDisposition,
+)
+from cqmgr.domain.catalog import (
+    AcceleratorAttachment,
+    CatalogEvidenceSource,
+    CatalogLocationCoverage,
+    ComputeAcceleratorType,
+    ComputeMachineType,
+    LocationCoverageExpectation,
+    LocationCoverageState,
 )
 from cqmgr.domain.identity import ADCIdentityEvidence, ADCQuotaProject, CredentialKind
 from cqmgr.domain.projects import CanonicalProject
@@ -356,8 +374,10 @@ def _monitoring_page() -> TimeSeriesPage:
     return TimeSeriesPage(tuple(items), cast("str", raw["nextPageToken"]))
 
 
-def test_effective_quota_reader_preserves_pages_values_and_unknown_scope() -> None:
-    """All public-schema QuotaInfo slices normalize without global-path inference."""
+def test_effective_quota_reader_preserves_pages_values_and_explicit_global_scope() -> (
+    None
+):
+    """An explicit global applicable location normalizes to global quota scope."""
     budget = RecordingBudget()
     client = FakeCloudQuotasPages(info_pages=_quota_info_pages())
     reader = GoogleEffectiveQuotaReader(
@@ -372,7 +392,7 @@ def test_effective_quota_reader_preserves_pages_values_and_unknown_scope() -> No
     assert result.coverage.pages_completed == TWO
     assert [value.identity.quota_scope for value in result.values] == [
         QuotaScope.REGIONAL,
-        QuotaScope.UNKNOWN,
+        QuotaScope.GLOBAL,
     ]
     assert result.values[0].effective_value.value == 2**63 - 1
     assert result.values[0].container_type.raw == "CONTAINER_TYPE_UNSPECIFIED"
@@ -381,6 +401,72 @@ def test_effective_quota_reader_preserves_pages_values_and_unknown_scope() -> No
     assert client.calls[1][2] == "public-page-2"
     assert len(budget.requests) == TWO
     assert budget.requests[0].adc_quota_project is not None
+
+
+def test_effective_quota_reader_output_resolves_maintained_gpu_companions() -> None:
+    """Normalized provider evidence matches both maintained GPU constraints."""
+    result = asyncio.run(
+        GoogleEffectiveQuotaReader(
+            FakeCloudQuotasPages(info_pages=_quota_info_pages()),
+            _policy(RecordingBudget()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(EffectiveQuotaReadRequest(_context(), "compute.googleapis.com"))
+    )
+    catalog = WorkloadCatalogEvidence(
+        compute_machine_types=(
+            ComputeMachineType(
+                "a3-highgpu-8g",
+                "us-central1-a",
+                (AcceleratorAttachment("nvidia-h100-80gb", 8),),
+                None,
+            ),
+        ),
+        tpu_locations=(),
+        tpu_accelerator_types=(),
+        tpu_runtime_versions=(),
+        coverage=(
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+                "us-central1-a",
+                LocationCoverageExpectation.REQUESTED,
+                LocationCoverageState.SUCCESS,
+            ),
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+                "us-central1-a",
+                LocationCoverageExpectation.REQUESTED,
+                LocationCoverageState.SUCCESS,
+            ),
+        ),
+        compute_accelerator_types=(
+            ComputeAcceleratorType("nvidia-h100-80gb", "us-central1-a", None),
+        ),
+    )
+    requirement = ComputeInstanceRequirement(
+        machine_type="a3-highgpu-8g",
+        instance_count=1,
+        provisioning_model=ProvisioningModel.STANDARD,
+        locations=CandidateLocations(("us-central1-a",)),
+    )
+
+    resolved = MAINTAINED_ACCELERATOR_OVERLAY.resolve(
+        requirement,
+        (
+            result.values[0],
+            replace(result.values[1], eligibility=result.values[0].eligibility),
+        ),
+        catalog,
+    )
+
+    location = resolved.locations[0]
+    assert location.disposition is WorkloadLocationDisposition.COMPATIBLE
+    assert tuple(
+        item.identity.quota_id for item in location.constraint_requirements
+    ) == (
+        "GPUS-ALL-REGIONS-per-project",
+        "GPUS-PER-GPU-FAMILY-per-project-region",
+    )
 
 
 def test_official_cloud_quotas_wrapper_uses_one_page_and_disables_retry() -> None:

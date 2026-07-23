@@ -820,6 +820,54 @@ def test_compute_all_compatible_honors_global_empty_accelerator_catalog() -> Non
     )
 
 
+def test_compute_global_empty_fails_closed_when_accelerator_values_exist() -> None:
+    """Contradictory global-empty coverage cannot hide a discovered declaration."""
+    requirement = ComputeInstanceRequirement(
+        machine_type="a4-highgpu-8g",
+        instance_count=1,
+        provisioning_model=ProvisioningModel.STANDARD,
+        locations=AllCompatibleLocations(),
+    )
+    catalog = WorkloadCatalogEvidence(
+        compute_machine_types=(
+            ComputeMachineType(
+                "a4-highgpu-8g",
+                "us-central1-a",
+                (AcceleratorAttachment("nvidia-b200", 8),),
+                None,
+            ),
+        ),
+        tpu_locations=(),
+        tpu_accelerator_types=(),
+        tpu_runtime_versions=(),
+        coverage=(
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+                "us-central1-a",
+                LocationCoverageExpectation.EXPECTED,
+                LocationCoverageState.SUCCESS,
+            ),
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+                "global",
+                LocationCoverageExpectation.EXPECTED,
+                LocationCoverageState.EMPTY,
+            ),
+        ),
+        compute_accelerator_types=(
+            ComputeAcceleratorType("nvidia-b200", "us-central1-a", None),
+        ),
+    )
+
+    result = MAINTAINED_ACCELERATOR_OVERLAY.resolve(requirement, (), catalog)
+
+    assert result.all_compatible_locations_exhaustive is False
+    location = result.locations[0]
+    assert location.disposition is WorkloadLocationDisposition.INCOMPLETE
+    assert location.failure_reason is not None
+    assert location.failure_reason.value == "missing-location-evidence"
+
+
 def test_cloud_tpu_all_compatible_requires_every_location_subsource() -> None:
     """TPU enumeration is not exhaustive when runtime coverage is incomplete."""
     gap = Diagnostic(
