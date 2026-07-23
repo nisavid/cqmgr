@@ -309,15 +309,17 @@ These requirements are hard gates rather than interface guidance:
     identity and current etag; new preferences use a deterministic identity.
     Children dispatch in accelerator-first order with canonical exact-slice
     identity as the final tie-breaker. Apply stops at the first conclusively
-    `failed` or transport-`unknown` child, preserves preceding `accepted`
+    `failed` child or any `unknown` child, preserves preceding `accepted`
     children, and marks later children `unattempted`. Multiple or conflicting
-    matches fail closed. Transport uncertainty is reconciled by reading the
-    child identity and is never retried blindly.
-12. **Write-ahead audit.** Preview evidence and the complete ordered pre-Apply
-    intent are appended and fsynced before success or provider dispatch. Each
-    child dispatch decision and outcome and the aggregate terminal result are
-    appended and fsynced. A missing durable outcome becomes a critical unknown
-    result with every available child reconciliation identity preserved.
+    matches fail closed. Transport or persistence uncertainty is reconciled by
+    reading the child identity and is never retried blindly.
+12. **Write-ahead audit.** Preview evidence is appended and fsynced before
+    Preview succeeds. After complete revalidation, Apply separately appends and
+    fsyncs the complete ordered pre-Apply intent before crossing the consumption
+    barrier or making a provider call. Each child dispatch decision and outcome
+    and the aggregate terminal result are appended and fsynced. A missing
+    durable outcome becomes a critical unknown result with every available child
+    reconciliation identity preserved.
 
 The product never exposes a generic provider write port to CLI or TUI code.
 Read and mutation ports remain separate even when one generated client backs

@@ -165,8 +165,10 @@ can satisfy the filters; coverage and completeness are then scoped explicitly
 to that queried provider set. The interface accepts `compute` and `tpu` as
 service-selector shorthand, but query identity, result data, persistence,
 audit, plans, and copied commands use the canonical full service DNS names.
-Filtering never suppresses unknown provider-declared hardware within a queried
-provider. V1 does not enumerate enabled services through Service Usage.
+Service and catalog-group provider pruning never suppresses unknown
+provider-declared hardware within a queried provider. Public semantic filters
+such as cataloged, guided, and mutable may exclude rows through their declared
+predicates. V1 does not enumerate enabled services through Service Usage.
 
 The Compute adapter exhausts `acceleratorTypes.aggregatedList` and
 `machineTypes.aggregatedList`, requests partial-success behavior, and retains

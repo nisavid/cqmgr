@@ -225,9 +225,9 @@ scenarios include:
 - a crash between consumption-marker creation and the ledger consumption
   transition leaves the plan consumed and quarantined rather than reusable after
   lease expiry;
-- recovery resumes only children without a persisted dispatch intent, while a
-  dispatch intent without a terminal outcome becomes durable `unknown` and is
-  never automatically re-dispatched;
+- recovery resumes only a child without a persisted dispatch intent when every
+  prior outcome is durably accepted, while a dispatch intent without a terminal
+  outcome becomes durable `unknown` and is never automatically re-dispatched;
 - a conclusively failed child stops dispatch, retains prior accepted children,
   marks later children unattempted, and performs no rollback;
 - an ambiguous dispatch is `unknown`, consumes and quarantines the plan, stops
@@ -236,9 +236,9 @@ scenarios include:
 - every dispatched child has one durable pre-intent and one durable terminal
   outcome or critical unknown record; and
 - Watch selects both single and bundle Apply records through the shared
-  `intent_id`, emits only material child or aggregate changes, reaches a bundle
-  condition only when every accepted child does, and emits exactly one terminal
-  operation result.
+  `intent_id`, emits one initial authoritative subject observation followed only
+  by material child or aggregate changes, reaches a bundle condition only when
+  every accepted child does, and emits exactly one terminal operation result.
 
 ### Provider adapter contracts
 
