@@ -258,6 +258,26 @@ def test_snapshot_decoder_migrates_supported_legacy_catalog_group() -> None:
     assert decoded.items[0].catalog_groups == (CatalogGroupId.COMPUTE_ACCELERATORS,)
 
 
+def test_snapshot_decoder_accepts_canonical_legacy_filter_order() -> None:
+    """Migration normalizes query identity without rejecting legacy array order."""
+    document = json.loads(_legacy_snapshot_record("cqmgr.quota-query-snapshot/v2"))
+    document["snapshot"]["metadata"]["query"]["filters"]["locations"] = [
+        "us-west1-a",
+        "us-central1-a",
+    ]
+    encoded = (
+        json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode()
+
+    decoded = decode_snapshot_record(encoded)
+
+    assert decoded.metadata.query.filters.locations == (
+        "us-central1-a",
+        "us-west1-a",
+    )
+
+
 @pytest.mark.parametrize(
     ("source_kind", "source_value"),
     [
