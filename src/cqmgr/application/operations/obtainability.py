@@ -171,19 +171,12 @@ class ObtainabilityOperations:
                 )
                 if not advice_read.complete:
                     missing_sources.append("compute-capacity-advice")
-                advice_authorization_failed = any(
-                    item.code.value == "provider-read-authorization-failed"
-                    for item in advice_read.diagnostics
-                )
             else:
                 advice = None
                 reasons.append(UnrankedReason.CURRENT_ADVICE_UNSUPPORTED)
-                advice_authorization_failed = False
 
             history: CapacityHistory | None
-            if advice_authorization_failed:
-                history = None
-            elif not request.support.history_supported:
+            if not request.support.history_supported:
                 history = None
                 reasons.append(UnrankedReason.HISTORY_UNSUPPORTED)
             elif candidate.machine.is_n1_attached_gpu:
