@@ -41,7 +41,7 @@ class CapacityAdviceReader(Protocol):
         request: CapacityAdviceReadRequest,
     ) -> ProviderRead[CapacityAdvice]:
         """Return normalized current advice without provider DTOs."""
-        ...
+        raise NotImplementedError
 
 
 class CapacityHistoryReader(Protocol):
@@ -52,4 +52,4 @@ class CapacityHistoryReader(Protocol):
         request: CapacityHistoryReadRequest,
     ) -> ProviderRead[CapacityHistory]:
         """Return normalized history without provider DTOs."""
-        ...
+        raise NotImplementedError

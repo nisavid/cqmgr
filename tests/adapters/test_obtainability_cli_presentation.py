@@ -1,11 +1,12 @@
 """Human and structured Spot obtainability presentation contracts."""
 
-# ruff: noqa: PLR2004
+from __future__ import annotations
 
+# ruff: noqa: PLR2004
 import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from cqmgr.adapters.cli.read_only import Presentation, emit_read_only_result
 from cqmgr.domain.obtainability import (
@@ -89,7 +90,7 @@ def _result() -> OperationResult[ObtainabilityComparison]:
 
 
 def test_obtainability_human_output_keeps_identity_derivations_and_disclaimer(
-    capsys: object,
+    capsys: CaptureFixture[str],
 ) -> None:
     """Human output exposes every rank component and avoids a capacity claim."""
     emit_read_only_result(
@@ -97,7 +98,7 @@ def test_obtainability_human_output_keeps_identity_derivations_and_disclaimer(
         Presentation("human", no_color=True, quiet=False),
     )
 
-    output = cast("CaptureFixture[str]", capsys).readouterr().out
+    output = capsys.readouterr().out
     assert "Candidate endpoint region: us-central1" in output
     assert "Candidate zones: us-central1-a" in output
     assert "Machine type: a3-highgpu-8g" in output
@@ -109,7 +110,7 @@ def test_obtainability_human_output_keeps_identity_derivations_and_disclaimer(
 
 
 def test_obtainability_json_output_preserves_exact_decimal_and_request_identity(
-    capsys: object,
+    capsys: CaptureFixture[str],
 ) -> None:
     """Structured output derives from the same typed result without float coercion."""
     emit_read_only_result(
@@ -117,7 +118,7 @@ def test_obtainability_json_output_preserves_exact_decimal_and_request_identity(
         Presentation("json", no_color=True, quiet=False),
     )
 
-    output = cast("CaptureFixture[str]", capsys).readouterr().out
+    output = capsys.readouterr().out
     mapping = json.loads(output)
     candidate = mapping["data"]["candidates"][0]
     assert candidate["candidate"]["vm_count"] == 4
