@@ -176,7 +176,7 @@ def _unresolved_location(location: str) -> ResolvedWorkloadLocation:
 
 def test_workload_inputs_expose_stable_discriminators_and_ordered_candidates() -> None:
     """Public workload-first shapes retain exact selection and kind semantics."""
-    locations = CandidateLocations(("us-east1-b", "us-central1-a"))
+    locations = CandidateLocations(("us-east1", "us-central1-a"))
     compute = ComputeInstanceRequirement(
         machine_type="a4-highgpu-8g",
         instance_count=2,
@@ -192,7 +192,7 @@ def test_workload_inputs_expose_stable_discriminators_and_ordered_candidates() -
         locations=AllCompatibleLocations(),
     )
 
-    assert locations.values == ("us-east1-b", "us-central1-a")
+    assert locations.values == ("us-east1", "us-central1-a")
     assert locations.mode is LocationSelectionMode.CANDIDATES
     assert compute.kind is WorkloadKind.COMPUTE_INSTANCE
     assert tpu.kind is WorkloadKind.CLOUD_TPU_SLICE
@@ -202,11 +202,11 @@ def test_workload_inputs_expose_stable_discriminators_and_ordered_candidates() -
 @pytest.mark.parametrize(
     ("values", "message"),
     [
-        ((), "canonical zones"),
-        (["us-central1-a"], "canonical zones"),
-        (("global",), "canonical zones"),
-        (("us-central1",), "canonical zones"),
-        (("US-central1-a",), "canonical zones"),
+        ((), "canonical regions or zones"),
+        (["us-central1-a"], "canonical regions or zones"),
+        (("global",), "canonical regions or zones"),
+        (("us-central",), "canonical regions or zones"),
+        (("US-central1-a",), "canonical regions or zones"),
         (("us-central1-a", "us-central1-a"), "unique"),
     ],
 )
@@ -645,9 +645,9 @@ def test_resolved_requirement_preserves_candidate_order_and_coverage_semantics()
         machine_type="a4-highgpu-8g",
         instance_count=1,
         provisioning_model=ProvisioningModel.STANDARD,
-        locations=CandidateLocations(("us-east1-b", "us-central1-a")),
+        locations=CandidateLocations(("us-east1", "us-central1-a")),
     )
-    east = _unresolved_location("us-east1-b")
+    east = _unresolved_location("us-east1")
     central = _unresolved_location("us-central1-a")
     result = ResolvedWorkloadRequirement(candidates, (east, central), None)
 

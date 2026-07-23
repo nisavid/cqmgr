@@ -201,6 +201,128 @@ def test_compute_instance_derives_attachment_consumers_and_each_candidate() -> N
     )
 
 
+def test_compute_region_candidate_requires_consistent_child_zone_evidence() -> None:
+    """A region resolves without choosing a zone when every child proves one shape."""
+    requirement = ComputeInstanceRequirement(
+        machine_type="a4-highgpu-8g",
+        instance_count=2,
+        provisioning_model=ProvisioningModel.STANDARD,
+        locations=CandidateLocations(("us-central1", "us-central1-a")),
+    )
+    zones = ("us-central1-a", "us-central1-b")
+    catalog = WorkloadCatalogEvidence(
+        compute_machine_types=tuple(
+            ComputeMachineType(
+                "a4-highgpu-8g",
+                zone,
+                (AcceleratorAttachment("nvidia-b200", 8),),
+                None,
+            )
+            for zone in zones
+        ),
+        tpu_locations=(),
+        tpu_accelerator_types=(),
+        tpu_runtime_versions=(),
+        coverage=tuple(
+            coverage
+            for zone in zones
+            for coverage in (
+                CatalogLocationCoverage(
+                    CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+                    zone,
+                    LocationCoverageExpectation.REQUESTED,
+                    LocationCoverageState.SUCCESS,
+                ),
+                CatalogLocationCoverage(
+                    CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+                    zone,
+                    LocationCoverageExpectation.REQUESTED,
+                    LocationCoverageState.SUCCESS,
+                ),
+            )
+        ),
+        compute_accelerator_types=tuple(
+            ComputeAcceleratorType("nvidia-b200", zone, None) for zone in zones
+        ),
+    )
+    quotas = (
+        _quota(
+            "GPUS-PER-GPU-FAMILY-per-project-region",
+            dimensions=(("gpu_family", "NVIDIA_B200"), ("region", "us-central1")),
+            scope=QuotaScope.REGIONAL,
+        ),
+        _quota("GPUS-ALL-REGIONS-per-project", dimensions=(), scope=QuotaScope.GLOBAL),
+    )
+
+    result = MAINTAINED_ACCELERATOR_OVERLAY.resolve(requirement, quotas, catalog)
+
+    assert tuple(item.location for item in result.locations) == (
+        "us-central1",
+        "us-central1-a",
+    )
+    assert result.locations[0].disposition is WorkloadLocationDisposition.COMPATIBLE
+    assert result.locations[1].disposition is WorkloadLocationDisposition.COMPATIBLE
+    assert result.locations[0].deployable_accelerator_quantity == DEPLOYABLE_QUANTITY
+    assert tuple(item.location for item in result.locations[0].coverage) == (
+        "us-central1-a",
+        "us-central1-a",
+        "us-central1-b",
+        "us-central1-b",
+    )
+
+
+def test_compute_region_candidate_fails_closed_on_conflicting_child_shapes() -> None:
+    """Different child-zone quantities cannot be hidden behind one region result."""
+    requirement = ComputeInstanceRequirement(
+        machine_type="a4-highgpu-8g",
+        instance_count=1,
+        provisioning_model=ProvisioningModel.STANDARD,
+        locations=CandidateLocations(("us-central1",)),
+    )
+    zones_and_counts = (("us-central1-a", 8), ("us-central1-b", 4))
+    catalog = WorkloadCatalogEvidence(
+        compute_machine_types=tuple(
+            ComputeMachineType(
+                "a4-highgpu-8g",
+                zone,
+                (AcceleratorAttachment("nvidia-b200", count),),
+                None,
+            )
+            for zone, count in zones_and_counts
+        ),
+        tpu_locations=(),
+        tpu_accelerator_types=(),
+        tpu_runtime_versions=(),
+        coverage=tuple(
+            coverage
+            for zone, _count in zones_and_counts
+            for coverage in (
+                CatalogLocationCoverage(
+                    CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+                    zone,
+                    LocationCoverageExpectation.REQUESTED,
+                    LocationCoverageState.SUCCESS,
+                ),
+                CatalogLocationCoverage(
+                    CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+                    zone,
+                    LocationCoverageExpectation.REQUESTED,
+                    LocationCoverageState.SUCCESS,
+                ),
+            )
+        ),
+        compute_accelerator_types=tuple(
+            ComputeAcceleratorType("nvidia-b200", zone, None)
+            for zone, _count in zones_and_counts
+        ),
+    )
+
+    result = MAINTAINED_ACCELERATOR_OVERLAY.resolve(requirement, (), catalog)
+
+    assert result.locations[0].location == "us-central1"
+    assert result.locations[0].disposition is WorkloadLocationDisposition.AMBIGUOUS
+
+
 def test_compute_instance_derives_an_independent_instance_count_companion() -> None:
     """A companion uses its own workload basis and native-unit conversion."""
     source = "https://docs.cloud.google.com/compute/resource-usage"

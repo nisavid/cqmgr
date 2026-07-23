@@ -113,13 +113,13 @@ class CandidateLocations:
     values: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        """Require one or more unique canonical zones."""
+        """Require one or more unique canonical regions or zones."""
         if (
             not isinstance(self.values, tuple)
             or not self.values
-            or any(not _is_canonical_zone(value) for value in self.values)
+            or any(not _is_canonical_region_or_zone(value) for value in self.values)
         ):
-            msg = "candidate locations must contain canonical zones"
+            msg = "candidate locations must contain canonical regions or zones"
             raise ValueError(msg)
         if len(set(self.values)) != len(self.values):
             msg = "candidate locations must be unique"
@@ -529,7 +529,7 @@ class ResolvedWorkloadLocation:
 
     def __post_init__(self) -> None:  # noqa: C901, PLR0912
         """Keep successful facts complete and failures explicit."""
-        _require_canonical_zone(self.location, "resolved location")
+        _require_canonical_region_or_zone(self.location, "resolved location")
         if not isinstance(self.disposition, WorkloadLocationDisposition):
             msg = "location disposition must be WorkloadLocationDisposition"
             raise TypeError(msg)
@@ -1135,7 +1135,7 @@ class SemanticAcceleratorOverlay:
                     "The catalog mapping lacks exact native-unit conversion evidence.",
                 )
             quota_location = (
-                location.rsplit("-", maxsplit=1)[0]
+                _compute_quota_region(location)
                 if isinstance(requirement, ComputeInstanceRequirement)
                 else location
             )
@@ -1328,6 +1328,16 @@ def _location_coverage(
         CatalogEvidenceSource.TPU_ACCELERATOR_TYPES,
         CatalogEvidenceSource.TPU_RUNTIME_VERSIONS,
     )
+    if _is_canonical_region(location):
+        return tuple(
+            item
+            for item in catalog.coverage
+            if item.source in sources
+            and (
+                item.location in {"global", location}
+                or _zone_belongs_to_region(item.location, location)
+            )
+        )
     return tuple(
         item
         for item in catalog.coverage
@@ -1339,6 +1349,20 @@ def _compute_location_coverage(
     catalog: WorkloadCatalogEvidence,
     location: str,
 ) -> tuple[CatalogLocationCoverage, ...]:
+    if _is_canonical_region(location):
+        return tuple(
+            item
+            for item in catalog.coverage
+            if item.source
+            in (
+                CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+                CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+            )
+            and (
+                item.location == "global"
+                or _zone_belongs_to_region(item.location, location)
+            )
+        )
     exact_accelerator_records = tuple(
         item
         for item in catalog.coverage
@@ -1394,7 +1418,7 @@ def _compute_global_empty_is_authoritative(
     )
 
 
-def _derive_workload_facts(  # noqa: C901, PLR0912
+def _derive_workload_facts(  # noqa: C901
     mappings: tuple[OverlayMapping, ...],
     requirement: ModernWorkloadRequirement,
     location: str,
@@ -1407,67 +1431,36 @@ def _derive_workload_facts(  # noqa: C901, PLR0912
                 ResolutionFailureReason.MISSING_LOCATION_EVIDENCE,
                 "Compute accelerator evidence is internally inconsistent.",
             )
-        required_sources = (
-            CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
-            CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+        if _is_canonical_region(location):
+            return _derive_compute_region_facts(
+                mappings,
+                requirement,
+                location,
+                catalog,
+            )
+        return _derive_compute_zone_facts(mappings, requirement, location, catalog)
+    if _is_canonical_region(location):
+        inventory_records = tuple(
+            item
+            for item in _location_coverage(requirement, location, catalog)
+            if item.source is CatalogEvidenceSource.TPU_LOCATIONS
         )
-        records = _compute_location_coverage(catalog, location)
+        child_locations = {
+            item.location for item in inventory_records if item.location != "global"
+        }
         if (
-            len(records) != len(required_sources)
-            or {item.source for item in records} != set(required_sources)
-            or any(not item.complete for item in records)
+            not inventory_records
+            or any(not item.complete for item in inventory_records)
+            or any(
+                sum(item.location == child for item in inventory_records) != 1
+                for child in child_locations
+            )
         ):
             raise WorkloadResolutionError(
                 ResolutionFailureReason.MISSING_LOCATION_EVIDENCE,
-                "Compute accelerator and machine evidence is incomplete "
-                "for this location.",
+                "Cloud TPU location evidence is incomplete for this region.",
             )
-        if any(item.state is not LocationCoverageState.SUCCESS for item in records):
-            _unsupported_compatibility()
-        machines = tuple(
-            machine
-            for machine in catalog.compute_machine_types
-            if machine.name == requirement.machine_type and machine.zone == location
-        )
-        if len(machines) > 1:
-            raise WorkloadResolutionError(
-                ResolutionFailureReason.AMBIGUOUS,
-                "Multiple machine-shape records match this location.",
-            )
-        if not machines:
-            _unsupported_compatibility()
-        machine = machines[0]
-        if machine.lifecycle is not None and (
-            machine.lifecycle.known
-            not in {CatalogLifecycle.ACTIVE, CatalogLifecycle.DEPRECATED}
-        ):
-            _unsupported_compatibility()
-        candidates = tuple(
-            (mapping, attachment, declaration)
-            for attachment in machine.guest_accelerators
-            for declaration in catalog.compute_accelerator_types
-            for mapping in mappings
-            if declaration.name == attachment.accelerator_type
-            and declaration.zone == location
-            and (
-                declaration.lifecycle is None
-                or declaration.lifecycle.known
-                in {CatalogLifecycle.ACTIVE, CatalogLifecycle.DEPRECATED}
-            )
-            and mapping.management_plane is ManagementPlane.COMPUTE
-            and requirement.machine_type in mapping.machine_types
-            and attachment.accelerator_type in mapping.provider_accelerator_types
-            and requirement.provisioning_model in mapping.provisioning_models
-        )
-        if len(candidates) > 1:
-            raise WorkloadResolutionError(
-                ResolutionFailureReason.AMBIGUOUS,
-                "Machine-shape evidence maps to multiple accelerator semantics.",
-            )
-        if not candidates:
-            _unsupported_compatibility()
-        mapping, attachment, _declaration = candidates[0]
-        return mapping, attachment.count * requirement.instance_count
+        _unsupported_compatibility()
     required_sources = (
         CatalogEvidenceSource.TPU_LOCATIONS,
         CatalogEvidenceSource.TPU_ACCELERATOR_TYPES,
@@ -1532,6 +1525,137 @@ def _derive_workload_facts(  # noqa: C901, PLR0912
         _unsupported_compatibility()
     mapping = mapping_candidates[0]
     return mapping, mapping.accelerator_counts[0] * requirement.slice_count
+
+
+def _derive_compute_region_facts(
+    mappings: tuple[OverlayMapping, ...],
+    requirement: ComputeInstanceRequirement,
+    region: str,
+    catalog: WorkloadCatalogEvidence,
+) -> tuple[OverlayMapping, int]:
+    """Resolve a region only when every covered child proves identical facts."""
+    records = _compute_location_coverage(catalog, region)
+    global_records = tuple(item for item in records if item.location == "global")
+    if any(not item.complete for item in global_records):
+        raise WorkloadResolutionError(
+            ResolutionFailureReason.MISSING_LOCATION_EVIDENCE,
+            "Compute catalog evidence is incomplete for this region.",
+        )
+    if _compute_global_empty_is_authoritative(catalog):
+        _unsupported_compatibility()
+    zones = tuple(
+        sorted(
+            {
+                item.location
+                for item in records
+                if _zone_belongs_to_region(item.location, region)
+            }
+            | {
+                item.zone
+                for item in catalog.compute_machine_types
+                if _zone_belongs_to_region(item.zone, region)
+            }
+            | {
+                item.zone
+                for item in catalog.compute_accelerator_types
+                if _zone_belongs_to_region(item.zone, region)
+            }
+        )
+    )
+    if not zones:
+        raise WorkloadResolutionError(
+            ResolutionFailureReason.MISSING_LOCATION_EVIDENCE,
+            "Compute catalog evidence does not cover this region.",
+        )
+    facts = tuple(
+        _derive_compute_zone_facts(mappings, requirement, zone, catalog)
+        for zone in zones
+    )
+    first = facts[0]
+    if any(fact != first for fact in facts[1:]):
+        raise WorkloadResolutionError(
+            ResolutionFailureReason.AMBIGUOUS,
+            "Compute child zones prove conflicting workload semantics.",
+        )
+    return first
+
+
+def _derive_compute_zone_facts(
+    mappings: tuple[OverlayMapping, ...],
+    requirement: ComputeInstanceRequirement,
+    zone: str,
+    catalog: WorkloadCatalogEvidence,
+) -> tuple[OverlayMapping, int]:
+    required_sources = (
+        CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+        CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+    )
+    records = _compute_location_coverage(catalog, zone)
+    if (
+        len(records) != len(required_sources)
+        or {item.source for item in records} != set(required_sources)
+        or any(not item.complete for item in records)
+    ):
+        raise WorkloadResolutionError(
+            ResolutionFailureReason.MISSING_LOCATION_EVIDENCE,
+            "Compute accelerator and machine evidence is incomplete for this location.",
+        )
+    if any(item.state is not LocationCoverageState.SUCCESS for item in records):
+        _unsupported_compatibility()
+    machines = tuple(
+        machine
+        for machine in catalog.compute_machine_types
+        if machine.name == requirement.machine_type and machine.zone == zone
+    )
+    if len(machines) > 1:
+        raise WorkloadResolutionError(
+            ResolutionFailureReason.AMBIGUOUS,
+            "Multiple machine-shape records match this location.",
+        )
+    if not machines:
+        _unsupported_compatibility()
+    machine = machines[0]
+    if machine.lifecycle is not None and (
+        machine.lifecycle.known
+        not in {CatalogLifecycle.ACTIVE, CatalogLifecycle.DEPRECATED}
+    ):
+        _unsupported_compatibility()
+    candidates = tuple(
+        (mapping, attachment, declaration)
+        for attachment in machine.guest_accelerators
+        for declaration in catalog.compute_accelerator_types
+        for mapping in mappings
+        if declaration.name == attachment.accelerator_type
+        and declaration.zone == zone
+        and (
+            declaration.lifecycle is None
+            or declaration.lifecycle.known
+            in {CatalogLifecycle.ACTIVE, CatalogLifecycle.DEPRECATED}
+        )
+        and mapping.management_plane is ManagementPlane.COMPUTE
+        and requirement.machine_type in mapping.machine_types
+        and attachment.accelerator_type in mapping.provider_accelerator_types
+        and requirement.provisioning_model in mapping.provisioning_models
+    )
+    if len(candidates) > 1:
+        raise WorkloadResolutionError(
+            ResolutionFailureReason.AMBIGUOUS,
+            "Machine-shape evidence maps to multiple accelerator semantics.",
+        )
+    if not candidates:
+        _unsupported_compatibility()
+    mapping, attachment, _declaration = candidates[0]
+    return mapping, attachment.count * requirement.instance_count
+
+
+def _compute_quota_region(location: str) -> str:
+    if _is_canonical_region(location):
+        return location
+    return location.rsplit("-", maxsplit=1)[0]
+
+
+def _zone_belongs_to_region(location: str, region: str) -> bool:
+    return _is_canonical_zone(location) and location.startswith(f"{region}-")
 
 
 def _unresolved_location(
@@ -1894,6 +2018,13 @@ def _require_canonical_zone(value: object, field_name: str) -> None:
         raise ValueError(msg)
 
 
+def _require_canonical_region_or_zone(value: object, field_name: str) -> None:
+    _require_location(value, field_name)
+    if not _is_canonical_region_or_zone(value):
+        msg = f"{field_name} must be an exact canonical region or zone"
+        raise ValueError(msg)
+
+
 def _is_official_source(value: object) -> bool:
     return isinstance(value, str) and value.startswith(
         ("https://docs.cloud.google.com/", "https://cloud.google.com/")
@@ -1934,13 +2065,24 @@ def _is_canonical_zone(value: object) -> bool:
     region, separator, suffix = value.rpartition("-")
     return (
         separator == "-"
-        and "-" in region
-        and all(region.split("-"))
-        and all(character in _LOCATION_CHARACTERS for character in value)
-        and region[-1:].isdigit()
+        and _is_canonical_region(region)
         and len(suffix) == 1
         and suffix.isalpha()
     )
+
+
+def _is_canonical_region(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and "-" in value
+        and all(value.split("-"))
+        and all(character in _LOCATION_CHARACTERS for character in value)
+        and value[-1:].isdigit()
+    )
+
+
+def _is_canonical_region_or_zone(value: object) -> bool:
+    return _is_canonical_region(value) or _is_canonical_zone(value)
 
 
 _B200_A4_REGIONAL = OverlayMapping(
