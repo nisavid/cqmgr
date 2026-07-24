@@ -408,7 +408,6 @@ class ReadOnlyOperations:
             ObtainabilityCompareRequest(
                 context,
                 prepared_comparison.candidates,
-                eligibility=prepared_comparison.eligibility,
                 resolver_provenance=prepared_comparison.resolver_provenance,
             )
         )
@@ -647,7 +646,6 @@ class ReadOnlyOperations:
             ObtainabilityCompareRequest(
                 context,
                 prepared_comparison.candidates,
-                eligibility=prepared_comparison.eligibility,
                 resolver_provenance=prepared_comparison.resolver_provenance,
             )
         )
@@ -692,7 +690,6 @@ class ReadOnlyOperations:
                 context,
                 prepared_comparison.candidates,
                 resolver_provenance=prepared_comparison.resolver_provenance,
-                eligibility=prepared_comparison.eligibility,
             )
         )
         return _with_provider_identity(delegated, context)
