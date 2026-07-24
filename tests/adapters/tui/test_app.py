@@ -2530,6 +2530,14 @@ def test_successful_apply_returns_and_reconciles_under_its_bound_scope() -> None
             assert app.active_workspace == "quotas"
             assert not app.query_one("#lifecycle-route").has_class("hidden")
 
+            await pilot.click("#lifecycle-back")
+            assert not app.query_one("#lifecycle-route").has_class("hidden")
+            await pilot.press("escape")
+            assert not app.query_one("#lifecycle-route").has_class("hidden")
+            assert "APPLY IN PROGRESS — route exit is deferred" in str(
+                _static(app, "#status-line").content
+            )
+
             lifecycle.release_apply.set()
             await asyncio.wait_for(operations.inspect_started.wait(), timeout=3)
             assert app.query_one("#lifecycle-route").has_class("hidden")
