@@ -7,7 +7,7 @@ import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from threading import Event, Timer
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, cast, override
 
 import pytest
 
@@ -17,6 +17,10 @@ from cqmgr.adapters.google.identity import (
 )
 from cqmgr.adapters.persistence.coordination import SharedBudgetCoordinator
 from cqmgr.application.configuration import ConfigSnapshot, Profile, SelectionState
+from cqmgr.application.operations.obtainability import (
+    PreparedObtainabilityComparison,
+    prepare_obtainability_comparison,
+)
 from cqmgr.application.operations.quotas import (
     QuotaBrowseData,
     QuotaInspectData,
@@ -565,6 +569,85 @@ def test_explicit_obtainability_resolves_exact_candidates_before_comparison() ->
     assert comparison_request.candidates == (candidate,)  # type: ignore[attr-defined]
     assert comparison_request.eligibility.queryable(candidate.candidate_id)  # type: ignore[attr-defined]
     assert comparison_request.resolver_provenance is resolved  # type: ignore[attr-defined]
+
+
+def test_explicit_obtainability_preserves_resolution_failure() -> None:
+    """A resolver without typed evidence blocks advice and keeps its exit class."""
+    candidate = ObtainabilityCandidate(
+        "us-central1",
+        ("us-central1-a",),
+        SpotMachineConfiguration("a3-highgpu-8g"),
+        2,
+        DistributionShape.ANY_SINGLE_ZONE,
+    )
+    failed = replace(
+        result("quota.resolve", None, resource_scope=scope("123456789")),
+        boundary=OperationBoundary(StableSymbol("workload-resolved"), reached=False),
+        outcome=Outcome(
+            StableSymbol("unsupported-compatibility"),
+            ExitClass.REJECTED_PRECONDITION,
+        ),
+    )
+    workloads = RecordingWorkloadOperations(failed)
+    obtainability = RecordingObtainabilityOperations()
+    facade, *_ = service(
+        selection=SelectionState(direct_resource_scope=scope("123456789")),
+        workloads=workloads,
+        obtainability=obtainability,
+    )
+
+    returned = asyncio.run(
+        facade.compare_obtainability(
+            (candidate,),
+            deadline=42.5,
+        )
+    )
+
+    assert returned.outcome.code.value == "spot-advice-resolution-failed"
+    assert returned.outcome.exit_class is ExitClass.REJECTED_PRECONDITION
+    assert obtainability.requests == []
+
+
+def test_prepared_obtainability_rejects_untyped_value() -> None:
+    """The no-reresolution seam accepts only a bound prepared comparison."""
+    facade, *_ = service()
+
+    with pytest.raises(
+        TypeError,
+        match="prepared obtainability comparison must be typed",
+    ):
+        asyncio.run(
+            facade.compare_obtainability_prepared(
+                cast("PreparedObtainabilityComparison", "not-prepared"),
+                deadline=42.5,
+            )
+        )
+
+
+def test_prepared_obtainability_reports_unconfigured_adapter() -> None:
+    """A valid prepared value still fails cleanly without an advice adapter."""
+    resolved = _resolved_spot_workload()
+    candidate = ObtainabilityCandidate(
+        "us-central1",
+        ("us-central1-a",),
+        SpotMachineConfiguration("a3-highgpu-8g"),
+        2,
+        DistributionShape.ANY_SINGLE_ZONE,
+    )
+    prepared = prepare_obtainability_comparison(resolved, (candidate,))
+    facade, *_ = service(
+        selection=SelectionState(direct_resource_scope=scope("123456789")),
+    )
+
+    returned = asyncio.run(
+        facade.compare_obtainability_prepared(
+            prepared,
+            deadline=42.5,
+        )
+    )
+
+    assert returned.outcome.code.value == "spot-advice-unavailable"
+    assert returned.outcome.exit_class is ExitClass.OPERATIONAL_FAILURE
 
 
 def test_all_compatible_obtainability_reuses_provider_context_and_resolver() -> None:

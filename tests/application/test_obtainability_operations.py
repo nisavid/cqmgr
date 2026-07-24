@@ -17,8 +17,10 @@ from cqmgr.application.operations.obtainability import (
     ObtainabilityCompareRequest,
     ObtainabilityEligibility,
     ObtainabilityOperations,
+    PreparedObtainabilityComparison,
     candidates_from_resolved_workload,
     eligibility_from_resolved_workload,
+    prepare_obtainability_comparison,
 )
 from cqmgr.application.ports.coordination import CancellationToken
 from cqmgr.application.ports.obtainability import (
@@ -373,6 +375,154 @@ def test_n1_attached_gpu_eligibility_keeps_exact_history_limit() -> None:
     )
 
 
+def test_prepared_comparison_rejects_unbound_or_untyped_values() -> None:
+    """Prepared execution binds exact candidates, eligibility, and provenance."""
+    candidate = ObtainabilityCandidate(
+        "us-central1",
+        (),
+        SpotMachineConfiguration("a3-highgpu-8g"),
+        2,
+        DistributionShape.BALANCED,
+    )
+    requirement = ComputeInstanceRequirement(
+        candidate.machine.machine_type,
+        candidate.vm_count,
+        ProvisioningModel.SPOT,
+        CandidateLocations((candidate.endpoint_region,)),
+    )
+    resolved = ResolvedWorkloadRequirement(
+        requirement,
+        (_resolved_location(candidate.endpoint_region),),
+        None,
+    )
+    prepared = prepare_obtainability_comparison(resolved, (candidate,))
+
+    with pytest.raises(ValueError, match="requires exact candidates"):
+        PreparedObtainabilityComparison((), prepared.eligibility, resolved)
+    with pytest.raises(TypeError, match="eligibility must be typed"):
+        PreparedObtainabilityComparison(
+            (candidate,),
+            cast("ObtainabilityEligibility", "bad"),
+            resolved,
+        )
+    with pytest.raises(TypeError, match="provenance must be typed"):
+        PreparedObtainabilityComparison(
+            (candidate,),
+            prepared.eligibility,
+            cast("ResolvedWorkloadRequirement", "bad"),
+        )
+    mismatched = replace(candidate, endpoint_region="us-east1", zones=())
+    with pytest.raises(ValueError, match="bind candidates in order"):
+        PreparedObtainabilityComparison(
+            (mismatched,),
+            prepared.eligibility,
+            resolved,
+        )
+
+
+def test_resolver_eligibility_rejects_unbound_request_shapes() -> None:
+    """Eligibility is defined only for one exact matching Compute request."""
+    candidate = ObtainabilityCandidate(
+        "us-central1",
+        (),
+        SpotMachineConfiguration("a3-highgpu-8g"),
+        2,
+        DistributionShape.BALANCED,
+    )
+    requirement = ComputeInstanceRequirement(
+        candidate.machine.machine_type,
+        candidate.vm_count,
+        ProvisioningModel.SPOT,
+        CandidateLocations((candidate.endpoint_region,)),
+    )
+    resolved = ResolvedWorkloadRequirement(
+        requirement,
+        (_resolved_location(candidate.endpoint_region),),
+        None,
+    )
+    tpu = CloudTpuSliceRequirement(
+        "v6e-8",
+        "2x4",
+        "tpu-vm-base",
+        1,
+        ProvisioningModel.SPOT,
+        AllCompatibleLocations(),
+    )
+
+    with pytest.raises(TypeError, match="compute-instance resolution"):
+        eligibility_from_resolved_workload(
+            ResolvedWorkloadRequirement(tpu, (), True),
+            (candidate,),
+        )
+    with pytest.raises(ValueError, match="requires exact candidates"):
+        eligibility_from_resolved_workload(resolved, ())
+    with pytest.raises(ValueError, match="one fixed request shape"):
+        eligibility_from_resolved_workload(
+            resolved,
+            (candidate, replace(candidate, vm_count=3)),
+        )
+    with pytest.raises(ValueError, match="request shapes must match"):
+        eligibility_from_resolved_workload(
+            replace(
+                resolved,
+                requirement=replace(requirement, machine_type="a4-highgpu-8g"),
+            ),
+            (candidate,),
+        )
+
+
+def test_resolver_eligibility_retains_nonspot_and_machine_support_reasons() -> None:
+    """Coverage distinguishes Spot eligibility from provider machine support."""
+    candidate = ObtainabilityCandidate(
+        "us-central1",
+        (),
+        SpotMachineConfiguration("a3-highgpu-8g"),
+        2,
+        DistributionShape.BALANCED,
+    )
+    standard = ComputeInstanceRequirement(
+        candidate.machine.machine_type,
+        candidate.vm_count,
+        ProvisioningModel.STANDARD,
+        CandidateLocations((candidate.endpoint_region,)),
+    )
+    standard_resolved = ResolvedWorkloadRequirement(
+        standard,
+        (_resolved_location(candidate.endpoint_region),),
+        None,
+    )
+
+    nonspot = eligibility_from_resolved_workload(
+        standard_resolved,
+        (candidate,),
+    )
+
+    assert nonspot.candidates[0].reasons == (UnrankedReason.SPOT_UNSUPPORTED,)
+
+    custom_candidate = replace(
+        candidate,
+        machine=SpotMachineConfiguration("custom-8-32768"),
+    )
+    custom_resolved = replace(
+        standard_resolved,
+        requirement=replace(
+            standard,
+            machine_type=custom_candidate.machine.machine_type,
+            provisioning_model=ProvisioningModel.SPOT,
+        ),
+    )
+
+    custom = eligibility_from_resolved_workload(
+        custom_resolved,
+        (custom_candidate,),
+    )
+
+    assert custom.support == AdviceSupport(False, False)
+    assert custom.catalog_coverage[0].reasons == (
+        "current-advice-unsupported-for-machine-configuration",
+    )
+
+
 def test_ineligible_candidate_never_reaches_advice_or_history_readers() -> None:
     """Resolver rejection remains visible without starting provider advice."""
     candidate = ObtainabilityCandidate(
@@ -692,6 +842,28 @@ def test_obtainability_request_rejects_mixed_or_untyped_comparisons() -> None:
             _context(),
             (first,),
             resolver_provenance=cast("ResolvedWorkloadRequirement", "bad"),
+        )
+    with pytest.raises(TypeError, match="eligibility must be typed"):
+        ObtainabilityCompareRequest(
+            _context(),
+            (first,),
+            eligibility=cast("ObtainabilityEligibility", "bad"),
+        )
+    mismatched_eligibility = ObtainabilityEligibility(
+        AdviceSupport(),
+        (),
+        (
+            ObtainabilityCandidateEligibility(
+                replace(first, endpoint_region="us-east1").candidate_id,
+                True,
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="bind every candidate in order"):
+        ObtainabilityCompareRequest(
+            _context(),
+            (first,),
+            eligibility=mismatched_eligibility,
         )
     with pytest.raises(TypeError, match="flags"):
         AdviceSupport(current_advice_supported=cast("bool", 1))
