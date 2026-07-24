@@ -680,6 +680,55 @@ def test_ineligible_candidate_does_not_suppress_queryable_sibling() -> None:
     )
 
 
+def test_location_ineligibility_does_not_change_product_coverage() -> None:
+    """Product support remains true when no requested location is queryable."""
+    candidate = ObtainabilityCandidate(
+        "us-central1",
+        (),
+        SpotMachineConfiguration("a3-highgpu-8g"),
+        1,
+        DistributionShape.ANY,
+    )
+    base = _resolved_candidates((candidate,))
+    unresolved = replace(
+        base.locations[0],
+        disposition=WorkloadLocationDisposition.INCOMPATIBLE,
+        accelerator_id=None,
+        owning_service=None,
+        management_plane=None,
+        supported_consumers=(),
+        quota_pool=None,
+        deployable_accelerator_quantity=None,
+        constraint_set=None,
+        constraint_requirements=(),
+        failure_reason=ResolutionFailureReason.UNSUPPORTED_COMPATIBILITY,
+    )
+    resolved = replace(base, locations=(unresolved,))
+    advice = ScriptedReader([])
+    history = ScriptedReader([])
+
+    result = asyncio.run(
+        ObtainabilityOperations(advice, history, clock=lambda: NOW).compare(
+            _request((candidate,), resolved=resolved)
+        )
+    )
+
+    assert result.data.catalog_coverage == (
+        ObtainabilityProductCoverage(
+            "a3-highgpu-8g",
+            "compute.googleapis.com",
+            True,
+            True,
+            True,
+        ),
+    )
+    assert advice.requests == []
+    assert history.requests == []
+    assessed = result.data.candidates[0]
+    assert assessed.advice is None
+    assert UnrankedReason.CATALOG_UNSUPPORTED in assessed.unranked_reasons
+
+
 def test_compare_ranks_complete_candidates_and_preserves_regional_score() -> None:
     """Application results expose rank derivations without copying scores to shards."""
     first = ObtainabilityCandidate(

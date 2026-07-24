@@ -189,8 +189,24 @@ def eligibility_from_resolved_workload(  # noqa: C901, PLR0912
     resolved_by_location = {
         location.location: location for location in resolved.locations
     }
+    compatible_locations = tuple(
+        location
+        for location in resolved.locations
+        if location.disposition is WorkloadLocationDisposition.COMPATIBLE
+    )
+    compute_product_ownership = not compatible_locations or any(
+        location.management_plane is ManagementPlane.COMPUTE
+        and location.owning_service == "compute.googleapis.com"
+        and WorkloadConsumer.COMPUTE_ENGINE in location.supported_consumers
+        for location in compatible_locations
+    )
+    product_cataloged = (
+        requirement.provisioning_model is ProvisioningModel.SPOT
+        and first.machine.gpu is None
+        and not first.machine.local_ssd_count
+        and compute_product_ownership
+    )
     candidate_eligibility: list[ObtainabilityCandidateEligibility] = []
-    product_cataloged = False
     for candidate in candidates:
         reasons: list[UnrankedReason] = []
         if requirement.provisioning_model is not ProvisioningModel.SPOT:
@@ -217,7 +233,6 @@ def eligibility_from_resolved_workload(  # noqa: C901, PLR0912
             reasons.append(UnrankedReason.NON_COMPUTE_MANAGEMENT_PLANE)
         reasons = list(dict.fromkeys(reasons))
         queryable = not reasons
-        product_cataloged = product_cataloged or queryable
         candidate_eligibility.append(
             ObtainabilityCandidateEligibility(
                 candidate.candidate_id,
