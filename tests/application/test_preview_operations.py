@@ -100,6 +100,7 @@ class MemoryPlanRepository:
         self.store_status = PlanRepositoryStatus.STORED
         self.export_status = PlanRepositoryStatus.EXPORTED
         self.load_any_digest = False
+        self.load_outcome: PlanRepositoryOutcome | None = None
 
     def store(
         self,
@@ -125,12 +126,14 @@ class MemoryPlanRepository:
         _now: datetime,
     ) -> PlanRepositoryOutcome:
         """Load one retained digest and ledger state."""
+        if self.load_outcome is not None:
+            return self.load_outcome
         if self.stored is None or (
             not self.load_any_digest and self.stored.digest != digest
         ):
             return PlanRepositoryOutcome(PlanRepositoryStatus.MISSING)
         return PlanRepositoryOutcome(
-            PlanRepositoryStatus.AVAILABLE,
+            PlanRepositoryStatus(self.state.value),
             plan_bytes=self.stored.bytes,
             state=self.state,
             authenticated=True,
@@ -993,6 +996,63 @@ def test_plan_review_preserves_foreign_expired_and_consumed_evidence(
         PlanIncapability.EXPIRED,
         PlanIncapability.FOREIGN_OR_UNAUTHENTICATED,
         PlanIncapability.INSTALLATION_MISMATCH,
+    )
+
+
+@pytest.mark.parametrize(
+    "local_outcome",
+    [
+        pytest.param(
+            PlanRepositoryOutcome(PlanRepositoryStatus.MISSING),
+            id="missing",
+        ),
+        pytest.param(
+            PlanRepositoryOutcome(
+                PlanRepositoryStatus.FAILED,
+                state=PlanLedgerState.AVAILABLE,
+                reason=StableSymbol("ledger-corrupt"),
+                authenticated=True,
+            ),
+            id="corrupt",
+        ),
+        pytest.param(
+            PlanRepositoryOutcome(
+                PlanRepositoryStatus.AVAILABLE,
+                authenticated=True,
+            ),
+            id="no-state",
+        ),
+    ],
+)
+def test_export_review_fails_closed_when_local_authority_is_unavailable(
+    tmp_path: Path,
+    local_outcome: PlanRepositoryOutcome,
+) -> None:
+    """An export is not Apply-capable without its local single-use authority."""
+    repository = MemoryPlanRepository()
+    operations = _operations(repository, MemoryAuditJournal())
+    plan_out = tmp_path / "portable.plan"
+    preview = operations.preview(
+        _preview_request(_preview_child(), plan_out=plan_out)
+    )
+    repository.load_outcome = local_outcome
+
+    result = operations.review(
+        PlanReviewRequest(
+            digest=None,
+            path=plan_out,
+            authentication_key=SecretValue(b"k" * 32),
+            local_installation_id="installation-123",
+            now=NOW,
+        )
+    )
+
+    assert preview.data.plan_digest is not None
+    assert result.boundary.reached
+    assert result.data.review is not None
+    assert not result.data.review.apply_capability
+    assert result.data.review.incapability_reasons == (
+        PlanIncapability.LOCAL_AUTHORITY_UNAVAILABLE,
     )
 
 

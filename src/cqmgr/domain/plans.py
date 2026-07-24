@@ -80,6 +80,7 @@ class PlanIncapability(StrEnum):
     CONSUMED = "consumed"
     QUARANTINED = "quarantined"
     INVALIDATED = "invalidated"
+    LOCAL_AUTHORITY_UNAVAILABLE = "local-authority-unavailable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -561,6 +562,7 @@ def review_plan(  # noqa: C901, PLR0912, PLR0913
     local_installation_id: str,
     state: PlanLedgerState,
     now: datetime,
+    local_authority_available: bool = True,
 ) -> PlanReview:
     """Classify applicability without hiding safe digest-valid contents."""
     if not isinstance(plan, (QuotaRequestPlan, QuotaRequestBundlePlan)):
@@ -578,6 +580,9 @@ def review_plan(  # noqa: C901, PLR0912, PLR0913
     if not isinstance(state, PlanLedgerState):
         msg = "state must be a PlanLedgerState"
         raise TypeError(msg)
+    if not isinstance(local_authority_available, bool):
+        msg = "local_authority_available must be bool"
+        raise TypeError(msg)
     require_utc(now, "now")
 
     reasons: list[PlanIncapability] = []
@@ -589,6 +594,8 @@ def review_plan(  # noqa: C901, PLR0912, PLR0913
         reasons.append(PlanIncapability.INSTALLATION_MISMATCH)
     if plan.unresolved_acknowledgements:
         reasons.append(PlanIncapability.UNACKNOWLEDGED)
+    if not local_authority_available:
+        reasons.append(PlanIncapability.LOCAL_AUTHORITY_UNAVAILABLE)
     if state in {PlanLedgerState.LEASED, PlanLedgerState.DISPATCHED}:
         reasons.append(PlanIncapability.LEASED)
     elif state is PlanLedgerState.CONSUMED:
