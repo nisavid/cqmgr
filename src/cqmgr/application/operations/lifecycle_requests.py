@@ -417,7 +417,7 @@ class LifecycleRequestOperations:
         if intent.quota_contact is None or evidence.principal is None:
             return PreparedLifecycleRequests(composition, None)
         trust = self._trust.load()
-        contact = _contact_binding(
+        contact = bind_protected_contact(
             intent.quota_contact,
             trust.authentication_key,
         )
@@ -437,7 +437,7 @@ class LifecycleRequestOperations:
         return PreparedLifecycleRequests(composition, preview)
 
 
-def _contact_binding(
+def bind_protected_contact(
     value: SecretValue,
     authentication_key: SecretValue,
 ) -> ContactBinding:
