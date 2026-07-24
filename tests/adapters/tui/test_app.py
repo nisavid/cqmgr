@@ -871,6 +871,55 @@ def test_workload_routes_decode_both_shapes_and_preserve_canonical_copy_cli() ->
     asyncio.run(scenario())
 
 
+def test_deferred_workload_worker_cannot_reclaim_ownership_after_leaving_quotas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A queued resolver cannot claim provider ownership after workspace departure."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            scheduled: list[Any] = []
+
+            def defer_worker(work: Any, **options: Any) -> None:
+                del options
+                scheduled.append(work)
+
+            monkeypatch.setattr(app, "run_worker", defer_worker)
+            await pilot.click("#resolve-compute")
+            _input(app, "#workload-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#workload-count").value = "1"
+            _input(app, "#workload-provisioning").value = "spot"
+            _input(app, "#workload-locations").value = "us-central1-a"
+            _button(app, "#workload-submit").press()
+            await pilot.pause()
+            assert len(scheduled) == 1
+
+            await pilot.click("#workspace-obtainability")
+            await pilot.pause()
+            quota_result = app.last_result
+            quota_status = str(_static(app, "#status-line").content)
+            quota_instrument = str(_static(app, "#instrument-bar").content)
+            quota_detail = str(_static(app, "#quota-detail").content)
+            quota_copy_cli = app.last_copied_cli
+
+            await scheduled.pop()
+            await pilot.pause()
+
+            assert len(operations.resolve_calls) == 1
+            assert app.active_workspace == "obtainability"
+            assert app.last_result is quota_result
+            assert str(_static(app, "#status-line").content) == quota_status
+            assert str(_static(app, "#instrument-bar").content) == quota_instrument
+            assert str(_static(app, "#quota-detail").content) == quota_detail
+            assert app.last_copied_cli == quota_copy_cli
+
+    asyncio.run(scenario())
+
+
 def test_narrow_inspection_preserves_selection_return_focus_and_status_axes() -> None:
     """One-pane detail keeps exact context and Escape restores the quota ledger."""
 
@@ -1470,7 +1519,8 @@ def test_reviewed_semantic_snapshots_cover_required_terminal_and_result_states()
                 instance_count=1,
                 provisioning_model=ProvisioningModel.SPOT,
                 locations=CandidateLocations(("us-central1-a",)),
-            )
+            ),
+            app._claim_provider_view(),  # noqa: SLF001 - bind direct call ownership
         )
         await pilot.pause()
 

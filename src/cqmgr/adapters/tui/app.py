@@ -950,8 +950,9 @@ class CloudQuotaManagerApp(App[None]):
         except (TypeError, ValueError) as error:
             self._set_status(f"INVALID WORKLOAD — {error}")
             return
+        generation = self._claim_provider_view()
         self.run_worker(
-            self.resolve_workload(requirement),
+            self.resolve_workload(requirement, generation),
             group="workload-resolve",
             exclusive=True,
             exit_on_error=False,
@@ -1142,15 +1143,17 @@ class CloudQuotaManagerApp(App[None]):
     async def resolve_workload(
         self,
         requirement: ComputeInstanceRequirement | CloudTpuSliceRequirement,
+        generation: int,
     ) -> OperationResult[Any]:
         """Resolve one typed workload and retain its exact cross-surface result."""
-        generation = self._claim_provider_view()
         result = await self.read_only.resolve(
             requirement,
             deadline=self._deadline(),
             scope_input=self.scope_input,
         )
-        if not self._owns_provider_view(generation):
+        if not (
+            self._owns_provider_view(generation) and self.active_workspace == "quotas"
+        ):
             return result
         self.last_result = result
         self._render_instrument(result)
