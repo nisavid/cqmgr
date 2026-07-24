@@ -6,6 +6,7 @@ import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -336,6 +337,103 @@ def test_composition_evidence_requires_verified_stable_principal() -> None:
 
     with pytest.raises(ValueError, match="stable"):
         PrincipalIdentity("operator@example.com")
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("scope_input", object(), TypeError),
+        ("selector", None, ValueError),
+        ("target_strategy", object(), TypeError),
+        ("targets", [], TypeError),
+        ("acknowledgements", ("",), ValueError),
+        ("expert", 1, TypeError),
+        ("quota_contact", "operator@example.com", TypeError),
+        ("plan_out", "request.plan", TypeError),
+    ],
+)
+def test_composition_intent_rejects_untyped_or_ambiguous_input(
+    field: str,
+    value: object,
+    error: type[Exception],
+) -> None:
+    """Surface-neutral intent rejects shapes that could diverge by adapter."""
+    values: dict[str, Any] = {
+        "scope_input": ReadOnlyScopeInput(explicit_resource_scope=SCOPE),
+        "selector": QuotaInspectSelector(
+            "compute.googleapis.com",
+            "GPU-DIRECT",
+            "us-central1",
+        ),
+        "workload": None,
+        "target_strategy": TargetStrategy.MANUAL,
+        "targets": ((None, "8"),),
+    }
+    values[field] = value
+
+    with pytest.raises(error):
+        LifecycleCompositionIntent(**values)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("kind", object(), TypeError),
+        ("resource_scope", object(), TypeError),
+        ("children", [object()], TypeError),
+        ("principal", object(), TypeError),
+        ("identity_verified", 1, TypeError),
+        ("normalized_workload", "", ValueError),
+    ],
+)
+def test_composition_evidence_rejects_untyped_or_incomplete_input(
+    field: str,
+    value: object,
+    error: type[Exception],
+) -> None:
+    """Fresh evidence remains typed before either surface can compose a Plan."""
+    values: dict[str, Any] = {
+        "kind": PlanKind.SINGLE,
+        "resource_scope": SCOPE,
+        "children": (_child(),),
+        "selected_location": None,
+        "principal": PlanPrincipal("principal://accounts/123"),
+        "identity_verified": True,
+        "normalized_workload": "exact-slice",
+    }
+    values[field] = value
+
+    with pytest.raises(error):
+        LifecycleCompositionEvidence(**values)
+
+
+def test_prepare_compose_only_and_missing_contact_never_invent_preview() -> None:
+    """Compose is trust-independent and Preview never invents contact input."""
+    trust = _Trust()
+    reader = _Reader(_child())
+    operations = LifecycleRequestOperations(reader, trust, now=lambda: NOW)
+    intent = LifecycleCompositionIntent(
+        scope_input=ReadOnlyScopeInput(explicit_resource_scope=SCOPE),
+        selector=QuotaInspectSelector(
+            "compute.googleapis.com",
+            "GPU-DIRECT",
+            "us-central1",
+        ),
+        workload=None,
+        target_strategy=TargetStrategy.MANUAL,
+        targets=((None, "8"),),
+    )
+
+    compose_only = asyncio.run(
+        operations.prepare(intent, deadline=DEADLINE, require_preview=False)
+    )
+    missing_contact = asyncio.run(
+        operations.prepare(intent, deadline=DEADLINE, require_preview=True)
+    )
+
+    assert compose_only.preview is None
+    assert missing_contact.preview is None
+    assert trust.loads == 1
 
 
 def test_read_only_reader_converts_exact_inspect_without_write_capability() -> None:

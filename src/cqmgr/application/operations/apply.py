@@ -1742,6 +1742,10 @@ def _revalidation_drift(
     *,
     accepted_child_ids: frozenset[str] = frozenset(),
 ) -> bool:
+    expected_children = (
+        *plan.children,
+        *getattr(plan, "no_op_children", ()),
+    )
     if (
         refreshed.resource_scope != plan.resource_scope
         or request.resource_scope_acknowledgement != plan.resource_scope
@@ -1750,10 +1754,10 @@ def _revalidation_drift(
         or refreshed.contact_binding != plan.contact_binding
         or request.contact_binding != plan.contact_binding
         or refreshed.constraints != plan.constraints
-        or len(refreshed.children) != len(plan.children)
+        or len(refreshed.children) != len(expected_children)
     ):
         return True
-    for expected, current in zip(plan.children, refreshed.children, strict=True):
+    for expected, current in zip(expected_children, refreshed.children, strict=True):
         if (
             current.child_id != expected.child_id
             or current.slice_identity != expected.slice_identity

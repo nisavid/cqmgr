@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import json
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import TYPE_CHECKING, Protocol
@@ -13,7 +14,13 @@ from cqmgr.application.operations.plans import (
     PreviewRequest,
 )
 from cqmgr.application.ports.secrets import SecretValue
-from cqmgr.domain.plans import ContactBinding, PlanKind, PlanPrincipal, TargetStrategy
+from cqmgr.domain.plans import (
+    ContactBinding,
+    EvidenceBinding,
+    PlanKind,
+    PlanPrincipal,
+    TargetStrategy,
+)
 from cqmgr.domain.results import StableSymbol
 
 _DIRECT_AND_COMPANION_COUNT = 2
@@ -264,6 +271,7 @@ class ReadOnlyLifecycleCompositionReader:
             observed_at=data.item.evidence_observed_at,
             preference_name=None if preference is None else preference.provider_name,
             preference_etag=None if preference is None else preference.etag,
+            evidence=(quota_state_evidence_binding(data),),
         )
         return LifecycleCompositionEvidence(
             kind=PlanKind.SINGLE,
@@ -602,7 +610,52 @@ def _child_from_inspect(
             observed_at=data.item.evidence_observed_at,
             preference_name=None if preference is None else preference.provider_name,
             preference_etag=None if preference is None else preference.etag,
+            evidence=(quota_state_evidence_binding(data),),
         ),
         principal,
         verified,
+    )
+
+
+def quota_state_evidence_binding(data: object) -> EvidenceBinding:
+    """Bind the exact provider facts that can invalidate Apply."""
+    from cqmgr.application.operations.quotas import QuotaInspectData  # noqa: PLC0415
+
+    if not isinstance(data, QuotaInspectData) or data.item is None:
+        message = "quota-state evidence requires one complete exact inspection"
+        raise LifecyclePreparationError(message)
+    item = data.item
+    effective = item.effective_value
+    observed_at = item.evidence_observed_at
+    if effective is None or observed_at is None or data.evidence is None:
+        message = "quota-state evidence requires one complete exact inspection"
+        raise LifecyclePreparationError(message)
+    preference = data.preference
+    payload = json.dumps(
+        {
+            "effective": effective.value,
+            "unit": effective.unit.symbol,
+            "usage": None if item.usage_value is None else item.usage_value.value,
+            "mutable": item.predicates.mutable,
+            "ongoing_rollout": data.evidence.ongoing_rollout,
+            "preference": (
+                None
+                if preference is None
+                else {
+                    "name": preference.provider_name,
+                    "preferred": preference.preferred_value,
+                    "granted": preference.granted_value,
+                    "etag": preference.etag,
+                    "reconciling": preference.reconciling,
+                }
+            ),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return EvidenceBinding(
+        StableSymbol("quota-state"),
+        f"sha256:{sha256(payload).hexdigest()}",
+        observed_at,
     )
