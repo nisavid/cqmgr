@@ -996,21 +996,21 @@ class CloudQuotaManagerApp(App[None]):
         )
         identity = result.identity_evidence
         if identity is None or identity.acting_principal is None:
-            principal = "acting principal unavailable"
+            principal = "authenticated principal unavailable"
         else:
             principal = identity.acting_principal.value
         lock = "LOCKED" if self.scope_locked else "unlocked"
         complete = "complete" if result.completeness.is_complete else "INCOMPLETE"
         self.query_one("#instrument-bar", Static).update(
             f"Resource scope: {scope} [{lock}]\n"
-            f"Acting principal: {principal} · Evidence: {complete}"
+            f"Authenticated principal: {principal} · Evidence: {complete}"
         )
 
     def _offline_instrument_text(self) -> str:
         return (
             f"Resource scope: {self._scope_label()} "
             f"[{'LOCKED' if self.scope_locked else 'unlocked'}]\n"
-            "Acting principal: deferred (offline) · Evidence: not observed"
+            "Authenticated principal: deferred (offline) · Evidence: not observed"
         )
 
     def _scope_label(self) -> str:
@@ -1237,7 +1237,7 @@ class CloudQuotaManagerApp(App[None]):
             "Resource scope: "
             + (scope.canonical_name if scope is not None else "unavailable")
             + (" [LOCKED]\n" if scope is not None else " [unbound]\n")
-            + "Acting principal: retained from typed operation evidence"
+            + "Authenticated principal: retained from typed operation evidence"
         )
 
     def _leave_lifecycle_route(self) -> None:
@@ -1609,6 +1609,8 @@ class CloudQuotaManagerApp(App[None]):
                         f"   Preference: {child.preference_name or 'none'}",
                         f"   Preference ETag: {child.preference_etag or 'none'}",
                         "   Disposition: verified no-op; no provider dispatch",
+                        "   Warnings: "
+                        + (", ".join(item.value for item in child.warnings) or "none"),
                         "   Required acknowledgements: "
                         + (
                             ", ".join(
@@ -2243,7 +2245,7 @@ class CloudQuotaManagerApp(App[None]):
                 (
                     f"Credential kind: {identity.credential_kind.value}",
                     f"Identity verification: {identity.verification.value}",
-                    "Acting principal: "
+                    "Authenticated principal: "
                     + (
                         identity.acting_principal.value
                         if identity.acting_principal is not None

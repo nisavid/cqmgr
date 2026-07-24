@@ -1510,7 +1510,10 @@ def _plan_child(
     )
 
 
-def _review_result() -> OperationResult[PlanReviewData]:
+def _review_result(
+    *,
+    no_op_children: tuple[QuotaRequestPlanChild, ...] = (),
+) -> OperationResult[PlanReviewData]:
     children = (
         _plan_child(
             "direct",
@@ -1530,8 +1533,10 @@ def _review_result() -> OperationResult[PlanReviewData]:
         target_strategy=TargetStrategy.MINIMUM,
         normalized_workload="compute-instance:a4-highgpu-8g:1",
         children=children,
+        no_op_children=no_op_children,
         constraints=tuple(
-            ConstraintReference(child.slice_identity) for child in children
+            ConstraintReference(child.slice_identity)
+            for child in (*children, *no_op_children)
         ),
         principal=PlanPrincipal("principal://accounts/42"),
         contact_binding=ContactBinding(
@@ -1790,13 +1795,16 @@ def test_wide_shell_opens_federated_quota_inspector_with_semantic_evidence() -> 
             query, options = operations.browse_calls[0]
             assert query == ReadOnlyQuotaQuery()
             assert options["scope_input"].explicit_resource_scope is None
-            assert "projects/123456789" in str(_static(app, "#instrument-bar").content)
-            assert "principal://accounts.google.com/operator@example.com" in str(
-                _static(app, "#instrument-bar").content
-            )
+            instrument = str(_static(app, "#instrument-bar").content)
+            assert "projects/123456789" in instrument
+            assert (
+                "Authenticated principal: "
+                "principal://accounts.google.com/operator@example.com"
+            ) in instrument
             table = _table(app, "#quota-ledger")
             assert table.row_count == 3
             visible = app.interface_snapshot()
+            assert "Acting principal:" not in visible
             assert "compute.googleapis.com: complete" in visible
             assert "tpu.googleapis.com: complete" in visible
             assert "NEW-PROVIDER-HARDWARE" in visible
@@ -1951,6 +1959,118 @@ def test_single_no_op_preview_preserves_drift_expert_and_contact_placeholders(  
             assert "Boundary: safe-complete-preview" in detail
             assert f"Started: {NOW.isoformat()}" in detail
             assert str(_static(app, "#lifecycle-copy-cli").content) == command
+
+    asyncio.run(scenario())
+
+
+def test_bundle_no_op_preview_retains_every_child_without_enabling_apply() -> None:
+    """A pure bundle no-op remains explicit and cannot dispatch provider writes."""
+
+    async def scenario() -> None:
+        direct = ComposeChild(
+            child_id="settled-direct",
+            slice_identity=_mutation_slice("QUOTA-SETTLED-DIRECT"),
+            effective=QuotaQuantity(4, UNIT),
+            usage=QuotaQuantity(2, UNIT),
+            workload=QuotaQuantity(1, UNIT),
+            manual_target=QuotaQuantity(4, UNIT),
+            preferred=QuotaQuantity(4, UNIT),
+            granted=QuotaQuantity(4, UNIT),
+            preference_settled=True,
+            direct_accelerator_rank=0,
+            scope_breadth_rank=1,
+            observed_at=NOW,
+            preference_name="preferences/settled-direct",
+            preference_etag="etag-settled-direct",
+            warnings=("direct-no-op-evidence",),
+        )
+        companion = replace(
+            direct,
+            child_id="settled-companion",
+            slice_identity=_mutation_slice("QUOTA-SETTLED-COMPANION"),
+            direct_accelerator_rank=1,
+            scope_breadth_rank=2,
+            preference_name="preferences/settled-companion",
+            preference_etag="etag-settled-companion",
+            warnings=("companion-no-op-evidence",),
+        )
+        compose_request = ComposeRequest(
+            kind=PlanKind.BUNDLE,
+            strategy=TargetStrategy.MANUAL,
+            resource_scope=SCOPE,
+            children=(direct, companion),
+            selected_location="us-central1",
+        )
+        preview_request = PreviewRequest(
+            composition=compose_request,
+            principal=PlanPrincipal("principal://accounts/42"),
+            contact_binding=ContactBinding(
+                StableSymbol("direct-user"),
+                "principal://accounts/42",
+                "hmac-sha256:" + ("c" * 64),
+            ),
+            installation_id="installation-42",
+            authentication_key=SecretValue(b"k" * 32),
+            identity_verified=True,
+            contact_verified=True,
+            keyring_mutation_capable=True,
+            normalized_workload="compute-instance:a4-highgpu-8g:1",
+            now=NOW,
+        )
+        composition = RequestPlanOperations.compose(compose_request)
+        assert composition.reached
+        assert all(child.no_op for child in composition.children)
+        preview_result = OperationResult(
+            operation=OperationName("request.preview"),
+            resource_scope=SCOPE,
+            boundary=OperationBoundary(
+                StableSymbol("safe-complete-preview"),
+                reached=True,
+            ),
+            outcome=Outcome(StableSymbol("verified-no-op"), ExitClass.SUCCESS),
+            completeness=Completeness.complete(),
+            started_at=NOW,
+            finished_at=NOW,
+            data=PreviewData(
+                composition=composition,
+                plan=None,
+                plan_digest=None,
+                audit_record_id="audit-bundle-no-op",
+                apply_capability=False,
+            ),
+        )
+        lifecycle = ScriptedLifecycleOperations(
+            _apply_result(),
+            preview_result=preview_result,
+        )
+        app = CloudQuotaManagerApp(
+            ScriptedReadOnlyOperations(_browse_result()),
+            ScriptedAuditOperations(),
+            lifecycle=lifecycle,  # type: ignore[arg-type]
+        )
+
+        async with app.run_test(size=(110, 38)) as pilot:
+            await pilot.pause()
+            app.open_compose(
+                compose_request,
+                preview=preview_request,
+            )
+            app._submit_lifecycle_preview()  # noqa: SLF001 - exercise route dispatch
+            await pilot.pause()
+
+            detail = str(_static(app, "#lifecycle-detail").content)
+            assert lifecycle.preview_calls == [preview_request]
+            assert lifecycle.apply_calls == []
+            assert "Bundle request composition" in detail
+            assert "settled-direct" in detail
+            assert "settled-companion" in detail
+            assert detail.count("Disposition: verified no-op") == 2
+            assert "Warnings: direct-no-op-evidence" in detail
+            assert "Warnings: companion-no-op-evidence" in detail
+            assert "Preview outcome: verified-no-op" in detail
+            assert "Plan digest: none (verified no-op)" in detail
+            assert "Apply capability: no" in detail
+            assert _button(app, "#lifecycle-apply").disabled
 
     asyncio.run(scenario())
 
@@ -2313,7 +2433,17 @@ def test_plan_review_and_watch_preserve_incapability_and_mixed_grant_evidence(  
     """Review and Watch retain exact trust reasons and orthogonal child state."""
 
     async def scenario() -> None:  # noqa: PLR0915
-        review_result = _review_result()
+        review_result = _review_result(
+            no_op_children=(
+                replace(
+                    _plan_child(
+                        "settled",
+                        direct_rank=1,
+                    ),
+                    warnings=(StableSymbol("verified-no-op-warning"),),
+                ),
+            ),
+        )
         watch_event = _watch_terminal_event()
         lifecycle = ScriptedLifecycleOperations(
             _apply_result(),
@@ -2338,6 +2468,10 @@ def test_plan_review_and_watch_preserve_incapability_and_mixed_grant_evidence(  
             app.open_plan_review(review_request)
 
             assert app.scope_locked
+            assert (
+                "Authenticated principal: authenticated principal unavailable"
+                in str(_static(app, "#instrument-bar").content)
+            )
             detail = str(_static(app, "#lifecycle-detail").content)
             assert "Kind: bundle" in detail
             assert "Authenticated: no" in detail
@@ -2354,6 +2488,8 @@ def test_plan_review_and_watch_preserve_incapability_and_mixed_grant_evidence(  
             assert "Granted: 5 1" in detail
             assert "Preference: preferences/direct" in detail
             assert "Preference ETag: etag-direct" in detail
+            assert "No-op 1. settled" in detail
+            assert "Warnings: verified-no-op-warning" in detail
             assert (
                 "Required acknowledgements: decrease-below-usage, "
                 "decrease-over-ten-percent"
