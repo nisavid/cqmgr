@@ -262,7 +262,9 @@ def test_prepare_preserves_expert_and_builds_protected_preview() -> None:
         plan_out=Path("request.plan"),
     )
 
-    prepared = asyncio.run(operations.prepare(intent, deadline=DEADLINE))
+    prepared = asyncio.run(
+        operations.prepare(intent, deadline=DEADLINE, require_preview=True)
+    )
 
     assert prepared.composition.expert is True
     assert prepared.composition.acknowledgements == ("decrease-over-ten-percent",)
@@ -278,6 +280,45 @@ def test_prepare_preserves_expert_and_builds_protected_preview() -> None:
     assert "operator@example.com" not in repr(prepared)
     assert trust.loads == 1
     assert reader.intents == [intent]
+
+
+def test_preview_requires_active_trust_before_provider_reads() -> None:
+    """Missing installation authority stops Preview before fresh provider access."""
+
+    class _MissingTrust:
+        def load(self) -> LoadedInstallationTrust:
+            message = "installation trust is missing"
+            raise RuntimeError(message)
+
+    reader = _Reader(_child())
+    operations = LifecycleRequestOperations(
+        reader,
+        _MissingTrust(),
+        now=lambda: NOW,
+    )
+    intent = LifecycleCompositionIntent(
+        scope_input=ReadOnlyScopeInput(explicit_resource_scope=SCOPE),
+        selector=QuotaInspectSelector(
+            "compute.googleapis.com",
+            "GPU-DIRECT",
+            "us-central1",
+        ),
+        workload=None,
+        target_strategy=TargetStrategy.MANUAL,
+        targets=((None, "8"),),
+        quota_contact=SecretValue(b"operator@example.com"),
+    )
+
+    with pytest.raises(RuntimeError, match="trust is missing"):
+        asyncio.run(
+            operations.prepare(
+                intent,
+                deadline=DEADLINE,
+                require_preview=True,
+            )
+        )
+
+    assert reader.intents == []
 
 
 def test_composition_evidence_requires_verified_stable_principal() -> None:

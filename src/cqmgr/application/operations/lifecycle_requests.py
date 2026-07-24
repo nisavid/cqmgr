@@ -402,8 +402,10 @@ class LifecycleRequestOperations:
         intent: LifecycleCompositionIntent,
         *,
         deadline: float,
+        require_preview: bool = False,
     ) -> PreparedLifecycleRequests:
         """Resolve fresh evidence once and derive Compose plus optional Preview."""
+        trust = self._trust.load() if require_preview else None
         evidence = await self._reader.read(intent, deadline=deadline)
         composition = ComposeRequest(
             kind=evidence.kind,
@@ -414,9 +416,10 @@ class LifecycleRequestOperations:
             expert=intent.expert,
             acknowledgements=intent.acknowledgements,
         )
-        if intent.quota_contact is None or evidence.principal is None:
+        if not require_preview:
             return PreparedLifecycleRequests(composition, None)
-        trust = self._trust.load()
+        if intent.quota_contact is None or evidence.principal is None or trust is None:
+            return PreparedLifecycleRequests(composition, None)
         contact = bind_protected_contact(
             intent.quota_contact,
             trust.authentication_key,
