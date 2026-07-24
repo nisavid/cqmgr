@@ -320,6 +320,7 @@ def plan_apply_copy_cli(
     digest: str | None = None,
     path: Path | None = None,
     acknowledge_resource_scope: str | None = None,
+    quota_contact_stdin: bool = False,
     presentation: CopyCliPresentation | None = None,
 ) -> str:
     """Render Apply with an explicitly incomplete acknowledgement by default."""
@@ -329,6 +330,9 @@ def plan_apply_copy_cli(
     ):
         msg = "Copy CLI Apply acknowledgement must be non-empty or None"
         raise ValueError(msg)
+    if not isinstance(quota_contact_stdin, bool):
+        msg = "Copy CLI Apply contact mode must be boolean"
+        raise TypeError(msg)
     arguments = [*_PLAN_APPLY_COMMAND]
     _append_plan_reference(arguments, digest=digest, path=path)
     arguments.extend(
@@ -337,6 +341,8 @@ def plan_apply_copy_cli(
             acknowledge_resource_scope or _RESOURCE_SCOPE_ACKNOWLEDGEMENT_PLACEHOLDER,
         )
     )
+    if quota_contact_stdin:
+        arguments.append("--quota-contact-stdin")
     _append_presentation(arguments, _copy_presentation(presentation))
     return shlex.join(arguments)
 

@@ -334,7 +334,10 @@ class _RequestFactory:
         self,
         value: PlanReferenceInput,
         acknowledgement: str,
+        *,
+        quota_contact: SecretValue | None = None,
     ) -> ApplyRequest:
+        del quota_contact
         assert value.digest is not None
         return ApplyRequest(
             digest=value.digest,
