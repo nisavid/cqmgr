@@ -49,7 +49,12 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from cqmgr.application.ports.audit import AuditJournal
-    from cqmgr.application.ports.plans import EncodedPlan, PlanCodec, PlanRepository
+    from cqmgr.application.ports.plans import (
+        DecodedPlan,
+        EncodedPlan,
+        PlanCodec,
+        PlanRepository,
+    )
     from cqmgr.application.ports.secrets import SecretValue
     from cqmgr.domain.scopes import ResourceScope
 
@@ -99,9 +104,6 @@ class ComposeRequest:
     resource_scope: ResourceScope
     children: tuple[ComposeChild, ...]
     selected_location: str | None = None
-    identity_verified: bool = True
-    contact_verified: bool = True
-    keyring_mutation_capable: bool = True
     expert: bool = False
     acknowledgements: tuple[str, ...] = ()
 
@@ -145,6 +147,9 @@ class PreviewRequest:
     contact_binding: ContactBinding
     installation_id: str
     authentication_key: SecretValue
+    identity_verified: bool
+    contact_verified: bool
+    keyring_mutation_capable: bool
     normalized_workload: str
     now: datetime
     plan_out: Path | None = None
@@ -227,6 +232,21 @@ class RequestPlanOperations:
                     if _has_usage_error(composition)
                     else ExitClass.REJECTED_PRECONDITION
                 ),
+            )
+        preview_reasons = _preview_trust_reasons(request)
+        if preview_reasons:
+            failed = Composition(
+                request.composition,
+                reached=False,
+                children=composition.children,
+                incapability_reasons=preview_reasons,
+            )
+            return _preview_result(
+                request,
+                failed,
+                reached=False,
+                outcome="preview-rejected",
+                exit_class=ExitClass.REJECTED_PRECONDITION,
             )
         if any(child.observed_at is None for child in request.composition.children):
             failed = Composition(
@@ -439,7 +459,13 @@ class RequestPlanOperations:
                 and decoded.authenticate(request.authentication_key.reveal())
             )
         )
-        state = loaded.state or PlanLedgerState.AVAILABLE
+        state = _review_state(
+            self._repository,
+            request,
+            decoded,
+            authenticated=authenticated,
+            exported_state=loaded.state,
+        )
         review = review_plan(
             decoded.plan,
             digest=decoded.digest,
@@ -456,16 +482,37 @@ class RequestPlanOperations:
         )
 
 
+def _review_state(
+    repository: PlanRepository,
+    request: PlanReviewRequest,
+    decoded: DecodedPlan,
+    *,
+    authenticated: bool,
+    exported_state: PlanLedgerState | None,
+) -> PlanLedgerState:
+    """Join authenticated local exports to their single-use ledger state."""
+    fallback = exported_state or PlanLedgerState.AVAILABLE
+    if (
+        request.path is None
+        or not authenticated
+        or request.authentication_key is None
+        or decoded.plan.installation_id != request.local_installation_id
+    ):
+        return fallback
+    local = repository.load(
+        decoded.digest,
+        request.authentication_key,
+        request.now,
+    )
+    if local.authenticated is not True or local.state is None:
+        return fallback
+    return local.state
+
+
 def _preflight_reasons(  # noqa: C901, PLR0912
     request: ComposeRequest,
 ) -> tuple[str, ...]:
     reasons = list(_request_usage_reasons(request))
-    if not request.identity_verified:
-        reasons.append("identity-unverified")
-    if not request.contact_verified:
-        reasons.append("contact-unverified")
-    if not request.keyring_mutation_capable:
-        reasons.append("keyring-incapable")
     if not isinstance(request.strategy, TargetStrategy):
         reasons.append("unsupported-target-strategy")
     if not request.children:
@@ -516,6 +563,18 @@ def _preflight_reasons(  # noqa: C901, PLR0912
             if acknowledgement not in request.acknowledgements
         )
     return tuple(dict.fromkeys(reasons))
+
+
+def _preview_trust_reasons(request: PreviewRequest) -> tuple[str, ...]:
+    """Return Preview-only identity, contact, and native-secret gates."""
+    reasons: list[str] = []
+    if not request.identity_verified:
+        reasons.append("identity-unverified")
+    if not request.contact_verified:
+        reasons.append("contact-unverified")
+    if not request.keyring_mutation_capable:
+        reasons.append("keyring-incapable")
+    return tuple(reasons)
 
 
 def _request_usage_reasons(request: ComposeRequest) -> tuple[str, ...]:
@@ -706,6 +765,11 @@ def _build_plan(request: PreviewRequest, composition: Composition) -> QuotaPlan:
         _build_bundle_child(child, inputs[child.child_id], request.composition)
         for child in composition.dispatch_children
     )
+    no_op_children = tuple(
+        _build_bundle_child(child, inputs[child.child_id], request.composition)
+        for child in composition.children
+        if child.no_op
+    )
     return QuotaRequestBundlePlan(
         resource_scope=request.composition.resource_scope,
         kind=PlanKind.BUNDLE,
@@ -719,6 +783,7 @@ def _build_plan(request: PreviewRequest, composition: Composition) -> QuotaPlan:
         installation_id=request.installation_id,
         issued_at=request.now,
         expires_at=request.now + PLAN_LIFETIME,
+        no_op_children=no_op_children,
     )
 
 

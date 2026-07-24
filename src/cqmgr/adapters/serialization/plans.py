@@ -244,6 +244,7 @@ def _bundle_plan_mapping(plan: QuotaRequestBundlePlan) -> dict[str, object]:
         "installation_id": plan.installation_id,
         "issued_at": _time(plan.issued_at),
         "kind": plan.kind.value,
+        "no_op_children": [_plan_child_mapping(child) for child in plan.no_op_children],
         "normalized_workload": plan.normalized_workload,
         "principal": {
             "impersonation_chain": list(plan.principal.impersonation_chain),
@@ -448,6 +449,7 @@ def _parse_bundle_plan(value: dict[str, Any]) -> QuotaRequestBundlePlan:
         "installation_id",
         "issued_at",
         "kind",
+        "no_op_children",
         "normalized_workload",
         "principal",
         "resource_scope",
@@ -470,6 +472,9 @@ def _parse_bundle_plan(value: dict[str, Any]) -> QuotaRequestBundlePlan:
         target_strategy=TargetStrategy(_string(mapping["target_strategy"])),
         normalized_workload=_string(mapping["normalized_workload"]),
         children=tuple(_parse_plan_child(item) for item in _list(mapping["children"])),
+        no_op_children=tuple(
+            _parse_plan_child(item) for item in _list(mapping["no_op_children"])
+        ),
         constraints=tuple(
             ConstraintReference(_parse_slice(item))
             for item in _list(mapping["constraints"])

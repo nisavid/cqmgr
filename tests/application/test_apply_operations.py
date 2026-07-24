@@ -934,6 +934,49 @@ def test_apply_dispatches_bound_order_once_and_durably_accepts_every_child() -> 
     ]
 
 
+def test_apply_result_retains_subject_no_ops_and_provider_lineage() -> None:
+    """Apply presentation data preserves the complete reviewed composition."""
+    no_op = _child(
+        "already-sufficient",
+        "GPU-SPOT",
+        direct_rank=1,
+        scope_rank=1,
+        target=4,
+    )
+    original = _plan()
+    plan = replace(
+        original,
+        constraints=(
+            *original.constraints,
+            ConstraintReference(no_op.slice_identity),
+        ),
+        no_op_children=(no_op,),
+    )
+    writer = _ScriptedWriter(
+        QuotaPreferenceWriteResult(
+            accepted=True,
+            outcome=StableSymbol("submitted"),
+            etag="direct-etag",
+            trace_id="direct-trace",
+        ),
+        QuotaPreferenceWriteResult(
+            accepted=True,
+            outcome=StableSymbol("submitted"),
+            etag="companion-etag",
+            trace_id="companion-trace",
+        ),
+    )
+
+    result, _, _, _ = _apply(plan, writer)
+
+    assert result.data.kind is PlanKind.BUNDLE
+    assert result.data.verified_no_ops == (no_op,)
+    assert [child.trace_id for child in result.data.children] == [
+        "direct-trace",
+        "companion-trace",
+    ]
+
+
 def test_apply_revalidates_then_persists_preintent_before_consumption_barrier() -> None:
     """Freshness precedes lease authority, then durable intent and dispatch."""
     plan = _plan()
@@ -1661,7 +1704,22 @@ def test_recovery_completes_existing_terminal_record_without_revalidation_or_sav
     reached: bool,  # noqa: FBT001
 ) -> None:
     """A durable terminal record only finishes the already-crossed ledger."""
-    plan = _plan()
+    original = _plan()
+    no_op = _child(
+        "already-sufficient",
+        "GPU-SPOT",
+        direct_rank=1,
+        scope_rank=3,
+        target=4,
+    )
+    plan = replace(
+        original,
+        constraints=(
+            *original.constraints,
+            ConstraintReference(no_op.slice_identity),
+        ),
+        no_op_children=(no_op,),
+    )
     repository = _MemoryPlanRepository(plan)
     repository.acquire_lease(
         repository.encoded.digest,
@@ -1709,6 +1767,8 @@ def test_recovery_completes_existing_terminal_record_without_revalidation_or_sav
 
     assert result.outcome.code == expected_outcome
     assert result.boundary.reached is reached
+    assert result.data.kind is PlanKind.BUNDLE
+    assert result.data.verified_no_ops == (no_op,)
     assert repository.state is PlanLedgerState.CONSUMED
     assert writer.requests == []
 
