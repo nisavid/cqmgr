@@ -9,7 +9,8 @@ import asyncio
 import json
 import os
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, override
 
@@ -66,6 +67,18 @@ from cqmgr.domain.identity import (
     PrincipalVerification,
     ProviderIdentityEvidence,
 )
+from cqmgr.domain.obtainability import (
+    AdviceShard,
+    CapacityAdvice,
+    CapacityHistory,
+    DistributionShape,
+    ObtainabilityBand,
+    ObtainabilityCandidate,
+    ObtainabilityComparison,
+    PriceInterval,
+    RankedCandidate,
+    SpotMachineConfiguration,
+)
 from cqmgr.domain.quota_queries import ProviderSourceCoverage, QuotaQueryItem
 from cqmgr.domain.quotas import (
     EffectiveQuotaSliceIdentity,
@@ -91,6 +104,7 @@ from cqmgr.domain.status import QuotaRequestStatus, Reconciliation
 if TYPE_CHECKING:
     import pytest
 
+    from cqmgr.application.operations.obtainability import AdviceSupport
     from cqmgr.application.ports.coordination import CancellationToken
 
 NOW = datetime(2026, 7, 23, 20, tzinfo=UTC)
@@ -293,6 +307,73 @@ def _failure_result() -> OperationResult[ReadOnlyFailureData]:
     )
 
 
+def _obtainability_result() -> OperationResult[ObtainabilityComparison]:
+    machine = SpotMachineConfiguration("a3-highgpu-8g")
+    candidate = ObtainabilityCandidate(
+        "us-central1",
+        ("us-central1-a", "us-central1-b"),
+        machine,
+        2,
+        DistributionShape.BALANCED,
+    )
+    advice = CapacityAdvice(
+        Decimal("0.8"),
+        "7d",
+        (
+            AdviceShard("us-central1-a", machine.machine_type, 1, "SPOT"),
+            AdviceShard("us-central1-b", machine.machine_type, 1, "SPOT"),
+        ),
+        NOW,
+    )
+    history = CapacityHistory(
+        machine.machine_type,
+        candidate.endpoint_region,
+        (),
+        (
+            PriceInterval(
+                NOW - timedelta(days=1),
+                NOW + timedelta(days=1),
+                Decimal("3.25"),
+            ),
+        ),
+        NOW,
+    )
+    comparison = ObtainabilityComparison(
+        (
+            RankedCandidate(
+                candidate,
+                advice,
+                history,
+                ObtainabilityBand.HIGH,
+                Decimal("0.12"),
+                Decimal("6.50"),
+                1,
+                (),
+            ),
+        )
+    )
+    return OperationResult(
+        operation=OperationName("obtainability.compare"),
+        resource_scope=SCOPE,
+        boundary=OperationBoundary(
+            StableSymbol("spot-advice-assessed"),
+            reached=True,
+        ),
+        outcome=Outcome(StableSymbol("spot-advice-assessed"), ExitClass.SUCCESS),
+        completeness=Completeness.complete(),
+        started_at=NOW,
+        finished_at=NOW,
+        data=comparison,
+        identity_evidence=ProviderIdentityEvidence(
+            credential_kind=CredentialKind.DIRECT_USER,
+            verification=PrincipalVerification.VERIFIED,
+            acting_principal=PrincipalIdentity(
+                "principal://accounts.google.com/operator@example.com"
+            ),
+        ),
+    )
+
+
 AUDIT_RECORD = AuditRecord(
     record_id="audit-00000000000000000001",
     sequence=1,
@@ -380,6 +461,13 @@ class ScriptedReadOnlyOperations:
         self.inspect_calls: list[tuple[QuotaInspectSelector, dict[str, Any]]] = []
         self.resolve_calls: list[
             tuple[ComputeInstanceRequirement | CloudTpuSliceRequirement, dict[str, Any]]
+        ] = []
+        self.obtainability_result = _obtainability_result()
+        self.obtainability_calls: list[
+            tuple[tuple[ObtainabilityCandidate, ...], dict[str, Any]]
+        ] = []
+        self.obtainability_all_calls: list[
+            tuple[ComputeInstanceRequirement, dict[str, Any]]
         ] = []
         self.closed = False
 
@@ -470,6 +558,58 @@ class ScriptedReadOnlyOperations:
             finished_at=NOW,
             data=ResolvedWorkloadRequirement(requirement, locations, exhaustive),
         )
+
+    async def compare_obtainability(  # noqa: PLR0913
+        self,
+        candidates: tuple[ObtainabilityCandidate, ...],
+        *,
+        deadline: float,
+        support: AdviceSupport,
+        catalog_coverage: tuple[object, ...] = (),
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[ObtainabilityComparison]:
+        self.obtainability_calls.append(
+            (
+                candidates,
+                {
+                    "deadline": deadline,
+                    "support": support,
+                    "catalog_coverage": catalog_coverage,
+                    "cancellation": cancellation,
+                    "scope_input": scope_input,
+                },
+            )
+        )
+        return self.obtainability_result
+
+    async def compare_obtainability_all_compatible(  # noqa: PLR0913
+        self,
+        requirement: ComputeInstanceRequirement,
+        *,
+        machine: SpotMachineConfiguration,
+        distribution_shape: DistributionShape,
+        deadline: float,
+        support: AdviceSupport,
+        catalog_coverage: tuple[object, ...] = (),
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[ObtainabilityComparison]:
+        self.obtainability_all_calls.append(
+            (
+                requirement,
+                {
+                    "machine": machine,
+                    "distribution_shape": distribution_shape,
+                    "deadline": deadline,
+                    "support": support,
+                    "catalog_coverage": catalog_coverage,
+                    "cancellation": cancellation,
+                    "scope_input": scope_input,
+                },
+            )
+        )
+        return self.obtainability_result
 
     async def aclose(self) -> None:
         self.closed = True
@@ -867,6 +1007,57 @@ def test_workload_routes_decode_both_shapes_and_preserve_canonical_copy_cli() ->
                 "cqmgr quota resolve cloud-tpu-slice "
             )
             assert "--all-compatible-locations" in app.last_copied_cli
+
+    asyncio.run(scenario())
+
+
+def test_obtainability_standalone_explicit_candidates_share_typed_cli_semantics() -> (
+    None
+):
+    """Compare only explicit standalone candidates and preserve evidence."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            _input(app, "#obtainability-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#obtainability-vm-count").value = "2"
+            _input(app, "#obtainability-distribution").value = "balanced"
+            _input(
+                app, "#obtainability-candidates"
+            ).value = "us-central1=us-central1-a,us-central1-b"
+            await pilot.click("#obtainability-compare")
+            await pilot.pause()
+
+            assert len(operations.obtainability_calls) == 1
+            candidates, options = operations.obtainability_calls[0]
+            assert len(candidates) == 1
+            assert candidates[0].endpoint_region == "us-central1"
+            assert candidates[0].zones == ("us-central1-a", "us-central1-b")
+            assert candidates[0].machine.machine_type == "a3-highgpu-8g"
+            assert candidates[0].vm_count == 2
+            assert candidates[0].distribution_shape is DistributionShape.BALANCED
+            assert options["scope_input"] == ReadOnlyScopeInput()
+            assert operations.obtainability_all_calls == []
+
+            detail = str(_static(app, "#obtainability-detail").content)
+            assert "Candidate identity: sha256:" in detail
+            assert "Provider candidate score: 0.8 (high)" in detail
+            assert "Recommended shard: us-central1-a" in detail
+            assert "Rank: 1" in detail
+            assert "30-day p90 preemption: 0.12" in detail
+            assert "Total-request hourly price: USD 6.50" in detail
+            assert "Capacity guarantee: no" in detail
+            assert app.last_copied_cli is not None
+            assert app.last_copied_cli.startswith("cqmgr obtainability compare ")
+            assert (
+                "--candidate us-central1=us-central1-a,us-central1-b"
+                in app.last_copied_cli
+            )
+            assert "--all-compatible-locations" not in app.last_copied_cli
 
     asyncio.run(scenario())
 

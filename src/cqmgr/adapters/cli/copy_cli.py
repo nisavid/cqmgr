@@ -17,6 +17,7 @@ if TYPE_CHECKING:
         CloudTpuSliceRequirement,
         ComputeInstanceRequirement,
     )
+    from cqmgr.domain.obtainability import ObtainabilityCandidate
     from cqmgr.domain.scopes import ResourceScope
 
 _MAXIMUM_LIMIT = 1000
@@ -33,6 +34,11 @@ _CLOUD_TPU_RESOLVE_COMMAND = canonical_command_path(
     "quota",
     "resolve",
     "cloud-tpu-slice",
+)
+_OBTAINABILITY_COMPARE_COMMAND = canonical_command_path(
+    "cqmgr",
+    "obtainability",
+    "compare",
 )
 
 
@@ -242,6 +248,89 @@ def quota_inspect_copy_cli(
     )
     _append_presentation(arguments, selected_presentation)
     return shlex.join(arguments)
+
+
+def obtainability_compare_copy_cli(
+    resource_scope: ResourceScope,
+    candidates: tuple[ObtainabilityCandidate, ...],
+    *,
+    presentation: CopyCliPresentation | None = None,
+) -> str:
+    """Render one exact explicit-candidate Spot comparison."""
+    from cqmgr.domain.obtainability import ObtainabilityCandidate  # noqa: PLC0415
+
+    _require_scope(resource_scope)
+    if (
+        not isinstance(candidates, tuple)
+        or not candidates
+        or any(not isinstance(item, ObtainabilityCandidate) for item in candidates)
+    ):
+        msg = "Copy CLI obtainability comparison requires typed candidates"
+        raise ValueError(msg)
+    if len({item.candidate_id for item in candidates}) != len(candidates):
+        msg = "Copy CLI obtainability candidates must be unique"
+        raise ValueError(msg)
+    if (
+        len(
+            {
+                (item.machine, item.vm_count, item.distribution_shape)
+                for item in candidates
+            }
+        )
+        != 1
+    ):
+        msg = "Copy CLI obtainability comparison must keep one request fixed"
+        raise ValueError(msg)
+    selected_presentation = presentation or CopyCliPresentation()
+    if not isinstance(selected_presentation, CopyCliPresentation):
+        msg = "Copy CLI presentation must use CopyCliPresentation"
+        raise TypeError(msg)
+    first = candidates[0]
+    arguments = [
+        *_OBTAINABILITY_COMPARE_COMMAND,
+        "--resource-scope",
+        resource_scope.canonical_name,
+        *_obtainability_shape_arguments(first),
+    ]
+    _repeat(
+        arguments,
+        "--candidate",
+        tuple(
+            candidate.endpoint_region
+            + ("=" + ",".join(candidate.zones) if candidate.zones else "")
+            for candidate in candidates
+        ),
+    )
+    _append_presentation(arguments, selected_presentation)
+    return shlex.join(arguments)
+
+
+def _obtainability_shape_arguments(
+    candidate: ObtainabilityCandidate,
+) -> tuple[str, ...]:
+    machine = candidate.machine
+    arguments = [
+        "--machine-type",
+        machine.machine_type,
+    ]
+    if machine.gpu is not None:
+        arguments.extend(
+            (
+                "--gpu-type",
+                machine.gpu.accelerator_type,
+                "--gpu-count",
+                str(machine.gpu.count),
+            )
+        )
+    arguments.extend(
+        (
+            "--vm-count",
+            str(candidate.vm_count),
+            "--distribution-shape",
+            candidate.distribution_shape.value,
+        )
+    )
+    return tuple(arguments)
 
 
 def _require_scope(resource_scope: object) -> None:
