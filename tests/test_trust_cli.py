@@ -72,6 +72,29 @@ def test_trust_init_fails_closed_when_state_already_exists(
     assert operations.calls == 1
 
 
+def test_trust_init_reports_explicit_incomplete_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Human output distinguishes a restarted incomplete bootstrap."""
+    operations = _Operations(
+        TrustInitializationResult(
+            initialized=True,
+            reason="incomplete-trust-restarted",
+        )
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_trust_initialization_operations",
+        lambda: operations,
+    )
+
+    result = CliRunner().invoke(cli_module.main, ["trust", "init"])
+
+    assert result.exit_code == 0
+    assert "after restarting an incomplete attempt" in result.stdout
+    assert operations.calls == 1
+
+
 def test_trust_help_never_builds_native_keyring_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

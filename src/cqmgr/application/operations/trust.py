@@ -15,6 +15,7 @@ from cqmgr.application.ports.secrets import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from contextlib import AbstractContextManager
 
     from cqmgr.application.ports.secrets import (
         SecretStore,
@@ -94,6 +95,13 @@ class InstallationTrustRepository(Protocol):
         replacement: InstallationTrust,
     ) -> None:
         """Atomically replace one exact expected phase."""
+
+    def restart_incomplete(
+        self,
+        expected: InstallationTrust,
+        replacement: InstallationTrust,
+    ) -> None:
+        """Atomically replace one exact incomplete bootstrap candidate."""
 
 
 class TrustLoadError(RuntimeError):
@@ -183,14 +191,21 @@ class TrustInitializationOperations:
         store: SecretStore,
         *,
         material: TrustMaterialGenerator,
+        workflow_lock: AbstractContextManager[object],
     ) -> None:
         """Bind create-once persistence, storage, and random material generation."""
         self._repository = repository
         self._store = store
         self._material = material
+        self._workflow_lock = workflow_lock
 
-    def initialize(self) -> TrustInitializationResult:  # noqa: C901, PLR0911
-        """Initialize fresh trust or fail closed around an interrupted intent."""
+    def initialize(self) -> TrustInitializationResult:
+        """Serialize and execute one explicit installation-trust attempt."""
+        with self._workflow_lock:
+            return self._initialize_locked()
+
+    def _initialize_locked(self) -> TrustInitializationResult:
+        """Initialize fresh trust or recover one exact incomplete candidate."""
         probe = self._store.probe()
         if not probe.mutation_capable:
             return TrustInitializationResult(
@@ -200,79 +215,147 @@ class TrustInitializationOperations:
         trust = self._repository.load()
         fresh_material: TrustMaterial | None = None
         if trust is None:
-            fresh_material = self._material()
-            installation_id, reference, key = fresh_material
-            if len(key.reveal()) != _AUTHENTICATION_KEY_BYTES:
-                return TrustInitializationResult(
-                    initialized=False,
-                    reason="invalid-trust-material",
-                )
-            try:
-                trust = InstallationTrust(
-                    installation_id,
-                    reference,
-                    _authentication_key_commitment(key),
-                    InstallationTrustPhase.PREPARED,
-                )
-            except (TypeError, ValueError):
-                return TrustInitializationResult(
-                    initialized=False,
-                    reason="invalid-trust-material",
-                )
+            prepared = self._prepare_material()
+            if isinstance(prepared, TrustInitializationResult):
+                return prepared
+            trust, fresh_material = prepared
             self._repository.create(trust)
         if trust.phase is InstallationTrustPhase.ACTIVE:
-            try:
-                loaded = InstallationTrustLoader(
-                    self._repository,
-                    self._store,
-                ).load()
-            except TrustLoadError:
-                return TrustInitializationResult(
-                    initialized=False,
-                    reason="trust-unavailable",
-                )
-            del loaded
-            return TrustInitializationResult(
-                initialized=False,
-                trust=trust,
-                reason="already-initialized",
-            )
+            return self._load_active(trust)
         if trust.phase is InstallationTrustPhase.CREATE_INTENT:
-            existing = self._store.get(trust.authentication_key_reference)
-            if (
-                existing.status is SecretStoreStatus.AVAILABLE
-                and existing.secret is not None
-                and len(existing.secret.reveal()) == _AUTHENTICATION_KEY_BYTES
-                and hmac.compare_digest(
-                    _authentication_key_commitment(existing.secret),
-                    trust.authentication_key_commitment,
-                )
-            ):
-                active = replace(trust, phase=InstallationTrustPhase.ACTIVE)
-                self._repository.transition(
-                    InstallationTrustPhase.CREATE_INTENT,
-                    active,
-                )
-                return TrustInitializationResult(initialized=True, trust=active)
-            return TrustInitializationResult(
-                initialized=False,
-                trust=trust,
-                reason="trust-create-interrupted",
-            )
-
+            return self._resume_create_intent(trust)
         if fresh_material is None:
+            return self._resume_prepared(trust)
+        return self._activate_prepared(trust, fresh_material)
+
+    def _prepare_material(
+        self,
+    ) -> tuple[InstallationTrust, TrustMaterial] | TrustInitializationResult:
+        fresh_material = self._material()
+        installation_id, reference, key = fresh_material
+        if len(key.reveal()) != _AUTHENTICATION_KEY_BYTES:
+            return TrustInitializationResult(
+                initialized=False,
+                reason="invalid-trust-material",
+            )
+        try:
+            trust = InstallationTrust(
+                installation_id,
+                reference,
+                _authentication_key_commitment(key),
+                InstallationTrustPhase.PREPARED,
+            )
+        except (TypeError, ValueError):
+            return TrustInitializationResult(
+                initialized=False,
+                reason="invalid-trust-material",
+            )
+        return trust, fresh_material
+
+    def _load_active(
+        self,
+        trust: InstallationTrust,
+    ) -> TrustInitializationResult:
+        try:
+            loaded = InstallationTrustLoader(
+                self._repository,
+                self._store,
+            ).load()
+        except TrustLoadError:
+            return TrustInitializationResult(
+                initialized=False,
+                reason="trust-unavailable",
+            )
+        del loaded
+        return TrustInitializationResult(
+            initialized=False,
+            trust=trust,
+            reason="already-initialized",
+        )
+
+    def _resume_create_intent(
+        self,
+        trust: InstallationTrust,
+    ) -> TrustInitializationResult:
+        existing = self._store.get(trust.authentication_key_reference)
+        if (
+            existing.status is SecretStoreStatus.AVAILABLE
+            and existing.secret is not None
+            and len(existing.secret.reveal()) == _AUTHENTICATION_KEY_BYTES
+            and hmac.compare_digest(
+                _authentication_key_commitment(existing.secret),
+                trust.authentication_key_commitment,
+            )
+        ):
+            active = replace(trust, phase=InstallationTrustPhase.ACTIVE)
+            self._repository.transition(
+                InstallationTrustPhase.CREATE_INTENT,
+                active,
+            )
+            return TrustInitializationResult(initialized=True, trust=active)
+        if existing.status is SecretStoreStatus.MISSING:
+            return self._restart_incomplete(trust)
+        return TrustInitializationResult(
+            initialized=False,
+            trust=trust,
+            reason="trust-create-interrupted",
+        )
+
+    def _resume_prepared(
+        self,
+        trust: InstallationTrust,
+    ) -> TrustInitializationResult:
+        existing = self._store.get(trust.authentication_key_reference)
+        if existing.status is SecretStoreStatus.MISSING:
+            return self._restart_incomplete(trust)
+        return TrustInitializationResult(
+            initialized=False,
+            trust=trust,
+            reason="trust-prepare-interrupted",
+        )
+
+    def _restart_incomplete(
+        self,
+        trust: InstallationTrust,
+    ) -> TrustInitializationResult:
+        prepared = self._prepare_material()
+        if isinstance(prepared, TrustInitializationResult):
+            return prepared
+        replacement, fresh_material = prepared
+        if (
+            replacement.installation_id == trust.installation_id
+            or replacement.authentication_key_reference
+            == trust.authentication_key_reference
+            or hmac.compare_digest(
+                replacement.authentication_key_commitment,
+                trust.authentication_key_commitment,
+            )
+        ):
             return TrustInitializationResult(
                 initialized=False,
                 trust=trust,
-                reason="trust-prepare-interrupted",
+                reason="trust-recovery-material-reused",
             )
+        self._repository.restart_incomplete(trust, replacement)
+        result = self._activate_prepared(replacement, fresh_material)
+        if result.initialized:
+            return replace(result, reason="incomplete-trust-restarted")
+        return result
+
+    def _activate_prepared(
+        self,
+        trust: InstallationTrust,
+        fresh_material: TrustMaterial,
+    ) -> TrustInitializationResult:
         installation_id, reference, key = fresh_material
         if (
             installation_id != trust.installation_id
             or reference != trust.authentication_key_reference
+            or not hmac.compare_digest(
+                _authentication_key_commitment(key),
+                trust.authentication_key_commitment,
+            )
         ):
-            # A prepared record already owns its exact material. Generators are
-            # not a recovery source after any retained bootstrap state exists.
             return TrustInitializationResult(
                 initialized=False,
                 trust=trust,

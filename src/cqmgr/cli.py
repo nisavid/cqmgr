@@ -601,7 +601,12 @@ def trust_init(output: str) -> None:
             )
         )
     elif result.initialized:
-        click.echo("Installation trust initialized.")
+        message = "Installation trust initialized."
+        if result.reason == "incomplete-trust-restarted":
+            message = (
+                "Installation trust initialized after restarting an incomplete attempt."
+            )
+        click.echo(message)
     if not result.initialized:
         message = result.reason or "installation trust initialization failed"
         raise click.ClickException(message)
