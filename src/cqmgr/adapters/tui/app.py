@@ -624,6 +624,8 @@ class CloudQuotaManagerApp(App[None]):
                 yield Button("Apply filters", id="apply-filters")
                 yield Button("Resolve Compute instance", id="resolve-compute")
                 yield Button("Resolve Cloud TPU slice", id="resolve-tpu")
+                yield Button("Review Plan", id="open-plan-review")
+                yield Button("Watch Apply", id="open-watch")
             with Vertical(id="quota-ledger-pane"):
                 yield Static(
                     "Provider coverage: awaiting read",
@@ -770,7 +772,7 @@ class CloudQuotaManagerApp(App[None]):
                     yield Input(placeholder="Apply intent ID", id="lifecycle-intent-id")
                     yield Input(
                         value="granted",
-                        placeholder="granted, reconciled, or terminal",
+                        placeholder="granted or fulfilled",
                         id="lifecycle-watch-condition",
                     )
                     yield Input(
@@ -1220,6 +1222,29 @@ class CloudQuotaManagerApp(App[None]):
         )
         return result
 
+    def _open_plan_review_input(self) -> None:
+        """Expose safe Review ingress without requiring an in-session Preview."""
+        self._enter_lifecycle_route(LifecycleRoute.PLAN_REVIEW, None)
+        self.query_one("#lifecycle-plan-input").remove_class("hidden")
+        self.query_one("#lifecycle-detail", Static).update(
+            "Plan Review\n"
+            "Enter exactly one local Plan digest or portable Plan file path.\n"
+            "Review is read-only; Apply remains disabled unless local authority "
+            "and Plan state permit it."
+        )
+        self._set_status("REVIEW READY — enter one exact Plan reference")
+
+    def _open_watch_input(self) -> None:
+        """Expose Watch ingress for an Apply intent created on any surface."""
+        self._enter_lifecycle_route(LifecycleRoute.WATCH, None)
+        self.query_one("#lifecycle-watch-input").remove_class("hidden")
+        self.query_one("#lifecycle-detail", Static).update(
+            "Watch Apply\n"
+            "Enter an Apply intent ID, terminal condition, and absolute deadline.\n"
+            "Polling begins only after explicit preparation and Start Watch."
+        )
+        self._set_status("WATCH INPUT READY — enter explicit durable context")
+
     def prepare_apply(
         self,
         request: ApplyRequest,
@@ -1270,7 +1295,7 @@ class CloudQuotaManagerApp(App[None]):
         self,
         request: WatchRequest,
         *,
-        bound_scope: ResourceScope,
+        bound_scope: ResourceScope | None,
         copy_cli: str | None = None,
     ) -> None:
         """Prepare one explicit condition and deadline without polling yet."""
@@ -1999,7 +2024,7 @@ class CloudQuotaManagerApp(App[None]):
             prepared = await preparation.prepare(
                 intent,
                 deadline=self._deadline(),
-                require_preview=intent.quota_contact is not None,
+                require_preview=True,
             )
             selector = intent.selector
             copy_cli = (
@@ -2117,7 +2142,7 @@ class CloudQuotaManagerApp(App[None]):
         """Build Watch from one explicit intent, condition, and absolute deadline."""
         requests = self.lifecycle_requests
         scope = self._lifecycle_state.bound_scope
-        if requests is None or scope is None:
+        if requests is None:
             self._set_status("WATCH UNAVAILABLE — durable Apply context is unavailable")
             return
         intent_id = self.query_one("#lifecycle-intent-id", Input).value.strip()
@@ -3193,6 +3218,10 @@ class CloudQuotaManagerApp(App[None]):
             self._open_selected_quota_composition()
         elif button_id == "workload-compose-request":
             self._open_resolved_workload_composition()
+        elif button_id == "open-plan-review":
+            self._open_plan_review_input()
+        elif button_id == "open-watch":
+            self._open_watch_input()
         elif button_id == "lifecycle-compose":
             self._submit_selected_quota_composition()
         elif button_id == "lifecycle-back":
