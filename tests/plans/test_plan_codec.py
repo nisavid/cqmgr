@@ -854,3 +854,10 @@ def test_review_validation_and_every_ledger_state_fail_closed() -> None:
         )
     with pytest.raises(TypeError, match="PlanLedgerState"):
         review_plan(plan, state=cast("PlanLedgerState", "available"), **common)
+    with pytest.raises(TypeError, match="local_authority_available"):
+        review_plan(
+            plan,
+            state=PlanLedgerState.AVAILABLE,
+            local_authority_available=cast("bool", 1),
+            **common,
+        )
