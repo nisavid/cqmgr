@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-# ruff: noqa: PLR2004
+# ruff: noqa: FBT003, PLR2004
 import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -13,9 +13,12 @@ import pytest
 
 from cqmgr.application.operations.obtainability import (
     AdviceSupport,
+    ObtainabilityCandidateEligibility,
     ObtainabilityCompareRequest,
+    ObtainabilityEligibility,
     ObtainabilityOperations,
     candidates_from_resolved_workload,
+    eligibility_from_resolved_workload,
 )
 from cqmgr.application.ports.coordination import CancellationToken
 from cqmgr.application.ports.obtainability import (
@@ -25,6 +28,7 @@ from cqmgr.application.ports.obtainability import (
 from cqmgr.application.ports.provider_reads import ProviderReadContext
 from cqmgr.domain.accelerator_overlay import (
     AllCompatibleLocations,
+    CandidateLocations,
     CloudTpuSliceRequirement,
     ComputeInstanceRequirement,
     ProvisioningModel,
@@ -256,6 +260,173 @@ def test_all_compatible_expansion_keeps_resolver_provenance_and_exact_zones() ->
         )
     )
     assert result.data.resolver_provenance is resolved
+
+
+def test_resolver_eligibility_gates_advice_and_retains_exact_coverage() -> None:
+    """Only cataloged Spot Compute evidence may authorize provider advice."""
+    candidate = ObtainabilityCandidate(
+        "us-central1",
+        (),
+        SpotMachineConfiguration("a3-highgpu-8g"),
+        2,
+        DistributionShape.BALANCED,
+    )
+    requirement = ComputeInstanceRequirement(
+        candidate.machine.machine_type,
+        candidate.vm_count,
+        ProvisioningModel.SPOT,
+        CandidateLocations((candidate.endpoint_region,)),
+    )
+    eligible = ResolvedWorkloadRequirement(
+        requirement,
+        (_resolved_location(candidate.endpoint_region),),
+        None,
+    )
+
+    eligibility = eligibility_from_resolved_workload(eligible, (candidate,))
+
+    assert eligibility == ObtainabilityEligibility(
+        AdviceSupport(),
+        (
+            ObtainabilityProductCoverage(
+                "a3-highgpu-8g",
+                "compute.googleapis.com",
+                True,
+                True,
+                True,
+            ),
+        ),
+        (ObtainabilityCandidateEligibility(candidate.candidate_id, True),),
+    )
+
+    non_compute = replace(
+        eligible,
+        locations=(
+            replace(
+                eligible.locations[0],
+                management_plane=ManagementPlane.TPU,
+                owning_service="tpu.googleapis.com",
+            ),
+        ),
+    )
+    ineligible = eligibility_from_resolved_workload(non_compute, (candidate,))
+
+    assert ineligible.support == AdviceSupport()
+    assert ineligible.catalog_coverage == (
+        ObtainabilityProductCoverage(
+            "a3-highgpu-8g",
+            "compute.googleapis.com",
+            False,
+            False,
+            False,
+            ("configuration-not-cataloged-for-spot-compute",),
+        ),
+    )
+    assert ineligible.candidates == (
+        ObtainabilityCandidateEligibility(
+            candidate.candidate_id,
+            False,
+            (UnrankedReason.NON_COMPUTE_MANAGEMENT_PLANE,),
+        ),
+    )
+
+
+def test_n1_attached_gpu_eligibility_keeps_exact_history_limit() -> None:
+    """Catalog presence does not imply unsupported N1 history coverage."""
+    candidate = ObtainabilityCandidate(
+        "us-central1",
+        (),
+        SpotMachineConfiguration(
+            "n1-standard-8",
+            GpuAttachment("nvidia-tesla-t4", 1),
+        ),
+        1,
+        DistributionShape.ANY,
+    )
+    requirement = ComputeInstanceRequirement(
+        candidate.machine.machine_type,
+        candidate.vm_count,
+        ProvisioningModel.SPOT,
+        CandidateLocations((candidate.endpoint_region,)),
+    )
+    resolved = ResolvedWorkloadRequirement(
+        requirement,
+        (_resolved_location(candidate.endpoint_region),),
+        None,
+    )
+
+    eligibility = eligibility_from_resolved_workload(resolved, (candidate,))
+
+    assert eligibility.support == AdviceSupport(True, False)
+    assert eligibility.catalog_coverage == (
+        ObtainabilityProductCoverage(
+            "n1-standard-8+nvidia-tesla-t4x1",
+            "compute.googleapis.com",
+            True,
+            True,
+            False,
+            ("history-unsupported-n1-attached-gpu",),
+        ),
+    )
+    assert eligibility.candidates == (
+        ObtainabilityCandidateEligibility(candidate.candidate_id, True),
+    )
+
+
+def test_ineligible_candidate_never_reaches_advice_or_history_readers() -> None:
+    """Resolver rejection remains visible without starting provider advice."""
+    candidate = ObtainabilityCandidate(
+        "us-central1",
+        (),
+        SpotMachineConfiguration("uncataloged-machine"),
+        1,
+        DistributionShape.ANY,
+    )
+    eligibility = ObtainabilityEligibility(
+        AdviceSupport(),
+        (
+            ObtainabilityProductCoverage(
+                "uncataloged-machine",
+                "compute.googleapis.com",
+                False,
+                False,
+                False,
+                ("configuration-not-cataloged-for-spot-compute",),
+            ),
+        ),
+        (
+            ObtainabilityCandidateEligibility(
+                candidate.candidate_id,
+                False,
+                (UnrankedReason.CATALOG_UNSUPPORTED,),
+            ),
+        ),
+    )
+    advice: ScriptedReader[CapacityAdvice] = ScriptedReader([])
+    history: ScriptedReader[CapacityHistory] = ScriptedReader([])
+
+    result = asyncio.run(
+        ObtainabilityOperations(
+            advice,
+            history,
+            clock=lambda: NOW,
+        ).compare(
+            ObtainabilityCompareRequest(
+                _context(),
+                (candidate,),
+                eligibility=eligibility,
+            )
+        )
+    )
+
+    assert advice.requests == []
+    assert history.requests == []
+    assert result.data.catalog_coverage == eligibility.catalog_coverage
+    assert result.data.candidates[0].unranked_reasons == (
+        UnrankedReason.CATALOG_UNSUPPORTED,
+        UnrankedReason.CURRENT_ADVICE_UNSUPPORTED,
+        UnrankedReason.HISTORY_UNSUPPORTED,
+    )
 
 
 def test_current_and_history_ports_are_independently_disableable() -> None:

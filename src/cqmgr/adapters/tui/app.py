@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast, override
 
 from textual.app import App, ComposeResult
@@ -14,7 +16,6 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, DataTable, Footer, Input, Static
 
 from cqmgr.adapters.cli.copy_cli import (
-    obtainability_all_compatible_copy_cli,
     obtainability_compare_copy_cli,
     quota_inspect_copy_cli,
     quota_list_copy_cli,
@@ -31,7 +32,11 @@ from cqmgr.application.operations.audit import (
     AuditListData,
     AuditVerifyData,
 )
-from cqmgr.application.operations.obtainability import AdviceSupport
+from cqmgr.application.operations.obtainability import (
+    PreparedObtainabilityComparison,
+    candidates_from_resolved_workload,
+    prepare_obtainability_comparison,
+)
 from cqmgr.application.operations.quotas import QuotaBrowseData, QuotaInspectData
 from cqmgr.application.operations.read_only import (
     IncompleteQuotaInspectData,
@@ -42,7 +47,6 @@ from cqmgr.application.operations.read_only import (
 )
 from cqmgr.application.ports.coordination import CancellationToken
 from cqmgr.domain.accelerator_overlay import (
-    AllCompatibleLocations,
     CloudTpuSliceRequirement,
     ComputeInstanceRequirement,
     ProvisioningModel,
@@ -65,6 +69,7 @@ if TYPE_CHECKING:
     from textual.binding import BindingType
     from textual.worker import Worker
 
+    from cqmgr.domain.obtainability import RankedCandidate
     from cqmgr.domain.quotas import QuotaQuantity
     from cqmgr.domain.results import OperationResult
 
@@ -107,31 +112,15 @@ class ReadOnlyOperationsLike(Protocol):
     ) -> OperationResult[Any]:
         """Resolve one workload-first requirement."""
 
-    async def compare_obtainability(  # noqa: PLR0913
+    async def compare_obtainability_prepared(
         self,
-        candidates: tuple[ObtainabilityCandidate, ...],
+        prepared_comparison: PreparedObtainabilityComparison,
         *,
         deadline: float,
-        support: AdviceSupport,
-        catalog_coverage: tuple[Any, ...] = (),
         cancellation: CancellationToken | None = None,
         scope_input: ReadOnlyScopeInput = _DEFAULT_SCOPE_INPUT,
     ) -> OperationResult[Any]:
-        """Compare one explicit fixed-shape candidate set."""
-
-    async def compare_obtainability_all_compatible(  # noqa: PLR0913
-        self,
-        requirement: ComputeInstanceRequirement,
-        *,
-        machine: SpotMachineConfiguration,
-        distribution_shape: DistributionShape,
-        deadline: float,
-        support: AdviceSupport,
-        catalog_coverage: tuple[Any, ...] = (),
-        cancellation: CancellationToken | None = None,
-        scope_input: ReadOnlyScopeInput = _DEFAULT_SCOPE_INPUT,
-    ) -> OperationResult[Any]:
-        """Resolve and compare one explicitly confirmed compatible expansion."""
+        """Compare one frozen resolver-backed candidate set without expansion."""
 
     async def aclose(self) -> None:
         """Close invocation-scoped provider clients."""
@@ -161,6 +150,79 @@ class QuotaSelection:
 
     item: QuotaQueryItem
     selector: QuotaInspectSelector
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceCopyCli:
+    """One canonical command owned by exactly one sibling workspace."""
+
+    workspace: str
+    command: str
+
+    def __post_init__(self) -> None:
+        """Reject cross-workspace or empty copy state."""
+        if self.workspace not in {"quotas", "obtainability", "audit"}:
+            msg = "copy CLI workspace must be canonical"
+            raise ValueError(msg)
+        if not self.command:
+            msg = "copy CLI command must be non-empty"
+            raise ValueError(msg)
+
+
+class ObtainabilityEntryMode(StrEnum):
+    """How the operator entered the sibling Obtainability workspace."""
+
+    STANDALONE = "standalone"
+    CONTEXTUAL = "contextual"
+
+
+@dataclass(frozen=True, slots=True)
+class ObtainabilityRequestFingerprint:
+    """Canonical digest of every operator-editable fixed-request input."""
+
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class ObtainabilityFormDraft:
+    """One decoded TUI request before resolver-backed eligibility."""
+
+    machine: SpotMachineConfiguration
+    vm_count: int
+    distribution_shape: DistributionShape
+    candidates: tuple[ObtainabilityCandidate, ...]
+    all_compatible: bool
+
+    @property
+    def fingerprint(self) -> ObtainabilityRequestFingerprint:
+        """Bind mode, fixed shape, and exact explicit candidate identities."""
+        machine = self.machine
+        encoded = "\x1f".join(
+            (
+                machine.machine_type,
+                "" if machine.gpu is None else machine.gpu.accelerator_type,
+                "" if machine.gpu is None else str(machine.gpu.count),
+                str(machine.local_ssd_count),
+                str(self.vm_count),
+                self.distribution_shape.value,
+                "all-compatible" if self.all_compatible else "explicit",
+                *(candidate.candidate_id for candidate in self.candidates),
+            )
+        )
+        return ObtainabilityRequestFingerprint(
+            "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ObtainabilityWorkflowState:
+    """Typed confirmation state for one exact Obtainability request."""
+
+    entry_mode: ObtainabilityEntryMode = ObtainabilityEntryMode.STANDALONE
+    pending_expansion: PreparedObtainabilityComparison | None = None
+    pending_fingerprint: ObtainabilityRequestFingerprint | None = None
+    confirmed_fingerprint: ObtainabilityRequestFingerprint | None = None
+    confirmed_candidate_ids: tuple[str, ...] = ()
 
 
 class CloudQuotaManagerApp(App[None]):
@@ -376,7 +438,7 @@ class CloudQuotaManagerApp(App[None]):
         self.active_workspace = "quotas"
         self.current_query = ReadOnlyQuotaQuery()
         self.last_result: OperationResult[Any] | None = None
-        self.last_copied_cli: str | None = None
+        self._copy_cli_by_workspace: dict[str, WorkspaceCopyCli] = {}
         self.selected_quota: QuotaSelection | None = None
         self._quota_items: dict[str, QuotaQueryItem] = {}
         self._detail_route = False
@@ -388,9 +450,7 @@ class CloudQuotaManagerApp(App[None]):
         self._workspace_generation = 0
         self._audit_operation_generation = 0
         self._resolved_compute: ResolvedWorkloadRequirement | None = None
-        self._obtainability_contextual = False
-        self._obtainability_confirmed = False
-        self._obtainability_all_pending = False
+        self._obtainability_state = ObtainabilityWorkflowState()
 
     @override
     def compose(self) -> ComposeResult:  # noqa: PLR0915
@@ -814,9 +874,28 @@ class CloudQuotaManagerApp(App[None]):
     def _deadline(self) -> float:
         return cast("float", self._monotonic()) + self._PROVIDER_OPERATION_SECONDS
 
+    @property
+    def last_copied_cli(self) -> str | None:
+        """Return only the canonical command owned by the active workspace."""
+        copy_cli = self._copy_cli_by_workspace.get(self.active_workspace)
+        return None if copy_cli is None else copy_cli.command
+
     def _show_copy_cli(self, command: str) -> None:
-        self.last_copied_cli = command
-        self.query_one("#copy-cli-preview", Static).update(command)
+        copy_cli = WorkspaceCopyCli(self.active_workspace, command)
+        self._copy_cli_by_workspace[self.active_workspace] = copy_cli
+        self._sync_copy_cli_preview()
+
+    def _sync_copy_cli_preview(self) -> None:
+        """Expose only the active workspace's canonical command."""
+        command = self.last_copied_cli
+        if self.active_workspace == "quotas":
+            self.query_one("#copy-cli-preview", Static).update(
+                command or "Copy CLI unavailable until an operation is fully specified."
+            )
+        elif self.active_workspace == "obtainability":
+            self.query_one("#obtainability-copy-cli", Static).update(
+                command or "Copy CLI unavailable until a comparison is fully specified."
+            )
 
     def interface_snapshot(self) -> str:
         """Return a deterministic semantic snapshot for reviewed Pilot states."""
@@ -953,6 +1032,7 @@ class CloudQuotaManagerApp(App[None]):
             self.query_one(f"#{widget_id}").set_class(name != workspace, "hidden")
             button = self.query_one(f"#workspace-{name}", Button)
             button.set_class(name == workspace, "active-workspace")
+        self._sync_copy_cli_preview()
         if workspace == "audit":
             operation_generation = self._claim_audit_operation()
             self.run_worker(
@@ -1083,10 +1163,29 @@ class CloudQuotaManagerApp(App[None]):
                 exclusive=True,
                 exit_on_error=False,
             )
-        elif (button_id == "copy-cli" and self.last_copied_cli is not None) or (
-            button_id == "obtainability-copy" and self.last_copied_cli is not None
+        elif button_id in {"copy-cli", "obtainability-copy"}:
+            command = self.last_copied_cli
+            if command is not None:
+                self.copy_to_clipboard(command)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Invalidate confirmation whenever an Obtainability input changes."""
+        input_id = event.input.id
+        state = self._obtainability_state
+        if (
+            input_id is not None
+            and input_id.startswith("obtainability-")
+            and state.confirmed_fingerprint is not None
         ):
-            self.copy_to_clipboard(self.last_copied_cli)
+            self._obtainability_state = replace(
+                state,
+                confirmed_fingerprint=None,
+                confirmed_candidate_ids=(),
+            )
+            if self.active_workspace == "obtainability":
+                self._set_status(
+                    "INPUT CHANGED — confirm the exact request before comparison"
+                )
 
     def _apply_filters(self) -> None:
         if self.active_workspace != "quotas":
@@ -1202,9 +1301,7 @@ class CloudQuotaManagerApp(App[None]):
         )
 
     def _prepare_standalone_obtainability(self) -> None:
-        self._obtainability_contextual = False
-        self._obtainability_confirmed = False
-        self._obtainability_all_pending = False
+        self._obtainability_state = ObtainabilityWorkflowState()
         self.query_one("#obtainability-breadcrumb", Static).update(
             "Obtainability / Standalone\n"
             "Fix one exact Spot VM request. Candidate locations never expand silently."
@@ -1225,11 +1322,8 @@ class CloudQuotaManagerApp(App[None]):
             )
             return
         requirement = resolved.requirement
-        self._obtainability_contextual = True
-        self._obtainability_confirmed = False
-        self._obtainability_all_pending = isinstance(
-            requirement.locations,
-            AllCompatibleLocations,
+        self._obtainability_state = ObtainabilityWorkflowState(
+            entry_mode=ObtainabilityEntryMode.CONTEXTUAL,
         )
         self.query_one(
             "#obtainability-machine-type", Input
@@ -1274,47 +1368,63 @@ class CloudQuotaManagerApp(App[None]):
         )
 
     def _confirm_obtainability(self) -> None:
-        self._obtainability_confirmed = True
+        state = self._obtainability_state
+        all_compatible = state.pending_expansion is not None
+        try:
+            draft = self._decode_obtainability_form(
+                all_compatible=all_compatible,
+            )
+        except (TypeError, ValueError) as error:
+            self._set_status(f"INVALID OBTAINABILITY REQUEST — {error}")
+            return
+        if (
+            state.pending_fingerprint is not None
+            and state.pending_fingerprint != draft.fingerprint
+        ):
+            self._obtainability_state = replace(
+                state,
+                confirmed_fingerprint=None,
+                confirmed_candidate_ids=(),
+            )
+            self._set_status(
+                "INPUT CHANGED — preview candidate expansion again before confirmation"
+            )
+            return
+        candidate_ids = (
+            tuple(
+                candidate.candidate_id
+                for candidate in state.pending_expansion.candidates
+            )
+            if state.pending_expansion is not None
+            else tuple(candidate.candidate_id for candidate in draft.candidates)
+        )
+        self._obtainability_state = replace(
+            state,
+            confirmed_fingerprint=draft.fingerprint,
+            confirmed_candidate_ids=candidate_ids,
+        )
         self._set_status("CONFIRMED — inherited fields and candidate mode are explicit")
 
     def _submit_obtainability(self) -> None:
         """Decode an explicit fixed request through the same parser as Click."""
-        if self._obtainability_contextual and not self._obtainability_confirmed:
-            self._set_status("CONFIRM INHERITED FIELDS — no advice query has started")
-            return
-        machine_type = self.query_one(
-            "#obtainability-machine-type",
-            Input,
-        ).value.strip()
-        gpu_type = self.query_one("#obtainability-gpu-type", Input).value.strip()
-        gpu_count = self.query_one("#obtainability-gpu-count", Input).value.strip()
-        candidate_text = self.query_one(
-            "#obtainability-candidates",
-            Input,
-        ).value.strip()
         try:
-            candidates = parse_obtainability_candidates(
-                machine_type=machine_type,
-                gpu_type=gpu_type or None,
-                gpu_count=gpu_count or None,
-                vm_count=self.query_one(
-                    "#obtainability-vm-count",
-                    Input,
-                ).value.strip(),
-                distribution_shape=self.query_one(
-                    "#obtainability-distribution",
-                    Input,
-                ).value.strip(),
-                candidates=tuple(candidate_text.split()),
-            )
+            draft = self._decode_obtainability_form(all_compatible=False)
         except (TypeError, ValueError) as error:
             self._set_status(f"INVALID OBTAINABILITY REQUEST — {error}")
+            return
+        state = self._obtainability_state
+        if state.entry_mode is ObtainabilityEntryMode.CONTEXTUAL and (
+            state.confirmed_fingerprint != draft.fingerprint
+            or state.confirmed_candidate_ids
+            != tuple(candidate.candidate_id for candidate in draft.candidates)
+        ):
+            self._set_status("CONFIRM INHERITED FIELDS — no advice query has started")
             return
         generation = self._claim_provider_view()
         cancellation = CancellationToken()
         self._cancellation = cancellation
         self.run_worker(
-            self._compare_obtainability(candidates, cancellation, generation),
+            self._compare_obtainability(draft, cancellation, generation),
             group="obtainability-compare",
             exclusive=True,
             exit_on_error=False,
@@ -1323,10 +1433,10 @@ class CloudQuotaManagerApp(App[None]):
     def _submit_obtainability_all(self) -> None:
         """Resolve an all-compatible expansion before any comparison begins."""
         try:
-            machine, count, shape = self._obtainability_shape()
+            draft = self._decode_obtainability_form(all_compatible=True)
             requirement = parse_compute_instance_requirement(
-                machine_type=machine.machine_type,
-                instance_count=str(count),
+                machine_type=draft.machine.machine_type,
+                instance_count=str(draft.vm_count),
                 provisioning_model=ProvisioningModel.SPOT.value,
                 locations=(),
                 all_compatible=True,
@@ -1334,15 +1444,25 @@ class CloudQuotaManagerApp(App[None]):
         except (TypeError, ValueError) as error:
             self._set_status(f"INVALID OBTAINABILITY REQUEST — {error}")
             return
-        if not self._obtainability_all_pending:
-            self._obtainability_all_pending = True
-            self._obtainability_confirmed = False
+        state = self._obtainability_state
+        if (
+            state.pending_expansion is None
+            or state.pending_fingerprint != draft.fingerprint
+        ):
+            self._obtainability_state = replace(
+                state,
+                pending_expansion=None,
+                pending_fingerprint=None,
+                confirmed_fingerprint=None,
+                confirmed_candidate_ids=(),
+            )
             generation = self._claim_provider_view()
             cancellation = CancellationToken()
             self._cancellation = cancellation
             self.run_worker(
                 self._preview_obtainability_expansion(
                     requirement,
+                    draft,
                     cancellation,
                     generation,
                 ),
@@ -1351,17 +1471,21 @@ class CloudQuotaManagerApp(App[None]):
                 exit_on_error=False,
             )
             return
-        if not self._obtainability_confirmed:
+        confirmed_ids = tuple(
+            candidate.candidate_id for candidate in state.pending_expansion.candidates
+        )
+        if (
+            state.confirmed_fingerprint != draft.fingerprint
+            or state.confirmed_candidate_ids != confirmed_ids
+        ):
             self._set_status("CONFIRM CANDIDATE EXPANSION — no comparison has started")
             return
         generation = self._claim_provider_view()
         cancellation = CancellationToken()
         self._cancellation = cancellation
         self.run_worker(
-            self._compare_obtainability_all(
-                requirement,
-                machine,
-                shape,
+            self._compare_obtainability_prepared(
+                state.pending_expansion,
                 cancellation,
                 generation,
             ),
@@ -1370,12 +1494,15 @@ class CloudQuotaManagerApp(App[None]):
             exit_on_error=False,
         )
 
-    def _obtainability_shape(
+    def _decode_obtainability_form(
         self,
-    ) -> tuple[SpotMachineConfiguration, int, DistributionShape]:
+        *,
+        all_compatible: bool,
+    ) -> ObtainabilityFormDraft:
+        """Decode every form field once through the shared public parsers."""
         gpu_type = self.query_one("#obtainability-gpu-type", Input).value.strip()
         gpu_count = self.query_one("#obtainability-gpu-count", Input).value.strip()
-        return parse_obtainability_shape(
+        machine, count, shape = parse_obtainability_shape(
             machine_type=self.query_one(
                 "#obtainability-machine-type",
                 Input,
@@ -1391,10 +1518,36 @@ class CloudQuotaManagerApp(App[None]):
                 Input,
             ).value.strip(),
         )
+        candidate_text = self.query_one(
+            "#obtainability-candidates",
+            Input,
+        ).value.strip()
+        candidates = (
+            ()
+            if all_compatible
+            else parse_obtainability_candidates(
+                machine_type=machine.machine_type,
+                gpu_type=(
+                    None if machine.gpu is None else machine.gpu.accelerator_type
+                ),
+                gpu_count=None if machine.gpu is None else str(machine.gpu.count),
+                vm_count=str(count),
+                distribution_shape=shape.value,
+                candidates=tuple(candidate_text.split()),
+            )
+        )
+        return ObtainabilityFormDraft(
+            machine,
+            count,
+            shape,
+            candidates,
+            all_compatible,
+        )
 
     async def _preview_obtainability_expansion(
         self,
         requirement: ComputeInstanceRequirement,
+        draft: ObtainabilityFormDraft,
         cancellation: CancellationToken,
         generation: int,
     ) -> None:
@@ -1413,10 +1566,28 @@ class CloudQuotaManagerApp(App[None]):
             )
             return
         self._resolved_compute = data
+        try:
+            candidates = candidates_from_resolved_workload(
+                data,
+                machine=draft.machine,
+                distribution_shape=draft.distribution_shape,
+            )
+            prepared = prepare_obtainability_comparison(data, candidates)
+        except (TypeError, ValueError):
+            self._set_status(
+                "EXPANSION UNAVAILABLE — no cataloged Spot Compute candidates"
+            )
+            return
+        self._obtainability_state = replace(
+            self._obtainability_state,
+            pending_expansion=prepared,
+            pending_fingerprint=draft.fingerprint,
+            confirmed_fingerprint=None,
+            confirmed_candidate_ids=(),
+        )
         compatible = tuple(
-            location.location
-            for location in data.locations
-            if location.disposition is WorkloadLocationDisposition.COMPATIBLE
+            candidate.zones[0] if candidate.zones else candidate.endpoint_region
+            for candidate in candidates
         )
         self.query_one("#obtainability-expansion", Static).update(
             "Candidate expansion before comparison: "
@@ -1424,57 +1595,33 @@ class CloudQuotaManagerApp(App[None]):
         )
         self._set_status("CONFIRM CANDIDATE EXPANSION — no comparison has started")
 
-    async def _compare_obtainability_all(
-        self,
-        requirement: ComputeInstanceRequirement,
-        machine: SpotMachineConfiguration,
-        shape: DistributionShape,
-        cancellation: CancellationToken,
-        generation: int,
-    ) -> None:
-        if cancellation.cancelled or not self._owns_obtainability_view(generation):
-            return
-        result = await self.read_only.compare_obtainability_all_compatible(
-            requirement,
-            machine=machine,
-            distribution_shape=shape,
-            deadline=self._deadline(),
-            support=self._advice_support(machine.machine_type),
-            cancellation=cancellation,
-            scope_input=self.scope_input,
-        )
-        if cancellation.cancelled or not self._owns_obtainability_view(generation):
-            return
-        self.last_result = result
-        self._render_instrument(result)
-        self._render_obtainability_result(result)
-        if result.resource_scope is not None:
-            command = obtainability_all_compatible_copy_cli(
-                result.resource_scope,
-                requirement,
-                machine=machine,
-                distribution_shape=shape,
-            )
-            self._show_copy_cli(command)
-            self.query_one("#obtainability-copy-cli", Static).update(command)
-
     async def _compare_obtainability(
         self,
-        candidates: tuple[ObtainabilityCandidate, ...],
+        draft: ObtainabilityFormDraft,
         cancellation: CancellationToken,
         generation: int,
     ) -> None:
         if cancellation.cancelled or not self._owns_obtainability_view(generation):
             return
-        self._set_status("READING — comparing exact Spot VM candidates")
-        first = candidates[0]
-        machine_type = first.machine.machine_type
-        support = self._advice_support(machine_type)
+        locations = tuple(
+            dict.fromkeys(
+                location
+                for candidate in draft.candidates
+                for location in (candidate.zones or (candidate.endpoint_region,))
+            )
+        )
+        requirement = parse_compute_instance_requirement(
+            machine_type=draft.machine.machine_type,
+            instance_count=str(draft.vm_count),
+            provisioning_model=ProvisioningModel.SPOT.value,
+            locations=locations,
+            all_compatible=False,
+        )
+        self._set_status("READING — checking exact Spot Compute eligibility")
         try:
-            result = await self.read_only.compare_obtainability(
-                candidates,
+            resolved_result = await self.read_only.resolve(
+                requirement,
                 deadline=self._deadline(),
-                support=support,
                 cancellation=cancellation,
                 scope_input=self.scope_input,
             )
@@ -1489,27 +1636,49 @@ class CloudQuotaManagerApp(App[None]):
             return
         if cancellation.cancelled or not self._owns_obtainability_view(generation):
             return
+        if not isinstance(resolved_result.data, ResolvedWorkloadRequirement):
+            self.last_result = resolved_result
+            self._render_instrument(resolved_result)
+            self._render_obtainability_result(resolved_result)
+            return
+        prepared = prepare_obtainability_comparison(
+            resolved_result.data,
+            draft.candidates,
+        )
+        await self._compare_obtainability_prepared(
+            prepared,
+            cancellation,
+            generation,
+        )
+
+    async def _compare_obtainability_prepared(
+        self,
+        prepared: PreparedObtainabilityComparison,
+        cancellation: CancellationToken,
+        generation: int,
+    ) -> None:
+        """Compare the exact resolver-backed candidates already confirmed."""
+        if cancellation.cancelled or not self._owns_obtainability_view(generation):
+            return
+        self._set_status("READING — comparing exact Spot VM candidates")
+        result = await self.read_only.compare_obtainability_prepared(
+            prepared,
+            deadline=self._deadline(),
+            cancellation=cancellation,
+            scope_input=self.scope_input,
+        )
+        if cancellation.cancelled or not self._owns_obtainability_view(generation):
+            return
         self.last_result = result
         self._render_instrument(result)
         self._render_obtainability_result(result)
         if result.resource_scope is not None:
             command = obtainability_compare_copy_cli(
                 result.resource_scope,
-                candidates,
+                prepared.candidates,
             )
             self._show_copy_cli(command)
             self.query_one("#obtainability-copy-cli", Static).update(command)
-
-    @staticmethod
-    def _advice_support(machine_type: str) -> AdviceSupport:
-        supported = (
-            not machine_type.startswith(("custom-", "ct", "tpu-"))
-            and "-custom-" not in machine_type
-        )
-        return AdviceSupport(
-            current_advice_supported=supported,
-            history_supported=supported,
-        )
 
     def _render_obtainability_result(self, result: OperationResult[Any]) -> None:
         data = result.data
@@ -1547,7 +1716,10 @@ class CloudQuotaManagerApp(App[None]):
                     + ("no" if data.no_capacity_guarantee else "yes"),
                 )
             )
-            if self._obtainability_contextual:
+            if (
+                self._obtainability_state.entry_mode
+                is ObtainabilityEntryMode.CONTEXTUAL
+            ):
                 lines.append("Return context: Quotas / Resolve / Compute instance")
             for coverage in data.catalog_coverage:
                 lines.extend(
@@ -1561,108 +1733,32 @@ class CloudQuotaManagerApp(App[None]):
                         "Coverage reasons: " + (", ".join(coverage.reasons) or "none"),
                     )
                 )
-            tie_components = self._obtainability_tie_components(data)
-            for assessment in data.candidates:
-                candidate = assessment.candidate
-                machine = candidate.machine
+            ranked = tuple(
+                assessment
+                for assessment in data.candidates
+                if not assessment.unranked_reasons
+            )
+            unranked = tuple(
+                assessment
+                for assessment in data.candidates
+                if assessment.unranked_reasons
+            )
+            lines.append(f"Ranked candidates: {len(ranked)}")
+            for assessment in ranked:
                 lines.extend(
-                    (
-                        f"Candidate identity: {candidate.candidate_id}",
-                        f"Endpoint region: {candidate.endpoint_region}",
-                        "Candidate zones: " + (", ".join(candidate.zones) or "none"),
-                        f"Machine type: {machine.machine_type}",
-                        "GPU: "
-                        + (
-                            f"{machine.gpu.accelerator_type} x{machine.gpu.count}"
-                            if machine.gpu is not None
-                            else "none"
-                        ),
-                        f"Local SSD count: {machine.local_ssd_count}",
-                        f"VM quantity: {candidate.vm_count}",
-                        f"Distribution shape: {candidate.distribution_shape.value}",
-                        "Rank: "
-                        + (
-                            str(assessment.rank)
-                            if assessment.rank is not None
-                            else "unranked"
-                        ),
-                        "Unranked reasons: "
-                        + (
-                            ", ".join(
-                                reason.value for reason in assessment.unranked_reasons
-                            )
-                            or "none"
-                        ),
-                        "Exact rank-component tie: "
-                        + (
-                            "yes; canonical candidate identity breaks the tie"
-                            if candidate.candidate_id in tie_components
-                            else "no"
-                        ),
+                    self._obtainability_candidate_lines(
+                        assessment,
+                        data.tied_candidate_ids,
                     )
                 )
-                advice = assessment.advice
-                if advice is None:
-                    lines.extend(
-                        (
-                            "Provider candidate score: unavailable",
-                            "Estimated uptime: unavailable",
-                            "Provider shards: unavailable",
-                        )
-                    )
-                else:
-                    band = (
-                        assessment.band.value
-                        if assessment.band is not None
-                        else "unknown"
-                    )
-                    lines.extend(
-                        (
-                            "Provider candidate score: "
-                            f"{advice.obtainability} ({band})",
-                            f"Estimated uptime: {advice.estimated_uptime}",
-                            f"Advice observed: {advice.retrieved_at.isoformat()}",
-                            f"Advice source: {advice.source}",
-                        )
-                    )
-                    if advice.shards:
-                        lines.extend(
-                            f"Recommended shard: {shard.zone} · "
-                            f"{shard.machine_type} · {shard.vm_count} VM · "
-                            f"{shard.provisioning_model}"
-                            for shard in advice.shards
-                        )
-                    else:
-                        lines.append("Recommended shards: none returned")
+            lines.append(f"Unranked candidates: {len(unranked)}")
+            for assessment in unranked:
                 lines.extend(
-                    (
-                        "30-day p90 preemption: "
-                        + (
-                            str(assessment.preemption_p90)
-                            if assessment.preemption_p90 is not None
-                            else "unavailable"
-                        ),
-                        "Total-request hourly price: "
-                        + (
-                            f"USD {assessment.total_request_hourly_price_usd}"
-                            if assessment.total_request_hourly_price_usd is not None
-                            else "unavailable"
-                        ),
+                    self._obtainability_candidate_lines(
+                        assessment,
+                        data.tied_candidate_ids,
                     )
                 )
-                if assessment.history is not None:
-                    lines.extend(
-                        (
-                            f"History location: {assessment.history.location}",
-                            "History observed: "
-                            f"{assessment.history.retrieved_at.isoformat()}",
-                            f"History source: {assessment.history.source}",
-                            "History preemption buckets: "
-                            f"{len(assessment.history.preemption)}",
-                            "History price intervals: "
-                            f"{len(assessment.history.prices)}",
-                        )
-                    )
         elif isinstance(data, ReadOnlyFailureData):
             lines.append(f"Reason: {data.reason}")
         lines.extend(self._obtainability_provenance_lines(result))
@@ -1707,25 +1803,125 @@ class CloudQuotaManagerApp(App[None]):
         return tuple(lines)
 
     @staticmethod
-    def _obtainability_tie_components(
-        data: ObtainabilityComparison,
-    ) -> frozenset[str]:
-        groups: dict[tuple[object, object, object], list[str]] = {}
-        for assessment in data.candidates:
-            if assessment.unranked_reasons:
-                continue
-            key = (
-                assessment.band,
-                assessment.preemption_p90,
-                assessment.total_request_hourly_price_usd,
+    def _obtainability_candidate_lines(
+        assessment: RankedCandidate,
+        tied_candidate_ids: frozenset[str],
+    ) -> tuple[str, ...]:
+        """Render one ranked or unranked candidate from domain-owned facts."""
+        candidate = assessment.candidate
+        machine = candidate.machine
+        lines = [
+            f"Candidate identity: {candidate.candidate_id}",
+            f"Endpoint region: {candidate.endpoint_region}",
+            "Candidate zones: " + (", ".join(candidate.zones) or "none"),
+            f"Machine type: {machine.machine_type}",
+            "GPU: "
+            + (
+                f"{machine.gpu.accelerator_type} x{machine.gpu.count}"
+                if machine.gpu is not None
+                else "none"
+            ),
+            f"Local SSD count: {machine.local_ssd_count}",
+            f"VM quantity: {candidate.vm_count}",
+            f"Distribution shape: {candidate.distribution_shape.value}",
+            "Rank: "
+            + (str(assessment.rank) if assessment.rank is not None else "unranked"),
+            "Unranked reasons: "
+            + (
+                ", ".join(reason.value for reason in assessment.unranked_reasons)
+                or "none"
+            ),
+            "Exact rank-component tie: "
+            + (
+                "yes; canonical candidate identity breaks the tie"
+                if candidate.candidate_id in tied_candidate_ids
+                else "no"
+            ),
+        ]
+        advice = assessment.advice
+        if advice is None:
+            lines.extend(
+                (
+                    "Obtainability score: unavailable",
+                    "Estimated uptime: unavailable",
+                    "Provider shards: unavailable",
+                )
             )
-            groups.setdefault(key, []).append(assessment.candidate.candidate_id)
-        return frozenset(
-            candidate_id
-            for identities in groups.values()
-            if len(identities) > 1
-            for candidate_id in identities
+        else:
+            band = assessment.band.value if assessment.band is not None else "unknown"
+            lines.extend(
+                (
+                    f"Obtainability score: {advice.obtainability} ({band})",
+                    f"Estimated uptime: {advice.estimated_uptime}",
+                    f"Advice observed: {advice.retrieved_at.isoformat()}",
+                    f"Advice source: {advice.source}",
+                )
+            )
+            if advice.shards:
+                lines.extend(
+                    f"Recommended shard: {shard.zone} · "
+                    f"{shard.machine_type} · {shard.vm_count} VM · "
+                    f"{shard.provisioning_model}"
+                    for shard in advice.shards
+                )
+            else:
+                lines.append("Recommended shards: none returned")
+
+        lines.append(
+            "30-day p90 preemption: "
+            + (
+                str(assessment.preemption_p90)
+                if assessment.preemption_p90 is not None
+                else "unavailable"
+            )
         )
+        preemption = assessment.preemption_derivation
+        if preemption is not None:
+            lines.extend(
+                "Preemption interval: "
+                f"{interval.started_at.isoformat()} through "
+                f"{interval.finished_at.isoformat()} · rate {interval.rate}"
+                for interval in preemption.intervals
+            )
+            lines.append(
+                "P90 derivation: nearest-rank "
+                f"{preemption.nearest_rank} of {len(preemption.intervals)} = "
+                f"{preemption.selected_rate}"
+            )
+
+        lines.append(
+            "Total-request hourly price: "
+            + (
+                f"USD {assessment.total_request_hourly_price_usd}"
+                if assessment.total_request_hourly_price_usd is not None
+                else "unavailable"
+            )
+        )
+        price = assessment.price_derivation
+        if price is not None:
+            lines.extend(
+                (
+                    "Price interval: "
+                    f"{price.interval.started_at.isoformat()} through "
+                    f"{price.interval.finished_at.isoformat()} · "
+                    f"USD {price.interval.usd_per_vm_hour} per VM-hour",
+                    "Price derivation: "
+                    f"USD {price.interval.usd_per_vm_hour} x {price.vm_count} VMs = "
+                    f"USD {price.total_request_hourly_price_usd} per hour",
+                )
+            )
+
+        if assessment.history is not None:
+            lines.extend(
+                (
+                    f"History location: {assessment.history.location}",
+                    f"History observed: {assessment.history.retrieved_at.isoformat()}",
+                    f"History source: {assessment.history.source}",
+                    f"History preemption buckets: {len(assessment.history.preemption)}",
+                    f"History price intervals: {len(assessment.history.prices)}",
+                )
+            )
+        return tuple(lines)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Inspect quota rows or local audit rows using their typed identities."""

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-# ruff: noqa: FBT003, PT007
+# ruff: noqa: FBT003, PLR2004, PT007
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, cast
@@ -126,11 +126,25 @@ def test_exact_rank_tie_uses_canonical_candidate_identity() -> None:
     ranked = rank_candidates(
         tuple((candidate, advice, history) for candidate in candidates)
     )
+    comparison = ObtainabilityComparison(ranked)
 
     assert tuple(item.candidate.candidate_id for item in ranked) == tuple(
         sorted(candidate.candidate_id for candidate in candidates)
     )
     assert tuple(item.rank for item in ranked) == (1, 2)
+    assert comparison.tied_candidate_ids == frozenset(
+        candidate.candidate_id for candidate in candidates
+    )
+    for assessment in comparison.candidates:
+        price = assessment.price_derivation
+        assert price is not None
+        assert price.interval.usd_per_vm_hour == Decimal("1.25")
+        assert price.vm_count == 4
+        assert price.total_request_hourly_price_usd == Decimal("5.00")
+        preemption = assessment.preemption_derivation
+        assert preemption is not None
+        assert preemption.nearest_rank == 27
+        assert preemption.selected_rate == assessment.preemption_p90
 
 
 def test_missing_and_non_attributable_components_have_exact_unranked_reasons() -> None:
