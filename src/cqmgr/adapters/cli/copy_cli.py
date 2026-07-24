@@ -17,7 +17,11 @@ if TYPE_CHECKING:
         CloudTpuSliceRequirement,
         ComputeInstanceRequirement,
     )
-    from cqmgr.domain.obtainability import ObtainabilityCandidate
+    from cqmgr.domain.obtainability import (
+        DistributionShape,
+        ObtainabilityCandidate,
+        SpotMachineConfiguration,
+    )
     from cqmgr.domain.scopes import ResourceScope
 
 _MAXIMUM_LIMIT = 1000
@@ -305,8 +309,69 @@ def obtainability_compare_copy_cli(
     return shlex.join(arguments)
 
 
+def obtainability_all_compatible_copy_cli(
+    resource_scope: ResourceScope,
+    requirement: ComputeInstanceRequirement,
+    *,
+    machine: SpotMachineConfiguration,
+    distribution_shape: DistributionShape,
+    presentation: CopyCliPresentation | None = None,
+) -> str:
+    """Render one explicit all-compatible Spot comparison."""
+    from cqmgr.domain.accelerator_overlay import (  # noqa: PLC0415
+        AllCompatibleLocations,
+        ComputeInstanceRequirement,
+        ProvisioningModel,
+    )
+    from cqmgr.domain.obtainability import (  # noqa: PLC0415
+        DistributionShape,
+        SpotMachineConfiguration,
+    )
+
+    _require_scope(resource_scope)
+    if (
+        not isinstance(requirement, ComputeInstanceRequirement)
+        or not isinstance(requirement.locations, AllCompatibleLocations)
+        or requirement.provisioning_model is not ProvisioningModel.SPOT
+    ):
+        msg = "Copy CLI all-compatible comparison requires one Spot requirement"
+        raise ValueError(msg)
+    if (
+        not isinstance(machine, SpotMachineConfiguration)
+        or machine.machine_type != requirement.machine_type
+        or not isinstance(distribution_shape, DistributionShape)
+    ):
+        msg = "Copy CLI all-compatible shape must match the resolved requirement"
+        raise ValueError(msg)
+    selected_presentation = presentation or CopyCliPresentation()
+    if not isinstance(selected_presentation, CopyCliPresentation):
+        msg = "Copy CLI presentation must use CopyCliPresentation"
+        raise TypeError(msg)
+    synthetic = _ObtainabilityCopyShape(
+        machine,
+        requirement.instance_count,
+        distribution_shape,
+    )
+    arguments = [
+        *_OBTAINABILITY_COMPARE_COMMAND,
+        "--resource-scope",
+        resource_scope.canonical_name,
+        *_obtainability_shape_arguments(synthetic),
+        "--all-compatible-locations",
+    ]
+    _append_presentation(arguments, selected_presentation)
+    return shlex.join(arguments)
+
+
+@dataclass(frozen=True, slots=True)
+class _ObtainabilityCopyShape:
+    machine: SpotMachineConfiguration
+    vm_count: int
+    distribution_shape: DistributionShape
+
+
 def _obtainability_shape_arguments(
-    candidate: ObtainabilityCandidate,
+    candidate: ObtainabilityCandidate | _ObtainabilityCopyShape,
 ) -> tuple[str, ...]:
     machine = candidate.machine
     arguments = [

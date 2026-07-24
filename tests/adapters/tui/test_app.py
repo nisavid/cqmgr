@@ -39,6 +39,7 @@ from cqmgr.domain.accelerator_overlay import (
     CloudTpuSliceRequirement,
     ComputeInstanceRequirement,
     ProvisioningModel,
+    QuotaConstraintRequirement,
     ResolutionFailureReason,
     ResolvedWorkloadLocation,
     ResolvedWorkloadRequirement,
@@ -52,7 +53,14 @@ from cqmgr.domain.audit import (
     AuditRecordKind,
     AuditVerification,
 )
-from cqmgr.domain.catalog import CatalogPredicates
+from cqmgr.domain.catalog import (
+    AcceleratorConstraintSet,
+    AcceleratorId,
+    CatalogPredicates,
+    ManagementPlane,
+    UnitConversionEvidence,
+    WorkloadConsumer,
+)
 from cqmgr.domain.diagnostics import (
     Diagnostic,
     DiagnosticCode,
@@ -81,6 +89,7 @@ from cqmgr.domain.obtainability import (
 )
 from cqmgr.domain.quota_queries import ProviderSourceCoverage, QuotaQueryItem
 from cqmgr.domain.quotas import (
+    ConstraintReference,
     EffectiveQuotaSliceIdentity,
     NormalizedDimensions,
     QuotaQuantity,
@@ -374,6 +383,80 @@ def _obtainability_result() -> OperationResult[ObtainabilityComparison]:
     )
 
 
+def _compatible_compute_location(location: str) -> ResolvedWorkloadLocation:
+    identity = EffectiveQuotaSliceIdentity(
+        SCOPE,
+        "compute.googleapis.com",
+        "GPUS-PER-GPU-FAMILY-per-project-region",
+        NormalizedDimensions((("region", location.rpartition("-")[0]),)),
+        QuotaScope.REGIONAL,
+    )
+    conversion = UnitConversionEvidence(
+        "card",
+        UNIT,
+        1,
+        "https://docs.cloud.google.com/compute/resource-usage",
+    )
+    return ResolvedWorkloadLocation(
+        location=location,
+        disposition=WorkloadLocationDisposition.COMPATIBLE,
+        accelerator_id=AcceleratorId("nvidia-h100"),
+        owning_service="compute.googleapis.com",
+        management_plane=ManagementPlane.COMPUTE,
+        supported_consumers=(WorkloadConsumer.COMPUTE_ENGINE,),
+        quota_pool="preemptible",
+        deployable_accelerator_quantity=8,
+        constraint_set=AcceleratorConstraintSet(
+            AcceleratorId("nvidia-h100"),
+            (ConstraintReference(identity),),
+        ),
+        constraint_requirements=(
+            QuotaConstraintRequirement(
+                identity,
+                8,
+                QuotaQuantity(8, UNIT),
+                conversion,
+            ),
+        ),
+        coverage=(),
+    )
+
+
+def _resolved_compute_result(
+    requirement: ComputeInstanceRequirement,
+    *,
+    locations: tuple[str, ...],
+) -> OperationResult[ResolvedWorkloadRequirement]:
+    return OperationResult(
+        operation=OperationName("quota.resolve"),
+        resource_scope=SCOPE,
+        boundary=OperationBoundary(
+            StableSymbol("workload-resolved"),
+            reached=True,
+        ),
+        outcome=Outcome(StableSymbol("succeeded"), ExitClass.SUCCESS),
+        completeness=Completeness.complete(),
+        started_at=NOW,
+        finished_at=NOW,
+        data=ResolvedWorkloadRequirement(
+            requirement,
+            tuple(_compatible_compute_location(location) for location in locations),
+            (
+                True
+                if isinstance(requirement.locations, AllCompatibleLocations)
+                else None
+            ),
+        ),
+        identity_evidence=ProviderIdentityEvidence(
+            credential_kind=CredentialKind.DIRECT_USER,
+            verification=PrincipalVerification.VERIFIED,
+            acting_principal=PrincipalIdentity(
+                "principal://accounts.google.com/operator@example.com"
+            ),
+        ),
+    )
+
+
 AUDIT_RECORD = AuditRecord(
     record_id="audit-00000000000000000001",
     sequence=1,
@@ -469,6 +552,7 @@ class ScriptedReadOnlyOperations:
         self.obtainability_all_calls: list[
             tuple[ComputeInstanceRequirement, dict[str, Any]]
         ] = []
+        self.resolve_result: OperationResult[ResolvedWorkloadRequirement] | None = None
         self.closed = False
 
     async def browse(  # noqa: PLR0913 - mirrors the production protocol
@@ -522,6 +606,8 @@ class ScriptedReadOnlyOperations:
             "scope_input": scope_input,
         }
         self.resolve_calls.append((requirement, options))
+        if self.resolve_result is not None:
+            return self.resolve_result
         if isinstance(requirement.locations, CandidateLocations):
             locations = tuple(
                 ResolvedWorkloadLocation(
@@ -1058,6 +1144,137 @@ def test_obtainability_standalone_explicit_candidates_share_typed_cli_semantics(
                 in app.last_copied_cli
             )
             assert "--all-compatible-locations" not in app.last_copied_cli
+
+    asyncio.run(scenario())
+
+
+def test_contextual_obtainability_requires_confirmation_of_inherited_fields() -> None:
+    """A resolved Spot shape stays visible and cannot compare before confirmation."""
+
+    async def scenario() -> None:
+        requirement = ComputeInstanceRequirement(
+            "a3-highgpu-8g",
+            2,
+            ProvisioningModel.SPOT,
+            CandidateLocations(("us-central1-a",)),
+        )
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        operations.resolve_result = _resolved_compute_result(
+            requirement,
+            locations=("us-central1-a",),
+        )
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-compute")
+            _input(app, "#workload-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#workload-count").value = "2"
+            _input(app, "#workload-provisioning").value = "spot"
+            _input(app, "#workload-locations").value = "us-central1-a"
+            _button(app, "#workload-submit").press()
+            await pilot.pause()
+
+            _button(app, "#workload-obtainability").press()
+            await pilot.pause()
+            assert app.active_workspace == "obtainability"
+            assert _input(app, "#obtainability-machine-type").value == "a3-highgpu-8g"
+            assert _input(app, "#obtainability-vm-count").value == "2"
+            assert (
+                _input(app, "#obtainability-candidates").value
+                == "us-central1=us-central1-a"
+            )
+            assert "Inherited from Quotas / Resolve / Compute instance" in str(
+                _static(app, "#obtainability-breadcrumb").content
+            )
+
+            await pilot.click("#obtainability-compare")
+            assert operations.obtainability_calls == []
+            assert "CONFIRM INHERITED FIELDS" in str(
+                _static(app, "#status-line").content
+            )
+
+            _button(app, "#obtainability-confirm").press()
+            _button(app, "#obtainability-compare").press()
+            await pilot.pause()
+
+            assert len(operations.obtainability_calls) == 1
+            candidates, _options = operations.obtainability_calls[0]
+            assert candidates[0].zones == ("us-central1-a",)
+            assert "Return context: Quotas / Resolve / Compute instance" in str(
+                _static(app, "#obtainability-detail").content
+            )
+
+            _button(app, "#obtainability-return").press()
+            await pilot.pause()
+            assert app.active_workspace == "quotas"
+            assert "Workload resolution" in str(_static(app, "#quota-detail").content)
+
+    asyncio.run(scenario())
+
+
+def test_all_compatible_obtainability_expansion_is_visible_and_explicit() -> None:
+    """All-compatible mode requires confirmation and retains resolver provenance."""
+
+    async def scenario() -> None:
+        requirement = ComputeInstanceRequirement(
+            "a3-highgpu-8g",
+            2,
+            ProvisioningModel.SPOT,
+            AllCompatibleLocations(),
+        )
+        resolved = _resolved_compute_result(
+            requirement,
+            locations=("us-central1-a", "us-east1-b"),
+        ).data
+        assert isinstance(resolved, ResolvedWorkloadRequirement)
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        comparison = operations.obtainability_result.data
+        assert isinstance(comparison, ObtainabilityComparison)
+        operations.obtainability_result = replace(
+            operations.obtainability_result,
+            data=replace(comparison, resolver_provenance=resolved),
+        )
+        operations.resolve_result = _resolved_compute_result(
+            requirement,
+            locations=("us-central1-a", "us-east1-b"),
+        )
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(100, 36)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            _input(app, "#obtainability-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#obtainability-vm-count").value = "2"
+            _input(app, "#obtainability-distribution").value = "balanced"
+
+            _button(app, "#obtainability-compare-all").press()
+            await pilot.pause()
+            assert operations.obtainability_all_calls == []
+            assert len(operations.resolve_calls) == 1
+            assert "no comparison has started" in str(
+                _static(app, "#obtainability-expansion").content
+            ).casefold() or "us-central1-a" in str(
+                _static(app, "#obtainability-expansion").content
+            )
+            assert "us-central1-a" in str(
+                _static(app, "#obtainability-expansion").content
+            )
+
+            _button(app, "#obtainability-confirm").press()
+            _button(app, "#obtainability-compare-all").press()
+            await pilot.pause()
+
+            assert len(operations.obtainability_all_calls) == 1
+            submitted, options = operations.obtainability_all_calls[0]
+            assert isinstance(submitted.locations, AllCompatibleLocations)
+            assert options["distribution_shape"] is DistributionShape.BALANCED
+            expansion = str(_static(app, "#obtainability-expansion").content)
+            assert "us-central1-a" in expansion
+            assert "us-east1-b" in expansion
+            assert app.last_copied_cli is not None
+            assert "--all-compatible-locations" in app.last_copied_cli
+            assert "--candidate" not in app.last_copied_cli
 
     asyncio.run(scenario())
 
