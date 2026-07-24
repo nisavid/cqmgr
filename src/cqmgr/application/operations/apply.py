@@ -516,6 +516,20 @@ class ApplyPlanOperations:
             request.authentication_key,
             request.now,
         )
+        consumed_terminal = (
+            resumed.status is PlanRepositoryStatus.CONSUMED
+            and resumed.authenticated is True
+            and record.state
+            in {
+                ApplyRecordState.ACCEPTED,
+                ApplyRecordState.FAILED,
+            }
+            and record.intent_id == request.digest
+            and record.plan_digest == request.digest
+            and record.resource_scope == request.resource_scope_acknowledgement
+        )
+        if consumed_terminal:
+            return self._project_consumed_terminal(record, request)
         quarantined_unknown = (
             resumed.status is PlanRepositoryStatus.QUARANTINED
             and record.state is ApplyRecordState.UNKNOWN
@@ -865,6 +879,78 @@ class ApplyPlanOperations:
             record,
             audit_record_ids,
             refreshed.contact_value,
+        )
+
+    def _project_consumed_terminal(
+        self,
+        record: ApplyRecord,
+        request: ApplyRequest,
+    ) -> OperationResult[ApplyData]:
+        """Return one authenticated terminal Apply after ledger completion."""
+        audit_record_ids: list[str] = []
+        failed = next(
+            (
+                child
+                for child in record.children
+                if child.disposition is ApplyChildDisposition.FAILED
+            ),
+            None,
+        )
+        if record.state is ApplyRecordState.ACCEPTED:
+            outcome = "applied"
+            exit_class = ExitClass.SUCCESS
+        elif failed is None:
+            outcome = "dispatch-intent-persistence-failed"
+            exit_class = ExitClass.OPERATIONAL_FAILURE
+        else:
+            provider_outcome = cast("StableSymbol", failed.provider_outcome)
+            outcome = provider_outcome.value
+            exit_class = _failure_exit(provider_outcome)
+        try:
+            audit_record_ids.extend(
+                self._append_child_outcome_audit(
+                    request,
+                    record.resource_scope,
+                    record,
+                    child,
+                )
+                for child in record.children
+                if child.disposition
+                in {
+                    ApplyChildDisposition.ACCEPTED,
+                    ApplyChildDisposition.FAILED,
+                }
+            )
+            audit_record_ids.append(
+                self._append_audit(
+                    request,
+                    record.resource_scope,
+                    AuditRecordKind.APPLY_RESULT,
+                    outcome,
+                    record.intent_id,
+                    facts=_aggregate_facts(record),
+                    occurred_at=cast("datetime", record.finished_at),
+                    deduplicate=True,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            return _result_for_record(
+                request,
+                record.resource_scope,
+                record,
+                reached=False,
+                outcome="critical-unknown",
+                exit_class=ExitClass.OPERATIONAL_FAILURE,
+                audit_record_ids=tuple(audit_record_ids),
+            )
+        return _result_for_record(
+            request,
+            record.resource_scope,
+            record,
+            reached=record.state is ApplyRecordState.ACCEPTED,
+            outcome=outcome,
+            exit_class=exit_class,
+            audit_record_ids=tuple(audit_record_ids),
         )
 
     def _invalidate(

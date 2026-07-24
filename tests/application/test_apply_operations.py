@@ -226,6 +226,12 @@ class _MemoryPlanRepository:
     ) -> PlanRepositoryOutcome:
         if self.resume_outcome is not None:
             return self.resume_outcome
+        if self.state is PlanLedgerState.CONSUMED:
+            return PlanRepositoryOutcome(
+                PlanRepositoryStatus.CONSUMED,
+                state=self.state,
+                authenticated=True,
+            )
         if self.state is PlanLedgerState.QUARANTINED:
             return PlanRepositoryOutcome(
                 PlanRepositoryStatus.QUARANTINED,
@@ -1686,6 +1692,99 @@ def test_recovery_completes_existing_terminal_record_without_revalidation_or_sav
     assert writer.requests == []
 
 
+@pytest.mark.parametrize(
+    ("mismatched_field", "authenticated", "request_scope"),
+    [
+        ("intent_id", True, SCOPE),
+        ("plan_digest", True, SCOPE),
+        (
+            None,
+            True,
+            ResourceScope(
+                ResourceScopeKind.PROJECT,
+                "projects/987654321",
+            ),
+        ),
+        (None, False, SCOPE),
+    ],
+)
+def test_consumed_recovery_rejects_unmatched_terminal_authority(
+    mismatched_field: str | None,
+    authenticated: bool,  # noqa: FBT001
+    request_scope: ResourceScope,
+) -> None:
+    """Consumed state cannot bless mismatched or unauthenticated terminal evidence."""
+    plan = _plan()
+    repository = _MemoryPlanRepository(plan)
+    repository.state = PlanLedgerState.CONSUMED
+    repository.resume_outcome = PlanRepositoryOutcome(
+        PlanRepositoryStatus.CONSUMED,
+        state=PlanLedgerState.CONSUMED,
+        authenticated=authenticated,
+    )
+    records = _MemoryApplyRecords()
+    records.record = _recovery_record(plan).stop_remaining_unattempted(NOW)
+    mismatched_digest = "sha256:" + ("f" * 64)
+    if mismatched_field == "intent_id":
+        records.record = replace(records.record, intent_id=mismatched_digest)
+    elif mismatched_field == "plan_digest":
+        records.record = replace(records.record, plan_digest=mismatched_digest)
+    writer = _FailFastWriter()
+
+    result, *_ = _apply(
+        plan,
+        cast("_ScriptedWriter", writer),
+        records=records,
+        repository=repository,
+        revalidator=_UnexpectedRevalidator(),
+        request=ApplyRequest(
+            digest=repository.encoded.digest,
+            authentication_key=KEY,
+            local_installation_id="installation-123",
+            resource_scope_acknowledgement=request_scope,
+            principal=PRINCIPAL,
+            contact_binding=CONTACT,
+            contact_value="operator@example.com",
+            now=NOW + timedelta(minutes=1),
+        ),
+    )
+
+    assert result.outcome.code == StableSymbol("apply-recovery-unavailable")
+    assert writer.calls == 0
+
+
+@pytest.mark.parametrize("fail_audit", [False, True])
+def test_consumed_recovery_projects_prewrite_terminal_result(
+    fail_audit: bool,  # noqa: FBT001
+) -> None:
+    """A consumed no-write terminal record remains replayable without plan bytes."""
+    plan = _plan()
+    repository = _MemoryPlanRepository(plan)
+    repository.state = PlanLedgerState.CONSUMED
+    records = _MemoryApplyRecords()
+    records.record = _recovery_record(plan).stop_remaining_unattempted(NOW)
+    audit = _MemoryAuditJournal()
+    audit.fail_on_append = 1 if fail_audit else None
+    writer = _FailFastWriter()
+    resolver = _ScriptedResolver(UnknownWriteResolution.ACCEPTED)
+
+    result, *_ = _apply(
+        plan,
+        cast("_ScriptedWriter", writer),
+        records=records,
+        repository=repository,
+        audit=audit,
+        revalidator=_UnexpectedRevalidator(),
+        unknown_resolver=resolver,
+    )
+
+    assert result.outcome.code == StableSymbol(
+        "critical-unknown" if fail_audit else "dispatch-intent-persistence-failed"
+    )
+    assert writer.calls == 0
+    assert resolver.requests == []
+
+
 def test_recovery_quarantines_terminal_record_without_dispatched_authority() -> None:
     """A terminal record cannot complete a ledger that never crossed the barrier."""
     plan = _plan()
@@ -2594,11 +2693,25 @@ def test_real_repositories_complete_terminal_record_after_process_crash(
             msg = "terminal recovery attempted an Apply-record save"
             raise AssertionError(msg)
 
+    class CrashAfterConsumedLedger(LocalPlanRepository):
+        @override
+        def complete(
+            self,
+            lease: PlanLease,
+            authentication_key: SecretValue,
+            now: datetime,
+        ) -> PlanRepositoryOutcome:
+            outcome = super().complete(lease, authentication_key, now)
+            if outcome.status is PlanRepositoryStatus.CONSUMED:
+                raise SimulatedProcessCrash
+            return outcome
+
     plan = _plan()
     encoded = PlanCodec.encode(plan, KEY.reveal())
     consumption_store = _MemoryConsumptionStore()
     plan_root = tmp_path / "plans"
     apply_root = tmp_path / "apply"
+    audit_root = tmp_path / "audit"
     plan_repository = LocalPlanRepository(plan_root, consumption_store)
     assert plan_repository.store(encoded, KEY).status is PlanRepositoryStatus.STORED
     records = CrashAfterTerminalSave(apply_root)
@@ -2634,7 +2747,7 @@ def test_real_repositories_complete_terminal_record_after_process_crash(
     operation = ApplyPlanOperations(
         repository=plan_repository,
         apply_records=records,
-        audit=cast("AuditJournal", _MemoryAuditJournal()),
+        audit=FilesystemAuditJournal(audit_root),
         codec=cast("PlanCodecPort", PlanCodec()),
         revalidator=cast(
             "ApplyRevalidator",
@@ -2655,22 +2768,56 @@ def test_real_repositories_complete_terminal_record_after_process_crash(
         is PlanLedgerState.DISPATCHED
     )
 
+    restarted_writer = _FailFastWriter()
+    restarted_resolver = _ScriptedResolver(UnknownWriteResolution.ACCEPTED)
     restarted = ApplyPlanOperations(
-        repository=LocalPlanRepository(plan_root, consumption_store),
+        repository=CrashAfterConsumedLedger(plan_root, consumption_store),
         apply_records=RejectSameRevisionSave(apply_root),
-        audit=cast("AuditJournal", _MemoryAuditJournal()),
+        audit=FilesystemAuditJournal(audit_root),
         codec=cast("PlanCodecPort", PlanCodec()),
         revalidator=cast("ApplyRevalidator", _UnexpectedRevalidator()),
-        writer=_ScriptedWriter(),
-        unknown_resolver=_ScriptedResolver(),
+        writer=cast("QuotaPreferenceWriter", restarted_writer),
+        unknown_resolver=restarted_resolver,
     )
-    result = asyncio.run(restarted.apply(request))
+    with pytest.raises(SimulatedProcessCrash):
+        asyncio.run(restarted.apply(request))
 
-    assert result.outcome.code == expected_outcome
-    assert result.boundary.reached is accepted
     assert (
         plan_repository.load(encoded.digest, KEY, request.now).state
         is PlanLedgerState.CONSUMED
+    )
+    assert restarted_writer.calls == 0
+    assert restarted_resolver.requests == []
+    audits_before_final = (
+        FilesystemAuditJournal(audit_root)
+        .query(AuditQuery(operations=(OperationName("plan.apply"),), limit=100))
+        .records
+    )
+
+    final_writer = _FailFastWriter()
+    final_resolver = _ScriptedResolver(UnknownWriteResolution.ACCEPTED)
+    final = ApplyPlanOperations(
+        repository=LocalPlanRepository(plan_root, consumption_store),
+        apply_records=RejectSameRevisionSave(apply_root),
+        audit=FilesystemAuditJournal(audit_root),
+        codec=cast("PlanCodecPort", PlanCodec()),
+        revalidator=cast("ApplyRevalidator", _UnexpectedRevalidator()),
+        writer=cast("QuotaPreferenceWriter", final_writer),
+        unknown_resolver=final_resolver,
+    )
+    result = asyncio.run(final.apply(request))
+    audits = (
+        FilesystemAuditJournal(audit_root)
+        .query(AuditQuery(operations=(OperationName("plan.apply"),), limit=100))
+        .records
+    )
+
+    assert result.outcome.code == expected_outcome
+    assert result.boundary.reached is accepted
+    assert final_writer.calls == 0
+    assert final_resolver.requests == []
+    assert tuple(record.draft for record in audits) == tuple(
+        record.draft for record in audits_before_final
     )
 
 
