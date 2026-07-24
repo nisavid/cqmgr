@@ -24,6 +24,9 @@ from cqmgr.adapters.tui.app import CloudQuotaManagerApp
 from cqmgr.application.operations.apply import (
     ApplyChildData,
     ApplyData,
+    ApplyProgressEvent,
+    ApplyProgressObserver,
+    ApplyProgressState,
     ApplyRequest,
 )
 from cqmgr.application.operations.audit import (
@@ -1280,7 +1283,13 @@ class ScriptedLifecycleOperations:
             raise AssertionError(msg)
         return self.review_result
 
-    async def apply(self, request: ApplyRequest) -> OperationResult[ApplyData]:
+    async def apply(
+        self,
+        request: ApplyRequest,
+        *,
+        on_progress: ApplyProgressObserver | None = None,
+    ) -> OperationResult[ApplyData]:
+        del on_progress
         self.apply_calls.append(request)
         return self.apply_result
 
@@ -1299,10 +1308,48 @@ class DelayedApplyLifecycleOperations(ScriptedLifecycleOperations):
         self.release_apply = asyncio.Event()
 
     @override
-    async def apply(self, request: ApplyRequest) -> OperationResult[ApplyData]:
+    async def apply(
+        self,
+        request: ApplyRequest,
+        *,
+        on_progress: ApplyProgressObserver | None = None,
+    ) -> OperationResult[ApplyData]:
+        del on_progress
         self.apply_calls.append(request)
         self.apply_started.set()
         await self.release_apply.wait()
+        return self.apply_result
+
+
+class ProgressingApplyLifecycleOperations(ScriptedLifecycleOperations):
+    """Pause between ordered child transitions exposed through Apply progress."""
+
+    def __init__(self, apply_result: OperationResult[ApplyData]) -> None:
+        super().__init__(apply_result)
+        self.first_dispatch_started = asyncio.Event()
+        self.release_first_dispatch = asyncio.Event()
+        self.second_dispatch_started = asyncio.Event()
+        self.release_second_dispatch = asyncio.Event()
+
+    @override
+    async def apply(
+        self,
+        request: ApplyRequest,
+        *,
+        on_progress: ApplyProgressObserver | None = None,
+    ) -> OperationResult[ApplyData]:
+        self.apply_calls.append(request)
+        assert on_progress is not None
+        on_progress(ApplyProgressEvent(1, 2, "direct", ApplyProgressState.DISPATCHING))
+        self.first_dispatch_started.set()
+        await self.release_first_dispatch.wait()
+        on_progress(ApplyProgressEvent(1, 2, "direct", ApplyProgressState.ACCEPTED))
+        on_progress(
+            ApplyProgressEvent(2, 2, "companion", ApplyProgressState.DISPATCHING)
+        )
+        self.second_dispatch_started.set()
+        await self.release_second_dispatch.wait()
+        on_progress(ApplyProgressEvent(2, 2, "companion", ApplyProgressState.ACCEPTED))
         return self.apply_result
 
 
@@ -1472,6 +1519,25 @@ def _successful_apply_result() -> OperationResult[ApplyData]:
             children=(child,),
             audit_record_ids=("audit-apply",),
         ),
+    )
+
+
+def _successful_bundle_apply_result() -> OperationResult[ApplyData]:
+    partial = _apply_result()
+    direct = partial.data.children[0]
+    companion = replace(
+        partial.data.children[-1],
+        disposition=ApplyChildDisposition.ACCEPTED,
+        provider_outcome=StableSymbol("accepted"),
+        etag="etag-companion",
+        submitted_at=NOW,
+    )
+    return replace(
+        partial,
+        boundary=replace(partial.boundary, reached=True),
+        outcome=Outcome(StableSymbol("submitted"), ExitClass.SUCCESS),
+        data=replace(partial.data, children=(direct, companion)),
+        diagnostics=(),
     )
 
 
@@ -2206,6 +2272,11 @@ def test_bundle_compose_and_non_atomic_apply_keep_scope_and_children_explicit(  
             assert "Target strategy: manual" in detail
             assert "Disposition: verified no-op" in detail
             assert "Disposition: mutation" in detail
+            assert (
+                "Accepted earlier children remain accepted if a later child "
+                "fails or becomes unknown."
+            ) in detail
+            assert "rolled back" not in detail
             assert "remaining-companion-bottleneck" in detail
             assert (
                 "Required acknowledgements: decrease-below-usage, "
@@ -2348,6 +2419,72 @@ def test_partial_apply_returns_with_every_child_outcome() -> None:
             assert "Required acknowledgements: decrease-below-usage" in detail
             assert "Supplied acknowledgements: decrease-below-usage" in detail
             assert "Unresolved acknowledgements: none" in detail
+
+    asyncio.run(scenario())
+
+
+def test_apply_renders_ordered_child_progress_before_terminal_completion() -> None:
+    """Pilot observes accepted and in-flight children while Apply remains active."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        lifecycle = ProgressingApplyLifecycleOperations(
+            _successful_bundle_apply_result()
+        )
+        app = CloudQuotaManagerApp(
+            operations,
+            ScriptedAuditOperations(),
+            lifecycle=lifecycle,  # type: ignore[arg-type]
+        )
+        request = ApplyRequest(
+            digest="sha256:" + ("a" * 64),
+            authentication_key=SecretValue(b"k" * 32),
+            local_installation_id="installation-42",
+            resource_scope_acknowledgement=SCOPE,
+            principal=PlanPrincipal("principal://accounts/42"),
+            contact_binding=ContactBinding(
+                StableSymbol("direct-user"),
+                "principal://accounts/42",
+                "hmac-sha256:" + ("c" * 64),
+            ),
+            contact_value="operator@example.com",
+            now=NOW,
+        )
+
+        async with app.run_test(size=(120, 42)) as pilot:
+            await pilot.pause()
+            app.prepare_apply(request)
+            _input(app, "#apply-scope-acknowledgement").value = SCOPE.canonical_name
+            await pilot.pause()
+            await pilot.click("#lifecycle-apply")
+            await asyncio.wait_for(lifecycle.first_dispatch_started.wait(), timeout=3)
+            await pilot.pause()
+
+            detail = str(_static(app, "#lifecycle-detail").content)
+            assert "Apply dispatch progress" in detail
+            assert "1/2 direct: dispatching" in detail
+            assert not app.query_one("#lifecycle-route").has_class("hidden")
+
+            lifecycle.release_first_dispatch.set()
+            await asyncio.wait_for(lifecycle.second_dispatch_started.wait(), timeout=3)
+            await pilot.pause()
+
+            detail = str(_static(app, "#lifecycle-detail").content)
+            assert "1/2 direct: accepted" in detail
+            assert "2/2 companion: dispatching" in detail
+            assert "APPLYING — 2/2 companion: dispatching" in str(
+                _static(app, "#status-line").content
+            )
+
+            lifecycle.release_second_dispatch.set()
+            await pilot.pause()
+            await pilot.pause()
+
+            assert lifecycle.apply_calls == [request]
+            assert app.query_one("#lifecycle-route").has_class("hidden")
+            refreshed = str(_static(app, "#quota-detail").content)
+            assert "Apply child direct: accepted" in refreshed
+            assert "Apply child companion: accepted" in refreshed
 
     asyncio.run(scenario())
 

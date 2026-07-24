@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from cqmgr.application.operations.apply import (
         ApplyData,
         ApplyPlanOperations,
+        ApplyProgressObserver,
         ApplyRequest,
     )
     from cqmgr.application.operations.plans import (
@@ -55,9 +56,16 @@ class LifecycleOperations:
         """Review one local or portable plan without applying it."""
         return self._plans.review(request)
 
-    async def apply(self, request: ApplyRequest) -> OperationResult[ApplyData]:
+    async def apply(
+        self,
+        request: ApplyRequest,
+        *,
+        on_progress: ApplyProgressObserver | None = None,
+    ) -> OperationResult[ApplyData]:
         """Consume one plan through the sole typed Apply operation."""
-        return await self._apply.apply(request)
+        if on_progress is None:
+            return await self._apply.apply(request)
+        return await self._apply.apply(request, on_progress=on_progress)
 
     def watch(self, request: WatchRequest) -> AsyncIterator[WatchStreamEvent]:
         """Observe one durable Apply intent through the typed Watch stream."""

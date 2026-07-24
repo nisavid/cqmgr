@@ -637,7 +637,7 @@ def smoke_artifact(  # noqa: PLR0915 - one installed-artifact acceptance flow
             environment=runtime_environment,
         )
         assert "Resource scope: projects/123" in scope_output
-        assert "Acting principal: deferred (offline)" in scope_output
+        assert "Authenticated principal: deferred (offline)" in scope_output
         assert _without_runtime_guard(scope_errors) == ""
 
         audit_output, audit_errors = _run(

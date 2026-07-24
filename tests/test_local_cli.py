@@ -345,7 +345,7 @@ def test_no_color_and_quiet_preserve_required_human_result_facts(
     assert selected.stdout == (
         "Resource scope: projects/123\n"
         "Resolution source: direct-selection\n"
-        "Acting principal: deferred (offline)\n"
+        "Authenticated principal: deferred (offline)\n"
     )
 
     rejected = CliRunner().invoke(

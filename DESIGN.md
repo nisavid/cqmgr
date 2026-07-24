@@ -145,7 +145,7 @@ state. Ambient decorative bloom is forbidden.
   and gemstones for compact semantic signals.
 - **Do** use rows, tables, panes, and integrated panels for ordinary product
   structure; reserve card-like treatment for self-contained portable artifacts.
-- **Do** keep exact quota identity, acting principal, provider evidence,
+- **Do** keep exact quota identity, authenticated principal, provider evidence,
   warnings, and planned mutation consequences visible before confirmation.
 - **Do** adapt material realism to the rendering surface while preserving the
   same semantic roles in CLI, TUI, and structured output.

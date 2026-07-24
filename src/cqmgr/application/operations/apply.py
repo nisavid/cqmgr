@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, cast
 
 from cqmgr.application.ports.apply import (
@@ -93,6 +95,48 @@ class ApplyRequest:
     contact_binding: ContactBinding
     contact_value: str = field(repr=False)
     now: datetime
+
+
+class ApplyProgressState(StrEnum):
+    """Surface-neutral progress state for one ordered Apply child."""
+
+    DISPATCHING = "dispatching"
+    ACCEPTED = "accepted"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+    UNATTEMPTED = "unattempted"
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyProgressEvent:
+    """One observable transition in deterministic Apply child order."""
+
+    order: int
+    total: int
+    child_id: str
+    state: ApplyProgressState
+
+    def __post_init__(self) -> None:
+        """Reject progress facts that cannot identify one ordered child."""
+        if not isinstance(self.order, int) or isinstance(self.order, bool):
+            msg = "Apply progress order must be an integer"
+            raise TypeError(msg)
+        if not isinstance(self.total, int) or isinstance(self.total, bool):
+            msg = "Apply progress total must be an integer"
+            raise TypeError(msg)
+        if self.total < 1 or self.order < 1 or self.order > self.total:
+            msg = "Apply progress order must be within the non-empty child set"
+            raise ValueError(msg)
+        if not isinstance(self.child_id, str) or not self.child_id:
+            msg = "Apply progress child_id must be a non-empty string"
+            raise ValueError(msg)
+        if not isinstance(self.state, ApplyProgressState):
+            msg = "Apply progress state must be an ApplyProgressState"
+            raise TypeError(msg)
+
+
+type ApplyProgressObserver = Callable[[ApplyProgressEvent], None]
+"""Best-effort presentation observer that cannot own Apply safety."""
 
 
 class ComposedApplyRevalidator:
@@ -196,7 +240,10 @@ class ApplyPlanOperations:
         self._unknown_resolver = unknown_resolver
 
     async def apply(  # noqa: C901, PLR0911
-        self, request: ApplyRequest
+        self,
+        request: ApplyRequest,
+        *,
+        on_progress: ApplyProgressObserver | None = None,
     ) -> OperationResult[ApplyData]:
         """Apply every child in plan-bound order without blind retry."""
         existing = self._apply_records.load(
@@ -207,7 +254,11 @@ class ApplyPlanOperations:
             existing.status is ApplyRecordRepositoryStatus.AVAILABLE
             and existing.record is not None
         ):
-            return await self._resume(existing.record, request)
+            return await self._resume(
+                existing.record,
+                request,
+                on_progress=on_progress,
+            )
         loaded = self._repository.load(
             request.digest,
             request.authentication_key,
@@ -338,6 +389,7 @@ class ApplyPlanOperations:
             record,
             audit_record_ids,
             refreshed.contact_value,
+            on_progress=on_progress,
         )
 
     def _invalidate_after_preflight(
@@ -380,11 +432,23 @@ class ApplyPlanOperations:
         record: ApplyRecord,
         audit_record_ids: list[str],
         contact_value: str,
+        *,
+        on_progress: ApplyProgressObserver | None,
     ) -> OperationResult[ApplyData]:
         """Resume at the first child without durable dispatch intent."""
         planned_by_id = {child.child_id: child for child in plan.children}
-        for child in record.children:
+        total = len(record.children)
+        for order, child in enumerate(record.children, start=1):
             if child.disposition is ApplyChildDisposition.ACCEPTED:
+                _notify_progress(
+                    on_progress,
+                    ApplyProgressEvent(
+                        order,
+                        total,
+                        child.child_id,
+                        ApplyProgressState.ACCEPTED,
+                    ),
+                )
                 continue
             if child.disposition in {
                 ApplyChildDisposition.FAILED,
@@ -449,10 +513,19 @@ class ApplyPlanOperations:
                     plan=plan,
                 )
 
+            _notify_progress(
+                on_progress,
+                ApplyProgressEvent(
+                    order,
+                    total,
+                    child.child_id,
+                    ApplyProgressState.DISPATCHING,
+                ),
+            )
             try:
                 provider_result = await self._writer.dispatch(write)
             except BaseException:  # noqa: BLE001
-                return await self._unknown_dispatch(
+                result = await self._unknown_dispatch(
                     plan,
                     plan.resource_scope,
                     lease,
@@ -461,6 +534,16 @@ class ApplyPlanOperations:
                     write,
                     audit_record_ids,
                 )
+                _notify_progress(
+                    on_progress,
+                    ApplyProgressEvent(
+                        order,
+                        total,
+                        child.child_id,
+                        ApplyProgressState.UNKNOWN,
+                    ),
+                )
+                return result
 
             disposition = (
                 ApplyChildDisposition.ACCEPTED
@@ -510,6 +593,15 @@ class ApplyPlanOperations:
                     audit_record_ids,
                     plan=plan,
                 )
+            _notify_progress(
+                on_progress,
+                ApplyProgressEvent(
+                    order,
+                    total,
+                    child.child_id,
+                    ApplyProgressState(disposition.value),
+                ),
+            )
             if disposition is ApplyChildDisposition.FAILED:
                 record = record.finalize(request.now)
                 if not self._save(record, request):
@@ -557,6 +649,8 @@ class ApplyPlanOperations:
         self,
         record: ApplyRecord,
         request: ApplyRequest,
+        *,
+        on_progress: ApplyProgressObserver | None,
     ) -> OperationResult[ApplyData]:
         """Recover an already-consumed Apply without re-dispatching an intent."""
         resumed = self._repository.resume_dispatched(
@@ -934,6 +1028,7 @@ class ApplyPlanOperations:
             record,
             audit_record_ids,
             refreshed.contact_value,
+            on_progress=on_progress,
         )
 
     def _authenticated_resumed_plan(
@@ -1808,6 +1903,19 @@ def _failure_exit(outcome: StableSymbol) -> ExitClass:
     if outcome.value in {"conflicting", "unchanged", "etag-conflict"}:
         return ExitClass.STALE_OR_CONFLICTING
     return ExitClass.OPERATIONAL_FAILURE
+
+
+def _notify_progress(
+    observer: ApplyProgressObserver | None,
+    event: ApplyProgressEvent,
+) -> None:
+    """Publish presentation progress without granting it Apply authority."""
+    if observer is None:
+        return
+    try:
+        observer(event)
+    except Exception:  # noqa: BLE001 - presentation cannot interrupt Apply
+        return
 
 
 def _result_for_record(  # noqa: PLR0913

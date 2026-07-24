@@ -5,6 +5,10 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING
 
+from cqmgr.application.operations.apply import (
+    ApplyProgressEvent,
+    ApplyProgressState,
+)
 from cqmgr.application.operations.lifecycle import LifecycleOperations
 
 if TYPE_CHECKING:
@@ -32,8 +36,22 @@ class _Apply:
     def __init__(self) -> None:
         self.calls: list[object] = []
 
-    async def apply(self, request: object) -> object:
+    async def apply(
+        self,
+        request: object,
+        *,
+        on_progress: object | None = None,
+    ) -> object:
         self.calls.append(request)
+        if callable(on_progress):
+            on_progress(
+                ApplyProgressEvent(
+                    order=1,
+                    total=1,
+                    child_id="direct",
+                    state=ApplyProgressState.DISPATCHING,
+                )
+            )
         return ("apply", request)
 
 
@@ -50,10 +68,22 @@ def test_every_surface_shares_existing_typed_lifecycle_operations() -> None:
     """Every adapter delegates the same typed inputs to the same operations."""
 
     async def run() -> None:
-        assert await operations.apply(apply_request) == (  # type: ignore[arg-type]
+        progress: list[ApplyProgressEvent] = []
+        assert await operations.apply(
+            apply_request,  # type: ignore[arg-type]
+            on_progress=progress.append,
+        ) == (
             "apply",
             apply_request,
         )
+        assert progress == [
+            ApplyProgressEvent(
+                order=1,
+                total=1,
+                child_id="direct",
+                state=ApplyProgressState.DISPATCHING,
+            )
+        ]
         assert [item async for item in operations.watch(watch_request)] == [  # type: ignore[arg-type]
             ("watch", watch_request)
         ]

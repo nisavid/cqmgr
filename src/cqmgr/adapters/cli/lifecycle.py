@@ -437,6 +437,9 @@ def _result_lines(mapping: Mapping[str, Any]) -> tuple[str, ...]:
         f"Complete: {str(mapping['complete']).lower()}",
         scope_line,
     ]
+    identity_evidence = mapping.get("identity_evidence")
+    if identity_evidence is not None:
+        lines.extend(_human_lines("identity_evidence", identity_evidence))
     lines.extend(_human_lines("data", mapping["data"]))
     return tuple(lines)
 
@@ -502,7 +505,11 @@ def _require_no_secrets(value: object) -> None:
 
 
 def _human_lines(prefix: str, value: object) -> list[str]:  # noqa: PLR0911
-    label = prefix.replace("_", " ").capitalize()
+    label = (
+        "Authenticated principal"
+        if prefix == "acting_principal"
+        else prefix.replace("_", " ").capitalize()
+    )
     if isinstance(value, Mapping):
         lines: list[str] = []
         for key, item in value.items():

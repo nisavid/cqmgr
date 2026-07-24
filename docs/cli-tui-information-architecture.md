@@ -122,12 +122,12 @@ project never become the resource scope. Every resource-scoped human and
 structured result shows the canonical resource name and the resolution source.
 
 `scope`, `profile`, and `config` operations are local and offline. They do not
-load or refresh ADC, resolve an acting principal, call Resource Manager or a
-quota provider, or claim that a selected project is accessible. Acting
-principal and impersonation-chain evidence belongs only to the provider-scoped
-operation that observed it. Until such an operation runs, the TUI says
-`acting principal deferred (offline)`; it does not turn the selected resource scope into
-identity evidence.
+load or refresh ADC, resolve an authenticated principal, call Resource Manager
+or a quota provider, or claim that a selected project is accessible.
+Authenticated-principal and impersonation-chain evidence belongs only to the
+provider-scoped operation that observed it. Until such an operation runs, the TUI says
+`authenticated principal deferred (offline)`; it does not turn the selected
+resource scope into identity evidence.
 
 Apply has an independent acknowledgement gate. `plan apply` requires the full
 canonical resource name, such as `projects/123456789`, through
@@ -378,9 +378,10 @@ The TUI has three sibling workspaces:
 A persistent instrument bar shows the active canonical resource scope, its
 resolution source, provider identity evidence when a provider-scoped operation
 has observed it, and evidence freshness or completeness. Before that
-observation it shows `acting principal deferred (offline)`; opening the TUI or changing local
-scope never initializes ADC merely to populate the bar. These are authoritative
-words and values; color and optional glyphs only reinforce them.
+observation it shows `authenticated principal deferred (offline)`; opening the
+TUI or changing local scope never initializes ADC merely to populate the bar.
+These are authoritative words and values; color and optional glyphs only
+reinforce them.
 
 Requirement resolution, request composition, Plan Review, Apply, and Watch are
 focused routes within their owning workspace. They replace the workspace body
@@ -417,7 +418,7 @@ derived headline only when it also exposes an explicit path to the full axes.
 Exact-slice detail always shows all three axes and their values.
 
 Selecting a slice opens its full identity, source evidence, preference
-provenance, related constraint set, acting principal, and valid next
+provenance, related constraint set, authenticated principal, and valid next
 operations. Single-slice request composition begins there. Workload-first
 composition begins with `quota resolve compute-instance` or
 `quota resolve cloud-tpu-slice`, presents separate constraint sets for every
@@ -543,11 +544,12 @@ that Apply and preserves every later child as `unattempted`. A dispatch intent
 without a terminal outcome is durably `unknown`, stops later dispatch, and
 requires read-after-unknown reconciliation; it is never dispatched again
 automatically. Apply stops at the first child whose
-acceptance cannot be proven, marks every later child `unattempted`, and never
-attempts rollback. Each plan-child disposition is exactly `accepted`, `failed`,
-`unknown`, or `unattempted`. A transport-unknown dispatch is `unknown`, not
-`failed`; a failed child preserves its exact unchanged, conflicting, or other
-conclusive failure outcome. Verified Preview no-ops remain separate explicit
+acceptance cannot be proven and marks every later child `unattempted`. Every
+earlier accepted child remains accepted. Each plan-child disposition is exactly
+`accepted`, `failed`, `unknown`, or `unattempted`. A transport-unknown dispatch
+is `unknown`, not `failed`; a failed child preserves its exact unchanged,
+conflicting, or other conclusive failure outcome. Verified Preview no-ops remain
+separate explicit
 facts. The aggregate result succeeds only when every plan child is accepted.
 
 After Apply, the TUI returns to the quota inspector with the affected constraint
