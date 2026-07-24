@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-import hmac
 import json
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import TYPE_CHECKING, Protocol
 
+from cqmgr.application.operations.contacts import (
+    bind_protected_contact as _bind_protected_contact,
+)
 from cqmgr.application.operations.plans import (
     ComposeChild,
     ComposeRequest,
@@ -30,6 +32,7 @@ if TYPE_CHECKING:
     from datetime import datetime
     from pathlib import Path
 
+    from cqmgr.application.operations.contacts import LifecycleContactResolver
     from cqmgr.application.operations.read_only import (
         QuotaInspectSelector,
         ReadOnlyScopeInput,
@@ -171,6 +174,14 @@ class InstallationTrustSource(Protocol):
 
 class LifecyclePreparationError(RuntimeError):
     """Fresh provider evidence could not safely become a lifecycle request."""
+
+
+def bind_protected_contact(
+    value: SecretValue,
+    authentication_key: SecretValue,
+) -> ContactBinding:
+    """Retain the established public import for protected input bindings."""
+    return _bind_protected_contact(value, authentication_key)
 
 
 class ReadOnlyLifecycleCompositionReader:
@@ -397,12 +408,14 @@ class LifecycleRequestOperations:
         self,
         reader: LifecycleCompositionReader,
         trust: InstallationTrustSource,
+        contacts: LifecycleContactResolver,
         *,
         now: Callable[[], datetime],
     ) -> None:
         """Bind read-only evidence, active local authority, and an explicit clock."""
         self._reader = reader
         self._trust = trust
+        self._contacts = contacts
         self._now = now
 
     async def prepare(
@@ -426,16 +439,18 @@ class LifecycleRequestOperations:
         )
         if not require_preview:
             return PreparedLifecycleRequests(composition, None)
-        if intent.quota_contact is None or evidence.principal is None or trust is None:
+        if evidence.principal is None or trust is None:
             return PreparedLifecycleRequests(composition, None)
-        contact = bind_protected_contact(
-            intent.quota_contact,
-            trust.authentication_key,
+        contact = await self._contacts.resolve_preview(
+            explicit_value=intent.quota_contact,
+            explicit_profile=intent.scope_input.explicit_profile,
+            principal=evidence.principal,
+            trust=trust,
         )
         preview = PreviewRequest(
             composition=composition,
             principal=evidence.principal,
-            contact_binding=contact,
+            contact_binding=contact.binding,
             installation_id=trust.installation_id,
             authentication_key=trust.authentication_key,
             identity_verified=evidence.identity_verified,
@@ -446,30 +461,6 @@ class LifecycleRequestOperations:
             plan_out=intent.plan_out,
         )
         return PreparedLifecycleRequests(composition, preview)
-
-
-def bind_protected_contact(
-    value: SecretValue,
-    authentication_key: SecretValue,
-) -> ContactBinding:
-    """Bind a protected per-operation contact without retaining its value."""
-    key = authentication_key.reveal()
-    contact = value.reveal()
-    source_digest = hmac.new(
-        key,
-        b"cqmgr-contact-source/v1:" + contact,
-        sha256,
-    ).hexdigest()
-    value_digest = hmac.new(
-        key,
-        b"cqmgr-contact-value/v1:" + contact,
-        sha256,
-    ).hexdigest()
-    return ContactBinding(
-        StableSymbol("per-operation-input"),
-        f"input:hmac-sha256:{source_digest}",
-        f"hmac-sha256:{value_digest}",
-    )
 
 
 def _plan_principal(value: object) -> tuple[PlanPrincipal | None, bool]:

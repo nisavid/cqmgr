@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,11 +17,13 @@ from cqmgr.adapters.cli.lifecycle import (
 )
 from cqmgr.adapters.persistence.plans import LocalPlanRepository
 from cqmgr.adapters.serialization.plans import PlanCodec
+from cqmgr.application.operations.contacts import (
+    ResolvedContact,
+    bind_protected_contact,
+)
 from cqmgr.application.operations.lifecycle_apply import (
     ApplyRefreshError,
-    EphemeralApplyContactRefresher,
 )
-from cqmgr.application.operations.lifecycle_requests import bind_protected_contact
 from cqmgr.application.operations.trust import LoadedInstallationTrust
 from cqmgr.application.ports.plans import (
     EncodedPlan,
@@ -66,6 +69,29 @@ class _Clock:
 
     def monotonic(self) -> float:
         return 100.0
+
+
+class _Contacts:
+    async def prepare_apply(
+        self,
+        binding: object,
+        *,
+        explicit_value: SecretValue | None,
+        principal: PlanPrincipal,
+        trust: LoadedInstallationTrust,
+    ) -> ResolvedContact:
+        del principal
+        if explicit_value is None:
+            message = "Apply requires the Plan-bound per-operation contact"
+            raise ApplyRefreshError(message)
+        resolved = bind_protected_contact(
+            explicit_value,
+            trust.authentication_key,
+        )
+        if resolved != binding:
+            message = "Apply quota contact does not match the reviewed Plan"
+            raise ApplyRefreshError(message)
+        return ResolvedContact(resolved, explicit_value)
 
 
 class _Decoded:
@@ -151,7 +177,7 @@ def _factory() -> tuple[ProtectedLifecycleCliRequestFactory, _Repository]:
         trust=_Trust(),
         repository=cast("Any", repository),
         codec=cast("Any", _Codec(plan)),
-        contacts=EphemeralApplyContactRefresher(),
+        contacts=cast("Any", _Contacts()),
         clock=_Clock(),
     )
     return factory, repository
@@ -192,10 +218,12 @@ def test_apply_imports_authenticated_plan_and_rebinds_contact() -> None:
     """Portable Apply becomes local only after trust and contact both match."""
     factory, repository = _factory()
 
-    request = factory.apply(
-        PlanReferenceInput(None, Path("request.plan")),
-        "projects/123",
-        quota_contact=CONTACT,
+    request = asyncio.run(
+        factory.apply(
+            PlanReferenceInput(None, Path("request.plan")),
+            "projects/123",
+            quota_contact=CONTACT,
+        )
     )
 
     assert request.digest == DIGEST
@@ -212,10 +240,12 @@ def test_apply_loads_available_local_plan_by_digest() -> None:
     """Digest Apply requires the local repository's available status."""
     factory, repository = _factory()
 
-    request = factory.apply(
-        PlanReferenceInput(DIGEST, None),
-        "projects/123",
-        quota_contact=CONTACT,
+    request = asyncio.run(
+        factory.apply(
+            PlanReferenceInput(DIGEST, None),
+            "projects/123",
+            quota_contact=CONTACT,
+        )
     )
 
     assert request.digest == DIGEST
@@ -236,14 +266,16 @@ def test_apply_imports_exported_plan_from_local_repository(tmp_path: Path) -> No
         trust=_Trust(),
         repository=repository,
         codec=cast("Any", PlanCodec()),
-        contacts=EphemeralApplyContactRefresher(),
+        contacts=cast("Any", _Contacts()),
         clock=_Clock(),
     )
 
-    request = factory.apply(
-        PlanReferenceInput(None, exported),
-        "projects/123",
-        quota_contact=CONTACT,
+    request = asyncio.run(
+        factory.apply(
+            PlanReferenceInput(None, exported),
+            "projects/123",
+            quota_contact=CONTACT,
+        )
     )
 
     assert request.digest == encoded.digest
@@ -257,10 +289,12 @@ def test_apply_rejects_contact_that_does_not_match_plan() -> None:
     factory, _ = _factory()
 
     with pytest.raises(ApplyRefreshError, match="does not match"):
-        factory.apply(
-            PlanReferenceInput(None, Path("request.plan")),
-            "projects/123",
-            quota_contact=SecretValue(b"other@example.com"),
+        asyncio.run(
+            factory.apply(
+                PlanReferenceInput(None, Path("request.plan")),
+                "projects/123",
+                quota_contact=SecretValue(b"other@example.com"),
+            )
         )
 
 
