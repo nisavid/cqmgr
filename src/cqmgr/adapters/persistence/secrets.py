@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from cqmgr.adapters.persistence.native_plan_lock import NativePlanInterprocessLock
+    from cqmgr.application.configuration import QuotaContactKeyringReference
 
 _VALUE_PREFIX = "cqmgr-secret/v1:"
 _NATIVE_BACKEND_IDENTITIES = {
@@ -78,6 +79,28 @@ class NativeSecretStore:
         try:
             with self._lock:
                 return self._get_unlocked(reference)
+        except Exception as error:  # noqa: BLE001
+            return _failure(error)
+
+    def get_quota_contact(
+        self,
+        reference: QuotaContactKeyringReference,
+    ) -> SecretStoreOutcome:
+        """Read one exact profile-bound contact from the allowlisted keyring."""
+        if not self.probe().mutation_capable:
+            return SecretStoreOutcome(SecretStoreStatus.UNSUPPORTED)
+        try:
+            with self._lock:
+                raw = self._backend.get_password(reference.service, reference.account)
+                if raw is None:
+                    return SecretStoreOutcome(SecretStoreStatus.MISSING)
+                if not isinstance(raw, str):
+                    return SecretStoreOutcome(SecretStoreStatus.FAILED)
+                try:
+                    secret = _decode(raw)
+                except ValueError:
+                    return SecretStoreOutcome(SecretStoreStatus.FAILED)
+                return SecretStoreOutcome.available(secret)
         except Exception as error:  # noqa: BLE001
             return _failure(error)
 

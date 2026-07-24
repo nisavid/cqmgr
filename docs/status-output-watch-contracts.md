@@ -19,7 +19,7 @@ fulfilled.
 
 | Domain operation | Success boundary | Required result facts |
 | --- | --- | --- |
-| Establish resource scope | The canonical project selection is resolved offline from explicit input, an explicitly named profile, a direct local selection, or the explicitly selected local profile. V1 rejects folder and organization operations without inferring a project. | Resource-scope type and selected resource name; resolution source; explicit `identity_evidence: deferred-offline`. Provider canonicalization, acting principal, and impersonation chain are deliberately not loaded. |
+| Establish resource scope | The canonical project selection is resolved offline from explicit input, an explicitly named profile, a direct local selection, or the explicitly selected local profile. V1 rejects folder and organization operations without inferring a project. | Resource-scope type and selected resource name; resolution source; explicit `identity_evidence: deferred-offline`. Provider canonicalization, authenticated principal, and impersonation chain are deliberately not loaded. |
 | Browse quota | The requested logical page or bounded query is read completely from its explicit queried-provider set. A bare query federates Compute and Cloud TPU; service or catalog-group filters prune provider reads and displayed rows. | Canonical resource scope; canonicalized query and page identity; exact slices; constraint-set relationships; independent queried-provider source/location coverage; intentionally unqueried providers; release-relative catalog digests and observation times; continuation identity when present. |
 | Inspect slice | One complete exact effective quota slice and its required related evidence are read. | Provider identity; dimensions and quota scope; effective value; usage; provider quota preference; eligibility; related constraints; independent source times and completeness. |
 | Resolve requirement | The supplied Compute instance or Cloud TPU slice requirement resolves without guessing for each selected location independently. One location may be complete when unrelated requested locations are incomplete; an all-compatible-locations aggregate is complete only after exhaustive compatible-location enumeration. | Discriminated normalized requirement; per-location compatibility disposition, native-unit requirement, owning service and management plane, exact constraint set, coverage, and ambiguity or rejection evidence. |
@@ -27,7 +27,7 @@ fulfilled.
 | Compose request | One direct exact-slice target or one selected compatible workload location is converted into absolute targets for every selected independently mutable child. | Request form; resource scope; exact-slice `manual` target or normalized workload, location, and selected strategy; complete ordered child set; exact slices, absolute targets, and units; prior desired, granted, effective, and fresh usage values; no-op children; directions; required warnings and acknowledgements. |
 | Preview plan | A locally portable, integrity-protected single or bundle quota request plan is produced, or every child is freshly verified as a no-op. V1 Apply capability is bound to the issuing installation. | Plan subject kind; bound resource scope; exact-slice `manual` input for `single`, or selected location, strategy, normalized workload, and complete constraint set for `bundle`; ordered non-no-op children; per-child evidence, identity, intent, principal, warnings, and acknowledgements; plan expiry, digest, issuing-installation trust, and Apply capability when a plan is produced, otherwise every no-op reason. |
 | Review plan | Canonical plan bytes and their digest are verified and all trustworthy bound evidence is presented without applying it. Expiry, foreign issuer, prior consumption, or unresolved acknowledgements remove Apply capability but do not make safe inspection fail. | Every bound plan fact, canonical and digest verification state, expiry, issuer and consumption state, unresolved acknowledgements, Apply capability, and exact incapability reasons. |
-| Apply plan | Every non-no-op child in the bound deterministic accelerator-first order is proven accepted. Apply is non-atomic; the first conclusively failed or transport-unknown child stops dispatch and accepted children are never rolled back. A verified all-no-op Preview has no Apply capability. | Plan digest and subject kind; resource scope; bound child order; every child's exact slice, target, unit, disposition, provider preference identity, etag and trace when present, submitted observation, and audit reference; aggregate boundary and outcome. |
+| Apply plan | Every non-no-op child in the bound deterministic accelerator-first order is proven accepted. Apply is non-atomic; the first conclusively failed or transport-unknown child stops dispatch, and every earlier accepted child remains accepted. A verified all-no-op Preview has no Apply capability. | Plan digest and subject kind; resource scope; bound child order; every child's exact slice, target, unit, disposition, provider preference identity, etag and trace when present, submitted observation, and audit reference; aggregate boundary and outcome. |
 | Watch request | The explicitly selected Watch condition is reached for one watched request or for every child in a bundle's accepted Watch set. | Single or bundle subject identity; selected condition; durable Apply record; ordered children, immutable dispositions, and unknown dispatch resolutions; per-watched-child preference identity, orthogonal status, target, granted, effective, and lineage values; aggregate state; all material observations and final outcome. |
 | Inspect audit | The requested bounded audit query is read completely. | Query and record identities; canonical resource scopes; observation times; continuity metadata. |
 | Verify audit | The requested records and rotation checkpoints form a valid chain. | Verified range and checkpoints, or the exact first continuity failure and affected range. |
@@ -118,7 +118,7 @@ These values describe durable non-atomic dispatch, not a transaction:
 - `unattempted` identifies every later child that was not dispatched because
   dispatch stopped.
 
-An aggregate result never relabels earlier accepted children as rolled back.
+An aggregate result preserves every earlier accepted child as accepted.
 It reaches the Apply boundary only when every non-no-op child is `accepted`.
 The exact failed or unknown child selects the aggregate nonzero exit class;
 accepted children and their reconciliation identities remain available for
@@ -218,7 +218,8 @@ The envelope contract is:
   selected project and carry `data.identity_evidence:
   "deferred-offline"`; they do not synthesize a principal or mark the result
   incomplete. Provider-scoped operations replace that deferral with
-  Resource Manager canonicalization and explicit acting-principal evidence.
+  Resource Manager canonicalization and explicit authenticated-principal
+  evidence.
 - `boundary.condition` names the operation's promised condition;
   `boundary.reached` is authoritative for success.
 - `outcome.code` is a stable symbolic outcome. `outcome.exit_class` is the
@@ -263,7 +264,7 @@ Presentation changes may not remove the facts needed to identify the resource sc
 interpret the operation boundary, or act safely. In particular:
 
 - every resource-scoped result identifies the canonical resource scope;
-- offline scope results state that acting-principal evidence was deferred,
+- offline scope results state that authenticated-principal evidence was deferred,
   while provider-scoped results show the resolved principal and impersonation
   chain;
 - quota results preserve exact slice identity, dimensions, scope, native unit,

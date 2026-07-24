@@ -12,10 +12,12 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    from cqmgr.adapters.cli.lifecycle import LifecycleCliRuntime
     from cqmgr.application.operations.audit import AuditOperations
     from cqmgr.application.operations.local import LocalOperations
     from cqmgr.application.operations.quotas import QuotaOperations
     from cqmgr.application.operations.read_only import ReadOnlyOperations
+    from cqmgr.application.operations.trust import TrustInitializationOperations
 
 _LOCAL_GROUPS = frozenset(
     ("scope", "sc", "profile", "pf", "config", "cfg", "audit", "aud")
@@ -40,11 +42,12 @@ class InvocationKind(StrEnum):
     HELP = "help"
     LOCAL = "local"
     TUI = "tui"
+    TRUST = "trust"
     PROVIDER = "provider"
     INVALID = "invalid"
 
 
-def classify_invocation(
+def classify_invocation(  # noqa: PLR0911
     arguments: Sequence[str],
     *,
     stdin_is_tty: bool,
@@ -62,6 +65,8 @@ def classify_invocation(
         return InvocationKind.HELP
     if command == "tui":
         return InvocationKind.HELP if "--help" in arguments else InvocationKind.TUI
+    if command == "trust":
+        return InvocationKind.HELP if "--help" in arguments else InvocationKind.TRUST
     if command in _LOCAL_GROUPS:
         return InvocationKind.HELP if "--help" in arguments else InvocationKind.LOCAL
     if command in _PROVIDER_GROUPS:
@@ -78,6 +83,10 @@ class RuntimePaths:
     audit: Path
     quota_snapshots: Path
     budgets: Path
+    trust: Path
+    plans: Path
+    apply_records: Path
+    watch: Path
 
 
 def _platform_paths(environment: Mapping[str, str]) -> RuntimePaths:
@@ -97,6 +106,10 @@ def _platform_paths(environment: Mapping[str, str]) -> RuntimePaths:
         audit=state_home / "cqmgr/audit",
         quota_snapshots=state_home / "cqmgr/quota-snapshots",
         budgets=state_home / "cqmgr/budgets",
+        trust=state_home / "cqmgr/trust.toml",
+        plans=state_home / "cqmgr/plans",
+        apply_records=state_home / "cqmgr/apply-records",
+        watch=state_home / "cqmgr/watch",
     )
 
 
@@ -121,6 +134,284 @@ def runtime_paths(environment: Mapping[str, str] | None = None) -> RuntimePaths:
         budgets=Path(
             source.get("CQMGR_BUDGET_PATH", str(defaults.budgets))
         ).expanduser(),
+        trust=Path(source.get("CQMGR_TRUST_PATH", str(defaults.trust))).expanduser(),
+        plans=Path(source.get("CQMGR_PLAN_PATH", str(defaults.plans))).expanduser(),
+        apply_records=Path(
+            source.get("CQMGR_APPLY_RECORD_PATH", str(defaults.apply_records))
+        ).expanduser(),
+        watch=Path(source.get("CQMGR_WATCH_PATH", str(defaults.watch))).expanduser(),
+    )
+
+
+def build_lifecycle_runtime(  # noqa: PLR0915
+    environment: Mapping[str, str] | None = None,
+) -> LifecycleCliRuntime:
+    """Compose production lifecycle operations without initializing trust."""
+    import asyncio  # noqa: PLC0415
+    import secrets  # noqa: PLC0415
+    import time  # noqa: PLC0415
+    from typing import Any, cast  # noqa: PLC0415
+
+    import keyring  # noqa: PLC0415
+    from google.cloud import cloudquotas_v1  # noqa: PLC0415
+
+    from cqmgr.adapters.cli.lifecycle import (  # noqa: PLC0415
+        LifecycleCliRuntime,
+        ProtectedLifecycleCliRequestFactory,
+    )
+    from cqmgr.adapters.clock import SystemClock  # noqa: PLC0415
+    from cqmgr.adapters.google.cloud_quotas import (  # noqa: PLC0415
+        CloudQuotasObservationClient,
+        GoogleWatchObservationReader,
+        OfficialCloudQuotasObservationClient,
+    )
+    from cqmgr.adapters.google.identity import (  # noqa: PLC0415
+        ADC_IDENTITY_SCOPES,
+        FederatedSubjectResolver,
+        GoogleADCIdentityProvider,
+        GoogleAuthRuntime,
+    )
+    from cqmgr.adapters.google.quota_preference_writes import (  # noqa: PLC0415
+        CloudQuotasMutationClient,
+        CloudQuotasQuotaPreferenceReadClient,
+        OfficialQuotaPreferenceUnknownResolver,
+        OfficialQuotaPreferenceWriter,
+    )
+    from cqmgr.adapters.persistence.apply_records import (  # noqa: PLC0415
+        LocalApplyRecordRepository,
+    )
+    from cqmgr.adapters.persistence.audit import FilesystemAuditJournal  # noqa: PLC0415
+    from cqmgr.adapters.persistence.configuration import (  # noqa: PLC0415
+        TomlConfigRepository,
+        TomlSelectionStateRepository,
+    )
+    from cqmgr.adapters.persistence.coordination import (  # noqa: PLC0415
+        DeterministicJitter,
+        SharedBudgetCoordinator,
+    )
+    from cqmgr.adapters.persistence.installation_trust import (  # noqa: PLC0415
+        TomlInstallationTrustRepository,
+    )
+    from cqmgr.adapters.persistence.native_plan_lock import (  # noqa: PLC0415
+        NativePlanInterprocessLock,
+    )
+    from cqmgr.adapters.persistence.plans import LocalPlanRepository  # noqa: PLC0415
+    from cqmgr.adapters.persistence.secrets import NativeSecretStore  # noqa: PLC0415
+    from cqmgr.adapters.persistence.watch import (  # noqa: PLC0415
+        LocalWatchCheckpointRepository,
+    )
+    from cqmgr.adapters.serialization.plans import PlanCodec  # noqa: PLC0415
+    from cqmgr.adapters.serialization.watch import HmacWatchResumeCodec  # noqa: PLC0415
+    from cqmgr.application.operations.apply import (  # noqa: PLC0415
+        ApplyPlanOperations,
+        ComposedApplyRevalidator,
+    )
+    from cqmgr.application.operations.contacts import (  # noqa: PLC0415
+        ProtectedContactResolver,
+    )
+    from cqmgr.application.operations.lifecycle import (  # noqa: PLC0415
+        LifecycleOperations,
+    )
+    from cqmgr.application.operations.lifecycle_apply import (  # noqa: PLC0415
+        CurrentApplyPrincipalRefresher,
+        ReadOnlyApplyEvidenceRefresher,
+    )
+    from cqmgr.application.operations.lifecycle_requests import (  # noqa: PLC0415
+        LifecycleRequestOperations,
+        ReadOnlyLifecycleCompositionReader,
+    )
+    from cqmgr.application.operations.plans import (  # noqa: PLC0415
+        RequestPlanOperations,
+    )
+    from cqmgr.application.operations.trust import (  # noqa: PLC0415
+        InstallationTrustLoader,
+    )
+    from cqmgr.application.operations.watch import WatchOperations  # noqa: PLC0415
+    from cqmgr.application.ports.coordination import (  # noqa: PLC0415
+        BudgetLimit,
+        BudgetScope,
+    )
+    from cqmgr.google_read_only import (  # noqa: PLC0415
+        CachedADCRuntime,
+        LazyClientProxy,
+    )
+
+    class _UnsupportedFederatedSubjectResolver:
+        def resolve(self, credential: object) -> None:  # noqa: ARG002
+            return None
+
+    paths = runtime_paths(environment)
+    clock = SystemClock()
+    native_lock = NativePlanInterprocessLock(
+        paths.trust.parent / ".native-plan-keyring.lock"
+    )
+    secret_store = NativeSecretStore(
+        cast("Any", keyring.get_keyring()),
+        native_lock,
+    )
+    trust = InstallationTrustLoader(
+        TomlInstallationTrustRepository(paths.trust),
+        secret_store,
+    )
+    repository = LocalPlanRepository(
+        paths.plans,
+        secret_store,
+        lock=native_lock,
+    )
+    apply_records = LocalApplyRecordRepository(paths.apply_records)
+    audit = FilesystemAuditJournal(paths.audit)
+    codec = PlanCodec()
+    codec_port = cast("Any", codec)
+    read_only = build_read_only_operations(environment)
+
+    adc = CachedADCRuntime(
+        GoogleAuthRuntime(
+            cast(
+                "FederatedSubjectResolver",
+                _UnsupportedFederatedSubjectResolver(),
+            )
+        ),
+        default_scopes=ADC_IDENTITY_SCOPES,
+    )
+    identity = GoogleADCIdentityProvider(adc)
+    generated = LazyClientProxy(
+        lambda: cloudquotas_v1.CloudQuotasAsyncClient(
+            credentials=cast("Any", adc.credential())
+        ),
+        closer=lambda client: client.transport.close(),
+    )
+    contacts = ProtectedContactResolver(
+        TomlConfigRepository(paths.configuration),
+        TomlSelectionStateRepository(paths.selection_state),
+        secret_store,
+        identity,
+    )
+    revalidator = ComposedApplyRevalidator(
+        principal=CurrentApplyPrincipalRefresher(identity),
+        contact=contacts,
+        evidence=ReadOnlyApplyEvidenceRefresher(
+            read_only,
+            deadline=lambda: time.monotonic() + 30.0,
+        ),
+    )
+    apply = ApplyPlanOperations(
+        repository=repository,
+        apply_records=apply_records,
+        audit=audit,
+        codec=codec_port,
+        revalidator=revalidator,
+        writer=OfficialQuotaPreferenceWriter(
+            cast("CloudQuotasMutationClient", generated)
+        ),
+        unknown_resolver=OfficialQuotaPreferenceUnknownResolver(
+            cast("CloudQuotasQuotaPreferenceReadClient", generated)
+        ),
+    )
+    budget = SharedBudgetCoordinator(
+        paths.budgets,
+        {scope: BudgetLimit(capacity=30, period_seconds=60.0) for scope in BudgetScope},
+    )
+    observation = OfficialCloudQuotasObservationClient(
+        cast("Any", generated),
+    )
+    watch = WatchOperations(
+        apply_records=apply_records,
+        checkpoints=LocalWatchCheckpointRepository(paths.watch),
+        resume_codec=HmacWatchResumeCodec(),
+        reader=GoogleWatchObservationReader(
+            cast("CloudQuotasObservationClient", observation)
+        ),
+        budgets=budget,
+        clock=clock,
+        stream_ids=lambda: f"stream-{secrets.token_urlsafe(18)}",
+        jitter=DeterministicJitter(f"cqmgr-watch-v1:{paths.watch}"),
+    )
+    operations = LifecycleOperations(
+        RequestPlanOperations(repository, audit, codec_port),
+        apply,
+        watch,
+    )
+    preparation = LifecycleRequestOperations(
+        ReadOnlyLifecycleCompositionReader(read_only),
+        trust,
+        contacts,
+        now=clock.now,
+    )
+    requests = ProtectedLifecycleCliRequestFactory(
+        trust=trust,
+        repository=repository,
+        codec=codec_port,
+        contacts=contacts,
+        clock=clock,
+    )
+
+    async def shutdown() -> None:
+        await asyncio.gather(
+            read_only.aclose(),
+            generated.aclose(),
+            return_exceptions=True,
+        )
+
+    return LifecycleCliRuntime(
+        operations,
+        requests,
+        preparation,
+        read_only=read_only,
+        shutdown=shutdown,
+    )
+
+
+def build_trust_initialization_operations(
+    environment: Mapping[str, str] | None = None,
+) -> TrustInitializationOperations:
+    """Compose the sole explicit native installation-trust creation path."""
+    import secrets  # noqa: PLC0415
+    from typing import Any, cast  # noqa: PLC0415
+
+    import keyring  # noqa: PLC0415
+
+    from cqmgr.adapters.persistence.installation_trust import (  # noqa: PLC0415
+        TomlInstallationTrustRepository,
+    )
+    from cqmgr.adapters.persistence.native_plan_lock import (  # noqa: PLC0415
+        NativePlanInterprocessLock,
+    )
+    from cqmgr.adapters.persistence.secrets import NativeSecretStore  # noqa: PLC0415
+    from cqmgr.application.operations.trust import (  # noqa: PLC0415
+        TrustInitializationOperations,
+    )
+    from cqmgr.application.ports.secrets import (  # noqa: PLC0415
+        SecretPurpose,
+        SecretStoreReference,
+        SecretValue,
+    )
+
+    path = runtime_paths(environment).trust
+    native_lock = NativePlanInterprocessLock(path.parent / ".native-plan-keyring.lock")
+    workflow_lock = NativePlanInterprocessLock(
+        path.parent / ".installation-trust-init.lock"
+    )
+    store = NativeSecretStore(
+        cast("Any", keyring.get_keyring()),
+        native_lock,
+    )
+
+    def material() -> tuple[str, SecretStoreReference, SecretValue]:
+        installation_id = f"installation-{secrets.token_urlsafe(18)}"
+        return (
+            installation_id,
+            SecretStoreReference.generate(
+                installation_id,
+                SecretPurpose.PLAN_AUTHENTICATION,
+            ),
+            SecretValue(secrets.token_bytes(32)),
+        )
+
+    return TrustInitializationOperations(
+        TomlInstallationTrustRepository(path),
+        store,
+        material=material,
+        workflow_lock=workflow_lock,
     )
 
 

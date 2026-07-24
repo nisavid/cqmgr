@@ -17,6 +17,9 @@ from cqmgr.adapters.serialization.plans import PlanCodec
 from cqmgr.application.operations.apply import (
     ApplyData,
     ApplyPlanOperations,
+    ApplyProgressEvent,
+    ApplyProgressObserver,
+    ApplyProgressState,
     ApplyRequest,
     ComposedApplyRevalidator,
 )
@@ -485,7 +488,13 @@ class _EvidenceRefresher:
         return ApplyEvidenceRefresh(
             SCOPE,
             self._plan.constraints,
-            tuple(_refreshed(child) for child in self._plan.children),
+            tuple(
+                _refreshed(child)
+                for child in (
+                    *self._plan.children,
+                    *getattr(self._plan, "no_op_children", ()),
+                )
+            ),
         )
 
 
@@ -812,7 +821,10 @@ def _valid_revalidation(plan: QuotaPlan) -> ApplyRevalidation:
         contact_binding=plan.contact_binding,
         contact_value="resolved@example.com",
         constraints=plan.constraints,
-        children=tuple(_refreshed(child) for child in plan.children),
+        children=tuple(
+            _refreshed(child)
+            for child in (*plan.children, *getattr(plan, "no_op_children", ()))
+        ),
     )
 
 
@@ -860,6 +872,7 @@ def _apply(  # noqa: PLR0913
     unknown_resolver: _ScriptedResolver | None = None,
     codec: object | None = None,
     request: ApplyRequest | None = None,
+    on_progress: ApplyProgressObserver | None = None,
 ) -> tuple[
     OperationResult[ApplyData],
     _MemoryPlanRepository,
@@ -892,7 +905,8 @@ def _apply(  # noqa: PLR0913
                 contact_binding=CONTACT,
                 contact_value="operator@example.com",
                 now=NOW + timedelta(minutes=1),
-            )
+            ),
+            on_progress=on_progress,
         )
     )
     return result, repository, apply_records, audit
@@ -932,6 +946,354 @@ def test_apply_dispatches_bound_order_once_and_durably_accepts_every_child() -> 
         AuditRecordKind.APPLY_RESULT,
         AuditRecordKind.APPLY_RESULT,
     ]
+
+
+def test_apply_result_preserves_submitted_time_and_plan_safety_context() -> None:
+    """Every dispatched child retains its Plan context and durable submit time."""
+    base = _plan()
+    direct = replace(
+        base.children[0],
+        warnings=(StableSymbol("expert-review-required"),),
+        required_acknowledgements=(
+            StableSymbol("decrease-below-usage"),
+            StableSymbol("decrease-over-ten-percent"),
+        ),
+        acknowledgements=(
+            StableSymbol("decrease-below-usage"),
+            StableSymbol("decrease-over-ten-percent"),
+        ),
+    )
+    plan = replace(base, children=(direct, base.children[1]))
+    writer = _ScriptedWriter(
+        QuotaPreferenceWriteResult(
+            accepted=True,
+            outcome=StableSymbol("submitted"),
+        ),
+        QuotaPreferenceWriteResult(
+            accepted=True,
+            outcome=StableSymbol("submitted"),
+        ),
+    )
+
+    result, _, _, _ = _apply(plan, writer)
+
+    child = result.data.children[0]
+    assert child.submitted_at == NOW + timedelta(minutes=1)
+    assert child.warnings == (StableSymbol("expert-review-required"),)
+    assert child.required_acknowledgements == (
+        StableSymbol("decrease-below-usage"),
+        StableSymbol("decrease-over-ten-percent"),
+    )
+    assert child.acknowledgements == (
+        StableSymbol("decrease-below-usage"),
+        StableSymbol("decrease-over-ten-percent"),
+    )
+    assert child.unresolved_acknowledgements == ()
+
+
+def test_apply_reports_ordered_dispatching_and_accepted_child_progress() -> None:
+    """Apply exposes each durable child transition before aggregate completion."""
+    progress: list[ApplyProgressEvent] = []
+
+    result, _, _, _ = _apply(
+        _plan(),
+        _ScriptedWriter(
+            QuotaPreferenceWriteResult(
+                accepted=True,
+                outcome=StableSymbol("submitted"),
+            ),
+            QuotaPreferenceWriteResult(
+                accepted=True,
+                outcome=StableSymbol("submitted"),
+            ),
+        ),
+        on_progress=progress.append,
+    )
+
+    assert result.succeeded
+    assert [
+        (event.order, event.total, event.child_id, event.state) for event in progress
+    ] == [
+        (1, 2, "direct", ApplyProgressState.DISPATCHING),
+        (1, 2, "direct", ApplyProgressState.ACCEPTED),
+        (2, 2, "companion", ApplyProgressState.DISPATCHING),
+        (2, 2, "companion", ApplyProgressState.ACCEPTED),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("event_args", "error", "message"),
+    [
+        (
+            (cast("int", "1"), 1, "direct", ApplyProgressState.ACCEPTED),
+            TypeError,
+            "order",
+        ),
+        (
+            (cast("int", bool(1)), 1, "direct", ApplyProgressState.ACCEPTED),
+            TypeError,
+            "order",
+        ),
+        (
+            (1, cast("int", "1"), "direct", ApplyProgressState.ACCEPTED),
+            TypeError,
+            "total",
+        ),
+        (
+            (1, cast("int", bool(1)), "direct", ApplyProgressState.ACCEPTED),
+            TypeError,
+            "total",
+        ),
+        ((1, 0, "direct", ApplyProgressState.ACCEPTED), ValueError, "child set"),
+        ((0, 1, "direct", ApplyProgressState.ACCEPTED), ValueError, "child set"),
+        ((2, 1, "direct", ApplyProgressState.ACCEPTED), ValueError, "child set"),
+        (
+            (1, 1, cast("str", 7), ApplyProgressState.ACCEPTED),
+            ValueError,
+            "child_id",
+        ),
+        ((1, 1, "", ApplyProgressState.ACCEPTED), ValueError, "child_id"),
+        (
+            (1, 1, "direct", cast("ApplyProgressState", "accepted")),
+            TypeError,
+            "state",
+        ),
+    ],
+)
+def test_apply_progress_event_rejects_invalid_boundary_facts(
+    event_args: tuple[int, int, str, ApplyProgressState],
+    error: type[Exception],
+    message: str,
+) -> None:
+    """Presentation progress never carries malformed ordered child evidence."""
+    with pytest.raises(error, match=message):
+        ApplyProgressEvent(*event_args)
+
+
+def test_apply_progress_observer_cannot_interrupt_dispatch() -> None:
+    """Presentation failure cannot acquire authority over Apply execution."""
+
+    def fail_to_render(_event: ApplyProgressEvent) -> None:
+        msg = "presentation unavailable"
+        raise RuntimeError(msg)
+
+    result, _, _, _ = _apply(
+        _plan(),
+        _ScriptedWriter(
+            QuotaPreferenceWriteResult(
+                accepted=True,
+                outcome=StableSymbol("submitted"),
+            ),
+            QuotaPreferenceWriteResult(
+                accepted=True,
+                outcome=StableSymbol("submitted"),
+            ),
+        ),
+        on_progress=fail_to_render,
+    )
+
+    assert result.succeeded
+    assert tuple(child.disposition for child in result.data.children) == (
+        ApplyChildDisposition.ACCEPTED,
+        ApplyChildDisposition.ACCEPTED,
+    )
+
+
+def test_partial_unknown_apply_preserves_every_child_plan_safety_fact() -> None:
+    """Accepted and unknown children retain safety facts after Apply stops."""
+    base = _plan()
+    direct = replace(
+        base.children[0],
+        warnings=(StableSymbol("expert-review-required"),),
+        required_acknowledgements=(StableSymbol("decrease-below-usage"),),
+        acknowledgements=(StableSymbol("decrease-below-usage"),),
+    )
+    companion = replace(
+        base.children[1],
+        warnings=(StableSymbol("remaining-companion-bottleneck"),),
+        required_acknowledgements=(StableSymbol("decrease-over-ten-percent"),),
+        acknowledgements=(StableSymbol("decrease-over-ten-percent"),),
+    )
+    plan = replace(base, children=(direct, companion))
+    writer = _ScriptedWriter(
+        QuotaPreferenceWriteResult(
+            accepted=True,
+            outcome=StableSymbol("submitted"),
+        ),
+        TimeoutError("transport lost"),
+    )
+
+    result, _, _, _ = _apply(plan, writer)
+
+    assert result.outcome.code == StableSymbol("unknown-dispatch")
+    assert tuple(child.disposition for child in result.data.children) == (
+        ApplyChildDisposition.ACCEPTED,
+        ApplyChildDisposition.UNKNOWN,
+    )
+    assert tuple(child.warnings for child in result.data.children) == (
+        direct.warnings,
+        companion.warnings,
+    )
+    assert tuple(child.required_acknowledgements for child in result.data.children) == (
+        direct.required_acknowledgements,
+        companion.required_acknowledgements,
+    )
+    assert tuple(child.acknowledgements for child in result.data.children) == (
+        direct.acknowledgements,
+        companion.acknowledgements,
+    )
+    assert all(
+        child.unresolved_acknowledgements == () for child in result.data.children
+    )
+
+
+def test_critical_unknown_apply_preserves_authenticated_plan_safety_facts() -> None:
+    """Critical containment does not erase authenticated Plan context."""
+    plan = replace(
+        _single_plan(),
+        warnings=(StableSymbol("expert-review-required"),),
+        required_acknowledgements=(StableSymbol("decrease-below-usage"),),
+        acknowledgements=(StableSymbol("decrease-below-usage"),),
+    )
+    records = _MemoryApplyRecords()
+    records.fail_load_resolutions = True
+
+    result, _, _, _ = _apply(
+        plan,
+        _ScriptedWriter(TimeoutError("transport lost")),
+        records=records,
+    )
+
+    assert result.outcome.code == StableSymbol("critical-unknown")
+    child = result.data.children[0]
+    assert child.warnings == plan.warnings
+    assert child.required_acknowledgements == plan.required_acknowledgements
+    assert child.acknowledgements == plan.acknowledgements
+    assert child.unresolved_acknowledgements == ()
+
+
+def test_pre_dispatch_failure_preserves_authenticated_plan_safety_facts() -> None:
+    """A zero-write terminal result retains the reviewed Plan safety context."""
+
+    class FailFirstRevisionOne(_MemoryApplyRecords):
+        failed = False
+
+        @override
+        def save(
+            self,
+            record: ApplyRecord,
+            _key: SecretValue,
+        ) -> ApplyRecordRepositoryOutcome:
+            if record.revision == 1 and not self.failed:
+                self.failed = True
+                return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.FAILED)
+            return super().save(record, _key)
+
+    base = _plan()
+    direct = replace(
+        base.children[0],
+        warnings=(StableSymbol("expert-review-required"),),
+        required_acknowledgements=(StableSymbol("decrease-below-usage"),),
+        acknowledgements=(StableSymbol("decrease-below-usage"),),
+    )
+    plan = replace(base, children=(direct, base.children[1]))
+
+    result, _, _, _ = _apply(
+        plan,
+        _ScriptedWriter(),
+        records=FailFirstRevisionOne(),
+    )
+
+    assert result.outcome.code == StableSymbol("dispatch-intent-persistence-failed")
+    child = result.data.children[0]
+    assert child.warnings == direct.warnings
+    assert child.required_acknowledgements == direct.required_acknowledgements
+    assert child.acknowledgements == direct.acknowledgements
+    assert child.unresolved_acknowledgements == ()
+
+
+def test_apply_result_retains_subject_no_ops_and_provider_lineage() -> None:
+    """Apply presentation data preserves the complete reviewed composition."""
+    no_op = _child(
+        "already-sufficient",
+        "GPU-SPOT",
+        direct_rank=1,
+        scope_rank=1,
+        target=4,
+    )
+    original = _plan()
+    plan = replace(
+        original,
+        constraints=(
+            *original.constraints,
+            ConstraintReference(no_op.slice_identity),
+        ),
+        no_op_children=(no_op,),
+    )
+    writer = _ScriptedWriter(
+        QuotaPreferenceWriteResult(
+            accepted=True,
+            outcome=StableSymbol("submitted"),
+            etag="direct-etag",
+            trace_id="direct-trace",
+        ),
+        QuotaPreferenceWriteResult(
+            accepted=True,
+            outcome=StableSymbol("submitted"),
+            etag="companion-etag",
+            trace_id="companion-trace",
+        ),
+    )
+
+    result, _, _, _ = _apply(plan, writer)
+
+    assert result.data.kind is PlanKind.BUNDLE
+    assert result.data.verified_no_ops == (no_op,)
+    assert [child.trace_id for child in result.data.children] == [
+        "direct-trace",
+        "companion-trace",
+    ]
+
+
+def test_verified_no_op_drift_invalidates_mixed_bundle_before_writes() -> None:
+    """A prior no-op remains part of the fresh all-or-nothing preflight."""
+    no_op = _child(
+        "already-sufficient",
+        "GPU-SPOT",
+        direct_rank=1,
+        scope_rank=1,
+        target=4,
+    )
+    original = _plan()
+    plan = replace(
+        original,
+        constraints=(
+            *original.constraints,
+            ConstraintReference(no_op.slice_identity),
+        ),
+        no_op_children=(no_op,),
+    )
+    current = _valid_revalidation(plan)
+    current = replace(
+        current,
+        children=(
+            *current.children[:-1],
+            replace(
+                current.children[-1],
+                effective=QuotaQuantity(no_op.effective.value + 1, UNIT),
+            ),
+        ),
+    )
+    writer = _FailFastWriter()
+
+    result, _, _, _ = _apply(
+        plan,
+        cast("_ScriptedWriter", writer),
+        revalidator=_ScriptedRevalidator(current),
+    )
+
+    assert result.outcome.code == StableSymbol("plan-invalidated")
+    assert writer.calls == 0
 
 
 def test_apply_revalidates_then_persists_preintent_before_consumption_barrier() -> None:
@@ -1661,7 +2023,22 @@ def test_recovery_completes_existing_terminal_record_without_revalidation_or_sav
     reached: bool,  # noqa: FBT001
 ) -> None:
     """A durable terminal record only finishes the already-crossed ledger."""
-    plan = _plan()
+    original = _plan()
+    no_op = _child(
+        "already-sufficient",
+        "GPU-SPOT",
+        direct_rank=1,
+        scope_rank=3,
+        target=4,
+    )
+    plan = replace(
+        original,
+        constraints=(
+            *original.constraints,
+            ConstraintReference(no_op.slice_identity),
+        ),
+        no_op_children=(no_op,),
+    )
     repository = _MemoryPlanRepository(plan)
     repository.acquire_lease(
         repository.encoded.digest,
@@ -1709,6 +2086,8 @@ def test_recovery_completes_existing_terminal_record_without_revalidation_or_sav
 
     assert result.outcome.code == expected_outcome
     assert result.boundary.reached is reached
+    assert result.data.kind is PlanKind.BUNDLE
+    assert result.data.verified_no_ops == (no_op,)
     assert repository.state is PlanLedgerState.CONSUMED
     assert writer.requests == []
 

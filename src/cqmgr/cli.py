@@ -6,11 +6,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, override
+from io import BytesIO
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast, override
 
 import click
 
@@ -20,6 +24,25 @@ from cqmgr.adapters.cli.audit import (
     parse_audit_query,
 )
 from cqmgr.adapters.cli.group import CanonicalAliasGroup
+from cqmgr.adapters.cli.lifecycle import (
+    DEFAULT_TARGET_STRATEGY,
+    MANUAL_TARGET_STRATEGY,
+    TARGET_STRATEGY_CHOICES,
+    WATCH_CONDITION_CHOICES,
+    LifecycleCliRuntime,
+    LifecyclePresentation,
+    PlanReferenceInput,
+    RequestCompositionInput,
+    WatchCliInput,
+    WatchPresentation,
+    emit_composition,
+    emit_lifecycle_result,
+    emit_watch_event,
+    parse_absolute_rfc3339,
+    parse_target_strategy,
+    parse_watch_condition,
+    read_quota_contact,
+)
 from cqmgr.adapters.cli.local import LocalPresentation, emit_local_result
 from cqmgr.adapters.cli.read_only import Presentation, emit_read_only_result
 from cqmgr.adapters.cli.read_only_requests import (
@@ -39,20 +62,27 @@ from cqmgr.application.operations.read_only import (
     QuotaInspectSelector,
     ReadOnlyScopeInput,
 )
+from cqmgr.application.operations.watch import WatchStartError
 from cqmgr.application.ports.configuration import ConfigurationRepositoryError
 from cqmgr.bootstrap import (
     InvocationKind,
     build_audit_operations,
+    build_lifecycle_runtime,
     build_local_operations,
     build_quota_cursor_operations,
     build_read_only_operations,
+    build_trust_initialization_operations,
     classify_invocation,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Sequence
+    from collections.abc import Awaitable, Iterator, Sequence
 
+    from cqmgr.application.operations.lifecycle_requests import (
+        PreparedLifecycleRequests,
+    )
     from cqmgr.application.operations.local import LocalOperations
+    from cqmgr.application.ports.secrets import SecretValue
 
 _OUTPUT_OPTION = click.option(
     "--output",
@@ -61,6 +91,11 @@ _OUTPUT_OPTION = click.option(
     show_default=True,
 )
 _PROVIDER_OPERATION_SECONDS = 60.0
+_ACKNOWLEDGEMENT_CODES = (
+    "decrease-below-usage",
+    "decrease-over-ten-percent",
+    "unlimited-transition",
+)
 
 
 def _require_obtainability_location_mode(
@@ -225,6 +260,276 @@ def _provider_deadline() -> float:
     return time.monotonic() + _PROVIDER_OPERATION_SECONDS
 
 
+def build_lifecycle_cli_runtime() -> LifecycleCliRuntime:
+    """Compose production lifecycle operations without initializing authority."""
+    try:
+        return build_lifecycle_runtime()
+    except (OSError, RuntimeError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+
+
+@contextmanager
+def _lifecycle_runtime_scope(
+    runtime: LifecycleCliRuntime,
+) -> Iterator[LifecycleCliRuntime]:
+    """Close one lifecycle graph after every successful or failed CLI leaf."""
+    try:
+        yield runtime
+    finally:
+        asyncio.run(runtime.aclose())
+
+
+def _prepare_lifecycle_requests(
+    runtime: LifecycleCliRuntime,
+    value: RequestCompositionInput,
+    *,
+    require_preview: bool,
+) -> PreparedLifecycleRequests | None:
+    """Resolve fresh async evidence when the production preparation seam exists."""
+    if runtime.preparation is None:
+        return None
+    try:
+        return asyncio.run(
+            runtime.preparation.prepare(
+                value.to_intent(),
+                deadline=_provider_deadline(),
+                require_preview=require_preview,
+            )
+        )
+    except (TypeError, ValueError, RuntimeError) as error:
+        raise click.ClickException(str(error)) from error
+
+
+def _protected_lifecycle_request[T](callback: Callable[[], T]) -> T:
+    """Translate expected protected-factory failures to stable Click output."""
+    try:
+        return callback()
+    except click.ClickException:
+        raise
+    except (OSError, TypeError, ValueError, RuntimeError) as error:
+        raise click.ClickException(str(error)) from error
+
+
+def _quota_contact_from_stdin(*, enabled: bool) -> SecretValue | None:
+    """Read protected contact bytes only when the operator selected stdin."""
+    if not enabled:
+        return None
+    binary = getattr(sys.stdin, "buffer", None)
+    if binary is not None:
+        return read_quota_contact(cast("Any", binary))
+    return read_quota_contact(BytesIO(sys.stdin.read().encode("utf-8")))
+
+
+def _plan_reference(digest: str | None, path: Path | None) -> PlanReferenceInput:
+    """Bind exactly one public Plan reference before runtime construction."""
+    try:
+        return PlanReferenceInput(digest, path)
+    except (TypeError, ValueError) as error:
+        raise click.UsageError(str(error)) from error
+
+
+def _manual_targets(values: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+    """Parse one absolute target for every explicitly named workload child."""
+    targets: list[tuple[str, str]] = []
+    for value in values:
+        child_id, separator, target = value.partition("=")
+        if not separator or not child_id or not target:
+            message = "manual workload targets must use CHILD_ID=VALUE"
+            raise click.UsageError(message)
+        targets.append((child_id, target))
+    if len({child_id for child_id, _ in targets}) != len(targets):
+        message = "manual workload target child IDs must be unique"
+        raise click.UsageError(message)
+    return tuple(targets)
+
+
+def _request_composition_input(  # noqa: C901, PLR0912, PLR0913
+    *,
+    resource_scope: str | None,
+    profile: str | None,
+    service: str | None,
+    quota_id: str | None,
+    location: str | None,
+    dimensions: tuple[str, ...],
+    targets: tuple[str, ...],
+    target_strategy: str | None,
+    acknowledgements: tuple[str, ...],
+    expert: bool,
+    quota_contact_stdin: bool,
+    plan_out: Path | None,
+    machine_type: str | None,
+    instance_count: str | None,
+    attached_accelerator_type: str | None,
+    attached_accelerator_count: str | None,
+    accelerator_type: str | None,
+    topology: str | None,
+    runtime_version: str | None,
+    slice_count: str | None,
+    provisioning_model: str | None,
+    candidates: tuple[str, ...],
+    all_compatible_locations: bool,
+) -> RequestCompositionInput:
+    """Decode the mutually exclusive exact, Compute, and Cloud TPU grammars."""
+    try:
+        scope_input = _read_only_scope_input(resource_scope, profile)
+        exact_values = (service, quota_id, location, dimensions)
+        compute_values = (
+            machine_type,
+            instance_count,
+            attached_accelerator_type,
+            attached_accelerator_count,
+        )
+        tpu_values = (accelerator_type, topology, runtime_version, slice_count)
+        exact_selected = any(exact_values)
+        compute_selected = any(compute_values)
+        tpu_selected = any(tpu_values)
+        if sum((exact_selected, compute_selected, tpu_selected)) != 1:
+            message = "select exactly one exact-slice, Compute, or Cloud TPU request"
+            raise ValueError(message)  # noqa: TRY301
+        selector = None
+        workload = None
+        if exact_selected:
+            if (
+                service is None
+                or quota_id is None
+                or location is None
+                or len(targets) != 1
+                or "=" in targets[0]
+                or target_strategy not in {None, MANUAL_TARGET_STRATEGY}
+                or any(compute_values)
+                or any(tpu_values)
+                or candidates
+                or all_compatible_locations
+                or provisioning_model is not None
+            ):
+                message = "exact request requires complete selectors and one target"
+                raise ValueError(message)  # noqa: TRY301
+            selector = QuotaInspectSelector(
+                service,
+                quota_id,
+                location,
+                parse_dimensions(dimensions),
+            )
+            strategy = parse_target_strategy(MANUAL_TARGET_STRATEGY)
+            parsed_targets: tuple[tuple[str | None, str], ...] = ((None, targets[0]),)
+        else:
+            if service is not None or quota_id is not None or location is not None:
+                message = "workload request cannot include exact-slice selectors"
+                raise ValueError(message)  # noqa: TRY301
+            if provisioning_model is None:
+                message = "workload request requires provisioning model"
+                raise ValueError(message)  # noqa: TRY301
+            if compute_selected:
+                if machine_type is None or instance_count is None:
+                    message = "Compute request requires machine type and instance count"
+                    raise ValueError(message)  # noqa: TRY301
+                workload = parse_compute_instance_requirement(
+                    machine_type=machine_type,
+                    instance_count=instance_count,
+                    provisioning_model=provisioning_model,
+                    locations=candidates,
+                    all_compatible=all_compatible_locations,
+                    attached_accelerator_type=attached_accelerator_type,
+                    attached_accelerator_count=attached_accelerator_count,
+                )
+            else:
+                if (
+                    accelerator_type is None
+                    or topology is None
+                    or runtime_version is None
+                    or slice_count is None
+                ):
+                    message = (
+                        "Cloud TPU request requires accelerator type, topology, "
+                        "runtime version, and slice count"
+                    )
+                    raise ValueError(message)  # noqa: TRY301
+                workload = parse_cloud_tpu_slice_requirement(
+                    accelerator_type=accelerator_type,
+                    topology=topology,
+                    runtime_version=runtime_version,
+                    slice_count=slice_count,
+                    provisioning_model=provisioning_model,
+                    locations=candidates,
+                    all_compatible=all_compatible_locations,
+                )
+            selected_strategy = target_strategy or DEFAULT_TARGET_STRATEGY
+            strategy = parse_target_strategy(selected_strategy)
+            manual_strategy = selected_strategy == MANUAL_TARGET_STRATEGY
+            parsed_targets = _manual_targets(targets) if manual_strategy else ()
+            if manual_strategy and not parsed_targets:
+                message = "manual workload strategy requires child targets"
+                raise ValueError(message)  # noqa: TRY301
+            if not manual_strategy and targets:
+                message = "derived workload strategies do not accept targets"
+                raise ValueError(message)  # noqa: TRY301
+        return RequestCompositionInput(
+            scope_input=scope_input,
+            selector=selector,
+            workload=workload,
+            target_strategy=strategy,
+            targets=parsed_targets,
+            acknowledgements=acknowledgements,
+            expert=expert,
+            quota_contact=_quota_contact_from_stdin(enabled=quota_contact_stdin),
+            plan_out=plan_out,
+        )
+    except (TypeError, ValueError) as error:
+        raise click.UsageError(str(error)) from error
+
+
+def _emit_lifecycle(
+    result: object,
+    presentation: LifecyclePresentation,
+) -> None:
+    """Emit one facade result and convert its stable exit class to Click."""
+    exit_class = emit_lifecycle_result(result, presentation)  # type: ignore[arg-type]
+    if exit_class:
+        raise click.exceptions.Exit(exit_class)
+
+
+async def _apply_lifecycle_async(
+    runtime: LifecycleCliRuntime,
+    value: PlanReferenceInput,
+    acknowledgement: str,
+    quota_contact: SecretValue | None,
+    presentation: LifecyclePresentation,
+) -> None:
+    try:
+        request = await runtime.requests.apply(
+            value,
+            acknowledgement,
+            quota_contact=quota_contact,
+        )
+    except (OSError, TypeError, ValueError, RuntimeError) as error:
+        raise click.ClickException(str(error)) from error
+    result = await runtime.operations.apply(request)  # type: ignore[arg-type]
+    _emit_lifecycle(result, presentation)
+
+
+async def _watch_lifecycle_async(
+    runtime: LifecycleCliRuntime,
+    request: object,
+    presentation: WatchPresentation,
+) -> None:
+    """Stream every material event and preserve the terminal result exit class."""
+    exit_class = 0
+    try:
+        async for event in runtime.operations.watch(request):  # type: ignore[arg-type]
+            emit_watch_event(event, presentation)
+            result = getattr(event, "result", None)
+            if result is not None:
+                exit_class = int(result.outcome.exit_class)
+    except WatchStartError as error:
+        click.echo(
+            f"Watch: {error.code.value} (exit {int(error.exit_class)})",
+            err=True,
+        )
+        raise click.exceptions.Exit(int(error.exit_class)) from None
+    if exit_class:
+        raise click.exceptions.Exit(exit_class)
+
+
 @click.group(
     cls=ClassifiedRootGroup,
     name="cqmgr",
@@ -266,6 +571,45 @@ def tui() -> None:
 @main.group(cls=CanonicalAliasGroup)
 def scope() -> None:
     """Inspect or change the local resource-scope selection."""
+
+
+@main.group(cls=CanonicalAliasGroup)
+def trust() -> None:
+    """Manage explicit installation-local signing trust."""
+
+
+@trust.command(name="init")
+@click.option(
+    "--output",
+    type=click.Choice(("human", "json"), case_sensitive=True),
+    default="human",
+    show_default=True,
+)
+def trust_init(output: str) -> None:
+    """Initialize installation signing trust once in the native keyring."""
+    operations = build_trust_initialization_operations()
+    result = operations.initialize()
+    if output == "json":
+        click.echo(
+            json.dumps(
+                {
+                    "initialized": result.initialized,
+                    "reason": result.reason,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    elif result.initialized:
+        message = "Installation trust initialized."
+        if result.reason == "incomplete-trust-restarted":
+            message = (
+                "Installation trust initialized after restarting an incomplete attempt."
+            )
+        click.echo(message)
+    if not result.initialized:
+        message = result.reason or "installation trust initialization failed"
+        raise click.ClickException(message)
 
 
 @scope.command(name="show")
@@ -836,6 +1180,369 @@ def obtainability_compare(  # noqa: PLR0913
         presentation,
         operations.aclose,
     )
+
+
+def _request_input_options[CommandT: Callable[..., Any]](
+    function: CommandT,
+) -> CommandT:
+    """Add the mutually exclusive exact and workload request vocabularies."""
+    decorated = click.option("--all-compatible-locations", is_flag=True)(function)
+    decorated = click.option("--candidate", multiple=True)(decorated)
+    decorated = click.option(
+        "--provisioning-model",
+        type=click.Choice(("standard", "spot", "flex-start", "reservation-bound")),
+    )(decorated)
+    decorated = click.option("--slice-count")(decorated)
+    decorated = click.option("--runtime-version")(decorated)
+    decorated = click.option("--topology")(decorated)
+    decorated = click.option("--accelerator-type")(decorated)
+    decorated = click.option("--attached-accelerator-count")(decorated)
+    decorated = click.option("--attached-accelerator-type")(decorated)
+    decorated = click.option("--instance-count")(decorated)
+    decorated = click.option("--machine-type")(decorated)
+    decorated = click.option(
+        "--quota-contact-stdin",
+        is_flag=True,
+    )(decorated)
+    decorated = click.option(
+        "--expert",
+        is_flag=True,
+        help="Enable expert-only request paths without bypassing safety gates.",
+    )(decorated)
+    decorated = click.option(
+        "--acknowledge",
+        multiple=True,
+        type=click.Choice(_ACKNOWLEDGEMENT_CODES),
+    )(decorated)
+    decorated = click.option(
+        "--target-strategy",
+        type=click.Choice(TARGET_STRATEGY_CHOICES),
+        default=None,
+        show_default=DEFAULT_TARGET_STRATEGY,
+    )(decorated)
+    decorated = click.option("--target", "targets", multiple=True)(decorated)
+    decorated = click.option("--dimension", "dimensions", multiple=True)(decorated)
+    decorated = click.option("--location")(decorated)
+    decorated = click.option("--quota-id")(decorated)
+    decorated = click.option("--service")(decorated)
+    decorated = _scope_options(decorated)
+    return cast("CommandT", decorated)
+
+
+def _composition_from_options(  # noqa: PLR0913
+    *,
+    resource_scope: str | None,
+    profile: str | None,
+    service: str | None,
+    quota_id: str | None,
+    location: str | None,
+    dimensions: tuple[str, ...],
+    targets: tuple[str, ...],
+    target_strategy: str | None,
+    acknowledge: tuple[str, ...],
+    expert: bool,
+    quota_contact_stdin: bool,
+    machine_type: str | None,
+    instance_count: str | None,
+    attached_accelerator_type: str | None,
+    attached_accelerator_count: str | None,
+    accelerator_type: str | None,
+    topology: str | None,
+    runtime_version: str | None,
+    slice_count: str | None,
+    provisioning_model: str | None,
+    candidate: tuple[str, ...],
+    all_compatible_locations: bool,
+    plan_out: Path | None,
+) -> RequestCompositionInput:
+    return _request_composition_input(
+        resource_scope=resource_scope,
+        profile=profile,
+        service=service,
+        quota_id=quota_id,
+        location=location,
+        dimensions=dimensions,
+        targets=targets,
+        target_strategy=target_strategy,
+        acknowledgements=acknowledge,
+        expert=expert,
+        quota_contact_stdin=quota_contact_stdin,
+        plan_out=plan_out,
+        machine_type=machine_type,
+        instance_count=instance_count,
+        attached_accelerator_type=attached_accelerator_type,
+        attached_accelerator_count=attached_accelerator_count,
+        accelerator_type=accelerator_type,
+        topology=topology,
+        runtime_version=runtime_version,
+        slice_count=slice_count,
+        provisioning_model=provisioning_model,
+        candidates=candidate,
+        all_compatible_locations=all_compatible_locations,
+    )
+
+
+@main.group(cls=CanonicalAliasGroup)
+def request() -> None:
+    """Compose, Preview, or Watch exact quota requests."""
+
+
+@request.command(name="compose")
+@_presentation_options
+@_request_input_options
+@_OUTPUT_OPTION
+def request_compose(  # noqa: PLR0913
+    output: str,
+    resource_scope: str | None,
+    profile: str | None,
+    service: str | None,
+    quota_id: str | None,
+    location: str | None,
+    dimensions: tuple[str, ...],
+    targets: tuple[str, ...],
+    target_strategy: str | None,
+    acknowledge: tuple[str, ...],
+    expert: bool,
+    quota_contact_stdin: bool,
+    machine_type: str | None,
+    instance_count: str | None,
+    attached_accelerator_type: str | None,
+    attached_accelerator_count: str | None,
+    accelerator_type: str | None,
+    topology: str | None,
+    runtime_version: str | None,
+    slice_count: str | None,
+    provisioning_model: str | None,
+    candidate: tuple[str, ...],
+    all_compatible_locations: bool,
+    no_color: bool,
+    quiet: bool,
+) -> None:
+    """Compose exact absolute targets without issuing a Plan."""
+    value = _composition_from_options(
+        resource_scope=resource_scope,
+        profile=profile,
+        service=service,
+        quota_id=quota_id,
+        location=location,
+        dimensions=dimensions,
+        targets=targets,
+        target_strategy=target_strategy,
+        acknowledge=acknowledge,
+        expert=expert,
+        quota_contact_stdin=quota_contact_stdin,
+        machine_type=machine_type,
+        instance_count=instance_count,
+        attached_accelerator_type=attached_accelerator_type,
+        attached_accelerator_count=attached_accelerator_count,
+        accelerator_type=accelerator_type,
+        topology=topology,
+        runtime_version=runtime_version,
+        slice_count=slice_count,
+        provisioning_model=provisioning_model,
+        candidate=candidate,
+        all_compatible_locations=all_compatible_locations,
+        plan_out=None,
+    )
+    runtime = build_lifecycle_cli_runtime()
+    with _lifecycle_runtime_scope(runtime):
+        prepared = _prepare_lifecycle_requests(runtime, value, require_preview=False)
+        request_value = (
+            _protected_lifecycle_request(lambda: runtime.requests.compose(value))
+            if prepared is None
+            else prepared.composition
+        )
+        composition = runtime.operations.compose(request_value)
+        exit_class = emit_composition(
+            composition,
+            LifecyclePresentation(output, no_color, quiet),
+        )
+        if exit_class:
+            raise click.exceptions.Exit(exit_class)
+
+
+@request.command(name="preview")
+@_presentation_options
+@click.option("--plan-out", type=click.Path(path_type=Path))
+@_request_input_options
+@_OUTPUT_OPTION
+def request_preview(  # noqa: PLR0913
+    output: str,
+    resource_scope: str | None,
+    profile: str | None,
+    service: str | None,
+    quota_id: str | None,
+    location: str | None,
+    dimensions: tuple[str, ...],
+    targets: tuple[str, ...],
+    target_strategy: str | None,
+    acknowledge: tuple[str, ...],
+    expert: bool,
+    quota_contact_stdin: bool,
+    machine_type: str | None,
+    instance_count: str | None,
+    attached_accelerator_type: str | None,
+    attached_accelerator_count: str | None,
+    accelerator_type: str | None,
+    topology: str | None,
+    runtime_version: str | None,
+    slice_count: str | None,
+    provisioning_model: str | None,
+    candidate: tuple[str, ...],
+    all_compatible_locations: bool,
+    plan_out: Path | None,
+    no_color: bool,
+    quiet: bool,
+) -> None:
+    """Preview one request and optionally export its portable Plan."""
+    value = _composition_from_options(
+        resource_scope=resource_scope,
+        profile=profile,
+        service=service,
+        quota_id=quota_id,
+        location=location,
+        dimensions=dimensions,
+        targets=targets,
+        target_strategy=target_strategy,
+        acknowledge=acknowledge,
+        expert=expert,
+        quota_contact_stdin=quota_contact_stdin,
+        machine_type=machine_type,
+        instance_count=instance_count,
+        attached_accelerator_type=attached_accelerator_type,
+        attached_accelerator_count=attached_accelerator_count,
+        accelerator_type=accelerator_type,
+        topology=topology,
+        runtime_version=runtime_version,
+        slice_count=slice_count,
+        provisioning_model=provisioning_model,
+        candidate=candidate,
+        all_compatible_locations=all_compatible_locations,
+        plan_out=plan_out,
+    )
+    runtime = build_lifecycle_cli_runtime()
+    with _lifecycle_runtime_scope(runtime):
+        prepared = _prepare_lifecycle_requests(runtime, value, require_preview=True)
+        if prepared is None:
+            request_value = _protected_lifecycle_request(
+                lambda: runtime.requests.preview(value)
+            )
+        else:
+            request_value = prepared.preview
+            if request_value is None:
+                message = "Preview requires a resolvable protected quota contact"
+                raise click.ClickException(message)
+        _emit_lifecycle(
+            runtime.operations.preview(request_value),
+            LifecyclePresentation(output, no_color, quiet),
+        )
+
+
+@request.command(name="watch")
+@_presentation_options
+@click.option(
+    "--output",
+    type=click.Choice(("human", "jsonl"), case_sensitive=True),
+    default=None,
+)
+@click.option("--deadline", required=True)
+@click.option("--condition", type=click.Choice(WATCH_CONDITION_CHOICES))
+@click.option("--resume")
+@click.option("--intent-id")
+def request_watch(  # noqa: PLR0913
+    intent_id: str | None,
+    resume: str | None,
+    condition: str | None,
+    deadline: str,
+    output: str | None,
+    no_color: bool,
+    quiet: bool,
+) -> None:
+    """Watch one durable Apply intent until an explicit condition or deadline."""
+    selected_output = output or ("human" if _interactive_streams()[1] else "jsonl")
+    try:
+        value = WatchCliInput(
+            intent_id=intent_id,
+            condition=None if condition is None else parse_watch_condition(condition),
+            resume=resume,
+            deadline=parse_absolute_rfc3339(deadline),
+        )
+        runtime = build_lifecycle_cli_runtime()
+        with _lifecycle_runtime_scope(runtime):
+            request_value = _protected_lifecycle_request(
+                lambda: runtime.requests.watch(value)
+            )
+            asyncio.run(
+                _watch_lifecycle_async(
+                    runtime,
+                    request_value,
+                    WatchPresentation(selected_output, no_color, quiet),
+                )
+            )
+    except (TypeError, ValueError) as error:
+        raise click.UsageError(str(error)) from error
+
+
+@main.group(cls=CanonicalAliasGroup)
+def plan() -> None:
+    """Review or Apply one local or portable quota request Plan."""
+
+
+@plan.command(name="review")
+@_presentation_options
+@click.option("--plan-file", type=click.Path(path_type=Path))
+@click.option("--plan", "digest")
+@_OUTPUT_OPTION
+def plan_review(
+    output: str,
+    digest: str | None,
+    plan_file: Path | None,
+    no_color: bool,
+    quiet: bool,
+) -> None:
+    """Review one Plan without provider mutation."""
+    value = _plan_reference(digest, plan_file)
+    runtime = build_lifecycle_cli_runtime()
+    with _lifecycle_runtime_scope(runtime):
+        request_value = _protected_lifecycle_request(
+            lambda: runtime.requests.review(value)
+        )
+        _emit_lifecycle(
+            runtime.operations.review(request_value),
+            LifecyclePresentation(output, no_color, quiet),
+        )
+
+
+@plan.command(name="apply")
+@_presentation_options
+@click.option("--quota-contact-stdin", is_flag=True)
+@click.option("--acknowledge-resource-scope", required=True)
+@click.option("--plan-file", type=click.Path(path_type=Path))
+@click.option("--plan", "digest")
+@_OUTPUT_OPTION
+def plan_apply(  # noqa: PLR0913
+    output: str,
+    digest: str | None,
+    plan_file: Path | None,
+    acknowledge_resource_scope: str,
+    quota_contact_stdin: bool,
+    no_color: bool,
+    quiet: bool,
+) -> None:
+    """Apply one reviewed Plan in its bound non-atomic child order."""
+    value = _plan_reference(digest, plan_file)
+    runtime = build_lifecycle_cli_runtime()
+    with _lifecycle_runtime_scope(runtime):
+        contact = _quota_contact_from_stdin(enabled=quota_contact_stdin)
+        asyncio.run(
+            _apply_lifecycle_async(
+                runtime,
+                value,
+                acknowledge_resource_scope,
+                contact,
+                LifecyclePresentation(output, no_color, quiet),
+            )
+        )
 
 
 @main.group(cls=CanonicalAliasGroup)

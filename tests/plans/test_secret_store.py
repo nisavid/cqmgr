@@ -20,6 +20,7 @@ from cqmgr.adapters.persistence.native_plan_lock import (
     NativePlanInterprocessLock,
 )
 from cqmgr.adapters.persistence.secrets import NativeSecretStore
+from cqmgr.application.configuration import QuotaContactKeyringReference
 from cqmgr.application.ports.secrets import (
     SecretBackendKind,
     SecretPurpose,
@@ -304,6 +305,28 @@ def test_create_is_once_verified_and_never_replaces_an_existing_secret(
     assert missing.status is SecretStoreStatus.MISSING
     assert backend.calls.count("delete") == 1
     assert backend.calls.count("set") == 1
+
+
+def test_profile_quota_contact_reads_only_its_exact_native_reference(
+    tmp_path: Path,
+) -> None:
+    """Profile contact reads decode one allowlisted keyring item without mutation."""
+    backend = _backend("keyring.backends.macOS")
+    store = _trusted_store(
+        backend,
+        NativePlanInterprocessLock(tmp_path / "contact-keyring.lock"),
+    )
+    reference = QuotaContactKeyringReference("primary")
+    backend.values[(reference.service, reference.account)] = (
+        "cqmgr-secret/v1:cHJvZmlsZUBleGFtcGxlLmNvbQ=="
+    )
+
+    loaded = store.get_quota_contact(reference)
+
+    assert loaded.status is SecretStoreStatus.AVAILABLE
+    assert loaded.secret is not None
+    assert loaded.secret.reveal() == b"profile@example.com"
+    assert backend.calls == ["get"]
 
 
 def test_plan_consumption_marker_is_not_delete_capable(tmp_path: Path) -> None:

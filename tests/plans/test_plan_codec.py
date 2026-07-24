@@ -55,6 +55,10 @@ LOCAL_KEY = b"l" * 32
 SHA256_A = "sha256:" + ("a" * 64)
 SHA256_B = "sha256:" + ("b" * 64)
 HMAC_SHA256_C = "hmac-sha256:" + ("c" * 64)
+PROFILE_REFERENCE = (
+    "cqmgr:quota-contact:v1:accelerators:installation-test:"
+    "item-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+)
 
 
 def _plan() -> QuotaRequestPlan:
@@ -74,7 +78,7 @@ def _plan() -> QuotaRequestPlan:
         ),
         contact_binding=ContactBinding(
             source=StableSymbol("selected-profile"),
-            source_identity="profile:accelerators",
+            source_identity=PROFILE_REFERENCE,
             value_digest=HMAC_SHA256_C,
         ),
         warnings=(StableSymbol("remaining-companion-bottleneck"),),
@@ -152,7 +156,7 @@ def test_plan_encoding_is_canonical_stable_and_authenticated() -> None:
     assert encoded.bytes.endswith(b"\n")
     assert b"operator@example.invalid" in encoded.bytes
     assert HMAC_SHA256_C.encode() in encoded.bytes
-    assert b"quota-contact" not in encoded.bytes
+    assert PROFILE_REFERENCE.encode() in encoded.bytes
 
     decoded = PlanCodec.decode(encoded.bytes)
     assert decoded.plan == _plan()
@@ -162,7 +166,7 @@ def test_plan_encoding_is_canonical_stable_and_authenticated() -> None:
 
 
 def test_bundle_plan_encoding_binds_kind_order_and_child_derivations() -> None:
-    """Portable bundle bytes retain every ordered independently mutable child."""
+    """Portable bundle bytes retain dispatch and verified no-op composition."""
     child = QuotaRequestPlanChild(
         child_id="direct",
         slice_identity=SLICE,
@@ -183,6 +187,17 @@ def test_bundle_plan_encoding_binds_kind_order_and_child_derivations() -> None:
         acknowledgements=(),
         evidence=(),
     )
+    companion_slice = replace(SLICE, quota_id="GPUS-ALL-REGIONS-per-project")
+    no_op = replace(
+        child,
+        child_id="already-sufficient",
+        slice_identity=companion_slice,
+        target=QuotaQuantity(6, UNIT),
+        effective=QuotaQuantity(6, UNIT),
+        prior_desired=QuotaQuantity(6, UNIT),
+        direct_accelerator_rank=1,
+        scope_breadth_rank=2,
+    )
     plan = QuotaRequestBundlePlan(
         resource_scope=SCOPE,
         kind=PlanKind.BUNDLE,
@@ -190,21 +205,28 @@ def test_bundle_plan_encoding_binds_kind_order_and_child_derivations() -> None:
         target_strategy=TargetStrategy.MINIMUM,
         normalized_workload="compute-instance:n1-standard-8:1",
         children=(child,),
-        constraints=(ConstraintReference(SLICE),),
+        constraints=(
+            ConstraintReference(SLICE),
+            ConstraintReference(companion_slice),
+        ),
         principal=_plan().principal,
         contact_binding=_plan().contact_binding,
         installation_id="installation-123",
         issued_at=NOW,
         expires_at=NOW + PLAN_LIFETIME,
+        no_op_children=(no_op,),
     )
 
     encoded = PlanCodec.encode(plan, LOCAL_KEY)
     decoded = PlanCodec.decode(encoded.bytes)
 
     assert decoded.plan == plan
+    assert isinstance(decoded.plan, QuotaRequestBundlePlan)
     assert decoded.plan.kind is PlanKind.BUNDLE
     assert decoded.plan.children == (child,)
+    assert decoded.plan.no_op_children == (no_op,)
     assert b'"kind":"bundle"' in encoded.bytes
+    assert b'"no_op_children":' in encoded.bytes
 
 
 @pytest.mark.parametrize(
@@ -295,6 +317,25 @@ def test_bundle_plan_rejects_inconsistent_subject_shapes() -> None:
     plan = _bundle_plan()
     other_scope = ResourceScope(ResourceScopeKind.PROJECT, "projects/987654321")
     other_slice = replace(SLICE, resource_scope=other_scope)
+    no_op_slice = replace(SLICE, quota_id="GPUS-ALL-REGIONS-per-project")
+    no_op = replace(
+        _bundle_child(),
+        child_id="already-sufficient",
+        slice_identity=no_op_slice,
+        target=QuotaQuantity(6, UNIT),
+        effective=QuotaQuantity(6, UNIT),
+        prior_desired=QuotaQuantity(6, UNIT),
+        direct_accelerator_rank=1,
+        scope_breadth_rank=2,
+    )
+    plan_with_no_op = replace(
+        plan,
+        constraints=(
+            *plan.constraints,
+            ConstraintReference(no_op_slice),
+        ),
+        no_op_children=(no_op,),
+    )
     later = replace(
         _bundle_child(),
         child_id="companion",
@@ -337,6 +378,68 @@ def test_bundle_plan_rejects_inconsistent_subject_shapes() -> None:
                 children=(replace(_bundle_child(), slice_identity=other_slice),),
             ),
             "resource scope",
+        ),
+        (
+            lambda: replace(
+                plan,
+                no_op_children=cast(
+                    "tuple[QuotaRequestPlanChild, ...]",
+                    [no_op],
+                ),
+            ),
+            "no_op_children",
+        ),
+        (
+            lambda: replace(
+                plan_with_no_op,
+                no_op_children=(replace(no_op, child_id="direct"),),
+            ),
+            "unique across composition",
+        ),
+        (
+            lambda: replace(
+                plan_with_no_op,
+                no_op_children=(
+                    no_op,
+                    replace(
+                        no_op,
+                        child_id="earlier",
+                        direct_accelerator_rank=0,
+                    ),
+                ),
+            ),
+            "deterministic",
+        ),
+        (
+            lambda: replace(
+                plan_with_no_op,
+                no_op_children=(
+                    replace(
+                        no_op,
+                        slice_identity=other_slice,
+                    ),
+                ),
+            ),
+            "resource scope",
+        ),
+        (
+            lambda: replace(
+                plan_with_no_op,
+                no_op_children=(
+                    replace(
+                        no_op,
+                        required_acknowledgements=(StableSymbol("confirm-change"),),
+                    ),
+                ),
+            ),
+            "cannot require acknowledgements",
+        ),
+        (
+            lambda: replace(
+                plan,
+                no_op_children=(no_op,),
+            ),
+            "constraint set",
         ),
         (
             lambda: replace(
@@ -530,13 +633,13 @@ def test_plan_value_types_reject_invalid_and_secret_bearing_shapes() -> None:
     with pytest.raises(ValueError, match="value_digest"):
         ContactBinding(
             StableSymbol("selected-profile"),
-            "profile:name",
+            PROFILE_REFERENCE,
             "raw@example.invalid",
         )
     with pytest.raises(ValueError, match="value_digest"):
         ContactBinding(
             StableSymbol("selected-profile"),
-            "profile:name",
+            PROFILE_REFERENCE,
             "hmac-sha256:" + ("A" * 64),
         )
     with pytest.raises(TypeError, match="evidence name"):
@@ -548,8 +651,8 @@ def test_plan_value_types_reject_invalid_and_secret_bearing_shapes() -> None:
 @pytest.mark.parametrize(
     ("source", "source_identity"),
     [
-        ("named-profile", "profile:accelerators"),
-        ("selected-profile", "profile:accelerators"),
+        ("named-profile", PROFILE_REFERENCE),
+        ("selected-profile", PROFILE_REFERENCE),
         ("direct-user", "principal://accounts/123"),
         ("per-operation-input", "input:hmac-sha256:" + ("d" * 64)),
     ],
@@ -755,3 +858,10 @@ def test_review_validation_and_every_ledger_state_fail_closed() -> None:
         )
     with pytest.raises(TypeError, match="PlanLedgerState"):
         review_plan(plan, state=cast("PlanLedgerState", "available"), **common)
+    with pytest.raises(TypeError, match="local_authority_available"):
+        review_plan(
+            plan,
+            state=PlanLedgerState.AVAILABLE,
+            local_authority_available=cast("bool", 1),
+            **common,
+        )

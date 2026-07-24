@@ -30,6 +30,8 @@ from cqmgr.domain.plans import (
     PlanKind,
     PlanLedgerState,
     PlanPrincipal,
+    QuotaRequestBundlePlan,
+    QuotaRequestPlan,
     TargetStrategy,
 )
 from cqmgr.domain.quotas import (
@@ -98,6 +100,7 @@ class MemoryPlanRepository:
         self.store_status = PlanRepositoryStatus.STORED
         self.export_status = PlanRepositoryStatus.EXPORTED
         self.load_any_digest = False
+        self.load_outcome: PlanRepositoryOutcome | None = None
 
     def store(
         self,
@@ -123,12 +126,14 @@ class MemoryPlanRepository:
         _now: datetime,
     ) -> PlanRepositoryOutcome:
         """Load one retained digest and ledger state."""
+        if self.load_outcome is not None:
+            return self.load_outcome
         if self.stored is None or (
             not self.load_any_digest and self.stored.digest != digest
         ):
             return PlanRepositoryOutcome(PlanRepositoryStatus.MISSING)
         return PlanRepositoryOutcome(
-            PlanRepositoryStatus.AVAILABLE,
+            PlanRepositoryStatus(self.state.value),
             plan_bytes=self.stored.bytes,
             state=self.state,
             authenticated=True,
@@ -236,6 +241,9 @@ def _preview_request(
         ),
         installation_id="installation-123",
         authentication_key=SecretValue(b"k" * 32),
+        identity_verified=True,
+        contact_verified=True,
+        keyring_mutation_capable=True,
         normalized_workload="compute-instance:n1-standard-8:1",
         now=NOW,
         plan_out=plan_out,
@@ -300,6 +308,143 @@ def test_minimum_composition_orders_mutations_and_retains_settled_no_op() -> Non
     assert composition.children[1].target == QuotaQuantity(6, UNIT)
     assert composition.children[1].no_op
     assert [child.child_id for child in composition.dispatch_children] == ["direct"]
+
+
+def test_mixed_bundle_plan_review_retains_verified_no_op_composition() -> None:
+    """Portable review keeps no-op derivation facts outside dispatch children."""
+    direct = _preview_child()
+    companion = ComposeChild(
+        child_id="companion",
+        slice_identity=_slice("GPUS-ALL-REGIONS-per-project", QuotaScope.GLOBAL),
+        effective=QuotaQuantity(8, UNIT),
+        usage=QuotaQuantity(2, UNIT),
+        workload=QuotaQuantity(4, UNIT),
+        preferred=QuotaQuantity(6, UNIT),
+        granted=QuotaQuantity(6, UNIT),
+        preference_settled=True,
+        direct_accelerator_rank=1,
+        scope_breadth_rank=3,
+        observed_at=NOW,
+    )
+    repository = MemoryPlanRepository()
+    operations = _operations(repository, MemoryAuditJournal())
+    request = replace(
+        _preview_request(direct),
+        composition=ComposeRequest(
+            kind=PlanKind.BUNDLE,
+            strategy=TargetStrategy.MINIMUM,
+            resource_scope=SCOPE,
+            children=(companion, direct),
+            selected_location="us-central1",
+        ),
+    )
+
+    preview = operations.preview(request)
+    review = operations.review(
+        PlanReviewRequest(
+            digest=preview.data.plan_digest,
+            path=None,
+            authentication_key=request.authentication_key,
+            local_installation_id=request.installation_id,
+            now=NOW,
+        )
+    )
+
+    assert isinstance(preview.data.plan, QuotaRequestBundlePlan)
+    assert [child.child_id for child in preview.data.plan.children] == ["direct"]
+    assert len(preview.data.plan.no_op_children) == 1
+    no_op = preview.data.plan.no_op_children[0]
+    assert no_op.child_id == "companion"
+    assert no_op.target == QuotaQuantity(6, UNIT)
+    assert no_op.target_strategy is TargetStrategy.MINIMUM
+    assert no_op.target_derivation == StableSymbol("usage-plus-workload")
+    assert no_op.prior_desired == QuotaQuantity(6, UNIT)
+    assert review.data.review is not None
+    assert isinstance(review.data.review.plan, QuotaRequestBundlePlan)
+    assert review.data.review.plan.no_op_children == (no_op,)
+
+
+def test_single_preview_and_review_preserve_every_revalidation_fact() -> None:
+    """A single Plan binds the same current safety facts as a bundle child."""
+    evidence = EvidenceBinding(
+        StableSymbol("effective"),
+        "sha256:" + ("a" * 64),
+        NOW,
+    )
+    child = ComposeChild(
+        child_id="single",
+        slice_identity=_slice("GPUS-PER-GPU-FAMILY-per-project-region"),
+        effective=QuotaQuantity(7, UNIT),
+        usage=QuotaQuantity(3, UNIT),
+        workload=QuotaQuantity(4, UNIT),
+        preferred=QuotaQuantity(6, UNIT),
+        granted=QuotaQuantity(5, UNIT),
+        preference_name="projects/123456789/locations/us-central1/preferences/single",
+        preference_etag="etag-single",
+        manual_target=QuotaQuantity(8, UNIT),
+        direct_accelerator_rank=1,
+        scope_breadth_rank=3,
+        warnings=("manual-review-required",),
+        observed_at=NOW,
+        evidence=(evidence,),
+    )
+    repository = MemoryPlanRepository()
+    operations = _operations(repository, MemoryAuditJournal())
+    request = replace(
+        _preview_request(child),
+        composition=ComposeRequest(
+            kind=PlanKind.SINGLE,
+            strategy=TargetStrategy.MANUAL,
+            resource_scope=SCOPE,
+            children=(child,),
+        ),
+        normalized_workload="exact-slice",
+    )
+
+    preview = operations.preview(request)
+    review = operations.review(
+        PlanReviewRequest(
+            digest=preview.data.plan_digest,
+            path=None,
+            authentication_key=request.authentication_key,
+            local_installation_id=request.installation_id,
+            now=NOW,
+        )
+    )
+
+    assert isinstance(preview.data.plan, QuotaRequestPlan)
+    planned = preview.data.plan.children[0]
+    assert (
+        planned.child_id,
+        planned.usage,
+        planned.workload,
+        planned.prior_desired,
+        planned.granted,
+        planned.preference_name,
+        planned.preference_etag,
+        planned.target_strategy,
+        planned.target_derivation,
+        planned.direct_accelerator_rank,
+        planned.scope_breadth_rank,
+        planned.warnings,
+        planned.evidence,
+    ) == (
+        "single",
+        QuotaQuantity(3, UNIT),
+        QuotaQuantity(4, UNIT),
+        QuotaQuantity(6, UNIT),
+        QuotaQuantity(5, UNIT),
+        child.preference_name,
+        "etag-single",
+        TargetStrategy.MANUAL,
+        StableSymbol("manual-absolute"),
+        1,
+        3,
+        (StableSymbol("manual-review-required"),),
+        (evidence,),
+    )
+    assert review.data.review is not None
+    assert review.data.review.plan == preview.data.plan
 
 
 @pytest.mark.parametrize(
@@ -461,18 +606,20 @@ def test_invalid_plan_kind_rejects_before_audit_or_storage() -> None:
 
 
 @pytest.mark.parametrize(
-    ("request_change", "reason"),
+    ("preview_change", "reason"),
     [
         ({"identity_verified": False}, "identity-unverified"),
         ({"contact_verified": False}, "contact-unverified"),
         ({"keyring_mutation_capable": False}, "keyring-incapable"),
     ],
 )
-def test_request_preconditions_fail_closed(
-    request_change: dict[str, Any], reason: str
+def test_preview_preconditions_do_not_block_target_composition(
+    preview_change: dict[str, Any], reason: str
 ) -> None:
-    """Identity, contact, and native-keyring gates reject before Preview."""
-    sentinel = FailFastMutationPort()
+    """Preview-only trust gates leave target derivation available."""
+    repository = MemoryPlanRepository()
+    audit = MemoryAuditJournal()
+    operations = _operations(repository, audit)
     child = ComposeChild(
         child_id="direct",
         slice_identity=_slice("GPUS-PER-GPU-FAMILY-per-project-region"),
@@ -481,20 +628,29 @@ def test_request_preconditions_fail_closed(
         workload=QuotaQuantity(4, UNIT),
         direct_accelerator_rank=0,
         scope_breadth_rank=1,
+        observed_at=NOW,
     )
-    result = RequestPlanOperations.compose(
-        ComposeRequest(
-            kind=PlanKind.BUNDLE,
-            strategy=TargetStrategy.MINIMUM,
-            resource_scope=SCOPE,
-            children=(child,),
-            selected_location="us-central1",
-            **request_change,
+    composition = ComposeRequest(
+        kind=PlanKind.BUNDLE,
+        strategy=TargetStrategy.MINIMUM,
+        resource_scope=SCOPE,
+        children=(child,),
+        selected_location="us-central1",
+    )
+
+    composed = RequestPlanOperations.compose(composition)
+    preview = operations.preview(
+        replace(
+            _preview_request(child),
+            composition=composition,
+            **preview_change,
         )
     )
 
-    assert result.incapability_reasons == (reason,)
-    assert sentinel.calls == 0
+    assert composed.reached
+    assert preview.data.composition.incapability_reasons == (reason,)
+    assert repository.stored is None
+    assert audit.drafts == []
 
 
 def test_preview_issues_one_authenticated_bundle_handle_and_atomic_export(
@@ -541,6 +697,9 @@ def test_preview_issues_one_authenticated_bundle_handle_and_atomic_export(
             ),
             installation_id="installation-123",
             authentication_key=SecretValue(b"k" * 32),
+            identity_verified=True,
+            contact_verified=True,
+            keyring_mutation_capable=True,
             normalized_workload="compute-instance:n1-standard-8:1",
             now=NOW,
             plan_out=plan_out,
@@ -602,6 +761,9 @@ def test_all_no_op_preview_is_audited_without_plan_or_export(tmp_path: Path) -> 
             ),
             installation_id="installation-123",
             authentication_key=SecretValue(b"k" * 32),
+            identity_verified=True,
+            contact_verified=True,
+            keyring_mutation_capable=True,
             normalized_workload="compute-instance:n1-standard-8:1",
             now=NOW,
             plan_out=tmp_path / "must-not-exist.plan",
@@ -782,6 +944,9 @@ def test_plan_review_preserves_foreign_expired_and_consumed_evidence(
             ),
             installation_id="installation-a",
             authentication_key=SecretValue(b"k" * 32),
+            identity_verified=True,
+            contact_verified=True,
+            keyring_mutation_capable=True,
             normalized_workload="compute-instance:n1-standard-8:1",
             now=NOW,
             plan_out=plan_out,
@@ -793,6 +958,15 @@ def test_plan_review_preserves_foreign_expired_and_consumed_evidence(
         PlanReviewRequest(
             digest=preview.data.plan_digest,
             path=None,
+            authentication_key=SecretValue(b"k" * 32),
+            local_installation_id="installation-a",
+            now=NOW,
+        )
+    )
+    consumed_export = operations.review(
+        PlanReviewRequest(
+            digest=None,
+            path=plan_out,
             authentication_key=SecretValue(b"k" * 32),
             local_installation_id="installation-a",
             now=NOW,
@@ -811,12 +985,72 @@ def test_plan_review_preserves_foreign_expired_and_consumed_evidence(
     assert consumed.boundary.reached
     assert consumed.data.review is not None
     assert consumed.data.review.incapability_reasons == (PlanIncapability.CONSUMED,)
+    assert consumed_export.boundary.reached
+    assert consumed_export.data.review is not None
+    assert consumed_export.data.review.incapability_reasons == (
+        PlanIncapability.CONSUMED,
+    )
     assert foreign_expired.boundary.reached
     assert foreign_expired.data.review is not None
     assert foreign_expired.data.review.incapability_reasons == (
         PlanIncapability.EXPIRED,
         PlanIncapability.FOREIGN_OR_UNAUTHENTICATED,
         PlanIncapability.INSTALLATION_MISMATCH,
+    )
+
+
+@pytest.mark.parametrize(
+    "local_outcome",
+    [
+        pytest.param(
+            PlanRepositoryOutcome(PlanRepositoryStatus.MISSING),
+            id="missing",
+        ),
+        pytest.param(
+            PlanRepositoryOutcome(
+                PlanRepositoryStatus.FAILED,
+                state=PlanLedgerState.AVAILABLE,
+                reason=StableSymbol("ledger-corrupt"),
+                authenticated=True,
+            ),
+            id="corrupt",
+        ),
+        pytest.param(
+            PlanRepositoryOutcome(
+                PlanRepositoryStatus.AVAILABLE,
+                authenticated=True,
+            ),
+            id="no-state",
+        ),
+    ],
+)
+def test_export_review_fails_closed_when_local_authority_is_unavailable(
+    tmp_path: Path,
+    local_outcome: PlanRepositoryOutcome,
+) -> None:
+    """An export is not Apply-capable without its local single-use authority."""
+    repository = MemoryPlanRepository()
+    operations = _operations(repository, MemoryAuditJournal())
+    plan_out = tmp_path / "portable.plan"
+    preview = operations.preview(_preview_request(_preview_child(), plan_out=plan_out))
+    repository.load_outcome = local_outcome
+
+    result = operations.review(
+        PlanReviewRequest(
+            digest=None,
+            path=plan_out,
+            authentication_key=SecretValue(b"k" * 32),
+            local_installation_id="installation-123",
+            now=NOW,
+        )
+    )
+
+    assert preview.data.plan_digest is not None
+    assert result.boundary.reached
+    assert result.data.review is not None
+    assert not result.data.review.apply_capability
+    assert result.data.review.incapability_reasons == (
+        PlanIncapability.LOCAL_AUTHORITY_UNAVAILABLE,
     )
 
 
@@ -876,6 +1110,9 @@ def test_target_and_ordering_failures_never_issue_a_plan(
             ),
             installation_id="installation-123",
             authentication_key=SecretValue(b"k" * 32),
+            identity_verified=True,
+            contact_verified=True,
+            keyring_mutation_capable=True,
             normalized_workload="compute-instance:n1-standard-8:1",
             now=NOW,
         )
@@ -940,6 +1177,9 @@ def test_unknown_target_strategy_and_later_stale_child_preflight_every_child() -
             ),
             installation_id="installation-123",
             authentication_key=SecretValue(b"k" * 32),
+            identity_verified=True,
+            contact_verified=True,
+            keyring_mutation_capable=True,
             normalized_workload="compute-instance:n1-standard-8:1",
             now=NOW,
         )

@@ -32,6 +32,8 @@ OPERATIONAL_FAILURE_EXIT = 9
         (("pf", "l"), False, False, InvocationKind.LOCAL),
         (("cfg", "get", "interface.no-color"), False, False, InvocationKind.LOCAL),
         (("tui",), True, True, InvocationKind.TUI),
+        (("trust", "init"), False, False, InvocationKind.TRUST),
+        (("trust", "--help"), False, False, InvocationKind.HELP),
         (("q", "l"), False, False, InvocationKind.PROVIDER),
         (("sco",), False, False, InvocationKind.INVALID),
         (("pro",), False, False, InvocationKind.INVALID),
@@ -247,7 +249,8 @@ def test_profile_json_exposes_only_safe_os_keyring_reference_metadata(
     Path(environment["CQMGR_CONFIG_PATH"]).write_text(
         'schema = "cqmgr.config/v1"\n\n'
         "[profiles.primary]\n"
-        'quota_contact_keyring_reference = "cqmgr:quota-contact:primary"\n'
+        'quota_contact_keyring_reference = "cqmgr:quota-contact:v1:primary:'
+        'installation-test:item-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"\n'
     )
 
     result = CliRunner().invoke(
@@ -261,9 +264,9 @@ def test_profile_json_exposes_only_safe_os_keyring_reference_metadata(
         "quota_contact_keyring_reference"
     ]
     assert reference == {
-        "account": "quota-contact:primary",
+        "account": "item-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         "backend": "os-keyring",
-        "service": "cqmgr",
+        "service": "io.nisavid.cqmgr/installation-test/quota-contact",
     }
 
 
@@ -345,7 +348,7 @@ def test_no_color_and_quiet_preserve_required_human_result_facts(
     assert selected.stdout == (
         "Resource scope: projects/123\n"
         "Resolution source: direct-selection\n"
-        "Acting principal: deferred (offline)\n"
+        "Authenticated principal: deferred (offline)\n"
     )
 
     rejected = CliRunner().invoke(

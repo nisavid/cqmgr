@@ -29,6 +29,16 @@ update-in-place or automatic write retry. Rotation creates a new random item,
 verifies it, and atomically switches the non-secret reference before the old
 item is eligible for explicit cleanup.
 
+Installation-trust bootstrap is serialized by its own interprocess workflow
+lock across non-secret state and native-keyring operations. A repeated explicit
+`cqmgr trust init` may replace an exact incomplete bootstrap candidate only
+when its exact keyring reference is definitively missing. Replacement
+atomically installs genuinely fresh prepared identity, reference, key
+commitment, and material before initialization continues. Locked, unavailable,
+failed, conflicting, or mismatched evidence remains fail-closed. Active
+installation authority is never replaced or recreated when its key is missing
+or inconsistent.
+
 Each plan also has a non-secret, digest-derived consumption-marker identity in
 that private namespace. Immediately before provider dispatch, cqmgr creates the
 marker once with a keyed digest-bound value and verifies the write. The marker

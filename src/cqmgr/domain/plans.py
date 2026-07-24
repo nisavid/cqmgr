@@ -26,7 +26,10 @@ PLAN_LIFETIME = timedelta(minutes=15)
 _LOWER_HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _MAXIMUM_CONTACT_SOURCE_IDENTITY_LENGTH = 256
 _PROFILE_CONTACT_SOURCE_IDENTITY = re.compile(
-    r"profile:[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z"
+    r"cqmgr:quota-contact:v1:"
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}:"
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}:"
+    r"item-[A-Za-z0-9_-]{32}\Z"
 )
 _DIRECT_USER_CONTACT_SOURCE_IDENTITY = re.compile(
     r"principal://[A-Za-z0-9][A-Za-z0-9._~-]*"
@@ -80,6 +83,7 @@ class PlanIncapability(StrEnum):
     CONSUMED = "consumed"
     QUARANTINED = "quarantined"
     INVALIDATED = "invalidated"
+    LOCAL_AUTHORITY_UNAVAILABLE = "local-authority-unavailable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +271,7 @@ class QuotaRequestBundlePlan:
     installation_id: str
     issued_at: datetime
     expires_at: datetime
+    no_op_children: tuple[QuotaRequestPlanChild, ...] = ()
     schema: str = field(default=PLAN_SCHEMA, init=False)
 
     def __post_init__(self) -> None:  # noqa: C901, PLR0912
@@ -313,8 +318,18 @@ class QuotaRequestBundlePlan:
         ):
             msg = "bundle child resource scope must match the plan"
             raise ValueError(msg)
+        _require_bundle_no_op_children(self)
         _require_tuple_of(self.constraints, ConstraintReference, "constraints")
         _require_plan_constraints(self.resource_scope, self.constraints)
+        constraint_identities = {
+            constraint.slice_identity for constraint in self.constraints
+        }
+        if any(
+            child.slice_identity not in constraint_identities
+            for child in (*self.children, *self.no_op_children)
+        ):
+            msg = "bundle composition children must belong to the constraint set"
+            raise ValueError(msg)
         if not isinstance(self.principal, PlanPrincipal):
             msg = "principal must be a PlanPrincipal"
             raise TypeError(msg)
@@ -343,6 +358,34 @@ class QuotaRequestBundlePlan:
             for child in self.children
             for acknowledgement in child.unresolved_acknowledgements
         )
+
+
+def _require_bundle_no_op_children(plan: QuotaRequestBundlePlan) -> None:
+    """Require verified no-op facts to be exact and composition-bound."""
+    _require_tuple_of(
+        plan.no_op_children,
+        QuotaRequestPlanChild,
+        "no_op_children",
+    )
+    composition = (*plan.children, *plan.no_op_children)
+    if len({child.child_id for child in composition}) != len(composition):
+        msg = "bundle plan child IDs must be unique across composition"
+        raise ValueError(msg)
+    if (
+        tuple(sorted(plan.no_op_children, key=lambda child: child.order_key))
+        != plan.no_op_children
+    ):
+        msg = "bundle no-op children must use deterministic accelerator-first order"
+        raise ValueError(msg)
+    if any(
+        child.slice_identity.resource_scope != plan.resource_scope
+        for child in plan.no_op_children
+    ):
+        msg = "bundle no-op child resource scope must match the plan"
+        raise ValueError(msg)
+    if any(child.required_acknowledgements for child in plan.no_op_children):
+        msg = "bundle no-op children cannot require acknowledgements"
+        raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True)
@@ -522,6 +565,7 @@ def review_plan(  # noqa: C901, PLR0912, PLR0913
     local_installation_id: str,
     state: PlanLedgerState,
     now: datetime,
+    local_authority_available: bool = True,
 ) -> PlanReview:
     """Classify applicability without hiding safe digest-valid contents."""
     if not isinstance(plan, (QuotaRequestPlan, QuotaRequestBundlePlan)):
@@ -539,6 +583,9 @@ def review_plan(  # noqa: C901, PLR0912, PLR0913
     if not isinstance(state, PlanLedgerState):
         msg = "state must be a PlanLedgerState"
         raise TypeError(msg)
+    if not isinstance(local_authority_available, bool):
+        msg = "local_authority_available must be bool"
+        raise TypeError(msg)
     require_utc(now, "now")
 
     reasons: list[PlanIncapability] = []
@@ -550,6 +597,8 @@ def review_plan(  # noqa: C901, PLR0912, PLR0913
         reasons.append(PlanIncapability.INSTALLATION_MISMATCH)
     if plan.unresolved_acknowledgements:
         reasons.append(PlanIncapability.UNACKNOWLEDGED)
+    if not local_authority_available:
+        reasons.append(PlanIncapability.LOCAL_AUTHORITY_UNAVAILABLE)
     if state in {PlanLedgerState.LEASED, PlanLedgerState.DISPATCHED}:
         reasons.append(PlanIncapability.LEASED)
     elif state is PlanLedgerState.CONSUMED:

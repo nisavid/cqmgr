@@ -851,7 +851,8 @@ def test_human_provider_result_preserves_identity_and_safe_diagnostics(
     assert "Credential kind: impersonated" in captured.out
     assert "Principal verification: verified" in captured.out
     assert (
-        "Acting principal: serviceAccount:quota-reader@example.iam.gserviceaccount.com"
+        "Authenticated principal: "
+        "serviceAccount:quota-reader@example.iam.gserviceaccount.com"
     ) in captured.out
     assert (
         "Impersonation chain: "
