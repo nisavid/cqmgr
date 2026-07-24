@@ -159,7 +159,7 @@ def test_preview_contact_precedence_is_explicit_named_selected_then_direct() -> 
         )
     )
     assert named.binding.source.value == "named-profile"
-    assert named.binding.source_identity == "profile:named"
+    assert named.binding.source_identity == named_ref.canonical_name
     assert contacts.references[-1] == named_ref
     assert selection.reads == identity.calls == 0
 
@@ -172,7 +172,7 @@ def test_preview_contact_precedence_is_explicit_named_selected_then_direct() -> 
         )
     )
     assert selected.binding.source.value == "selected-profile"
-    assert selected.binding.source_identity == "profile:selected"
+    assert selected.binding.source_identity == selected_ref.canonical_name
     assert contacts.references[-1] == selected_ref
     assert identity.calls == 0
 
