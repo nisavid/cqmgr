@@ -506,6 +506,10 @@ def test_failed_revalidation_durably_invalidates_without_consumption_marker(
         repository.acquire_lease(encoded.digest, PLAN_KEY, NOW).status
         is PlanRepositoryStatus.INVALIDATED
     )
+    assert (
+        repository.resume_dispatched(encoded.digest, PLAN_KEY, NOW).status
+        is PlanRepositoryStatus.INVALIDATED
+    )
 
 
 def test_load_recovers_dispatch_deadline_before_decoding_corrupt_plan(

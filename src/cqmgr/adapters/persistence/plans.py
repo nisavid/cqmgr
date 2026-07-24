@@ -475,6 +475,8 @@ class LocalPlanRepository:
                 self._write_record(digest_hex, record, key)
             except OSError:
                 return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
+        if record.state is PlanLedgerState.CONSUMED:
+            return _outcome_for_record(record, authenticated=True)
         if record.state is PlanLedgerState.QUARANTINED:
             return _outcome_for_record(
                 record,
