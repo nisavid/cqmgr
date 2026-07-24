@@ -1386,6 +1386,12 @@ def _apply_result() -> OperationResult[ApplyData]:
             unknown_resolution=resolution,
             trace_id=f"trace-{child_id}",
             audit_record_ids=(f"audit-{child_id}",),
+            submitted_at=(
+                None if disposition is ApplyChildDisposition.UNATTEMPTED else NOW
+            ),
+            warnings=(StableSymbol("expert-review-required"),),
+            required_acknowledgements=(StableSymbol("decrease-below-usage"),),
+            acknowledgements=(StableSymbol("decrease-below-usage"),),
         )
         for index, (
             child_id,
@@ -1571,6 +1577,71 @@ def _review_result() -> OperationResult[PlanReviewData]:
                 StableSymbol("authenticated-bytes"),
                 lifecycle_or_preview_status=RedactedText("consumed"),
             ),
+        ),
+    )
+
+
+def _preview_plan_result() -> OperationResult[PreviewData]:
+    """Build one Apply-capable Preview with complete bound Plan evidence."""
+    reviewed = _review_result().data.review
+    assert reviewed is not None
+    assert isinstance(reviewed.plan, QuotaRequestBundlePlan)
+    children = (
+        replace(
+            reviewed.plan.children[0],
+            acknowledgements=reviewed.plan.children[0].required_acknowledgements,
+        ),
+        reviewed.plan.children[1],
+    )
+    plan = replace(
+        reviewed.plan,
+        children=children,
+        issued_at=NOW,
+        expires_at=NOW + timedelta(minutes=15),
+    )
+    composition = RequestPlanOperations.compose(
+        ComposeRequest(
+            kind=PlanKind.BUNDLE,
+            strategy=TargetStrategy.MINIMUM,
+            resource_scope=SCOPE,
+            children=tuple(
+                ComposeChild(
+                    child_id=child.child_id,
+                    slice_identity=child.slice_identity,
+                    effective=child.effective,
+                    usage=child.usage,
+                    workload=child.workload,
+                    preferred=child.prior_desired,
+                    granted=child.granted,
+                    preference_name=child.preference_name,
+                    preference_etag=child.preference_etag,
+                    direct_accelerator_rank=child.direct_accelerator_rank,
+                    scope_breadth_rank=child.scope_breadth_rank,
+                    warnings=tuple(item.value for item in child.warnings),
+                    observed_at=NOW,
+                    evidence=child.evidence,
+                )
+                for child in children
+            ),
+            selected_location="us-central1",
+            acknowledgements=tuple(item.value for item in children[0].acknowledgements),
+        )
+    )
+    assert composition.reached
+    return OperationResult(
+        operation=OperationName("plan.preview"),
+        resource_scope=SCOPE,
+        boundary=OperationBoundary(StableSymbol("safe-complete-preview"), True),
+        outcome=Outcome(StableSymbol("plan-issued"), ExitClass.SUCCESS),
+        completeness=Completeness.complete(),
+        started_at=NOW,
+        finished_at=NOW,
+        data=PreviewData(
+            composition=composition,
+            plan=plan,
+            plan_digest="sha256:" + ("a" * 64),
+            audit_record_id="audit-preview",
+            apply_capability=True,
         ),
     )
 
@@ -1884,6 +1955,69 @@ def test_single_no_op_preview_preserves_drift_expert_and_contact_placeholders(  
     asyncio.run(scenario())
 
 
+def test_preview_plan_renders_complete_bound_evidence() -> None:
+    """Preview exposes the Apply-capable Plan facts needed for safe handoff."""
+
+    async def scenario() -> None:
+        preview = _preview_plan_result()
+        lifecycle = ScriptedLifecycleOperations(
+            _apply_result(),
+            preview_result=preview,
+        )
+        app = CloudQuotaManagerApp(
+            ScriptedReadOnlyOperations(_browse_result()),
+            ScriptedAuditOperations(),
+            lifecycle=lifecycle,  # type: ignore[arg-type]
+        )
+
+        async with app.run_test(size=(120, 42)) as pilot:
+            await pilot.pause()
+            result = app.open_preview(
+                PreviewRequest(
+                    composition=preview.data.composition.request,
+                    principal=PlanPrincipal("principal://accounts/42"),
+                    contact_binding=ContactBinding(
+                        StableSymbol("direct-user"),
+                        "principal://accounts/42",
+                        "hmac-sha256:" + ("c" * 64),
+                    ),
+                    installation_id="installation-42",
+                    authentication_key=SecretValue(b"k" * 32),
+                    identity_verified=True,
+                    contact_verified=True,
+                    keyring_mutation_capable=True,
+                    normalized_workload="compute-instance:a4-highgpu-8g:1",
+                    now=NOW,
+                )
+            )
+
+            assert result is preview
+            detail = str(_static(app, "#lifecycle-detail").content)
+            assert "Kind: bundle" in detail
+            assert "Normalized workload: compute-instance:a4-highgpu-8g:1" in detail
+            assert "Principal: principal://accounts/42" in detail
+            assert "Issuing installation: installation-42" in detail
+            assert f"Issued: {NOW.isoformat()}" in detail
+            assert f"Expires: {(NOW + timedelta(minutes=15)).isoformat()}" in detail
+            assert "Prior desired: 6 1" in detail
+            assert "Granted: 5 1" in detail
+            assert "Warnings: remaining-bottleneck" in detail
+            assert (
+                "Required acknowledgements: decrease-below-usage, "
+                "decrease-over-ten-percent"
+            ) in detail
+            assert (
+                "Supplied acknowledgements: decrease-below-usage, "
+                "decrease-over-ten-percent"
+            ) in detail
+            assert "Unresolved acknowledgements: none" in detail
+            assert "Evidence effective-quota: sha256:" in detail
+            assert "Constraint 1: compute.googleapis.com / QUOTA-DIRECT" in detail
+            assert "operator@example.com" not in detail
+
+    asyncio.run(scenario())
+
+
 def test_bundle_compose_and_non_atomic_apply_keep_scope_and_children_explicit(  # noqa: PLR0915
 ) -> None:
     """Compose and Apply keep every gate and ordered child outcome visible."""
@@ -2038,6 +2172,62 @@ def test_bundle_compose_and_non_atomic_apply_keep_scope_and_children_explicit(  
             assert "Apply child uncertain: unknown" in refreshed
             assert "Apply child companion: unattempted" in refreshed
             assert _table(app, "#quota-ledger").has_focus
+
+    asyncio.run(scenario())
+
+
+def test_partial_apply_returns_with_every_child_outcome() -> None:
+    """A stopping Apply returns automatically without flattening child evidence."""
+
+    async def scenario() -> None:
+        result = _apply_result()
+        lifecycle = ScriptedLifecycleOperations(result)
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(
+            operations,
+            ScriptedAuditOperations(),
+            lifecycle=lifecycle,  # type: ignore[arg-type]
+        )
+        request = ApplyRequest(
+            digest=result.data.plan_digest,
+            authentication_key=SecretValue(b"k" * 32),
+            local_installation_id="installation-42",
+            resource_scope_acknowledgement=SCOPE,
+            principal=PlanPrincipal("principal://accounts/42"),
+            contact_binding=ContactBinding(
+                StableSymbol("direct-user"),
+                "principal://accounts/42",
+                "hmac-sha256:" + ("c" * 64),
+            ),
+            contact_value="operator@example.com",
+            now=NOW,
+        )
+
+        async with app.run_test(size=(120, 42)) as pilot:
+            await pilot.pause()
+            operations.inspect_calls.clear()
+            app.prepare_apply(request)
+            _input(app, "#apply-scope-acknowledgement").value = SCOPE.canonical_name
+            await pilot.pause()
+            await pilot.click("#lifecycle-apply")
+            await pilot.pause()
+            await pilot.pause()
+
+            assert not result.succeeded
+            assert app.query_one("#lifecycle-route").has_class("hidden")
+            assert not app.query_one("#quota-workbench").has_class("hidden")
+            assert len(operations.inspect_calls) == len(result.data.children)
+            detail = str(_static(app, "#quota-detail").content)
+            assert "Apply child direct: accepted" in detail
+            assert "Apply child unchanged: failed" in detail
+            assert "Apply child uncertain: unknown" in detail
+            assert "Apply child companion: unattempted" in detail
+            assert f"Submitted at: {NOW.isoformat()}" in detail
+            assert "Submitted at: none" in detail
+            assert "Warnings: expert-review-required" in detail
+            assert "Required acknowledgements: decrease-below-usage" in detail
+            assert "Supplied acknowledgements: decrease-below-usage" in detail
+            assert "Unresolved acknowledgements: none" in detail
 
     asyncio.run(scenario())
 

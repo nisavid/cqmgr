@@ -145,6 +145,18 @@ class ApplyChildData:
     provider_outcome: StableSymbol | None = None
     unknown_resolution: UnknownDispatchResolution | None = None
     audit_record_ids: tuple[str, ...] = ()
+    submitted_at: datetime | None = None
+    warnings: tuple[StableSymbol, ...] = ()
+    required_acknowledgements: tuple[StableSymbol, ...] = ()
+    acknowledgements: tuple[StableSymbol, ...] = ()
+
+    @property
+    def unresolved_acknowledgements(self) -> tuple[StableSymbol, ...]:
+        """Return required Plan acknowledgements absent from the applied intent."""
+        acknowledged = frozenset(self.acknowledgements)
+        return tuple(
+            item for item in self.required_acknowledgements if item not in acknowledged
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1769,18 +1781,14 @@ def _result_for_record(  # noqa: PLR0913
     audit_record_ids: tuple[str, ...],
     quarantine_identity: str | None = None,
 ) -> OperationResult[ApplyData]:
+    plan_children = (
+        {child.child_id: child for child in plan.children} if plan is not None else {}
+    )
     children = tuple(
-        ApplyChildData(
-            child_id=child.child_id,
-            disposition=child.disposition,
-            slice_identity=child.slice_identity,
-            target=child.target,
-            preference_identity=child.preference_identity,
-            etag=child.accepted_etag or child.etag,
-            trace_id=child.accepted_trace_id,
-            provider_outcome=child.provider_outcome,
-            unknown_resolution=child.unknown_resolution,
-            audit_record_ids=audit_record_ids,
+        _apply_child_data(
+            child,
+            plan_children.get(child.child_id),
+            audit_record_ids,
         )
         for child in record.children
         if child.disposition is not None
@@ -1800,6 +1808,32 @@ def _result_for_record(  # noqa: PLR0913
         ),
         audit_record_ids=audit_record_ids,
         quarantine_identity=quarantine_identity,
+    )
+
+
+def _apply_child_data(
+    child: ApplyChildRecord,
+    planned: QuotaRequestPlanChild | None,
+    audit_record_ids: tuple[str, ...],
+) -> ApplyChildData:
+    """Project one durable outcome with its authenticated Plan safety context."""
+    return ApplyChildData(
+        child_id=child.child_id,
+        disposition=cast("ApplyChildDisposition", child.disposition),
+        slice_identity=child.slice_identity,
+        target=child.target,
+        preference_identity=child.preference_identity,
+        etag=child.accepted_etag or child.etag,
+        trace_id=child.accepted_trace_id,
+        provider_outcome=child.provider_outcome,
+        unknown_resolution=child.unknown_resolution,
+        audit_record_ids=audit_record_ids,
+        submitted_at=child.dispatch_intent_at,
+        warnings=planned.warnings if planned is not None else (),
+        required_acknowledgements=(
+            planned.required_acknowledgements if planned is not None else ()
+        ),
+        acknowledgements=planned.acknowledgements if planned is not None else (),
     )
 
 
