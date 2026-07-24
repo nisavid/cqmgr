@@ -77,7 +77,6 @@ from cqmgr.bootstrap import (
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Iterator, Sequence
-    from typing import BinaryIO
 
     from cqmgr.application.operations.lifecycle_requests import (
         PreparedLifecycleRequests,
@@ -317,7 +316,7 @@ def _quota_contact_from_stdin(*, enabled: bool) -> SecretValue | None:
         return None
     binary = getattr(sys.stdin, "buffer", None)
     if binary is not None:
-        return read_quota_contact(cast("BinaryIO", binary))
+        return read_quota_contact(cast("Any", binary))
     return read_quota_contact(BytesIO(sys.stdin.read().encode("utf-8")))
 
 

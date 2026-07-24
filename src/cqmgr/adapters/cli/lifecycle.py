@@ -315,15 +315,15 @@ class LifecycleCliRequestFactory(Protocol):
 
     def compose(self, value: RequestCompositionInput) -> ComposeRequest:
         """Resolve a public Compose input into its protected typed request."""
-        ...
+        raise NotImplementedError
 
     def preview(self, value: RequestCompositionInput) -> PreviewRequest:
         """Resolve a public Preview input into its protected typed request."""
-        ...
+        raise NotImplementedError
 
     def review(self, value: PlanReferenceInput) -> PlanReviewRequest:
         """Resolve one public Plan reference for Review."""
-        ...
+        raise NotImplementedError
 
     async def apply(
         self,
@@ -333,11 +333,11 @@ class LifecycleCliRequestFactory(Protocol):
         quota_contact: SecretValue | None = None,
     ) -> ApplyRequest:
         """Resolve one Plan reference, exact scope, and protected contact input."""
-        ...
+        raise NotImplementedError
 
     def watch(self, value: WatchCliInput) -> WatchRequest:
         """Resolve public Watch controls into protected runtime inputs."""
-        ...
+        raise NotImplementedError
 
 
 class LifecycleCliClock(Protocol):
@@ -345,11 +345,11 @@ class LifecycleCliClock(Protocol):
 
     def now(self) -> datetime:
         """Return current aware UTC time."""
-        ...
+        raise NotImplementedError
 
     def monotonic(self) -> float:
         """Return current process-local monotonic seconds."""
-        ...
+        raise NotImplementedError
 
 
 @dataclass(slots=True)

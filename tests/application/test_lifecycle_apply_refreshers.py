@@ -1,5 +1,8 @@
 """Read-only production Apply refresher contracts."""
 
+# Runtime type expressions keep CodeQL's import analysis aligned with these tests.
+# ruff: noqa: TC006
+
 from __future__ import annotations
 
 import asyncio
@@ -139,9 +142,9 @@ def _inspect_result(identity: EffectiveQuotaSliceIdentity) -> object:
 
 def test_current_principal_requires_verified_stable_adc() -> None:
     """Apply receives the current stable principal without identity switching."""
-    refresher = CurrentApplyPrincipalRefresher(cast("Any", _Identity()))
+    refresher = CurrentApplyPrincipalRefresher(cast(Any, _Identity()))
 
-    principal = asyncio.run(refresher.refresh_principal(cast("Any", object()), NOW))
+    principal = asyncio.run(refresher.refresh_principal(cast(Any, object()), NOW))
 
     assert principal == PlanPrincipal(
         "serviceAccount:agent@example.iam.gserviceaccount.com"
@@ -151,7 +154,7 @@ def test_current_principal_requires_verified_stable_adc() -> None:
 def test_current_principal_rejects_invalid_timeout_and_unverified_identity() -> None:
     """Apply never treats an invalid budget or unstable ADC identity as authority."""
     with pytest.raises(ValueError, match="positive"):
-        CurrentApplyPrincipalRefresher(cast("Any", _Identity()), timeout_seconds=0)
+        CurrentApplyPrincipalRefresher(cast(Any, _Identity()), timeout_seconds=0)
 
     class _UnverifiedIdentity:
         async def resolve(self, **kwargs: object) -> ADCIdentityEvidence:
@@ -163,9 +166,9 @@ def test_current_principal_rejects_invalid_timeout_and_unverified_identity() -> 
                 verification=PrincipalVerification.UNVERIFIED,
             )
 
-    refresher = CurrentApplyPrincipalRefresher(cast("Any", _UnverifiedIdentity()))
+    refresher = CurrentApplyPrincipalRefresher(cast(Any, _UnverifiedIdentity()))
     with pytest.raises(ApplyRefreshError, match="stably verified"):
-        asyncio.run(refresher.refresh_principal(cast("Any", object()), NOW))
+        asyncio.run(refresher.refresh_principal(cast(Any, object()), NOW))
 
 
 def test_ephemeral_contact_requires_exact_plan_binding() -> None:
@@ -218,17 +221,17 @@ def test_evidence_refresher_inspects_every_exact_planned_child() -> None:
         ),
     )
     refresher = ReadOnlyApplyEvidenceRefresher(
-        cast("Any", read_only),
+        cast(Any, read_only),
         deadline=lambda: DEADLINE,
     )
 
-    refreshed = asyncio.run(refresher.refresh_evidence(cast("Any", plan), NOW))
+    refreshed = asyncio.run(refresher.refresh_evidence(cast(Any, plan), NOW))
 
     assert refreshed.resource_scope == SCOPE
     assert refreshed.constraints[0].slice_identity == identity
     assert refreshed.children[0].effective == QuotaQuantity(4, UNIT)
     assert refreshed.children[0].usage == QuotaQuantity(2, UNIT)
-    selector, kwargs = cast("tuple[Any, dict[str, object]]", read_only.calls[0])
+    selector, kwargs = cast(tuple[Any, dict[str, object]], read_only.calls[0])
     assert selector.quota_id == identity.quota_id
     assert selector.location == "us-central1"
     assert kwargs["deadline"] == DEADLINE
@@ -244,14 +247,14 @@ def test_evidence_refresher_rejects_failed_and_scope_mismatched_reads() -> None:
         outcome=SimpleNamespace(code=StableSymbol("provider-unavailable")),
     )
     refresher = ReadOnlyApplyEvidenceRefresher(
-        cast("Any", _ReadOnly(failed)),
+        cast(Any, _ReadOnly(failed)),
         deadline=lambda: DEADLINE,
     )
     with pytest.raises(ApplyRefreshError, match="provider-unavailable"):
         asyncio.run(
             refresher.refresh_evidence(
                 cast(
-                    "Any",
+                    Any,
                     SimpleNamespace(
                         resource_scope=SCOPE,
                         constraints=(ConstraintReference(identity),),
@@ -264,14 +267,14 @@ def test_evidence_refresher_rejects_failed_and_scope_mismatched_reads() -> None:
 
     other_scope = ResourceScope(ResourceScopeKind.PROJECT, "projects/456")
     refresher = ReadOnlyApplyEvidenceRefresher(
-        cast("Any", _ReadOnly(_inspect_result(identity))),
+        cast(Any, _ReadOnly(_inspect_result(identity))),
         deadline=lambda: DEADLINE,
     )
     with pytest.raises(ApplyRefreshError, match="exact Plan scope"):
         asyncio.run(
             refresher.refresh_evidence(
                 cast(
-                    "Any",
+                    Any,
                     SimpleNamespace(
                         resource_scope=other_scope,
                         constraints=(ConstraintReference(identity),),
@@ -298,12 +301,12 @@ def test_evidence_refresher_rejects_slice_without_exact_location() -> None:
         children=(SimpleNamespace(child_id="single", slice_identity=identity),),
     )
     refresher = ReadOnlyApplyEvidenceRefresher(
-        cast("Any", _ReadOnly(_inspect_result(identity))),
+        cast(Any, _ReadOnly(_inspect_result(identity))),
         deadline=lambda: DEADLINE,
     )
 
     with pytest.raises(LifecyclePreparationError, match="exact location"):
-        asyncio.run(refresher.refresh_evidence(cast("Any", plan), NOW))
+        asyncio.run(refresher.refresh_evidence(cast(Any, plan), NOW))
 
 
 def test_evidence_refresher_includes_dispatch_and_verified_no_op_children() -> None:
@@ -324,7 +327,7 @@ def test_evidence_refresher_includes_dispatch_and_verified_no_op_children() -> N
     )
     refresher = ReadOnlyApplyEvidenceRefresher(
         cast(
-            "Any",
+            Any,
             _ReadOnlyByQuota(
                 {
                     direct.quota_id: _inspect_result(direct),
@@ -335,7 +338,7 @@ def test_evidence_refresher_includes_dispatch_and_verified_no_op_children() -> N
         deadline=lambda: DEADLINE,
     )
 
-    refreshed = asyncio.run(refresher.refresh_evidence(cast("Any", plan), NOW))
+    refreshed = asyncio.run(refresher.refresh_evidence(cast(Any, plan), NOW))
 
     assert refreshed.constraints == plan.constraints
     assert tuple(child.child_id for child in refreshed.children) == (

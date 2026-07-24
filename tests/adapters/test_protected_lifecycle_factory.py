@@ -1,5 +1,8 @@
 """Protected Review, Apply, and Watch CLI request construction."""
 
+# Runtime type expressions keep CodeQL's import analysis aligned with these tests.
+# ruff: noqa: TC006
+
 from __future__ import annotations
 
 import asyncio
@@ -185,9 +188,9 @@ def _factory() -> tuple[ProtectedLifecycleCliRequestFactory, _Repository]:
     repository = _Repository()
     factory = ProtectedLifecycleCliRequestFactory(
         trust=_Trust(),
-        repository=cast("Any", repository),
-        codec=cast("Any", _Codec(plan)),
-        contacts=cast("Any", _Contacts()),
+        repository=cast(Any, repository),
+        codec=cast(Any, _Codec(plan)),
+        contacts=cast(Any, _Contacts()),
         clock=_Clock(),
     )
     return factory, repository
@@ -275,8 +278,8 @@ def test_apply_imports_exported_plan_from_local_repository(tmp_path: Path) -> No
     factory = ProtectedLifecycleCliRequestFactory(
         trust=_Trust(),
         repository=repository,
-        codec=cast("Any", PlanCodec()),
-        contacts=cast("Any", _Contacts()),
+        codec=cast(Any, PlanCodec()),
+        contacts=cast(Any, _Contacts()),
         clock=_Clock(),
     )
 
@@ -332,9 +335,9 @@ def test_obsolete_synchronous_composition_paths_fail_closed() -> None:
     factory, _ = _factory()
 
     with pytest.raises(RuntimeError, match="Compose requires async"):
-        factory.compose(cast("Any", object()))
+        factory.compose(cast(Any, object()))
     with pytest.raises(RuntimeError, match="Preview requires async"):
-        factory.preview(cast("Any", object()))
+        factory.preview(cast(Any, object()))
 
 
 def test_review_binds_authority_only_to_local_digest() -> None:
@@ -355,9 +358,9 @@ def test_export_review_survives_missing_authority_but_digest_review_does_not() -
     _, repository = _factory()
     factory = ProtectedLifecycleCliRequestFactory(
         trust=_MissingTrust(),
-        repository=cast("Any", repository),
-        codec=cast("Any", _Codec(object())),
-        contacts=cast("Any", _Contacts()),
+        repository=cast(Any, repository),
+        codec=cast(Any, _Codec(object())),
+        contacts=cast(Any, _Contacts()),
         clock=_Clock(),
     )
 

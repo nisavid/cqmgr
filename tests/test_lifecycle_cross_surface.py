@@ -1,7 +1,8 @@
 """Cross-surface acceptance proof for the shared mutation lifecycle facade."""
 
 # Hermetic protocol doubles intentionally expose their calls as test evidence.
-# ruff: noqa: ANN401, PLR2004, SLF001
+# Runtime type expressions keep CodeQL's import analysis aligned with these tests.
+# ruff: noqa: ANN401, PLR2004, SLF001, TC006
 
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from textual.widgets import Input, Static
 
 import cqmgr.cli as cli_module
 from cqmgr.adapters.cli.lifecycle import (
+    LifecycleCliRequestFactory,
     LifecycleCliRuntime,
     PlanReferenceInput,
     RequestCompositionInput,
@@ -49,14 +51,24 @@ from cqmgr.application.operations.watch import (
     WatchOperations,
     WatchRequest,
 )
-from cqmgr.application.ports.apply import ApplyRevalidation, RefreshedApplyChild
+from cqmgr.application.ports.apply import (
+    ApplyRevalidation,
+    ApplyRevalidator,
+    RefreshedApplyChild,
+)
+from cqmgr.application.ports.apply_records import ApplyRecordRepository
+from cqmgr.application.ports.audit import AuditJournal
 from cqmgr.application.ports.coordination import (
     BudgetGrant,
     CancellationToken,
 )
+from cqmgr.application.ports.plans import PlanCodec as PlanCodecPort
+from cqmgr.application.ports.plans import PlanRepository
 from cqmgr.application.ports.provider_writes import (
     QuotaPreferenceUnknownResolutionResult,
+    QuotaPreferenceUnknownResolver,
     QuotaPreferenceWrite,
+    QuotaPreferenceWriter,
     QuotaPreferenceWriteResult,
     UnknownWriteResolution,
 )
@@ -69,7 +81,7 @@ from cqmgr.application.ports.secrets import (
     SecretStoreStatus,
     SecretValue,
 )
-from cqmgr.application.ports.watch import WatchObservation
+from cqmgr.application.ports.watch import WatchCheckpointRepository, WatchObservation
 from cqmgr.domain.apply_records import ApplyChildDisposition
 from cqmgr.domain.audit import AuditFactName, AuditQuery
 from cqmgr.domain.diagnostics import (
@@ -104,21 +116,8 @@ from cqmgr.domain.status import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from cqmgr.adapters.cli.lifecycle import LifecycleCliRequestFactory
-    from cqmgr.application.ports.apply import ApplyRevalidator
-    from cqmgr.application.ports.apply_records import ApplyRecordRepository
-    from cqmgr.application.ports.audit import AuditJournal
     from cqmgr.application.ports.coordination import BudgetRequest
-    from cqmgr.application.ports.plans import PlanCodec as PlanCodecPort
-    from cqmgr.application.ports.plans import PlanRepository
-    from cqmgr.application.ports.provider_writes import (
-        QuotaPreferenceUnknownResolver,
-        QuotaPreferenceWriter,
-    )
-    from cqmgr.application.ports.watch import (
-        WatchCheckpointRepository,
-        WatchObservationRequest,
-    )
+    from cqmgr.application.ports.watch import WatchObservationRequest
     from cqmgr.domain.audit import AuditRecordDraft
     from cqmgr.domain.watch import WatchStreamEvent
 
@@ -450,26 +449,26 @@ def _harness(root: Path, kind: PlanKind) -> _Harness:
     writer = _AcceptedWriter()
     clock = _Clock()
     plans = RequestPlanOperations(
-        repository=cast("PlanRepository", repository),
-        audit=cast("AuditJournal", audit),
-        codec=cast("PlanCodecPort", PlanCodec()),
+        repository=cast(PlanRepository, repository),
+        audit=cast(AuditJournal, audit),
+        codec=cast(PlanCodecPort, PlanCodec()),
     )
     apply = ApplyPlanOperations(
-        repository=cast("PlanRepository", repository),
-        apply_records=cast("ApplyRecordRepository", apply_records),
-        audit=cast("AuditJournal", audit),
-        codec=cast("PlanCodecPort", PlanCodec()),
-        revalidator=cast("ApplyRevalidator", _CurrentSourceRevalidator(kind)),
-        writer=cast("QuotaPreferenceWriter", writer),
+        repository=cast(PlanRepository, repository),
+        apply_records=cast(ApplyRecordRepository, apply_records),
+        audit=cast(AuditJournal, audit),
+        codec=cast(PlanCodecPort, PlanCodec()),
+        revalidator=cast(ApplyRevalidator, _CurrentSourceRevalidator(kind)),
+        writer=cast(QuotaPreferenceWriter, writer),
         unknown_resolver=cast(
-            "QuotaPreferenceUnknownResolver",
+            QuotaPreferenceUnknownResolver,
             _UnknownResolver(),
         ),
     )
     watch = WatchOperations(
-        apply_records=cast("ApplyRecordRepository", apply_records),
+        apply_records=cast(ApplyRecordRepository, apply_records),
         checkpoints=cast(
-            "WatchCheckpointRepository",
+            WatchCheckpointRepository,
             LocalWatchCheckpointRepository(root / "watch"),
         ),
         resume_codec=HmacWatchResumeCodec(),
@@ -615,7 +614,7 @@ def _install_cli_runtime(
         "build_lifecycle_cli_runtime",
         lambda: LifecycleCliRuntime(
             harness.facade,
-            cast("LifecycleCliRequestFactory", harness.factory),
+            cast(LifecycleCliRequestFactory, harness.factory),
         ),
     )
 
