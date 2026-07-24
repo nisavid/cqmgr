@@ -505,7 +505,7 @@ class ApplyPlanOperations:
             exit_class=ExitClass.SUCCESS,
         )
 
-    async def _resume(  # noqa: C901, PLR0911, PLR0912
+    async def _resume(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self,
         record: ApplyRecord,
         request: ApplyRequest,
@@ -520,6 +520,16 @@ class ApplyPlanOperations:
             resumed.status is PlanRepositoryStatus.QUARANTINED
             and record.state is ApplyRecordState.UNKNOWN
         )
+        quarantined_prewrite_failure = (
+            resumed.status is PlanRepositoryStatus.QUARANTINED
+            and resumed.reason == StableSymbol("dispatch-intent-persistence-failed")
+            and record.state is ApplyRecordState.FAILED
+            and not any(
+                child.disposition is ApplyChildDisposition.FAILED
+                for child in record.children
+            )
+        )
+        recoverable_quarantine = quarantined_unknown or quarantined_prewrite_failure
         if (
             (
                 resumed.status
@@ -527,11 +537,11 @@ class ApplyPlanOperations:
                     PlanRepositoryStatus.LEASED,
                     PlanRepositoryStatus.DISPATCHED,
                 }
-                and not quarantined_unknown
+                and not recoverable_quarantine
             )
             or resumed.plan_bytes is None
             or resumed.authenticated is not True
-            or (resumed.lease is None and not quarantined_unknown)
+            or (resumed.lease is None and not recoverable_quarantine)
         ):
             return _result_for_record(
                 request,
@@ -542,10 +552,14 @@ class ApplyPlanOperations:
                 exit_class=ExitClass.STALE_OR_CONFLICTING,
                 audit_record_ids=(),
             )
-        if record.state in {
-            ApplyRecordState.ACCEPTED,
-            ApplyRecordState.FAILED,
-        }:
+        if (
+            record.state
+            in {
+                ApplyRecordState.ACCEPTED,
+                ApplyRecordState.FAILED,
+            }
+            and not quarantined_prewrite_failure
+        ):
             if (
                 resumed.status is not PlanRepositoryStatus.DISPATCHED
                 or resumed.lease is None
@@ -614,6 +628,57 @@ class ApplyPlanOperations:
                 record,
                 [],
             )
+        audit_record_ids: list[str] = []
+        if quarantined_prewrite_failure:
+            try:
+                audit_record_ids.append(
+                    self._append_audit(
+                        request,
+                        record.resource_scope,
+                        AuditRecordKind.APPLY_RESULT,
+                        "dispatch-intent-persistence-failed",
+                        record.intent_id,
+                        facts=_aggregate_facts(record),
+                        occurred_at=cast("datetime", record.finished_at),
+                        deduplicate=True,
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                return self._critical_unknown(
+                    record.resource_scope,
+                    None,
+                    request,
+                    record,
+                    audit_record_ids,
+                )
+            return _result_for_record(
+                request,
+                record.resource_scope,
+                record,
+                reached=False,
+                outcome="dispatch-intent-persistence-failed",
+                exit_class=ExitClass.OPERATIONAL_FAILURE,
+                audit_record_ids=tuple(audit_record_ids),
+            )
+        try:
+            audit_record_ids.extend(
+                self._append_child_outcome_audit(
+                    request,
+                    record.resource_scope,
+                    record,
+                    child,
+                )
+                for child in record.children
+                if child.disposition is ApplyChildDisposition.ACCEPTED
+            )
+        except Exception:  # noqa: BLE001
+            return self._critical_unknown(
+                record.resource_scope,
+                resumed.lease,
+                request,
+                record,
+                audit_record_ids,
+            )
         stopping = next(
             (
                 child
@@ -666,7 +731,7 @@ class ApplyPlanOperations:
                             resumed.lease,
                             request,
                             record,
-                            [],
+                            audit_record_ids,
                         )
                     provider_outcome = cast("StableSymbol", stopping.provider_outcome)
                     return self._finish(
@@ -674,7 +739,7 @@ class ApplyPlanOperations:
                         cast("PlanLease", resumed.lease),
                         request,
                         record,
-                        [],
+                        audit_record_ids,
                         outcome=provider_outcome.value,
                         exit_class=_failure_exit(provider_outcome),
                     )
@@ -707,7 +772,7 @@ class ApplyPlanOperations:
                     request,
                     record,
                     write,
-                    [],
+                    audit_record_ids,
                 )
             return await self._finish_unknown(
                 record.resource_scope,
@@ -715,7 +780,7 @@ class ApplyPlanOperations:
                 request,
                 record,
                 write,
-                [],
+                audit_record_ids,
                 already_quarantined=quarantined_unknown,
             )
         try:
@@ -729,7 +794,7 @@ class ApplyPlanOperations:
                         resumed.lease,
                         request,
                         record,
-                        [],
+                        audit_record_ids,
                     )
                 return self._invalidate(
                     plan,
@@ -742,7 +807,7 @@ class ApplyPlanOperations:
                 resumed.lease,
                 request,
                 record,
-                [],
+                audit_record_ids,
             )
         accepted_child_ids = frozenset(
             child.child_id
@@ -763,7 +828,7 @@ class ApplyPlanOperations:
                         resumed.lease,
                         request,
                         record,
-                        [],
+                        audit_record_ids,
                     )
                 return self._invalidate(
                     plan,
@@ -775,7 +840,7 @@ class ApplyPlanOperations:
                 resumed.lease,
                 request,
                 record,
-                [],
+                audit_record_ids,
             )
         if resumed.status is PlanRepositoryStatus.LEASED:
             consumed = self._repository.mark_dispatched(
@@ -791,14 +856,14 @@ class ApplyPlanOperations:
                     reached=False,
                     outcome="plan-consumption-failed",
                     exit_class=ExitClass.OPERATIONAL_FAILURE,
-                    audit_record_ids=(),
+                    audit_record_ids=tuple(audit_record_ids),
                 )
         return await self._dispatch_children(
             plan,
             cast("PlanLease", resumed.lease),
             request,
             record,
-            [],
+            audit_record_ids,
             refreshed.contact_value,
         )
 
@@ -1072,6 +1137,28 @@ class ApplyPlanOperations:
             request,
             "dispatch-intent-persistence-failed",
         ):
+            return self._critical_unknown(
+                resource_scope,
+                lease,
+                request,
+                terminal,
+                audit_record_ids,
+                reconciliation_identity=reconciliation_identity,
+            )
+        try:
+            audit_record_ids.append(
+                self._append_audit(
+                    request,
+                    resource_scope,
+                    AuditRecordKind.APPLY_RESULT,
+                    "dispatch-intent-persistence-failed",
+                    terminal.intent_id,
+                    facts=_aggregate_facts(terminal),
+                    occurred_at=cast("datetime", terminal.finished_at),
+                    deduplicate=True,
+                )
+            )
+        except Exception:  # noqa: BLE001
             return self._critical_unknown(
                 resource_scope,
                 lease,
