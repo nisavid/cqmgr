@@ -934,6 +934,49 @@ def test_apply_dispatches_bound_order_once_and_durably_accepts_every_child() -> 
     ]
 
 
+def test_apply_result_preserves_submitted_time_and_plan_safety_context() -> None:
+    """Every dispatched child retains its Plan context and durable submit time."""
+    base = _plan()
+    direct = replace(
+        base.children[0],
+        warnings=(StableSymbol("expert-review-required"),),
+        required_acknowledgements=(
+            StableSymbol("decrease-below-usage"),
+            StableSymbol("decrease-over-ten-percent"),
+        ),
+        acknowledgements=(
+            StableSymbol("decrease-below-usage"),
+            StableSymbol("decrease-over-ten-percent"),
+        ),
+    )
+    plan = replace(base, children=(direct, base.children[1]))
+    writer = _ScriptedWriter(
+        QuotaPreferenceWriteResult(
+            accepted=True,
+            outcome=StableSymbol("submitted"),
+        ),
+        QuotaPreferenceWriteResult(
+            accepted=True,
+            outcome=StableSymbol("submitted"),
+        ),
+    )
+
+    result, _, _, _ = _apply(plan, writer)
+
+    child = result.data.children[0]
+    assert child.submitted_at == NOW + timedelta(minutes=1)
+    assert child.warnings == (StableSymbol("expert-review-required"),)
+    assert child.required_acknowledgements == (
+        StableSymbol("decrease-below-usage"),
+        StableSymbol("decrease-over-ten-percent"),
+    )
+    assert child.acknowledgements == (
+        StableSymbol("decrease-below-usage"),
+        StableSymbol("decrease-over-ten-percent"),
+    )
+    assert child.unresolved_acknowledgements == ()
+
+
 def test_apply_result_retains_subject_no_ops_and_provider_lineage() -> None:
     """Apply presentation data preserves the complete reviewed composition."""
     no_op = _child(
