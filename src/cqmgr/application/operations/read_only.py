@@ -22,6 +22,7 @@ from cqmgr.application.operations.obtainability import (
     PreparedObtainabilityComparison,
     candidates_from_resolved_workload,
     prepare_obtainability_comparison,
+    product_coverage_from_resolved_workload,
 )
 from cqmgr.application.operations.quotas import (
     MAX_BROWSE_LIMIT,
@@ -393,6 +394,10 @@ class ReadOnlyOperations:
                     finished_at=resolved_result.finished_at,
                     data=ObtainabilityComparison(
                         (),
+                        catalog_coverage=product_coverage_from_resolved_workload(
+                            resolved,
+                            machine,
+                        ),
                         resolver_provenance=resolved,
                     ),
                     diagnostics=resolved_result.diagnostics,
@@ -619,6 +624,14 @@ class ReadOnlyOperations:
             first.vm_count,
             ProvisioningModel.SPOT,
             CandidateLocations(locations),
+            attached_accelerator_type=(
+                None
+                if first.machine.gpu is None
+                else first.machine.gpu.accelerator_type
+            ),
+            attached_accelerator_count=(
+                None if first.machine.gpu is None else first.machine.gpu.count
+            ),
         )
         resolved_result = await self._workloads.resolve(
             QuotaResolveRequest(context, requirement)

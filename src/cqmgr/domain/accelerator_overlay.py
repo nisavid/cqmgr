@@ -141,13 +141,15 @@ LocationSelection = CandidateLocations | AllCompatibleLocations
 
 @dataclass(frozen=True, slots=True)
 class ComputeInstanceRequirement:
-    """Deployable Compute instance shape without caller-supplied accelerator facts."""
+    """Deployable Compute instance shape with an optional exact attachment request."""
 
     kind: WorkloadKind = field(init=False, default=WorkloadKind.COMPUTE_INSTANCE)
     machine_type: str
     instance_count: int
     provisioning_model: ProvisioningModel
     locations: LocationSelection
+    attached_accelerator_type: str | None = None
+    attached_accelerator_count: int | None = None
 
     def __post_init__(self) -> None:
         """Require the complete public Compute-instance input shape."""
@@ -159,6 +161,20 @@ class ComputeInstanceRequirement:
         if not isinstance(self.locations, (CandidateLocations, AllCompatibleLocations)):
             msg = "locations must select candidates or all compatible locations"
             raise TypeError(msg)
+        if (self.attached_accelerator_type is None) != (
+            self.attached_accelerator_count is None
+        ):
+            msg = "attached accelerator type and count must be supplied together"
+            raise ValueError(msg)
+        if self.attached_accelerator_type is not None:
+            _require_nonempty(
+                self.attached_accelerator_type,
+                "attached_accelerator_type",
+            )
+            _require_positive_count(
+                self.attached_accelerator_count,
+                "attached_accelerator_count",
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -526,6 +542,8 @@ class ResolvedWorkloadLocation:
     coverage: tuple[CatalogLocationCoverage, ...]
     assessments: tuple[QuotaConstraintAssessment, ...] = ()
     failure_reason: ResolutionFailureReason | None = None
+    attached_accelerator_type: str | None = None
+    attached_accelerator_count: int | None = None
 
     def __post_init__(self) -> None:  # noqa: C901, PLR0912
         """Keep successful facts complete and failures explicit."""
@@ -592,6 +610,7 @@ class ResolvedWorkloadLocation:
         ):
             msg = "assessments must contain QuotaConstraintAssessment"
             raise TypeError(msg)
+        self._validate_attachment(compatible=compatible)
         if self.assessments:
             expected_assessments = tuple(
                 (item.identity, item.required) for item in self.constraint_requirements
@@ -603,12 +622,58 @@ class ResolvedWorkloadLocation:
                 msg = "assessments must use each exact constraint requirement"
                 raise ValueError(msg)
 
+    def _validate_attachment(self, *, compatible: bool) -> None:
+        if (self.attached_accelerator_type is None) != (
+            self.attached_accelerator_count is None
+        ):
+            msg = "resolved attachment type and count must be supplied together"
+            raise ValueError(msg)
+        if self.attached_accelerator_type is None:
+            return
+        if not compatible:
+            msg = "unresolved location cannot claim a proven attachment"
+            raise ValueError(msg)
+        _require_nonempty(
+            self.attached_accelerator_type,
+            "resolved attached_accelerator_type",
+        )
+        _require_positive_count(
+            self.attached_accelerator_count,
+            "resolved attached_accelerator_count",
+        )
+
     @property
     def permits(self) -> bool | None:
         """Whether every independently limiting assessed slice permits the shape."""
         if not self.assessments:
             return None
         return all(assessment.permits for assessment in self.assessments)
+
+    def proves_requested_compute_attachment(
+        self,
+        requirement: ComputeInstanceRequirement,
+    ) -> bool:
+        """Whether resolver-owned facts prove the exact requested attachment demand."""
+        accelerator_type = requirement.attached_accelerator_type
+        accelerator_count = requirement.attached_accelerator_count
+        if accelerator_type is None or accelerator_count is None:
+            return False
+        expected_quantity = accelerator_count * requirement.instance_count
+        constraint_set = self.constraint_set
+        return (
+            self.disposition is WorkloadLocationDisposition.COMPATIBLE
+            and self.attached_accelerator_type == accelerator_type
+            and self.attached_accelerator_count == accelerator_count
+            and self.accelerator_id is not None
+            and self.deployable_accelerator_quantity == expected_quantity
+            and constraint_set is not None
+            and constraint_set.accelerator_id == self.accelerator_id
+            and bool(self.constraint_requirements)
+            and all(
+                item.source_quantity == expected_quantity
+                for item in self.constraint_requirements
+            )
+        )
 
 
 ModernWorkloadRequirement = ComputeInstanceRequirement | CloudTpuSliceRequirement
@@ -673,6 +738,7 @@ class OverlayMapping:
     reviewed_on: date
     machine_types: tuple[str, ...] = ()
     provider_accelerator_types: tuple[str, ...] = ()
+    operator_selected_accelerator_types: tuple[str, ...] = ()
     topologies: tuple[str, ...] = ()
     runtime_versions: tuple[str, ...] = ()
     accelerator_counts: tuple[int, ...] = ()
@@ -788,6 +854,10 @@ def _validate_mapping_compatibility(mapping: OverlayMapping) -> None:
     for field_name, values in (
         ("machine_types", mapping.machine_types),
         ("provider_accelerator_types", mapping.provider_accelerator_types),
+        (
+            "operator_selected_accelerator_types",
+            mapping.operator_selected_accelerator_types,
+        ),
         ("topologies", mapping.topologies),
         ("runtime_versions", mapping.runtime_versions),
     ):
@@ -802,6 +872,11 @@ def _validate_mapping_compatibility(mapping: OverlayMapping) -> None:
     ):
         msg = "mapping accelerator_counts must contain positive integers"
         raise TypeError(msg)
+    if not set(mapping.operator_selected_accelerator_types).issubset(
+        mapping.provider_accelerator_types
+    ):
+        msg = "operator-selected accelerator types must be provider accelerator types"
+        raise ValueError(msg)
     if not isinstance(mapping.provisioning_models, tuple) or any(
         not isinstance(model, ProvisioningModel)
         for model in mapping.provisioning_models
@@ -1180,6 +1255,18 @@ class SemanticAcceleratorOverlay:
             constraint_set=constraint_set,
             constraint_requirements=constraint_requirements,
             coverage=coverage,
+            attached_accelerator_type=(
+                requirement.attached_accelerator_type
+                if isinstance(requirement, ComputeInstanceRequirement)
+                and mapping.operator_selected_accelerator_types
+                else None
+            ),
+            attached_accelerator_count=(
+                requirement.attached_accelerator_count
+                if isinstance(requirement, ComputeInstanceRequirement)
+                and mapping.operator_selected_accelerator_types
+                else None
+            ),
         )
 
     def _constraint_set_for_resolution(
@@ -1635,6 +1722,18 @@ def _derive_compute_zone_facts(
         and mapping.management_plane is ManagementPlane.COMPUTE
         and requirement.machine_type in mapping.machine_types
         and attachment.accelerator_type in mapping.provider_accelerator_types
+        and (
+            (
+                not mapping.operator_selected_accelerator_types
+                and requirement.attached_accelerator_type is None
+            )
+            or (
+                requirement.attached_accelerator_type == attachment.accelerator_type
+                and requirement.attached_accelerator_count == attachment.count
+                and attachment.accelerator_type
+                in mapping.operator_selected_accelerator_types
+            )
+        )
         and requirement.provisioning_model in mapping.provisioning_models
     )
     if len(candidates) > 1:
@@ -1891,6 +1990,10 @@ def _canonical_mapping_bytes(mapping: OverlayMapping) -> bytes:
             _encode_text_sequence(
                 "provider-accelerator-types", mapping.provider_accelerator_types
             ),
+            _encode_text_sequence(
+                "operator-selected-accelerator-types",
+                mapping.operator_selected_accelerator_types,
+            ),
             _encode_text_sequence("topologies", mapping.topologies),
             _encode_text_sequence("runtime-versions", mapping.runtime_versions),
             _encode_text_sequence(
@@ -2136,6 +2239,55 @@ _B200_A4_REGIONAL = OverlayMapping(
     provisioning_models=(ProvisioningModel.STANDARD,),
 )
 
+_T4_N1_SPOT_REGIONAL = OverlayMapping(
+    group_id=CatalogGroupId.COMPUTE_ACCELERATORS,
+    accelerator_id=AcceleratorId("nvidia-t4"),
+    management_plane=ManagementPlane.COMPUTE,
+    workload_consumers=(WorkloadConsumer.COMPUTE_ENGINE, WorkloadConsumer.GKE),
+    selector=QuotaSelector(
+        service="compute.googleapis.com",
+        quota_id=None,
+        quota_display_name="Preemptible NVIDIA T4 GPUs",
+        dimensions=(DimensionSelector("region"),),
+        native_unit=QuotaUnit("1"),
+        quota_scope=QuotaScope.REGIONAL,
+        location_dimension="region",
+    ),
+    quota_pool="preemptible",
+    conversion=UnitConversionEvidence(
+        source_unit="card",
+        quota_unit=QuotaUnit("1"),
+        quota_units_per_source=1,
+        source_reference=_COMPUTE_QUOTA_SOURCE,
+    ),
+    companion_requirements=(
+        CompanionRequirementMapping(
+            selector=QuotaSelector(
+                service="compute.googleapis.com",
+                quota_id="GPUS-ALL-REGIONS-per-project",
+                quota_display_name=None,
+                dimensions=(),
+                native_unit=QuotaUnit("1"),
+                quota_scope=QuotaScope.GLOBAL,
+                location_dimension=None,
+            ),
+            quantity_basis=WorkloadQuantityBasis.ACCELERATOR_QUANTITY,
+            conversion=UnitConversionEvidence(
+                source_unit="card",
+                quota_unit=QuotaUnit("1"),
+                quota_units_per_source=1,
+                source_reference=_COMPUTE_QUOTA_SOURCE,
+            ),
+        ),
+    ),
+    source_url=_COMPUTE_QUOTA_SOURCE,
+    reviewed_on=_REVIEW_DATE,
+    machine_types=("n1-standard-16",),
+    provider_accelerator_types=("nvidia-tesla-t4",),
+    operator_selected_accelerator_types=("nvidia-tesla-t4",),
+    provisioning_models=(ProvisioningModel.SPOT,),
+)
+
 _H100_REGIONAL = OverlayMapping(
     group_id=CatalogGroupId.COMPUTE_ACCELERATORS,
     accelerator_id=AcceleratorId("nvidia-h100"),
@@ -2254,6 +2406,7 @@ _LEGACY_TPU_V6E_STANDARD = OverlayMapping(
 MAINTAINED_ACCELERATOR_OVERLAY = SemanticAcceleratorOverlay(
     (
         _B200_A4_REGIONAL,
+        _T4_N1_SPOT_REGIONAL,
         _H100_REGIONAL,
         _COMPUTE_TPU_V6E_STANDARD,
         _LEGACY_TPU_V6E_STANDARD,

@@ -78,6 +78,7 @@ from cqmgr.domain.obtainability import (
     DistributionShape,
     ObtainabilityCandidate,
     ObtainabilityComparison,
+    ObtainabilityProductCoverage,
     SpotMachineConfiguration,
 )
 from cqmgr.domain.projects import CanonicalProject, ProjectReference, ProjectResolution
@@ -802,6 +803,18 @@ def test_all_compatible_empty_expansion_merges_context_diagnostics() -> None:
     )
 
     assert returned.outcome.code.value == "spot-advice-no-compatible-locations"
+    assert isinstance(returned.data, ObtainabilityComparison)
+    assert returned.data.catalog_coverage == (
+        ObtainabilityProductCoverage(
+            product_id="a3-highgpu-8g",
+            service="compute.googleapis.com",
+            cataloged=False,
+            current_advice_supported=False,
+            history_supported=False,
+            reasons=("no-compatible-locations-proven",),
+        ),
+    )
+    assert returned.data.resolver_provenance is empty
     assert tuple(item.code.value for item in returned.diagnostics) == (
         "identity-principal-unverified",
         "no-compatible-locations",

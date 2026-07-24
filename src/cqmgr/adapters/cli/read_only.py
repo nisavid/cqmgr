@@ -358,6 +358,14 @@ def _resolution_lines(data: ResolvedWorkloadRequirement) -> list[str]:
                     if location.deployable_accelerator_quantity is not None
                     else "unavailable"
                 ),
+                "Proven attached accelerator type: "
+                f"{location.attached_accelerator_type or 'unavailable'}",
+                "Proven attached accelerator count: "
+                + (
+                    str(location.attached_accelerator_count)
+                    if location.attached_accelerator_count is not None
+                    else "unavailable"
+                ),
                 "Permits: "
                 + (
                     str(location.permits).lower()
@@ -407,11 +415,21 @@ def _workload_shape_lines(
 ) -> list[str]:
     """Render every caller-owned workload input without derived selector guesses."""
     if isinstance(requirement, ComputeInstanceRequirement):
-        return [
+        lines = [
             f"Machine type: {requirement.machine_type}",
             f"Instance count: {requirement.instance_count}",
             f"Provisioning model: {requirement.provisioning_model.value}",
         ]
+        if requirement.attached_accelerator_type is not None:
+            lines.extend(
+                (
+                    "Attached accelerator type: "
+                    f"{requirement.attached_accelerator_type}",
+                    "Attached accelerator count: "
+                    f"{requirement.attached_accelerator_count}",
+                )
+            )
+        return lines
     return [
         f"Accelerator type: {requirement.accelerator_type}",
         f"Topology: {requirement.topology}",

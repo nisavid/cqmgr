@@ -117,20 +117,34 @@ def parse_read_only_quota_query(  # noqa: PLR0913
     )
 
 
-def parse_compute_instance_requirement(
+def parse_compute_instance_requirement(  # noqa: PLR0913
     *,
     machine_type: str,
     instance_count: str,
     provisioning_model: str,
     locations: tuple[str, ...],
     all_compatible: bool,
+    attached_accelerator_type: str | None = None,
+    attached_accelerator_count: str | None = None,
 ) -> ComputeInstanceRequirement:
     """Decode one Compute workload shape with one explicit location mode."""
+    if (attached_accelerator_type is None) != (attached_accelerator_count is None):
+        msg = "attached accelerator type and count must be supplied together"
+        raise ValueError(msg)
     return ComputeInstanceRequirement(
         machine_type=machine_type,
         instance_count=_parse_positive_integer(instance_count, "instance count"),
         provisioning_model=ProvisioningModel(provisioning_model),
         locations=_parse_locations(locations, all_compatible=all_compatible),
+        attached_accelerator_type=attached_accelerator_type,
+        attached_accelerator_count=(
+            None
+            if attached_accelerator_count is None
+            else _parse_positive_integer(
+                attached_accelerator_count,
+                "attached accelerator count",
+            )
+        ),
     )
 
 

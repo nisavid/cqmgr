@@ -547,10 +547,12 @@ def test_human_resolution_preserves_each_location_and_constraint(
         (ConstraintReference(IDENTITY), ConstraintReference(companion_identity)),
     )
     requirement = ComputeInstanceRequirement(
-        machine_type="a3-highgpu-8g",
+        machine_type="n1-standard-16",
         instance_count=1,
-        provisioning_model=ProvisioningModel.STANDARD,
+        provisioning_model=ProvisioningModel.SPOT,
         locations=CandidateLocations(("us-central1-a",)),
+        attached_accelerator_type="nvidia-tesla-t4",
+        attached_accelerator_count=2,
     )
     location = ResolvedWorkloadLocation(
         location="us-central1-a",
@@ -593,6 +595,8 @@ def test_human_resolution_preserves_each_location_and_constraint(
             ),
         ),
         coverage=(),
+        attached_accelerator_type="nvidia-tesla-t4",
+        attached_accelerator_count=2,
     )
     result = OperationResult(
         operation=OperationName("quota.resolve"),
@@ -617,9 +621,13 @@ def test_human_resolution_preserves_each_location_and_constraint(
     assert captured.err == ""
     assert "Resource scope: projects/123" in captured.out
     assert "Requirement: compute-instance" in captured.out
-    assert "Machine type: a3-highgpu-8g" in captured.out
+    assert "Machine type: n1-standard-16" in captured.out
     assert "Instance count: 1" in captured.out
-    assert "Provisioning model: standard" in captured.out
+    assert "Provisioning model: spot" in captured.out
+    assert "Attached accelerator type: nvidia-tesla-t4" in captured.out
+    assert "Attached accelerator count: 2" in captured.out
+    assert "Proven attached accelerator type: nvidia-tesla-t4" in captured.out
+    assert "Proven attached accelerator count: 2" in captured.out
     assert "Location mode: candidates" in captured.out
     assert "Location: us-central1-a" in captured.out
     assert "Disposition: compatible" in captured.out

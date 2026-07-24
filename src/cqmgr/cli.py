@@ -619,6 +619,8 @@ def _location_options[CommandT: Callable[..., Any]](
 )
 @click.option("--instance-count", required=True)
 @click.option("--machine-type", required=True)
+@click.option("--attached-accelerator-count")
+@click.option("--attached-accelerator-type")
 @_scope_options
 @_OUTPUT_OPTION
 def resolve_compute_instance(  # noqa: PLR0913
@@ -627,6 +629,8 @@ def resolve_compute_instance(  # noqa: PLR0913
     profile: str | None,
     machine_type: str,
     instance_count: str,
+    attached_accelerator_type: str | None,
+    attached_accelerator_count: str | None,
     provisioning_model: str,
     candidate: tuple[str, ...],
     all_compatible_locations: bool,
@@ -644,6 +648,8 @@ def resolve_compute_instance(  # noqa: PLR0913
             provisioning_model=provisioning_model,
             locations=candidate,
             all_compatible=all_compatible_locations,
+            attached_accelerator_type=attached_accelerator_type,
+            attached_accelerator_count=attached_accelerator_count,
         )
     except (TypeError, ValueError) as error:
         reason = str(error)
@@ -802,6 +808,12 @@ def obtainability_compare(  # noqa: PLR0913
             provisioning_model="spot",
             locations=(),
             all_compatible=True,
+            attached_accelerator_type=(
+                None if machine.gpu is None else machine.gpu.accelerator_type
+            ),
+            attached_accelerator_count=(
+                None if machine.gpu is None else str(machine.gpu.count)
+            ),
         )
         _run_read_only(
             lambda: operations.compare_obtainability_all_compatible(

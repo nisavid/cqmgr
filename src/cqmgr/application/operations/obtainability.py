@@ -157,7 +157,73 @@ def prepare_obtainability_comparison(
     )
 
 
-def eligibility_from_resolved_workload(  # noqa: C901, PLR0912
+def product_coverage_from_resolved_workload(
+    resolved: ResolvedWorkloadRequirement,
+    machine: SpotMachineConfiguration,
+) -> tuple[ObtainabilityProductCoverage, ...]:
+    """Derive fixed-shape product coverage even when expansion yields no candidates."""
+    requirement = resolved.requirement
+    if not isinstance(requirement, ComputeInstanceRequirement):
+        msg = "obtainability coverage requires a compute-instance resolution"
+        raise TypeError(msg)
+    if requirement.machine_type != machine.machine_type:
+        msg = "resolver and obtainability request shapes must match"
+        raise ValueError(msg)
+    compatible_locations = tuple(
+        location
+        for location in resolved.locations
+        if location.disposition is WorkloadLocationDisposition.COMPATIBLE
+    )
+    compute_product_ownership = bool(compatible_locations) and any(
+        location.management_plane is ManagementPlane.COMPUTE
+        and location.owning_service == "compute.googleapis.com"
+        and WorkloadConsumer.COMPUTE_ENGINE in location.supported_consumers
+        for location in compatible_locations
+    )
+    attachment_request_matches = _attachment_request_matches(machine, requirement)
+    attachments_cataloged = attachment_request_matches and (
+        machine.gpu is None
+        or (
+            bool(compatible_locations)
+            and all(
+                location.proves_requested_compute_attachment(requirement)
+                for location in compatible_locations
+            )
+        )
+    )
+    product_cataloged = (
+        requirement.provisioning_model is ProvisioningModel.SPOT
+        and not machine.local_ssd_count
+        and compute_product_ownership
+        and attachments_cataloged
+    )
+    machine_support = _machine_advice_support(machine)
+    current_supported = product_cataloged and machine_support.current_advice_supported
+    history_supported = product_cataloged and machine_support.history_supported
+    coverage_reasons: tuple[str, ...]
+    if not compatible_locations:
+        coverage_reasons = ("no-compatible-locations-proven",)
+    elif not product_cataloged:
+        coverage_reasons = ("configuration-not-cataloged-for-spot-compute",)
+    elif machine.is_n1_attached_gpu:
+        coverage_reasons = ("history-unsupported-n1-attached-gpu",)
+    elif not current_supported:
+        coverage_reasons = ("current-advice-unsupported-for-machine-configuration",)
+    else:
+        coverage_reasons = ()
+    return (
+        ObtainabilityProductCoverage(
+            _product_id(machine),
+            "compute.googleapis.com",
+            product_cataloged,
+            current_supported,
+            history_supported,
+            coverage_reasons,
+        ),
+    )
+
+
+def eligibility_from_resolved_workload(
     resolved: ResolvedWorkloadRequirement,
     candidates: tuple[ObtainabilityCandidate, ...],
 ) -> ObtainabilityEligibility:
@@ -186,37 +252,35 @@ def eligibility_from_resolved_workload(  # noqa: C901, PLR0912
         raise ValueError(msg)
 
     machine_support = _machine_advice_support(first.machine)
+    catalog_coverage = product_coverage_from_resolved_workload(
+        resolved,
+        first.machine,
+    )
     resolved_by_location = {
         location.location: location for location in resolved.locations
     }
-    compatible_locations = tuple(
-        location
-        for location in resolved.locations
-        if location.disposition is WorkloadLocationDisposition.COMPATIBLE
-    )
-    compute_product_ownership = not compatible_locations or any(
-        location.management_plane is ManagementPlane.COMPUTE
-        and location.owning_service == "compute.googleapis.com"
-        and WorkloadConsumer.COMPUTE_ENGINE in location.supported_consumers
-        for location in compatible_locations
-    )
-    product_cataloged = (
-        requirement.provisioning_model is ProvisioningModel.SPOT
-        and first.machine.gpu is None
-        and not first.machine.local_ssd_count
-        and compute_product_ownership
-    )
     candidate_eligibility: list[ObtainabilityCandidateEligibility] = []
     for candidate in candidates:
         reasons: list[UnrankedReason] = []
         if requirement.provisioning_model is not ProvisioningModel.SPOT:
             reasons.append(UnrankedReason.SPOT_UNSUPPORTED)
-        if candidate.machine.gpu is not None or candidate.machine.local_ssd_count:
-            reasons.append(UnrankedReason.CATALOG_UNSUPPORTED)
         required_locations = candidate.zones or (candidate.endpoint_region,)
         locations = tuple(
             resolved_by_location.get(location) for location in required_locations
         )
+        if (
+            not _attachment_request_matches(candidate.machine, requirement)
+            or candidate.machine.local_ssd_count
+            or (
+                candidate.machine.gpu is not None
+                and any(
+                    location is None
+                    or not location.proves_requested_compute_attachment(requirement)
+                    for location in locations
+                )
+            )
+        ):
+            reasons.append(UnrankedReason.CATALOG_UNSUPPORTED)
         if any(
             location is None
             or location.disposition is not WorkloadLocationDisposition.COMPATIBLE
@@ -241,30 +305,26 @@ def eligibility_from_resolved_workload(  # noqa: C901, PLR0912
             )
         )
 
-    current_supported = product_cataloged and machine_support.current_advice_supported
-    history_supported = product_cataloged and machine_support.history_supported
-    coverage_reasons: tuple[str, ...]
-    if not product_cataloged:
-        coverage_reasons = ("configuration-not-cataloged-for-spot-compute",)
-    elif first.machine.is_n1_attached_gpu:
-        coverage_reasons = ("history-unsupported-n1-attached-gpu",)
-    elif not current_supported:
-        coverage_reasons = ("current-advice-unsupported-for-machine-configuration",)
-    else:
-        coverage_reasons = ()
     return ObtainabilityEligibility(
         machine_support,
-        (
-            ObtainabilityProductCoverage(
-                _product_id(first.machine),
-                "compute.googleapis.com",
-                product_cataloged,
-                current_supported,
-                history_supported,
-                coverage_reasons,
-            ),
-        ),
+        catalog_coverage,
         tuple(candidate_eligibility),
+    )
+
+
+def _attachment_request_matches(
+    machine: SpotMachineConfiguration,
+    requirement: ComputeInstanceRequirement,
+) -> bool:
+    gpu = machine.gpu
+    return (
+        gpu is None
+        and requirement.attached_accelerator_type is None
+        and requirement.attached_accelerator_count is None
+    ) or (
+        gpu is not None
+        and requirement.attached_accelerator_type == gpu.accelerator_type
+        and requirement.attached_accelerator_count == gpu.count
     )
 
 

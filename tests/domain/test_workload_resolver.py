@@ -13,6 +13,7 @@ from cqmgr.domain.accelerator_overlay import (
     OverlayMapping,
     ProvisioningModel,
     QuotaSelector,
+    ResolutionFailureReason,
     SemanticAcceleratorOverlay,
     SpecializedHardwareCatalog,
     SpecializedHardwareRecord,
@@ -64,6 +65,8 @@ from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 
 DEPLOYABLE_QUANTITY = 16
 CONSTRAINT_COUNT = 2
+N1_INSTANCE_COUNT = 3
+N1_ATTACHED_ACCELERATOR_COUNT = 2
 
 
 def _quota(
@@ -72,6 +75,7 @@ def _quota(
     dimensions: tuple[tuple[str, str], ...],
     scope: QuotaScope,
     effective: int = 64,
+    display_name: str | None = None,
 ) -> EffectiveQuotaEvidence:
     return EffectiveQuotaEvidence(
         identity=EffectiveQuotaSliceIdentity(
@@ -101,7 +105,8 @@ def _quota(
         refresh_interval=None,
         ongoing_rollout=False,
         container_type=ProviderSymbol("PROJECT", QuotaContainerType),
-        quota_display_name=(
+        quota_display_name=display_name
+        or (
             "GPUs (all regions)"
             if scope is QuotaScope.GLOBAL
             else "GPUs per family per region"
@@ -199,6 +204,146 @@ def test_compute_instance_derives_attachment_consumers_and_each_candidate() -> N
         for item in result.locations
         if item.constraint_set is not None
     )
+
+
+def _n1_t4_spot_catalog(
+    *,
+    attachment_count: int = 2,
+    accelerator_state: LocationCoverageState = LocationCoverageState.SUCCESS,
+) -> WorkloadCatalogEvidence:
+    accelerator_diagnostics = (
+        ()
+        if accelerator_state is LocationCoverageState.SUCCESS
+        else (
+            Diagnostic(
+                DiagnosticCode("accelerator-location-read-failed"),
+                Severity.ERROR,
+                DiagnosticPhase("provider-read"),
+                DiagnosticSource("compute"),
+                RetryDisposition.AFTER_REFRESH,
+                RedactedText("The accelerator catalog could not be read."),
+            ),
+        )
+    )
+    return WorkloadCatalogEvidence(
+        compute_machine_types=(
+            ComputeMachineType(
+                "n1-standard-16",
+                "us-central1-a",
+                (AcceleratorAttachment("nvidia-tesla-t4", attachment_count),),
+                None,
+            ),
+        ),
+        tpu_locations=(),
+        tpu_accelerator_types=(),
+        tpu_runtime_versions=(),
+        coverage=(
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+                "us-central1-a",
+                LocationCoverageExpectation.REQUESTED,
+                accelerator_state,
+                accelerator_diagnostics,
+            ),
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+                "us-central1-a",
+                LocationCoverageExpectation.REQUESTED,
+                LocationCoverageState.SUCCESS,
+            ),
+        ),
+        compute_accelerator_types=(
+            ComputeAcceleratorType("nvidia-tesla-t4", "us-central1-a", None),
+        ),
+    )
+
+
+def _n1_t4_spot_quotas() -> tuple[EffectiveQuotaEvidence, ...]:
+    return (
+        _quota(
+            "PREEMPTIBLE_NVIDIA_T4_GPUS",
+            dimensions=(("region", "us-central1"),),
+            scope=QuotaScope.REGIONAL,
+            display_name="Preemptible NVIDIA T4 GPUs",
+        ),
+        _quota("GPUS-ALL-REGIONS-per-project", dimensions=(), scope=QuotaScope.GLOBAL),
+    )
+
+
+def test_n1_spot_requirement_derives_exact_requested_attachment() -> None:
+    """A public resolver input proves one exact N1 attached-GPU request."""
+    requirement = ComputeInstanceRequirement(
+        machine_type="n1-standard-16",
+        instance_count=N1_INSTANCE_COUNT,
+        provisioning_model=ProvisioningModel.SPOT,
+        locations=CandidateLocations(("us-central1-a",)),
+        attached_accelerator_type="nvidia-tesla-t4",
+        attached_accelerator_count=N1_ATTACHED_ACCELERATOR_COUNT,
+    )
+
+    result = MAINTAINED_ACCELERATOR_OVERLAY.resolve(
+        requirement,
+        _n1_t4_spot_quotas(),
+        _n1_t4_spot_catalog(),
+    )
+
+    location = result.locations[0]
+    assert location.disposition is WorkloadLocationDisposition.COMPATIBLE
+    assert location.accelerator_id == AcceleratorId("nvidia-t4")
+    expected_quantity = N1_INSTANCE_COUNT * N1_ATTACHED_ACCELERATOR_COUNT
+    assert location.deployable_accelerator_quantity == expected_quantity
+    assert location.attached_accelerator_type == "nvidia-tesla-t4"
+    assert location.attached_accelerator_count == N1_ATTACHED_ACCELERATOR_COUNT
+    assert all(
+        item.source_quantity == expected_quantity
+        for item in location.constraint_requirements
+    )
+
+
+def test_n1_spot_requirement_fails_closed_on_attachment_mismatch() -> None:
+    """A mismatched requested count cannot inherit N1 T4 quota semantics."""
+    requirement = ComputeInstanceRequirement(
+        machine_type="n1-standard-16",
+        instance_count=N1_INSTANCE_COUNT,
+        provisioning_model=ProvisioningModel.SPOT,
+        locations=CandidateLocations(("us-central1-a",)),
+        attached_accelerator_type="nvidia-tesla-t4",
+        attached_accelerator_count=1,
+    )
+
+    result = MAINTAINED_ACCELERATOR_OVERLAY.resolve(
+        requirement,
+        _n1_t4_spot_quotas(),
+        _n1_t4_spot_catalog(),
+    )
+
+    location = result.locations[0]
+    assert location.disposition is WorkloadLocationDisposition.INCOMPATIBLE
+    assert location.failure_reason is ResolutionFailureReason.UNSUPPORTED_COMPATIBILITY
+
+
+def test_n1_spot_requirement_fails_closed_on_incomplete_attachment_evidence() -> None:
+    """Incomplete accelerator coverage cannot prove an N1 T4 attachment."""
+    requirement = ComputeInstanceRequirement(
+        machine_type="n1-standard-16",
+        instance_count=N1_INSTANCE_COUNT,
+        provisioning_model=ProvisioningModel.SPOT,
+        locations=CandidateLocations(("us-central1-a",)),
+        attached_accelerator_type="nvidia-tesla-t4",
+        attached_accelerator_count=N1_ATTACHED_ACCELERATOR_COUNT,
+    )
+
+    result = MAINTAINED_ACCELERATOR_OVERLAY.resolve(
+        requirement,
+        _n1_t4_spot_quotas(),
+        _n1_t4_spot_catalog(
+            accelerator_state=LocationCoverageState.FAILED,
+        ),
+    )
+
+    location = result.locations[0]
+    assert location.disposition is WorkloadLocationDisposition.INCOMPLETE
+    assert location.failure_reason is ResolutionFailureReason.MISSING_LOCATION_EVIDENCE
 
 
 def test_compute_region_candidate_requires_consistent_child_zone_evidence() -> None:
