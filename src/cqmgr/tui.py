@@ -25,15 +25,27 @@ def build_app(
         build_read_only_operations,
     )
 
+    lifecycle_requests = None
+    lifecycle_shutdown = None
     if lifecycle is None and lifecycle_preparation is None:
         runtime = build_lifecycle_runtime()
         lifecycle = runtime.operations
         lifecycle_preparation = runtime.preparation
+        lifecycle_requests = runtime.requests
+        lifecycle_shutdown = runtime.aclose
+        read_only = runtime.read_only
+        if read_only is None:
+            message = "lifecycle runtime must expose its read-only operation graph"
+            raise RuntimeError(message)
+    else:
+        read_only = build_read_only_operations()
     return CloudQuotaManagerApp(
-        build_read_only_operations(),
+        read_only,
         build_audit_operations(),
         lifecycle=lifecycle,
         lifecycle_preparation=lifecycle_preparation,
+        lifecycle_requests=lifecycle_requests,
+        lifecycle_shutdown=lifecycle_shutdown,
     )
 
 

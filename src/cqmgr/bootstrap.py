@@ -148,6 +148,7 @@ def build_lifecycle_runtime(  # noqa: PLR0915
     environment: Mapping[str, str] | None = None,
 ) -> LifecycleCliRuntime:
     """Compose production lifecycle operations without initializing trust."""
+    import asyncio  # noqa: PLC0415
     import secrets  # noqa: PLC0415
     import time  # noqa: PLC0415
     from typing import Any, cast  # noqa: PLC0415
@@ -181,6 +182,10 @@ def build_lifecycle_runtime(  # noqa: PLR0915
         LocalApplyRecordRepository,
     )
     from cqmgr.adapters.persistence.audit import FilesystemAuditJournal  # noqa: PLC0415
+    from cqmgr.adapters.persistence.configuration import (  # noqa: PLC0415
+        TomlConfigRepository,
+        TomlSelectionStateRepository,
+    )
     from cqmgr.adapters.persistence.coordination import (  # noqa: PLC0415
         DeterministicJitter,
         SharedBudgetCoordinator,
@@ -202,12 +207,14 @@ def build_lifecycle_runtime(  # noqa: PLR0915
         ApplyPlanOperations,
         ComposedApplyRevalidator,
     )
+    from cqmgr.application.operations.contacts import (  # noqa: PLC0415
+        ProtectedContactResolver,
+    )
     from cqmgr.application.operations.lifecycle import (  # noqa: PLC0415
         LifecycleOperations,
     )
     from cqmgr.application.operations.lifecycle_apply import (  # noqa: PLC0415
         CurrentApplyPrincipalRefresher,
-        EphemeralApplyContactRefresher,
         ReadOnlyApplyEvidenceRefresher,
     )
     from cqmgr.application.operations.lifecycle_requests import (  # noqa: PLC0415
@@ -274,7 +281,12 @@ def build_lifecycle_runtime(  # noqa: PLR0915
         ),
         closer=lambda client: client.transport.close(),
     )
-    contacts = EphemeralApplyContactRefresher()
+    contacts = ProtectedContactResolver(
+        TomlConfigRepository(paths.configuration),
+        TomlSelectionStateRepository(paths.selection_state),
+        secret_store,
+        identity,
+    )
     revalidator = ComposedApplyRevalidator(
         principal=CurrentApplyPrincipalRefresher(identity),
         contact=contacts,
@@ -323,6 +335,7 @@ def build_lifecycle_runtime(  # noqa: PLR0915
     preparation = LifecycleRequestOperations(
         ReadOnlyLifecycleCompositionReader(read_only),
         trust,
+        contacts,
         now=clock.now,
     )
     requests = ProtectedLifecycleCliRequestFactory(
@@ -332,7 +345,21 @@ def build_lifecycle_runtime(  # noqa: PLR0915
         contacts=contacts,
         clock=clock,
     )
-    return LifecycleCliRuntime(operations, requests, preparation)
+
+    async def shutdown() -> None:
+        await asyncio.gather(
+            read_only.aclose(),
+            generated.aclose(),
+            return_exceptions=True,
+        )
+
+    return LifecycleCliRuntime(
+        operations,
+        requests,
+        preparation,
+        read_only=read_only,
+        shutdown=shutdown,
+    )
 
 
 def build_trust_initialization_operations(
