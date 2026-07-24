@@ -397,6 +397,7 @@ class ApplyPlanOperations:
                     request,
                     record,
                     audit_record_ids,
+                    plan=plan,
                     reconciliation_identity=child.preference_identity,
                 )
             planned_child = planned_by_id[child.child_id]
@@ -435,6 +436,7 @@ class ApplyPlanOperations:
                         durable_before_intent,
                         write.preference_identity,
                         audit_record_ids,
+                        plan=plan,
                     )
             except BaseException:  # noqa: BLE001
                 return self._pre_dispatch_failure(
@@ -444,12 +446,14 @@ class ApplyPlanOperations:
                     durable_before_intent,
                     write.preference_identity,
                     audit_record_ids,
+                    plan=plan,
                 )
 
             try:
                 provider_result = await self._writer.dispatch(write)
             except BaseException:  # noqa: BLE001
                 return await self._unknown_dispatch(
+                    plan,
                     plan.resource_scope,
                     lease,
                     request,
@@ -478,6 +482,7 @@ class ApplyPlanOperations:
                     request,
                     record,
                     audit_record_ids,
+                    plan=plan,
                 )
             try:
                 audit_record_ids.append(
@@ -503,6 +508,7 @@ class ApplyPlanOperations:
                     request,
                     record,
                     audit_record_ids,
+                    plan=plan,
                 )
             if disposition is ApplyChildDisposition.FAILED:
                 record = record.finalize(request.now)
@@ -513,6 +519,7 @@ class ApplyPlanOperations:
                         request,
                         record,
                         audit_record_ids,
+                        plan=plan,
                     )
                 return self._finish(
                     plan.resource_scope,
@@ -533,6 +540,7 @@ class ApplyPlanOperations:
                 request,
                 record,
                 audit_record_ids,
+                plan=plan,
             )
         return self._finish(
             plan.resource_scope,
@@ -633,6 +641,7 @@ class ApplyPlanOperations:
                     request,
                     record,
                     [],
+                    plan=plan,
                 )
             if record.state is ApplyRecordState.ACCEPTED:
                 return self._finish(
@@ -697,6 +706,7 @@ class ApplyPlanOperations:
                     request,
                     record,
                     audit_record_ids,
+                    plan=plan,
                 )
             return _result_for_record(
                 request,
@@ -726,6 +736,7 @@ class ApplyPlanOperations:
                 request,
                 record,
                 audit_record_ids,
+                plan=plan,
             )
         stopping = next(
             (
@@ -769,6 +780,7 @@ class ApplyPlanOperations:
                     request,
                     record,
                     [],
+                    plan=plan,
                 )
             if stopping is not None:
                 if stopping.disposition is ApplyChildDisposition.FAILED:
@@ -780,6 +792,7 @@ class ApplyPlanOperations:
                             request,
                             record,
                             audit_record_ids,
+                            plan=plan,
                         )
                     provider_outcome = cast("StableSymbol", stopping.provider_outcome)
                     return self._finish(
@@ -816,6 +829,7 @@ class ApplyPlanOperations:
             )
             if unresolved is not None:
                 return await self._unknown_dispatch(
+                    plan,
                     record.resource_scope,
                     cast("PlanLease", resumed.lease),
                     request,
@@ -824,6 +838,7 @@ class ApplyPlanOperations:
                     audit_record_ids,
                 )
             return await self._finish_unknown(
+                plan,
                 record.resource_scope,
                 resumed.lease,
                 request,
@@ -844,6 +859,7 @@ class ApplyPlanOperations:
                         request,
                         record,
                         audit_record_ids,
+                        plan=plan,
                     )
                 return self._invalidate(
                     plan,
@@ -857,6 +873,7 @@ class ApplyPlanOperations:
                 request,
                 record,
                 audit_record_ids,
+                plan=plan,
             )
         accepted_child_ids = frozenset(
             child.child_id
@@ -878,6 +895,7 @@ class ApplyPlanOperations:
                         request,
                         record,
                         audit_record_ids,
+                        plan=plan,
                     )
                 return self._invalidate(
                     plan,
@@ -890,6 +908,7 @@ class ApplyPlanOperations:
                 request,
                 record,
                 audit_record_ids,
+                plan=plan,
             )
         if resumed.status is PlanRepositoryStatus.LEASED:
             consumed = self._repository.mark_dispatched(
@@ -998,6 +1017,7 @@ class ApplyPlanOperations:
                 request,
                 record,
                 audit_record_ids,
+                plan=plan,
             )
         return _result_for_record(
             request,
@@ -1069,6 +1089,7 @@ class ApplyPlanOperations:
 
     async def _unknown_dispatch(  # noqa: PLR0913
         self,
+        plan: QuotaPlan,
         resource_scope: ResourceScope,
         lease: PlanLease,
         request: ApplyRequest,
@@ -1089,8 +1110,10 @@ class ApplyPlanOperations:
                 request,
                 record,
                 audit_record_ids,
+                plan=plan,
             )
         return await self._finish_unknown(
+            plan,
             resource_scope,
             lease,
             request,
@@ -1101,6 +1124,7 @@ class ApplyPlanOperations:
 
     async def _finish_unknown(  # noqa: C901, PLR0911, PLR0913
         self,
+        plan: QuotaPlan,
         resource_scope: ResourceScope,
         lease: PlanLease | None,
         request: ApplyRequest,
@@ -1120,6 +1144,7 @@ class ApplyPlanOperations:
                     request,
                     record,
                     audit_record_ids,
+                    plan=plan,
                 )
         unknown_child = next(
             child for child in record.children if child.child_id == write.child_id
@@ -1152,6 +1177,7 @@ class ApplyPlanOperations:
                 request,
                 record,
                 audit_record_ids,
+                plan=plan,
             )
         if not already_quarantined and (
             lease is None
@@ -1167,6 +1193,7 @@ class ApplyPlanOperations:
                 request,
                 record,
                 audit_record_ids,
+                plan=plan,
             )
         loaded_resolutions = self._apply_records.load_unknown_resolutions(
             record.intent_id,
@@ -1179,6 +1206,7 @@ class ApplyPlanOperations:
                 request,
                 record,
                 audit_record_ids,
+                plan=plan,
             )
         retained = next(
             (
@@ -1224,6 +1252,7 @@ class ApplyPlanOperations:
                         request,
                         record,
                         audit_record_ids,
+                        plan=plan,
                     )
             record = record.resolve_unknown(
                 write.child_id,
@@ -1258,11 +1287,13 @@ class ApplyPlanOperations:
                     request,
                     record,
                     audit_record_ids,
+                    plan=plan,
                 )
         return _result_for_record(
             request,
             resource_scope,
             record,
+            plan=plan,
             reached=False,
             outcome="unknown-dispatch",
             exit_class=ExitClass.OPERATIONAL_FAILURE,
@@ -1278,6 +1309,8 @@ class ApplyPlanOperations:
         record: ApplyRecord,
         reconciliation_identity: str,
         audit_record_ids: list[str],
+        *,
+        plan: QuotaPlan,
     ) -> OperationResult[ApplyData]:
         terminal = record.stop_remaining_unattempted(request.now)
         if not self._save(terminal, request):
@@ -1287,6 +1320,7 @@ class ApplyPlanOperations:
                 request,
                 record,
                 audit_record_ids,
+                plan=plan,
                 reconciliation_identity=reconciliation_identity,
             )
         if not self._quarantine(
@@ -1300,6 +1334,7 @@ class ApplyPlanOperations:
                 request,
                 terminal,
                 audit_record_ids,
+                plan=plan,
                 reconciliation_identity=reconciliation_identity,
             )
         try:
@@ -1322,12 +1357,14 @@ class ApplyPlanOperations:
                 request,
                 terminal,
                 audit_record_ids,
+                plan=plan,
                 reconciliation_identity=reconciliation_identity,
             )
         return _result_for_record(
             request,
             resource_scope,
             terminal,
+            plan=plan,
             reached=False,
             outcome="dispatch-intent-persistence-failed",
             exit_class=ExitClass.OPERATIONAL_FAILURE,
@@ -1342,6 +1379,7 @@ class ApplyPlanOperations:
         record: ApplyRecord,
         audit_record_ids: list[str],
         *,
+        plan: QuotaPlan | None = None,
         reconciliation_identity: str | None = None,
     ) -> OperationResult[ApplyData]:
         quarantine_identity = reconciliation_identity or next(
@@ -1369,6 +1407,7 @@ class ApplyPlanOperations:
             request,
             resource_scope,
             critical_record,
+            plan=plan,
             reached=False,
             outcome=(
                 "critical-unknown" if quarantined else "critical-unknown-uncontained"
@@ -1505,6 +1544,7 @@ class ApplyPlanOperations:
                 request,
                 record,
                 audit_record_ids,
+                plan=plan,
             )
         completed = self._repository.complete(
             lease,
@@ -1518,6 +1558,7 @@ class ApplyPlanOperations:
                 request,
                 record,
                 audit_record_ids,
+                plan=plan,
             )
         return _result_for_record(
             request,

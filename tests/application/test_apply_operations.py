@@ -977,6 +977,123 @@ def test_apply_result_preserves_submitted_time_and_plan_safety_context() -> None
     assert child.unresolved_acknowledgements == ()
 
 
+def test_partial_unknown_apply_preserves_every_child_plan_safety_fact() -> None:
+    """Accepted and unknown children retain safety facts after Apply stops."""
+    base = _plan()
+    direct = replace(
+        base.children[0],
+        warnings=(StableSymbol("expert-review-required"),),
+        required_acknowledgements=(StableSymbol("decrease-below-usage"),),
+        acknowledgements=(StableSymbol("decrease-below-usage"),),
+    )
+    companion = replace(
+        base.children[1],
+        warnings=(StableSymbol("remaining-companion-bottleneck"),),
+        required_acknowledgements=(StableSymbol("decrease-over-ten-percent"),),
+        acknowledgements=(StableSymbol("decrease-over-ten-percent"),),
+    )
+    plan = replace(base, children=(direct, companion))
+    writer = _ScriptedWriter(
+        QuotaPreferenceWriteResult(
+            accepted=True,
+            outcome=StableSymbol("submitted"),
+        ),
+        TimeoutError("transport lost"),
+    )
+
+    result, _, _, _ = _apply(plan, writer)
+
+    assert result.outcome.code == StableSymbol("unknown-dispatch")
+    assert tuple(child.disposition for child in result.data.children) == (
+        ApplyChildDisposition.ACCEPTED,
+        ApplyChildDisposition.UNKNOWN,
+    )
+    assert tuple(child.warnings for child in result.data.children) == (
+        direct.warnings,
+        companion.warnings,
+    )
+    assert tuple(
+        child.required_acknowledgements for child in result.data.children
+    ) == (
+        direct.required_acknowledgements,
+        companion.required_acknowledgements,
+    )
+    assert tuple(child.acknowledgements for child in result.data.children) == (
+        direct.acknowledgements,
+        companion.acknowledgements,
+    )
+    assert all(
+        child.unresolved_acknowledgements == () for child in result.data.children
+    )
+
+
+def test_critical_unknown_apply_preserves_authenticated_plan_safety_facts() -> None:
+    """Critical containment does not erase authenticated Plan context."""
+    plan = replace(
+        _single_plan(),
+        warnings=(StableSymbol("expert-review-required"),),
+        required_acknowledgements=(StableSymbol("decrease-below-usage"),),
+        acknowledgements=(StableSymbol("decrease-below-usage"),),
+    )
+    records = _MemoryApplyRecords()
+    records.fail_load_resolutions = True
+
+    result, _, _, _ = _apply(
+        plan,
+        _ScriptedWriter(TimeoutError("transport lost")),
+        records=records,
+    )
+
+    assert result.outcome.code == StableSymbol("critical-unknown")
+    child = result.data.children[0]
+    assert child.warnings == plan.warnings
+    assert child.required_acknowledgements == plan.required_acknowledgements
+    assert child.acknowledgements == plan.acknowledgements
+    assert child.unresolved_acknowledgements == ()
+
+
+def test_pre_dispatch_failure_preserves_authenticated_plan_safety_facts() -> None:
+    """A zero-write terminal result retains the reviewed Plan safety context."""
+
+    class FailFirstRevisionOne(_MemoryApplyRecords):
+        failed = False
+
+        @override
+        def save(
+            self,
+            record: ApplyRecord,
+            _key: SecretValue,
+        ) -> ApplyRecordRepositoryOutcome:
+            if record.revision == 1 and not self.failed:
+                self.failed = True
+                return ApplyRecordRepositoryOutcome(
+                    ApplyRecordRepositoryStatus.FAILED
+                )
+            return super().save(record, _key)
+
+    base = _plan()
+    direct = replace(
+        base.children[0],
+        warnings=(StableSymbol("expert-review-required"),),
+        required_acknowledgements=(StableSymbol("decrease-below-usage"),),
+        acknowledgements=(StableSymbol("decrease-below-usage"),),
+    )
+    plan = replace(base, children=(direct, base.children[1]))
+
+    result, _, _, _ = _apply(
+        plan,
+        _ScriptedWriter(),
+        records=FailFirstRevisionOne(),
+    )
+
+    assert result.outcome.code == StableSymbol("dispatch-intent-persistence-failed")
+    child = result.data.children[0]
+    assert child.warnings == direct.warnings
+    assert child.required_acknowledgements == direct.required_acknowledgements
+    assert child.acknowledgements == direct.acknowledgements
+    assert child.unresolved_acknowledgements == ()
+
+
 def test_apply_result_retains_subject_no_ops_and_provider_lineage() -> None:
     """Apply presentation data preserves the complete reviewed composition."""
     no_op = _child(
