@@ -33,6 +33,10 @@ from cqmgr.domain.status import WatchCondition
 if TYPE_CHECKING:
     from cqmgr.application.operations.apply import ApplyRequest
     from cqmgr.application.operations.lifecycle import LifecycleOperations
+    from cqmgr.application.operations.lifecycle_requests import (
+        LifecycleCompositionIntent,
+        LifecycleRequestOperations,
+    )
     from cqmgr.application.operations.plans import (
         ComposeRequest,
         PlanReviewRequest,
@@ -212,6 +216,24 @@ class RequestCompositionInput:
             msg = "lifecycle plan output must use Path or None"
             raise TypeError(msg)
 
+    def to_intent(self) -> LifecycleCompositionIntent:
+        """Translate the validated public adapter shape to the shared async input."""
+        from cqmgr.application.operations.lifecycle_requests import (  # noqa: PLC0415
+            LifecycleCompositionIntent,
+        )
+
+        return LifecycleCompositionIntent(
+            scope_input=self.scope_input,
+            selector=self.selector,
+            workload=self.workload,
+            target_strategy=self.target_strategy,
+            targets=self.targets,
+            acknowledgements=self.acknowledgements,
+            expert=self.expert,
+            quota_contact=self.quota_contact,
+            plan_out=self.plan_out,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class PlanReferenceInput:
@@ -310,6 +332,7 @@ class LifecycleCliRuntime:
 
     operations: LifecycleOperations
     requests: LifecycleCliRequestFactory
+    preparation: LifecycleRequestOperations | None = None
 
 
 def read_quota_contact(stream: BinaryIO) -> SecretValue:

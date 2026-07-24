@@ -126,6 +126,28 @@ def _workload_input() -> RequestCompositionInput:
     )
 
 
+def test_request_composition_input_translates_without_losing_expert_intent() -> None:
+    """The async application intent preserves every validated adapter-owned field."""
+    value = replace(
+        _exact_input(),
+        acknowledgements=("decrease-over-ten-percent",),
+        expert=True,
+        quota_contact=SecretValue(b"operator@example.com"),
+        plan_out=Path("request.plan"),
+    )
+
+    intent = value.to_intent()
+
+    assert intent.scope_input is value.scope_input
+    assert intent.selector is value.selector
+    assert intent.target_strategy is TargetStrategy.MANUAL
+    assert intent.targets == ((None, "8"),)
+    assert intent.acknowledgements == ("decrease-over-ten-percent",)
+    assert intent.expert is True
+    assert intent.quota_contact is value.quota_contact
+    assert intent.plan_out == Path("request.plan")
+
+
 def test_exact_preview_copy_cli_retains_safe_inputs_and_contact_stdin() -> None:
     """A copied Preview is canonical and never places the contact value in argv."""
     command = request_exact_copy_cli(
