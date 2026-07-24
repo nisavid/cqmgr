@@ -330,7 +330,7 @@ class _RequestFactory:
             now=NOW + timedelta(minutes=1),
         )
 
-    def apply(
+    async def apply(
         self,
         value: PlanReferenceInput,
         acknowledgement: str,
@@ -542,7 +542,7 @@ async def _textual_review_apply_watch(
     """Drive Review, Apply, and initial Watch through one Textual session."""
     app = _RecordingApp(harness.facade)
     review_request = harness.factory.review(PlanReferenceInput(digest, None))
-    apply_request = harness.factory.apply(
+    apply_request = await harness.factory.apply(
         PlanReferenceInput(digest, None),
         SCOPE.canonical_name,
     )

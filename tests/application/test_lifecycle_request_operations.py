@@ -10,6 +10,11 @@ from typing import Any
 
 import pytest
 
+from cqmgr.application.operations.contacts import (
+    ContactResolutionError,
+    ResolvedContact,
+    bind_protected_contact,
+)
 from cqmgr.application.operations.lifecycle_requests import (
     LifecycleCompositionEvidence,
     LifecycleCompositionIntent,
@@ -83,6 +88,26 @@ class _Trust:
             "installation-test",
             KEY,
             keyring_mutation_capable=True,
+        )
+
+
+class _Contacts:
+    async def resolve_preview(
+        self,
+        *,
+        explicit_value: SecretValue | None,
+        explicit_profile: str | None,
+        principal: PlanPrincipal,
+        trust: LoadedInstallationTrust,
+    ) -> ResolvedContact:
+        assert explicit_profile is None
+        assert principal == PlanPrincipal("principal://accounts/123")
+        if explicit_value is None:
+            message = "verified direct-user quota contact is unavailable"
+            raise ContactResolutionError(message)
+        return ResolvedContact(
+            bind_protected_contact(explicit_value, trust.authentication_key),
+            explicit_value,
         )
 
 
@@ -244,6 +269,7 @@ def test_prepare_preserves_expert_and_builds_protected_preview() -> None:
     operations = LifecycleRequestOperations(
         reader,
         trust,
+        _Contacts(),
         now=lambda: NOW,
     )
     intent = LifecycleCompositionIntent(
@@ -295,6 +321,7 @@ def test_preview_requires_active_trust_before_provider_reads() -> None:
     operations = LifecycleRequestOperations(
         reader,
         _MissingTrust(),
+        _Contacts(),
         now=lambda: NOW,
     )
     intent = LifecycleCompositionIntent(
@@ -411,7 +438,12 @@ def test_prepare_compose_only_and_missing_contact_never_invent_preview() -> None
     """Compose is trust-independent and Preview never invents contact input."""
     trust = _Trust()
     reader = _Reader(_child())
-    operations = LifecycleRequestOperations(reader, trust, now=lambda: NOW)
+    operations = LifecycleRequestOperations(
+        reader,
+        trust,
+        _Contacts(),
+        now=lambda: NOW,
+    )
     intent = LifecycleCompositionIntent(
         scope_input=ReadOnlyScopeInput(explicit_resource_scope=SCOPE),
         selector=QuotaInspectSelector(
@@ -427,12 +459,10 @@ def test_prepare_compose_only_and_missing_contact_never_invent_preview() -> None
     compose_only = asyncio.run(
         operations.prepare(intent, deadline=DEADLINE, require_preview=False)
     )
-    missing_contact = asyncio.run(
-        operations.prepare(intent, deadline=DEADLINE, require_preview=True)
-    )
+    with pytest.raises(ContactResolutionError, match="direct-user"):
+        asyncio.run(operations.prepare(intent, deadline=DEADLINE, require_preview=True))
 
     assert compose_only.preview is None
-    assert missing_contact.preview is None
     assert trust.loads == 1
 
 

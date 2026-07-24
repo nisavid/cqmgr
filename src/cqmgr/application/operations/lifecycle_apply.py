@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from cqmgr.application.operations.contacts import bind_protected_contact
 from cqmgr.application.operations.lifecycle_requests import (
     LifecyclePreparationError,
-    bind_protected_contact,
     quota_state_evidence_binding,
 )
 from cqmgr.application.ports.apply import (
