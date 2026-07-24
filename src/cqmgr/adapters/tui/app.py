@@ -465,6 +465,8 @@ class CloudQuotaManagerApp(App[None]):
         self.set_class(self._detail_route and mode == "narrow", "detail-route")
 
     def _start_quota_load(self, query: ReadOnlyQuotaQuery) -> None:
+        if self.active_workspace != "quotas":
+            return
         generation = self._claim_provider_view()
         self._cancellation = CancellationToken()
         self._provider_worker = self.run_worker(
@@ -483,13 +485,18 @@ class CloudQuotaManagerApp(App[None]):
     def _owns_provider_view(self, generation: int) -> bool:
         return generation == self._provider_generation
 
+    def _owns_quota_view(self, generation: int) -> bool:
+        return self.active_workspace == "quotas" and self._owns_provider_view(
+            generation
+        )
+
     async def _load_quotas(
         self,
         query: ReadOnlyQuotaQuery,
         cancellation: CancellationToken,
         generation: int,
     ) -> None:
-        if cancellation.cancelled or not self._owns_provider_view(generation):
+        if cancellation.cancelled or not self._owns_quota_view(generation):
             return
         self._set_status("READING — querying required provider inventory")
         try:
@@ -500,17 +507,17 @@ class CloudQuotaManagerApp(App[None]):
                 scope_input=self.scope_input,
             )
         except asyncio.CancelledError:
-            if self._owns_provider_view(generation):
+            if self._owns_quota_view(generation):
                 self._set_status("CANCELLED — prior provider read superseded")
             raise
         except Exception:  # noqa: BLE001 - no typed result exists for worker failure
-            if self._owns_provider_view(generation):
+            if self._owns_quota_view(generation):
                 self._set_status(
                     "ERROR — quota inventory unavailable; retry the read-only operation"
                 )
             return
-        if cancellation.cancelled or not self._owns_provider_view(generation):
-            if self._owns_provider_view(generation):
+        if cancellation.cancelled or not self._owns_quota_view(generation):
+            if self._owns_quota_view(generation):
                 self._set_status("CANCELLED — prior provider read superseded")
             return
         self.last_result = result
@@ -825,7 +832,7 @@ class CloudQuotaManagerApp(App[None]):
         button_id = event.button.id
         if button_id and button_id.startswith("workspace-"):
             self._set_active_workspace(button_id.removeprefix("workspace-"))
-        elif button_id == "apply-filters":
+        elif button_id == "apply-filters" and self.active_workspace == "quotas":
             self._apply_filters()
         elif button_id == "detail-back":
             self.action_return_to_ledger()
@@ -833,9 +840,9 @@ class CloudQuotaManagerApp(App[None]):
             self._open_workload_route("compute-instance")
         elif button_id == "resolve-tpu":
             self._open_workload_route("cloud-tpu-slice")
-        elif button_id == "workload-submit":
+        elif button_id == "workload-submit" and self.active_workspace == "quotas":
             self._submit_workload()
-        elif button_id == "audit-verify":
+        elif button_id == "audit-verify" and self.active_workspace == "audit":
             operation_generation = self._claim_audit_operation()
             self.run_worker(
                 self._verify_audit(
@@ -850,6 +857,8 @@ class CloudQuotaManagerApp(App[None]):
             self.copy_to_clipboard(self.last_copied_cli)
 
     def _apply_filters(self) -> None:
+        if self.active_workspace != "quotas":
+            return
         text = self.query_one("#filter-text", Input).value.strip() or None
         service_value = self.query_one("#filter-service", Input).value.strip()
         try:
@@ -891,6 +900,8 @@ class CloudQuotaManagerApp(App[None]):
 
     def _submit_workload(self) -> None:
         """Decode form primitives through the same public parser as Click."""
+        if self.active_workspace != "quotas":
+            return
         kind = self._workload_kind
         if kind is None:
             self._set_status("INVALID WORKLOAD — select a workload route")
@@ -960,11 +971,11 @@ class CloudQuotaManagerApp(App[None]):
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Inspect quota rows or local audit rows using their typed identities."""
-        if event.data_table.id == "quota-ledger":
+        if event.data_table.id == "quota-ledger" and self.active_workspace == "quotas":
             item = self._quota_items.get(str(event.row_key.value))
             if item is not None:
                 self._select_quota(item)
-        elif event.data_table.id == "audit-table":
+        elif event.data_table.id == "audit-table" and self.active_workspace == "audit":
             operation_generation = self._claim_audit_operation()
             self.run_worker(
                 self._inspect_audit(
@@ -978,6 +989,8 @@ class CloudQuotaManagerApp(App[None]):
             )
 
     def _select_quota(self, item: QuotaQueryItem) -> None:
+        if self.active_workspace != "quotas":
+            return
         selector = QuotaInspectSelector(
             item.identity.service,
             item.identity.quota_id,
@@ -1001,14 +1014,14 @@ class CloudQuotaManagerApp(App[None]):
         selector: QuotaInspectSelector,
         generation: int,
     ) -> None:
-        if not self._owns_provider_view(generation):
+        if not self._owns_quota_view(generation):
             return
         result = await self.read_only.inspect(
             selector,
             deadline=self._deadline(),
             scope_input=self.scope_input,
         )
-        if not self._owns_provider_view(generation):
+        if not self._owns_quota_view(generation):
             return
         self.last_result = result
         self._render_instrument(result)
@@ -1151,9 +1164,7 @@ class CloudQuotaManagerApp(App[None]):
             deadline=self._deadline(),
             scope_input=self.scope_input,
         )
-        if not (
-            self._owns_provider_view(generation) and self.active_workspace == "quotas"
-        ):
+        if not self._owns_quota_view(generation):
             return result
         self.last_result = result
         self._render_instrument(result)

@@ -920,6 +920,83 @@ def test_deferred_workload_worker_cannot_reclaim_ownership_after_leaving_quotas(
     asyncio.run(scenario())
 
 
+def test_delayed_quota_selection_does_not_dispatch_after_workspace_departure() -> None:
+    """A queued quota-row message is ignored outside the Quotas workspace."""
+
+    async def run_case(workspace: str) -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            table = _table(app, "#quota-ledger")
+            event = DataTable.RowSelected(table, 0, next(iter(table.rows)))
+
+            await pilot.click(f"#workspace-{workspace}")
+            await pilot.pause()
+            workspace_result = app.last_result
+
+            app.on_data_table_row_selected(event)
+            await pilot.pause()
+
+            assert app.active_workspace == workspace
+            assert operations.inspect_calls == []
+            assert app.last_result is workspace_result
+
+    async def scenario() -> None:
+        await run_case("audit")
+        await run_case("obtainability")
+
+    asyncio.run(scenario())
+
+
+def test_delayed_quota_buttons_do_not_dispatch_after_workspace_departure() -> None:
+    """Queued filter and workload actions are ignored outside Quotas."""
+
+    async def filter_case() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            _input(app, "#filter-text").value = "GPU"
+            event = Button.Pressed(_button(app, "#apply-filters"))
+            await pilot.click("#workspace-obtainability")
+            await pilot.pause()
+
+            app.on_button_pressed(event)
+            await pilot.pause()
+
+            assert len(operations.browse_calls) == 1
+            assert app.current_query == ReadOnlyQuotaQuery()
+
+    async def workload_case() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-compute")
+            _input(app, "#workload-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#workload-count").value = "1"
+            _input(app, "#workload-provisioning").value = "spot"
+            _input(app, "#workload-locations").value = "us-central1-a"
+            event = Button.Pressed(_button(app, "#workload-submit"))
+            await pilot.click("#workspace-obtainability")
+            await pilot.pause()
+
+            app.on_button_pressed(event)
+            await pilot.pause()
+
+            assert operations.resolve_calls == []
+
+    async def scenario() -> None:
+        await filter_case()
+        await workload_case()
+
+    asyncio.run(scenario())
+
+
 def test_narrow_inspection_preserves_selection_return_focus_and_status_axes() -> None:
     """One-pane detail keeps exact context and Escape restores the quota ledger."""
 
