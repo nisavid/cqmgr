@@ -492,13 +492,15 @@ class ProtectedLifecycleCliRequestFactory:
                 trust.authentication_key,
                 self._clock.now(),
             )
+            expected_status = PlanRepositoryStatus.AVAILABLE
         else:
             if value.path is None:  # pragma: no cover - validated input
                 message = "Apply requires one Plan reference"
                 raise RuntimeError(message)
             loaded = self._repository.read_export(value.path)
+            expected_status = PlanRepositoryStatus.EXPORTED
         if (
-            loaded.status is not PlanRepositoryStatus.AVAILABLE
+            loaded.status is not expected_status
             or loaded.plan_bytes is None
         ):
             message = "Apply Plan is unavailable"

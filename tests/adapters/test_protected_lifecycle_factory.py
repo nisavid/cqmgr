@@ -14,6 +14,8 @@ from cqmgr.adapters.cli.lifecycle import (
     ProtectedLifecycleCliRequestFactory,
     WatchCliInput,
 )
+from cqmgr.adapters.persistence.plans import LocalPlanRepository
+from cqmgr.adapters.serialization.plans import PlanCodec
 from cqmgr.application.operations.lifecycle_apply import (
     ApplyRefreshError,
     EphemeralApplyContactRefresher,
@@ -25,8 +27,20 @@ from cqmgr.application.ports.plans import (
     PlanRepositoryOutcome,
     PlanRepositoryStatus,
 )
-from cqmgr.application.ports.secrets import SecretValue
-from cqmgr.domain.plans import PlanPrincipal
+from cqmgr.application.ports.secrets import (
+    SecretStoreOutcome,
+    SecretStoreReference,
+    SecretStoreStatus,
+    SecretValue,
+)
+from cqmgr.domain.plans import PLAN_LIFETIME, PlanPrincipal, QuotaRequestPlan
+from cqmgr.domain.quotas import (
+    EffectiveQuotaSliceIdentity,
+    NormalizedDimensions,
+    QuotaQuantity,
+    QuotaScope,
+    QuotaUnit,
+)
 from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 from cqmgr.domain.status import WatchCondition
 
@@ -74,12 +88,27 @@ class _Codec:
 
 class _Repository:
     def __init__(self) -> None:
+        self.loaded: list[str] = []
         self.stored: list[EncodedPlan] = []
+
+    def load(
+        self,
+        digest: str,
+        authentication_key: SecretValue,
+        now: datetime,
+    ) -> PlanRepositoryOutcome:
+        assert authentication_key is KEY
+        assert now == NOW
+        self.loaded.append(digest)
+        return PlanRepositoryOutcome(
+            PlanRepositoryStatus.AVAILABLE,
+            plan_bytes=b"portable-plan",
+        )
 
     def read_export(self, path: Path) -> PlanRepositoryOutcome:
         assert path == Path("request.plan")
         return PlanRepositoryOutcome(
-            PlanRepositoryStatus.AVAILABLE,
+            PlanRepositoryStatus.EXPORTED,
             plan_bytes=b"portable-plan",
         )
 
@@ -91,6 +120,23 @@ class _Repository:
         assert authentication_key is KEY
         self.stored.append(encoded)
         return PlanRepositoryOutcome(PlanRepositoryStatus.STORED)
+
+
+class _MissingConsumptionMarkers:
+    def get_consumption_marker(
+        self,
+        reference: SecretStoreReference,
+    ) -> SecretStoreOutcome:
+        del reference
+        return SecretStoreOutcome(SecretStoreStatus.MISSING)
+
+    def create_consumption_marker(
+        self,
+        reference: SecretStoreReference,
+        secret: SecretValue,
+    ) -> SecretStoreOutcome:
+        del reference, secret
+        return SecretStoreOutcome(SecretStoreStatus.CREATED)
 
 
 def _factory() -> tuple[ProtectedLifecycleCliRequestFactory, _Repository]:
@@ -111,6 +157,37 @@ def _factory() -> tuple[ProtectedLifecycleCliRequestFactory, _Repository]:
     return factory, repository
 
 
+def _real_encoded_plan() -> EncodedPlan:
+    scope = ResourceScope(ResourceScopeKind.PROJECT, "projects/123")
+    unit = QuotaUnit("1")
+    plan = QuotaRequestPlan(
+        resource_scope=scope,
+        slice_identity=EffectiveQuotaSliceIdentity(
+            resource_scope=scope,
+            service="compute.googleapis.com",
+            quota_id="GPUS-PER-PROJECT",
+            dimensions=NormalizedDimensions(),
+            quota_scope=QuotaScope.GLOBAL,
+        ),
+        target=QuotaQuantity(8, unit),
+        effective=QuotaQuantity(4, unit),
+        effective_observed_at=NOW,
+        preference_name=None,
+        preference_etag=None,
+        principal=PlanPrincipal("principal://accounts/123"),
+        contact_binding=bind_protected_contact(CONTACT, KEY),
+        warnings=(),
+        required_acknowledgements=(),
+        acknowledgements=(),
+        constraints=(),
+        evidence=(),
+        installation_id="installation-test",
+        issued_at=NOW,
+        expires_at=NOW + PLAN_LIFETIME,
+    )
+    return PlanCodec.encode(plan, KEY.reveal())
+
+
 def test_apply_imports_authenticated_plan_and_rebinds_contact() -> None:
     """Portable Apply becomes local only after trust and contact both match."""
     factory, repository = _factory()
@@ -129,6 +206,50 @@ def test_apply_imports_authenticated_plan_and_rebinds_contact() -> None:
     )
     assert request.contact_value == "operator@example.com"
     assert repository.stored == [EncodedPlan(b"portable-plan", DIGEST)]
+
+
+def test_apply_loads_available_local_plan_by_digest() -> None:
+    """Digest Apply requires the local repository's available status."""
+    factory, repository = _factory()
+
+    request = factory.apply(
+        PlanReferenceInput(DIGEST, None),
+        "projects/123",
+        quota_contact=CONTACT,
+    )
+
+    assert request.digest == DIGEST
+    assert repository.loaded == [DIGEST]
+    assert repository.stored == []
+
+
+def test_apply_imports_exported_plan_from_local_repository(tmp_path: Path) -> None:
+    """Portable Apply accepts the repository's authenticated exported status."""
+    repository = LocalPlanRepository(
+        tmp_path / "repository",
+        _MissingConsumptionMarkers(),
+    )
+    encoded = _real_encoded_plan()
+    exported = tmp_path / "request.plan"
+    assert repository.export(encoded, exported).status is PlanRepositoryStatus.EXPORTED
+    factory = ProtectedLifecycleCliRequestFactory(
+        trust=_Trust(),
+        repository=repository,
+        codec=cast("Any", PlanCodec()),
+        contacts=EphemeralApplyContactRefresher(),
+        clock=_Clock(),
+    )
+
+    request = factory.apply(
+        PlanReferenceInput(None, exported),
+        "projects/123",
+        quota_contact=CONTACT,
+    )
+
+    assert request.digest == encoded.digest
+    assert repository.load(encoded.digest, KEY, NOW).status is (
+        PlanRepositoryStatus.AVAILABLE
+    )
 
 
 def test_apply_rejects_contact_that_does_not_match_plan() -> None:
