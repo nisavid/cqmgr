@@ -59,6 +59,7 @@ from cqmgr.domain.apply_records import (
     UnknownResolutionEvidence,
 )
 from cqmgr.domain.audit import (
+    AuditFactName,
     AuditQuery,
     AuditRecord,
     AuditRecordDraft,
@@ -229,6 +230,7 @@ class _MemoryPlanRepository:
         if self.state is PlanLedgerState.CONSUMED:
             return PlanRepositoryOutcome(
                 PlanRepositoryStatus.CONSUMED,
+                plan_bytes=self.encoded.bytes,
                 state=self.state,
                 authenticated=True,
             )
@@ -1753,6 +1755,82 @@ def test_consumed_recovery_rejects_unmatched_terminal_authority(
     assert writer.calls == 0
 
 
+@pytest.mark.parametrize(
+    "changed_authority",
+    [
+        "installation",
+        "principal",
+        "contact",
+    ],
+)
+def test_consumed_recovery_rejects_changed_plan_authority(
+    changed_authority: str,
+) -> None:
+    """Terminal projection remains bound to the reviewed Apply authority."""
+    plan = _plan()
+    repository = _MemoryPlanRepository(plan)
+    repository.state = PlanLedgerState.CONSUMED
+    records = _MemoryApplyRecords()
+    records.record = _recovery_record(plan).stop_remaining_unattempted(NOW)
+    writer = _FailFastWriter()
+    request = ApplyRequest(
+        digest=repository.encoded.digest,
+        authentication_key=KEY,
+        local_installation_id=(
+            "installation-other"
+            if changed_authority == "installation"
+            else "installation-123"
+        ),
+        resource_scope_acknowledgement=SCOPE,
+        principal=(
+            PlanPrincipal("principal://accounts/987")
+            if changed_authority == "principal"
+            else PRINCIPAL
+        ),
+        contact_binding=(
+            replace(CONTACT, value_digest="hmac-sha256:" + ("f" * 64))
+            if changed_authority == "contact"
+            else CONTACT
+        ),
+        contact_value="operator@example.com",
+        now=NOW + timedelta(minutes=1),
+    )
+
+    result, *_ = _apply(
+        plan,
+        cast("_ScriptedWriter", writer),
+        records=records,
+        repository=repository,
+        revalidator=_UnexpectedRevalidator(),
+        request=request,
+    )
+
+    assert result.outcome.code == StableSymbol("apply-recovery-unavailable")
+    assert writer.calls == 0
+
+
+def test_consumed_recovery_rejects_undecodable_plan_authority() -> None:
+    """Terminal projection fails closed when immutable authority cannot decode."""
+    plan = _plan()
+    repository = _MemoryPlanRepository(plan)
+    repository.state = PlanLedgerState.CONSUMED
+    records = _MemoryApplyRecords()
+    records.record = _recovery_record(plan).stop_remaining_unattempted(NOW)
+    writer = _FailFastWriter()
+
+    result, *_ = _apply(
+        plan,
+        cast("_ScriptedWriter", writer),
+        records=records,
+        repository=repository,
+        codec=_FailingCodec(),
+        revalidator=_UnexpectedRevalidator(),
+    )
+
+    assert result.outcome.code == StableSymbol("apply-recovery-unavailable")
+    assert writer.calls == 0
+
+
 @pytest.mark.parametrize("fail_audit", [False, True])
 def test_consumed_recovery_projects_prewrite_terminal_result(
     fail_audit: bool,  # noqa: FBT001
@@ -1783,6 +1861,72 @@ def test_consumed_recovery_projects_prewrite_terminal_result(
     )
     assert writer.calls == 0
     assert resolver.requests == []
+
+
+def test_consumed_recovery_audit_failure_preserves_critical_evidence() -> None:
+    """Terminal projection failure retains every reconciliation identity."""
+
+    class FailFirstAudit(_MemoryAuditJournal):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        @override
+        def append(
+            self,
+            draft: AuditRecordDraft,
+            **kwargs: object,
+        ) -> _AuditRecord:
+            if not self.failed:
+                self.failed = True
+                raise OSError
+            return super().append(draft, **kwargs)
+
+    plan = _plan()
+    repository = _MemoryPlanRepository(plan)
+    repository.state = PlanLedgerState.CONSUMED
+    records = _MemoryApplyRecords()
+    terminal = _recovery_record(plan)
+    for child in terminal.children:
+        terminal = terminal.record_dispatch_intent(child.child_id, NOW)
+        terminal = terminal.record_outcome(
+            child.child_id,
+            ApplyChildDisposition.ACCEPTED,
+            StableSymbol("submitted"),
+            NOW,
+        )
+    terminal = terminal.finalize(NOW)
+    records.record = terminal
+    audit = FailFirstAudit()
+    writer = _FailFastWriter()
+
+    result, *_ = _apply(
+        plan,
+        cast("_ScriptedWriter", writer),
+        records=records,
+        repository=repository,
+        audit=audit,
+        revalidator=_UnexpectedRevalidator(),
+    )
+
+    reconciliation_identities = tuple(
+        child.preference_identity for child in terminal.children
+    )
+    assert result.outcome.code == StableSymbol("critical-unknown")
+    assert result.data.quarantine_identity == reconciliation_identities[-1]
+    assert (
+        tuple(child.preference_identity for child in result.data.children)
+        == reconciliation_identities
+    )
+    assert records.record is not None
+    assert records.record.state is ApplyRecordState.CRITICAL_UNKNOWN
+    assert [draft.kind for draft in audit.drafts] == [AuditRecordKind.CRITICAL_UNKNOWN]
+    assert any(
+        fact.name is AuditFactName.PREFERENCE_IDENTITY
+        and fact.value.value == reconciliation_identities[-1]
+        for fact in audit.drafts[0].facts
+    )
+    assert writer.calls == 0
 
 
 def test_recovery_quarantines_terminal_record_without_dispatched_authority() -> None:
