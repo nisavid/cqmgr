@@ -20,6 +20,10 @@ from textual.filter import Monochrome, NoColor
 from textual.widgets import Button, Checkbox, DataTable, Input, Static
 
 import cqmgr.cli as cli_module
+from cqmgr.adapters.cli.lifecycle import (
+    PlanReferenceInput,
+    WatchCliInput,
+)
 from cqmgr.adapters.serialization.results import operation_result_mapping
 from cqmgr.adapters.tui.app import CloudQuotaManagerApp
 from cqmgr.application.operations.apply import (
@@ -181,6 +185,7 @@ SCOPE = ResourceScope(ResourceScopeKind.PROJECT, "projects/123456789")
 OTHER_PROJECT_SCOPE = ResourceScope(ResourceScopeKind.PROJECT, "projects/987654321")
 ALT_SCOPE = ResourceScope(ResourceScopeKind.FOLDER, "folders/987654321")
 UNIT = QuotaUnit("1")
+KEY = SecretValue(b"k" * 32)
 DEFAULT_SCOPE_INPUT = ReadOnlyScopeInput()
 
 
@@ -1323,23 +1328,39 @@ class ScriptedLifecyclePreparation:
         self.intents.append(intent)
         effective = self.item.effective_value
         assert effective is not None
-        target = QuotaQuantity(int(intent.targets[0][1]), effective.unit)
+        workload = intent.workload
+        child_id = "single" if workload is None else "direct"
+        target_value = intent.targets[0][1] if intent.targets else str(effective.value)
+        target = QuotaQuantity(int(target_value), effective.unit)
         composition = ComposeRequest(
-            PlanKind.SINGLE,
-            TargetStrategy.MANUAL,
+            PlanKind.SINGLE if workload is None else PlanKind.BUNDLE,
+            intent.target_strategy,
             self.item.identity.resource_scope,
             (
                 ComposeChild(
-                    child_id="single",
+                    child_id=child_id,
                     slice_identity=self.item.identity,
                     effective=effective,
                     usage=self.item.usage_value,
-                    workload=None,
+                    workload=(
+                        None
+                        if workload is None
+                        else QuotaQuantity(effective.value, effective.unit)
+                    ),
                     direct_accelerator_rank=0,
                     scope_breadth_rank=1,
                     manual_target=target,
                     observed_at=self.item.evidence_observed_at,
                 ),
+            ),
+            selected_location=(
+                None
+                if workload is None
+                else (
+                    workload.locations.values[0]
+                    if isinstance(workload.locations, CandidateLocations)
+                    else "us-central1-a"
+                )
             ),
             expert=intent.expert,
             acknowledgements=intent.acknowledgements,
@@ -1360,6 +1381,41 @@ class ScriptedLifecyclePreparation:
             NOW,
         )
         return SimpleNamespace(composition=composition, preview=preview)
+
+
+class ScriptedLifecycleRequestFactory:
+    """Construct protected post-Preview requests while retaining public inputs."""
+
+    def __init__(
+        self,
+        review_request: PlanReviewRequest,
+        apply_request: ApplyRequest,
+        watch_request: WatchRequest,
+    ) -> None:
+        self.review_request = review_request
+        self.apply_request = apply_request
+        self.watch_request = watch_request
+        self.review_inputs: list[PlanReferenceInput] = []
+        self.apply_inputs: list[tuple[PlanReferenceInput, str, SecretValue | None]] = []
+        self.watch_inputs: list[WatchCliInput] = []
+
+    def review(self, value: PlanReferenceInput) -> PlanReviewRequest:
+        self.review_inputs.append(value)
+        return self.review_request
+
+    async def apply(
+        self,
+        value: PlanReferenceInput,
+        acknowledgement: str,
+        *,
+        quota_contact: SecretValue | None = None,
+    ) -> ApplyRequest:
+        self.apply_inputs.append((value, acknowledgement, quota_contact))
+        return self.apply_request
+
+    def watch(self, value: WatchCliInput) -> WatchRequest:
+        self.watch_inputs.append(value)
+        return self.watch_request
 
 
 class DelayedApplyLifecycleOperations(ScriptedLifecycleOperations):
@@ -2822,6 +2878,218 @@ def test_selected_quota_composes_through_async_preparation() -> None:
             assert "operator@example.com" not in copied
 
     asyncio.run(scenario())
+
+
+def test_operator_can_reach_review_apply_and_watch_only_through_controls(  # noqa: PLR0915
+) -> None:
+    """Production-shaped controls carry one Preview through protected Watch."""
+
+    async def scenario() -> None:
+        preview_result = _preview_plan_result()
+        plan = preview_result.data.plan
+        assert plan is not None
+        digest = preview_result.data.plan_digest
+        assert digest is not None
+        reviewed = review_plan(
+            plan,
+            digest=digest,
+            authenticated=True,
+            local_installation_id=plan.installation_id,
+            state=PlanLedgerState.AVAILABLE,
+            now=NOW,
+        )
+        review_result = replace(
+            _review_result(),
+            data=PlanReviewData(reviewed),
+            diagnostics=(),
+        )
+        apply_request = ApplyRequest(
+            digest=digest,
+            authentication_key=KEY,
+            local_installation_id=plan.installation_id,
+            resource_scope_acknowledgement=SCOPE,
+            principal=plan.principal,
+            contact_binding=plan.contact_binding,
+            contact_value="operator@example.com",
+            now=NOW,
+        )
+        watch_request = WatchRequest(
+            intent_id="intent-success",
+            condition=WatchCondition.GRANTED,
+            resume=None,
+            authentication_key=KEY,
+            installation_id=plan.installation_id,
+            deadline=12345.0,
+            cancellation=CancellationToken(),
+        )
+        requests = ScriptedLifecycleRequestFactory(
+            PlanReviewRequest(
+                digest,
+                None,
+                KEY,
+                plan.installation_id,
+                NOW,
+            ),
+            apply_request,
+            watch_request,
+        )
+        browse = _browse_result()
+        assert isinstance(browse.data, QuotaBrowseData)
+        item = browse.data.items[0]
+        preparation = ScriptedLifecyclePreparation(item)
+        lifecycle = ScriptedLifecycleOperations(
+            _successful_apply_result(),
+            preview_result=preview_result,
+            review_result=review_result,
+            watch_events=(_watch_terminal_event(),),
+        )
+        app = CloudQuotaManagerApp(
+            ScriptedReadOnlyOperations(browse),
+            ScriptedAuditOperations(),
+            lifecycle=lifecycle,  # type: ignore[arg-type]
+            lifecycle_preparation=preparation,  # type: ignore[arg-type]
+            lifecycle_requests=requests,  # type: ignore[arg-type]
+        )
+
+        async with app.run_test(size=(120, 80)) as pilot:
+            await pilot.pause()
+            app._select_quota(item)  # noqa: SLF001 - select through inspected evidence
+            await pilot.pause()
+            await pilot.click("#quota-compose-request")
+            _input(app, "#lifecycle-target").value = "8"
+            _input(app, "#lifecycle-contact").value = "operator@example.com"
+            await pilot.click("#lifecycle-compose")
+            await pilot.pause()
+            await pilot.click("#lifecycle-preview")
+            await pilot.pause()
+
+            assert _input(app, "#lifecycle-plan-digest").value == digest
+            await pilot.click("#lifecycle-review")
+            await pilot.pause()
+            assert requests.review_inputs == [PlanReferenceInput(digest, None)]
+            assert not _button(app, "#lifecycle-prepare-apply").disabled
+
+            _input(app, "#apply-scope-acknowledgement").value = SCOPE.canonical_name
+            _input(app, "#lifecycle-apply-contact").value = "operator@example.com"
+            await pilot.click("#lifecycle-prepare-apply")
+            await pilot.pause()
+            assert requests.apply_inputs[0][1] == SCOPE.canonical_name
+            assert requests.apply_inputs[0][2] is not None
+            assert not _button(app, "#lifecycle-apply").disabled
+            await pilot.click("#lifecycle-apply")
+            await pilot.pause()
+
+            assert lifecycle.apply_calls == [apply_request]
+            assert _input(app, "#lifecycle-intent-id").value == "intent-success"
+            _input(app, "#lifecycle-watch-deadline").value = "2026-07-25T00:00:00Z"
+            await pilot.click("#lifecycle-prepare-watch")
+            await pilot.pause()
+            assert requests.watch_inputs[0].intent_id == "intent-success"
+            await pilot.click("#lifecycle-watch")
+            await pilot.pause()
+
+            assert lifecycle.watch_calls == [watch_request]
+
+    asyncio.run(scenario())
+
+
+def test_compute_and_tpu_resolutions_reach_workload_composition_controls() -> None:
+    """Both public workload kinds preserve typed intent into shared preparation."""
+
+    async def run_case(
+        requirement: ComputeInstanceRequirement | CloudTpuSliceRequirement,
+        *,
+        route: str,
+        values: dict[str, str],
+    ) -> None:
+        browse = _browse_result()
+        assert isinstance(browse.data, QuotaBrowseData)
+        operations = ScriptedReadOnlyOperations(browse)
+        operations.resolve_result = OperationResult(
+            operation=OperationName("quota.resolve"),
+            resource_scope=SCOPE,
+            boundary=OperationBoundary(StableSymbol("workload-resolved"), True),
+            outcome=Outcome(StableSymbol("succeeded"), ExitClass.SUCCESS),
+            completeness=Completeness.complete(),
+            started_at=NOW,
+            finished_at=NOW,
+            data=ResolvedWorkloadRequirement(
+                requirement,
+                (_compatible_compute_location("us-central1-a"),),
+                None,
+            ),
+        )
+        preparation = ScriptedLifecyclePreparation(browse.data.items[0])
+        lifecycle = ScriptedLifecycleOperations(_apply_result())
+        app = CloudQuotaManagerApp(
+            operations,
+            ScriptedAuditOperations(),
+            lifecycle=lifecycle,  # type: ignore[arg-type]
+            lifecycle_preparation=preparation,  # type: ignore[arg-type]
+        )
+
+        async with app.run_test(size=(120, 70)) as pilot:
+            await pilot.pause()
+            await pilot.click(route)
+            for field, value in values.items():
+                _input(app, field).value = value
+            await pilot.click("#workload-submit")
+            await pilot.pause()
+            assert not _button(app, "#workload-compose-request").has_class("hidden")
+            await pilot.click("#workload-compose-request")
+            _input(app, "#lifecycle-target").value = "direct=8"
+            _input(app, "#lifecycle-contact").value = "operator@example.com"
+            await pilot.click("#lifecycle-compose")
+            await pilot.pause()
+
+            assert preparation.intents[0].workload == requirement
+            assert preparation.intents[0].selector is None
+            assert preparation.intents[0].targets == (("direct", "8"),)
+
+    compute = ComputeInstanceRequirement(
+        "a3-highgpu-8g",
+        1,
+        ProvisioningModel.STANDARD,
+        CandidateLocations(("us-central1-a",)),
+        attached_accelerator_type="nvidia-h100-80gb",
+        attached_accelerator_count=8,
+    )
+    tpu = CloudTpuSliceRequirement(
+        "v6e-8",
+        "2x4",
+        "v2-alpha-tpuv6e",
+        1,
+        ProvisioningModel.STANDARD,
+        CandidateLocations(("us-central1-a",)),
+    )
+    asyncio.run(
+        run_case(
+            compute,
+            route="#resolve-compute",
+            values={
+                "#workload-machine-type": "a3-highgpu-8g",
+                "#workload-gpu-type": "nvidia-h100-80gb",
+                "#workload-gpu-count": "8",
+                "#workload-count": "1",
+                "#workload-provisioning": "standard",
+                "#workload-locations": "us-central1-a",
+            },
+        )
+    )
+    asyncio.run(
+        run_case(
+            tpu,
+            route="#resolve-tpu",
+            values={
+                "#workload-accelerator-type": "v6e-8",
+                "#workload-topology": "2x4",
+                "#workload-runtime-version": "v2-alpha-tpuv6e",
+                "#workload-count": "1",
+                "#workload-provisioning": "standard",
+                "#workload-locations": "us-central1-a",
+            },
+        )
+    )
 
 
 def test_watch_timeout_interruption_and_resume_remain_explicit() -> None:
