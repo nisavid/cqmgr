@@ -544,6 +544,24 @@ class ScriptedAuditOperations:
         )
 
 
+class DelayedAuditOperations(ScriptedAuditOperations):
+    """Delay one local Audit page until the user has left its workspace."""
+
+    def __init__(self, records: tuple[AuditRecord, ...] = ()) -> None:
+        super().__init__(records)
+        self.list_started = asyncio.Event()
+        self.release_list = asyncio.Event()
+        self.list_returned = asyncio.Event()
+
+    @override
+    async def list(self, query: AuditQuery) -> OperationResult[AuditListData]:
+        self.list_calls.append(query)
+        self.list_started.set()
+        await self.release_list.wait()
+        self.list_returned.set()
+        return _audit_result(self.records)
+
+
 class SupersededReadOnlyOperations(ScriptedReadOnlyOperations):
     """Hold the first read until the TUI cancels it, then complete the refresh."""
 
@@ -1030,6 +1048,40 @@ def test_audit_workspace_owns_state_over_older_quota_refresh() -> None:
             assert str(_static(app, "#status-line").content) == audit_status
             assert str(_static(app, "#instrument-bar").content) == audit_instrument
             assert app.last_copied_cli == audit_copy_cli
+
+    asyncio.run(scenario())
+
+
+def test_quota_workspace_owns_state_over_older_audit_load() -> None:
+    """An older Audit load cannot replace the active quota operation."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        audit = DelayedAuditOperations()
+        app = CloudQuotaManagerApp(operations, audit)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-audit")
+            await audit.list_started.wait()
+
+            await pilot.click("#workspace-quotas")
+            app.action_refresh()
+            await pilot.pause()
+            quota_result = app.last_result
+            assert quota_result is operations.result
+            quota_status = str(_static(app, "#status-line").content)
+            quota_instrument = str(_static(app, "#instrument-bar").content)
+            quota_copy_cli = app.last_copied_cli
+
+            audit.release_list.set()
+            await audit.list_returned.wait()
+            await pilot.pause()
+
+            assert app.active_workspace == "quotas"
+            assert app.last_result is quota_result
+            assert str(_static(app, "#status-line").content) == quota_status
+            assert str(_static(app, "#instrument-bar").content) == quota_instrument
+            assert app.last_copied_cli == quota_copy_cli
 
     asyncio.run(scenario())
 

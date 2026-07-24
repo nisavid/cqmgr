@@ -308,6 +308,7 @@ class CloudQuotaManagerApp(App[None]):
         self._provider_worker: Worker[Any] | None = None
         self._cancellation: CancellationToken | None = None
         self._provider_generation = 0
+        self._workspace_generation = 0
 
     @override
     def compose(self) -> ComposeResult:
@@ -723,6 +724,8 @@ class CloudQuotaManagerApp(App[None]):
     def _set_active_workspace(self, workspace: str) -> None:
         if workspace not in {"quotas", "obtainability", "audit"}:
             return
+        self._workspace_generation += 1
+        generation = self._workspace_generation
         if workspace == "audit":
             self._claim_provider_view()
         self.active_workspace = workspace
@@ -733,14 +736,16 @@ class CloudQuotaManagerApp(App[None]):
             button.set_class(name == workspace, "active-workspace")
         if workspace == "audit":
             self.run_worker(
-                self._load_audit(),
+                self._load_audit(generation),
                 group="audit-load",
                 exclusive=True,
                 exit_on_error=False,
             )
 
-    async def _load_audit(self) -> None:
+    async def _load_audit(self, generation: int) -> None:
         result = await self.audit.list(AuditQuery())
+        if generation != self._workspace_generation or self.active_workspace != "audit":
+            return
         self.last_result = result
         table = self.query_one("#audit-table", DataTable)
         table.clear()
