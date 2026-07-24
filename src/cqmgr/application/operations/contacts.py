@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+from collections import deque
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import TYPE_CHECKING, Protocol
@@ -125,7 +126,10 @@ class ProtectedContactResolver:
         self._contacts = contacts
         self._identity = identity
         self._identity_timeout_seconds = identity_timeout_seconds
-        self._apply_contexts: dict[ContactBinding, _ApplyContactContext] = {}
+        self._apply_contexts: dict[
+            ContactBinding,
+            deque[_ApplyContactContext],
+        ] = {}
 
     async def resolve_preview(
         self,
@@ -174,10 +178,13 @@ class ProtectedContactResolver:
             principal=principal,
             trust=trust,
         )
-        self._apply_contexts[binding] = _ApplyContactContext(
-            explicit_value,
-            principal,
-            trust,
+        contexts = self._apply_contexts.setdefault(binding, deque())
+        contexts.append(
+            _ApplyContactContext(
+                explicit_value,
+                principal,
+                trust,
+            )
         )
         return resolved
 
@@ -188,10 +195,13 @@ class ProtectedContactResolver:
     ) -> ApplyContactRefresh:
         """Freshly resolve the exact Plan-bound source without fallback."""
         del now
-        context = self._apply_contexts.get(binding)
-        if context is None:
+        contexts = self._apply_contexts.get(binding)
+        if contexts is None:
             message = "Apply quota contact source is unavailable"
             raise ContactResolutionError(message)
+        context = contexts.popleft()
+        if not contexts:
+            del self._apply_contexts[binding]
         resolved = await self._resolve_bound(
             binding,
             explicit_value=context.explicit_value,
@@ -224,7 +234,18 @@ class ProtectedContactResolver:
                 source_identity=None,
             )
         elif source in {"named-profile", "selected-profile"}:
-            profile_name = binding.source_identity.removeprefix("profile:")
+            from cqmgr.application.configuration import (  # noqa: PLC0415
+                QuotaContactKeyringReference,
+            )
+
+            try:
+                bound_reference = QuotaContactKeyringReference.parse(
+                    binding.source_identity
+                )
+            except (TypeError, ValueError) as error:
+                message = "Apply quota-contact profile reference is invalid"
+                raise ContactResolutionError(message) from error
+            profile_name = bound_reference.profile_name
             if source == "selected-profile":
                 selection = await self._selection.read()
                 if selection.selected_profile != profile_name:
@@ -272,7 +293,7 @@ class ProtectedContactResolver:
             outcome.secret,
             trust.authentication_key,
             source=source,
-            source_identity=f"profile:{profile_name}",
+            source_identity=reference.canonical_name,
         )
 
     async def _resolve_direct_user(

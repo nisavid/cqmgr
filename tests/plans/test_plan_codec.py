@@ -55,6 +55,10 @@ LOCAL_KEY = b"l" * 32
 SHA256_A = "sha256:" + ("a" * 64)
 SHA256_B = "sha256:" + ("b" * 64)
 HMAC_SHA256_C = "hmac-sha256:" + ("c" * 64)
+PROFILE_REFERENCE = (
+    "cqmgr:quota-contact:v1:accelerators:installation-test:"
+    "item-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+)
 
 
 def _plan() -> QuotaRequestPlan:
@@ -74,7 +78,7 @@ def _plan() -> QuotaRequestPlan:
         ),
         contact_binding=ContactBinding(
             source=StableSymbol("selected-profile"),
-            source_identity="profile:accelerators",
+            source_identity=PROFILE_REFERENCE,
             value_digest=HMAC_SHA256_C,
         ),
         warnings=(StableSymbol("remaining-companion-bottleneck"),),
@@ -152,7 +156,7 @@ def test_plan_encoding_is_canonical_stable_and_authenticated() -> None:
     assert encoded.bytes.endswith(b"\n")
     assert b"operator@example.invalid" in encoded.bytes
     assert HMAC_SHA256_C.encode() in encoded.bytes
-    assert b"quota-contact" not in encoded.bytes
+    assert PROFILE_REFERENCE.encode() in encoded.bytes
 
     decoded = PlanCodec.decode(encoded.bytes)
     assert decoded.plan == _plan()
@@ -629,13 +633,13 @@ def test_plan_value_types_reject_invalid_and_secret_bearing_shapes() -> None:
     with pytest.raises(ValueError, match="value_digest"):
         ContactBinding(
             StableSymbol("selected-profile"),
-            "profile:name",
+            PROFILE_REFERENCE,
             "raw@example.invalid",
         )
     with pytest.raises(ValueError, match="value_digest"):
         ContactBinding(
             StableSymbol("selected-profile"),
-            "profile:name",
+            PROFILE_REFERENCE,
             "hmac-sha256:" + ("A" * 64),
         )
     with pytest.raises(TypeError, match="evidence name"):
@@ -647,8 +651,8 @@ def test_plan_value_types_reject_invalid_and_secret_bearing_shapes() -> None:
 @pytest.mark.parametrize(
     ("source", "source_identity"),
     [
-        ("named-profile", "profile:accelerators"),
-        ("selected-profile", "profile:accelerators"),
+        ("named-profile", PROFILE_REFERENCE),
+        ("selected-profile", PROFILE_REFERENCE),
         ("direct-user", "principal://accounts/123"),
         ("per-operation-input", "input:hmac-sha256:" + ("d" * 64)),
     ],

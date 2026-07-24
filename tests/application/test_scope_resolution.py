@@ -133,11 +133,18 @@ def test_interface_settings_reject_non_enum_keys() -> None:
 
 def test_quota_contact_uses_a_closed_profile_bound_os_keyring_reference() -> None:
     """Profiles can retain only safe native-keyring item identity metadata."""
-    reference = QuotaContactKeyringReference("primary")
+    reference = QuotaContactKeyringReference(
+        "primary",
+        "installation-test",
+        "item-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    )
 
-    assert reference.canonical_name == "cqmgr:quota-contact:primary"
-    assert reference.service == "cqmgr"
-    assert reference.account == "quota-contact:primary"
+    assert reference.canonical_name == (
+        "cqmgr:quota-contact:v1:primary:installation-test:"
+        "item-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    )
+    assert reference.service == ("io.nisavid.cqmgr/installation-test/quota-contact")
+    assert reference.account == "item-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     assert (
         Profile(
             name="primary",

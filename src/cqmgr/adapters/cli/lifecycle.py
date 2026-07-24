@@ -53,7 +53,12 @@ if TYPE_CHECKING:
     )
     from cqmgr.application.operations.trust import LoadedInstallationTrust
     from cqmgr.application.operations.watch import WatchRequest
-    from cqmgr.application.ports.plans import DecodedPlan, PlanCodec, PlanRepository
+    from cqmgr.application.ports.plans import (
+        DecodedPlan,
+        EncodedPlan,
+        PlanCodec,
+        PlanRepository,
+    )
     from cqmgr.domain.accelerator_overlay import (
         CloudTpuSliceRequirement,
         ComputeInstanceRequirement,
@@ -440,7 +445,8 @@ class ProtectedLifecycleCliRequestFactory:
         from cqmgr.application.operations.apply import ApplyRequest  # noqa: PLC0415
 
         trust = self._trust.load()
-        decoded = self._load_apply_plan(value, trust)
+        acknowledgement_scope = parse_resource_scope_name(acknowledgement)
+        decoded, portable = self._load_apply_plan(value, trust)
         plan = decoded.plan
         if plan.installation_id != trust.installation_id or not decoded.authenticate(
             trust.authentication_key.reveal()
@@ -453,11 +459,13 @@ class ProtectedLifecycleCliRequestFactory:
             principal=plan.principal,
             trust=trust,
         )
+        if portable is not None:
+            self._import_apply_plan(portable, trust)
         return ApplyRequest(
             digest=decoded.digest,
             authentication_key=trust.authentication_key,
             local_installation_id=trust.installation_id,
-            resource_scope_acknowledgement=parse_resource_scope_name(acknowledgement),
+            resource_scope_acknowledgement=acknowledgement_scope,
             principal=plan.principal,
             contact_binding=plan.contact_binding,
             contact_value=contact.value.reveal().decode("utf-8"),
@@ -487,8 +495,8 @@ class ProtectedLifecycleCliRequestFactory:
         self,
         value: PlanReferenceInput,
         trust: LoadedInstallationTrust,
-    ) -> DecodedPlan:
-        """Load and locally import one exact authenticated Apply plan."""
+    ) -> tuple[DecodedPlan, EncodedPlan | None]:
+        """Load one Apply plan and defer portable import until contact succeeds."""
         from cqmgr.application.ports.plans import (  # noqa: PLC0415
             EncodedPlan,
             PlanRepositoryStatus,
@@ -511,18 +519,31 @@ class ProtectedLifecycleCliRequestFactory:
             message = "Apply Plan is unavailable"
             raise RuntimeError(message)
         decoded = self._codec.decode(loaded.plan_bytes)
-        if value.digest is None:
-            imported = self._repository.store(
-                EncodedPlan(loaded.plan_bytes, decoded.digest),
-                trust.authentication_key,
-            )
-            if imported.status not in {
-                PlanRepositoryStatus.STORED,
-                PlanRepositoryStatus.CONFLICT,
-            }:
-                message = "Apply Plan could not be imported"
-                raise RuntimeError(message)
-        return decoded
+        portable = (
+            EncodedPlan(loaded.plan_bytes, decoded.digest)
+            if value.digest is None
+            else None
+        )
+        return decoded, portable
+
+    def _import_apply_plan(
+        self,
+        portable: EncodedPlan,
+        trust: LoadedInstallationTrust,
+    ) -> None:
+        """Import an authenticated portable Plan after protected contact success."""
+        from cqmgr.application.ports.plans import PlanRepositoryStatus  # noqa: PLC0415
+
+        imported = self._repository.store(
+            portable,
+            trust.authentication_key,
+        )
+        if imported.status not in {
+            PlanRepositoryStatus.STORED,
+            PlanRepositoryStatus.CONFLICT,
+        }:
+            message = "Apply Plan could not be imported"
+            raise RuntimeError(message)
 
 
 def read_quota_contact(stream: BinaryIO) -> SecretValue:
