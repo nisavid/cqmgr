@@ -54,6 +54,7 @@ if TYPE_CHECKING:
         EncodedPlan,
         PlanCodec,
         PlanRepository,
+        PlanRepositoryOutcome,
     )
     from cqmgr.application.ports.secrets import SecretValue
     from cqmgr.domain.scopes import ResourceScope
@@ -459,20 +460,21 @@ class RequestPlanOperations:
                 and decoded.authenticate(request.authentication_key.reveal())
             )
         )
-        state = _review_state(
+        ledger_state, local_authority_available = _review_state(
             self._repository,
             request,
             decoded,
+            loaded=loaded,
             authenticated=authenticated,
-            exported_state=loaded.state,
         )
         review = review_plan(
             decoded.plan,
             digest=decoded.digest,
             authenticated=authenticated,
             local_installation_id=request.local_installation_id,
-            state=state,
+            state=ledger_state,
             now=request.now,
+            local_authority_available=local_authority_available,
         )
         return _plan_review_result(
             request,
@@ -487,26 +489,33 @@ def _review_state(
     request: PlanReviewRequest,
     decoded: DecodedPlan,
     *,
+    loaded: PlanRepositoryOutcome,
     authenticated: bool,
-    exported_state: PlanLedgerState | None,
-) -> PlanLedgerState:
+) -> tuple[PlanLedgerState, bool]:
     """Join authenticated local exports to their single-use ledger state."""
-    fallback = exported_state or PlanLedgerState.AVAILABLE
+    fallback = loaded.state or PlanLedgerState.AVAILABLE
     if (
-        request.path is None
-        or not authenticated
+        not authenticated
         or request.authentication_key is None
         or decoded.plan.installation_id != request.local_installation_id
     ):
-        return fallback
-    local = repository.load(
-        decoded.digest,
-        request.authentication_key,
-        request.now,
+        return fallback, True
+    local = (
+        loaded
+        if request.path is None
+        else repository.load(
+            decoded.digest,
+            request.authentication_key,
+            request.now,
+        )
     )
-    if local.authenticated is not True or local.state is None:
-        return fallback
-    return local.state
+    if (
+        local.authenticated is not True
+        or local.state is None
+        or local.status.value != local.state.value
+    ):
+        return fallback, False
+    return local.state, True
 
 
 def _preflight_reasons(  # noqa: C901, PLR0912
