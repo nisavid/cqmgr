@@ -1311,12 +1311,14 @@ class ApplyPlanOperations:
             request,
             "critical-unknown",
         )
-        critical_record = self._record_critical_evidence(
+        critical_record, critical_audit_id = self._record_critical_evidence(
             resource_scope,
             request,
             record,
             quarantine_identity,
         )
+        if critical_audit_id is not None and critical_audit_id not in audit_record_ids:
+            audit_record_ids.append(critical_audit_id)
         return _result_for_record(
             request,
             resource_scope,
@@ -1336,7 +1338,7 @@ class ApplyPlanOperations:
         request: ApplyRequest,
         record: ApplyRecord,
         quarantine_identity: str,
-    ) -> ApplyRecord:
+    ) -> tuple[ApplyRecord, str | None]:
         """Best-effort evidence after the primary persistence path failed."""
         loaded = self._apply_records.load(
             record.intent_id,
@@ -1376,7 +1378,7 @@ class ApplyPlanOperations:
             critical = durable.mark_critical_unknown(request.now)
             if self._save(critical, request):
                 durable = critical
-            self._append_audit(
+            critical_audit_id = self._append_audit(
                 request,
                 resource_scope,
                 AuditRecordKind.CRITICAL_UNKNOWN,
@@ -1390,8 +1392,8 @@ class ApplyPlanOperations:
                 ),
             )
         except BaseException:  # noqa: BLE001
-            return durable
-        return durable
+            return durable, None
+        return durable, critical_audit_id
 
     def _quarantine(
         self,

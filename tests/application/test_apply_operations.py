@@ -1921,6 +1921,7 @@ def test_consumed_recovery_audit_failure_preserves_critical_evidence() -> None:
     assert records.record is not None
     assert records.record.state is ApplyRecordState.CRITICAL_UNKNOWN
     assert [draft.kind for draft in audit.drafts] == [AuditRecordKind.CRITICAL_UNKNOWN]
+    assert result.data.audit_record_ids == ("audit-00000000000000000001",)
     assert any(
         fact.name is AuditFactName.PREFERENCE_IDENTITY
         and fact.value.value == reconciliation_identities[-1]
