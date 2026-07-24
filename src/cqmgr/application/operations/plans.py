@@ -488,7 +488,7 @@ def _preflight_reasons(  # noqa: C901, PLR0912
             reasons.append("resource-scope-mismatch")
         if child.direct_accelerator_rank not in {0, 1}:
             reasons.append("unsupported-direct-accelerator-rank")
-        if child.scope_breadth_rank not in {0, 1, 2, 3, 4}:
+        if child.scope_breadth_rank not in {0, 1, 2, 3}:
             reasons.append("unsupported-scope-breadth-rank")
         if not child.fresh:
             reasons.append("stale-evidence")

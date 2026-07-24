@@ -401,6 +401,154 @@ class LocalPlanRepository:
             status=PlanRepositoryStatus.DISPATCHED,
         )
 
+    def resume_dispatched(
+        self,
+        digest: str,
+        authentication_key: SecretValue,
+        now: datetime,
+    ) -> PlanRepositoryOutcome:
+        """Recover a prepared or consumed Apply lease without reopening a plan."""
+        require_utc(now, "now")
+        try:
+            key = _key_bytes(authentication_key)
+            digest_hex = _digest_hex(digest)
+        except (TypeError, ValueError):
+            return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
+        return self._with_lock(
+            lambda: self._resume_dispatched_locked(
+                digest,
+                digest_hex,
+                key,
+                now,
+            )
+        )
+
+    def _resume_dispatched_locked(  # noqa: C901, PLR0911, PLR0912
+        self,
+        digest: str,
+        digest_hex: str,
+        key: bytes,
+        now: datetime,
+    ) -> PlanRepositoryOutcome:
+        try:
+            record = self._read_record(digest_hex, key)
+            plan_bytes, decoded = self._read_local_plan(digest, digest_hex)
+        except (OSError, PlanDecodeError, ValueError):
+            return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
+        if not decoded.authenticate(key):
+            return PlanRepositoryOutcome(
+                PlanRepositoryStatus.CONFLICT,
+                state=record.state,
+                authenticated=False,
+            )
+        marker_status = self._read_consumption_marker(
+            digest_hex,
+            decoded.plan.installation_id,
+            key,
+        )
+        if marker_status not in {
+            SecretStoreStatus.AVAILABLE,
+            SecretStoreStatus.MISSING,
+        }:
+            return PlanRepositoryOutcome(
+                PlanRepositoryStatus.FAILED,
+                state=record.state,
+                reason=StableSymbol("consumption-marker-unavailable"),
+                authenticated=True,
+            )
+        if (
+            record.state is PlanLedgerState.LEASED
+            and marker_status is SecretStoreStatus.AVAILABLE
+            and record.lease_token is not None
+            and record.lease_expires_at is not None
+        ):
+            record = _LedgerRecord(
+                PlanLedgerState.DISPATCHED,
+                lease_token=record.lease_token,
+                lease_expires_at=record.lease_expires_at,
+            )
+            try:
+                self._write_record(digest_hex, record, key)
+            except OSError:
+                return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
+        recovered = record.recover(now)
+        if recovered.decision in {
+            PlanLedgerDecision.ACCEPTED,
+            PlanLedgerDecision.EXPIRED,
+        }:
+            record = recovered.record
+            try:
+                self._write_record(digest_hex, record, key)
+            except OSError:
+                return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
+        if record.state is PlanLedgerState.QUARANTINED:
+            return _outcome_for_record(record, authenticated=True)
+        if (
+            record.state is PlanLedgerState.AVAILABLE
+            and marker_status is SecretStoreStatus.MISSING
+        ):
+            if decoded.plan.is_expired(now):
+                record = _LedgerRecord.quarantined(
+                    StableSymbol("plan-expired-after-preintent")
+                )
+                try:
+                    self._write_record(digest_hex, record, key)
+                except OSError:
+                    return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
+                return _outcome_for_record(record, authenticated=True)
+            lease = PlanLease(
+                digest,
+                secrets.token_urlsafe(24),
+                min(now + timedelta(minutes=1), decoded.plan.expires_at),
+            )
+            record = record.acquire(
+                token=lease.token,
+                expires_at=lease.expires_at,
+            ).record
+            try:
+                self._write_record(digest_hex, record, key)
+            except OSError:
+                return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
+        if (
+            record.state is PlanLedgerState.DISPATCHED
+            and marker_status is SecretStoreStatus.MISSING
+            and record.lease_token is not None
+        ):
+            quarantined = record.quarantine(
+                token=record.lease_token,
+                reason=StableSymbol("consumption-marker-missing"),
+            ).record
+            try:
+                self._write_record(digest_hex, quarantined, key)
+            except OSError:
+                return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
+            return _outcome_for_record(quarantined, authenticated=True)
+        if (
+            record.state
+            not in {
+                PlanLedgerState.LEASED,
+                PlanLedgerState.DISPATCHED,
+            }
+            or record.lease_token is None
+            or record.lease_expires_at is None
+        ):
+            return _unavailable_for_record(record)
+        return PlanRepositoryOutcome(
+            (
+                PlanRepositoryStatus.LEASED
+                if record.state is PlanLedgerState.LEASED
+                else PlanRepositoryStatus.DISPATCHED
+            ),
+            plan_bytes=plan_bytes,
+            state=record.state,
+            lease=PlanLease(
+                digest,
+                record.lease_token,
+                record.lease_expires_at,
+            ),
+            authenticated=True,
+        )
+
     def complete(
         self,
         lease: PlanLease,
@@ -454,6 +602,52 @@ class LocalPlanRepository:
         except (OSError, ValueError):
             return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
         transition = record.quarantine(token=lease.token, reason=reason)
+        if transition.decision is PlanLedgerDecision.CONFLICT:
+            return PlanRepositoryOutcome(PlanRepositoryStatus.CONFLICT)
+        if transition.decision is PlanLedgerDecision.IDEMPOTENT:
+            return _outcome_for_record(transition.record)
+        try:
+            self._write_record(digest_hex, transition.record, key)
+        except OSError:
+            return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
+        return _outcome_for_record(transition.record)
+
+    def invalidate(
+        self,
+        lease: PlanLease,
+        reason: StableSymbol,
+        authentication_key: SecretValue,
+        now: datetime,
+    ) -> PlanRepositoryOutcome:
+        """Persist terminal no-write invalidation after failed revalidation."""
+        require_utc(now, "now")
+        if not isinstance(reason, StableSymbol):
+            msg = "invalidation reason must be a StableSymbol"
+            raise TypeError(msg)
+        try:
+            key = _key_bytes(authentication_key)
+        except (TypeError, ValueError):
+            return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
+        try:
+            digest_hex = _digest_hex(lease.digest)
+        except (TypeError, ValueError):
+            return PlanRepositoryOutcome(PlanRepositoryStatus.MISSING)
+        return self._with_lock(
+            lambda: self._invalidate_locked(digest_hex, key, lease, reason)
+        )
+
+    def _invalidate_locked(
+        self,
+        digest_hex: str,
+        key: bytes,
+        lease: PlanLease,
+        reason: StableSymbol,
+    ) -> PlanRepositoryOutcome:
+        try:
+            record = self._read_record(digest_hex, key)
+        except (OSError, ValueError):
+            return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
+        transition = record.invalidate(token=lease.token, reason=reason)
         if transition.decision is PlanLedgerDecision.CONFLICT:
             return PlanRepositoryOutcome(PlanRepositoryStatus.CONFLICT)
         try:
