@@ -289,6 +289,16 @@ def _prepare_lifecycle_requests(
         raise click.ClickException(str(error)) from error
 
 
+def _protected_lifecycle_request[T](callback: Callable[[], T]) -> T:
+    """Translate expected protected-factory failures to stable Click output."""
+    try:
+        return callback()
+    except click.ClickException:
+        raise
+    except (OSError, TypeError, ValueError, RuntimeError) as error:
+        raise click.ClickException(str(error)) from error
+
+
 def _quota_contact_from_stdin(*, enabled: bool) -> SecretValue | None:
     """Read protected contact bytes only when the operator selected stdin."""
     if not enabled:
@@ -1311,7 +1321,9 @@ def request_compose(  # noqa: PLR0913
     runtime = build_lifecycle_cli_runtime()
     prepared = _prepare_lifecycle_requests(runtime, value, require_preview=False)
     request_value = (
-        runtime.requests.compose(value) if prepared is None else prepared.composition
+        _protected_lifecycle_request(lambda: runtime.requests.compose(value))
+        if prepared is None
+        else prepared.composition
     )
     composition = runtime.operations.compose(request_value)
     exit_class = emit_composition(
@@ -1384,7 +1396,9 @@ def request_preview(  # noqa: PLR0913
     runtime = build_lifecycle_cli_runtime()
     prepared = _prepare_lifecycle_requests(runtime, value, require_preview=True)
     if prepared is None:
-        request_value = runtime.requests.preview(value)
+        request_value = _protected_lifecycle_request(
+            lambda: runtime.requests.preview(value)
+        )
     else:
         request_value = prepared.preview
         if request_value is None:
@@ -1426,7 +1440,9 @@ def request_watch(  # noqa: PLR0913
             deadline=parse_absolute_rfc3339(deadline),
         )
         runtime = build_lifecycle_cli_runtime()
-        request_value = runtime.requests.watch(value)
+        request_value = _protected_lifecycle_request(
+            lambda: runtime.requests.watch(value)
+        )
     except (TypeError, ValueError) as error:
         raise click.UsageError(str(error)) from error
     asyncio.run(
@@ -1458,8 +1474,9 @@ def plan_review(
     """Review one Plan without provider mutation."""
     value = _plan_reference(digest, plan_file)
     runtime = build_lifecycle_cli_runtime()
+    request_value = _protected_lifecycle_request(lambda: runtime.requests.review(value))
     _emit_lifecycle(
-        runtime.operations.review(runtime.requests.review(value)),
+        runtime.operations.review(request_value),
         LifecyclePresentation(output, no_color, quiet),
     )
 
@@ -1483,10 +1500,13 @@ def plan_apply(  # noqa: PLR0913
     """Apply one reviewed Plan in its bound non-atomic child order."""
     value = _plan_reference(digest, plan_file)
     runtime = build_lifecycle_cli_runtime()
-    request_value = runtime.requests.apply(
-        value,
-        acknowledge_resource_scope,
-        quota_contact=_quota_contact_from_stdin(enabled=quota_contact_stdin),
+    contact = _quota_contact_from_stdin(enabled=quota_contact_stdin)
+    request_value = _protected_lifecycle_request(
+        lambda: runtime.requests.apply(
+            value,
+            acknowledge_resource_scope,
+            quota_contact=contact,
+        )
     )
     asyncio.run(
         _apply_lifecycle_async(

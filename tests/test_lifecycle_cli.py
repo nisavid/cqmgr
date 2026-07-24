@@ -406,6 +406,63 @@ def test_plan_review_and_apply_dispatch_exact_reference_and_acknowledgement(
 
 
 @pytest.mark.parametrize(
+    ("arguments", "method"),
+    [
+        (
+            ["plan", "review", "--plan", "sha256:" + ("a" * 64)],
+            "review",
+        ),
+        (
+            [
+                "plan",
+                "apply",
+                "--plan",
+                "sha256:" + ("a" * 64),
+                "--acknowledge-resource-scope",
+                "projects/123",
+            ],
+            "apply",
+        ),
+        (
+            [
+                "request",
+                "watch",
+                "--intent-id",
+                "intent-1",
+                "--condition",
+                "granted",
+                "--deadline",
+                "2026-07-25T00:00:00Z",
+            ],
+            "watch",
+        ),
+    ],
+)
+def test_protected_factory_failures_emit_stable_click_errors(
+    monkeypatch: MonkeyPatch,
+    arguments: list[str],
+    method: str,
+) -> None:
+    """Trust, contact, and plan failures never escape as raw tracebacks."""
+    facade, factory = _runtime(monkeypatch)
+
+    def fail(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        message = f"{method} protected input is unavailable"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(factory, method, fail)
+
+    result = CliRunner().invoke(cli_module.main, arguments)
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == f"Error: {method} protected input is unavailable\n"
+    assert "Traceback" not in result.output
+    assert facade.calls == []
+
+
+@pytest.mark.parametrize(
     "arguments",
     [
         ["plan", "review"],
