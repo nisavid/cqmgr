@@ -389,10 +389,9 @@ def test_lease_dispatch_terminal_consumption_is_single_use(tmp_path: Path) -> No
         repository.complete(leased.lease, PLAN_KEY, NOW).status
         is PlanRepositoryStatus.CONSUMED
     )
-    assert (
-        repository.resume_dispatched(encoded.digest, PLAN_KEY, NOW).status
-        is PlanRepositoryStatus.CONSUMED
-    )
+    resumed = repository.resume_dispatched(encoded.digest, PLAN_KEY, NOW)
+    assert resumed.status is PlanRepositoryStatus.CONSUMED
+    assert resumed.plan_bytes == encoded.bytes
     assert (
         repository.complete(leased.lease, PLAN_KEY, NOW).status
         is PlanRepositoryStatus.CONSUMED

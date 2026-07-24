@@ -54,7 +54,12 @@ if TYPE_CHECKING:
     )
     from cqmgr.application.ports.apply_records import ApplyRecordRepository
     from cqmgr.application.ports.audit import AuditJournal
-    from cqmgr.application.ports.plans import PlanCodec, PlanLease, PlanRepository
+    from cqmgr.application.ports.plans import (
+        PlanCodec,
+        PlanLease,
+        PlanRepository,
+        PlanRepositoryOutcome,
+    )
     from cqmgr.application.ports.provider_writes import (
         QuotaPreferenceUnknownResolver,
         QuotaPreferenceWriter,
@@ -517,8 +522,7 @@ class ApplyPlanOperations:
             request.now,
         )
         consumed_terminal = (
-            resumed.status is PlanRepositoryStatus.CONSUMED
-            and resumed.authenticated is True
+            self._consumed_authority_matches(resumed, request)
             and record.state
             in {
                 ApplyRecordState.ACCEPTED,
@@ -881,6 +885,29 @@ class ApplyPlanOperations:
             refreshed.contact_value,
         )
 
+    def _consumed_authority_matches(
+        self,
+        resumed: PlanRepositoryOutcome,
+        request: ApplyRequest,
+    ) -> bool:
+        """Authenticate the immutable reviewed authority for terminal replay."""
+        if (
+            resumed.status is not PlanRepositoryStatus.CONSUMED
+            or resumed.authenticated is not True
+            or resumed.plan_bytes is None
+        ):
+            return False
+        try:
+            decoded = self._codec.decode(resumed.plan_bytes)
+            authenticated = decoded.authenticate(request.authentication_key.reveal())
+        except (TypeError, ValueError):
+            return False
+        return (
+            authenticated
+            and decoded.digest == request.digest
+            and not _request_drift(decoded.plan, request)
+        )
+
     def _project_consumed_terminal(
         self,
         record: ApplyRecord,
@@ -934,14 +961,12 @@ class ApplyPlanOperations:
                 )
             )
         except Exception:  # noqa: BLE001
-            return _result_for_record(
-                request,
+            return self._critical_unknown(
                 record.resource_scope,
+                None,
+                request,
                 record,
-                reached=False,
-                outcome="critical-unknown",
-                exit_class=ExitClass.OPERATIONAL_FAILURE,
-                audit_record_ids=tuple(audit_record_ids),
+                audit_record_ids,
             )
         return _result_for_record(
             request,
