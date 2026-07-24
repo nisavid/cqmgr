@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from cqmgr.adapters.cli.group import canonical_command_path
+from cqmgr.adapters.cli.lifecycle import canonical_absolute_rfc3339
 
 if TYPE_CHECKING:
     from cqmgr.application.operations.read_only import (
@@ -339,9 +340,7 @@ def request_watch_copy_cli(
     """Render one initial or resumed Watch command with explicit deadline."""
     from cqmgr.domain.status import WatchCondition  # noqa: PLC0415
 
-    if not isinstance(deadline, str) or not deadline:
-        msg = "Copy CLI Watch deadline must be non-empty"
-        raise ValueError(msg)
+    canonical_deadline = canonical_absolute_rfc3339(deadline)
     initial = intent_id is not None
     resumed = resume is not None
     if initial == resumed:
@@ -375,7 +374,7 @@ def request_watch_copy_cli(
         )
     else:
         arguments.extend(("--resume", cast("str", resume)))
-    arguments.extend(("--deadline", deadline, "--output", selected.output))
+    arguments.extend(("--deadline", canonical_deadline, "--output", selected.output))
     if selected.no_color:
         arguments.append("--no-color")
     if selected.quiet:

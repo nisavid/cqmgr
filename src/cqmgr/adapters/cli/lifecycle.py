@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from dataclasses import field as dataclass_field
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
@@ -22,10 +23,12 @@ from cqmgr.domain.diagnostics import (
     DiagnosticSource,
 )
 from cqmgr.domain.identity import PrincipalIdentity
+from cqmgr.domain.plans import TargetStrategy
 from cqmgr.domain.quotas import MonitoringValue, MonitoringValueKind, QuotaQuantity
 from cqmgr.domain.redaction import RedactedText
 from cqmgr.domain.results import OperationResult, StableSymbol
 from cqmgr.domain.scopes import ResourceScope
+from cqmgr.domain.status import WatchCondition
 
 if TYPE_CHECKING:
     from cqmgr.application.operations.apply import ApplyRequest
@@ -44,9 +47,47 @@ if TYPE_CHECKING:
         CloudTpuSliceRequirement,
         ComputeInstanceRequirement,
     )
-    from cqmgr.domain.plans import TargetStrategy
-    from cqmgr.domain.status import WatchCondition
     from cqmgr.domain.watch import WatchStreamEvent
+
+_RFC3339_TIMESTAMP = re.compile(
+    r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?"
+    r"(?:Z|[+-]\d{2}:\d{2})\Z"
+)
+TARGET_STRATEGY_CHOICES = tuple(item.value for item in TargetStrategy)
+DEFAULT_TARGET_STRATEGY = TargetStrategy.MINIMUM.value
+MANUAL_TARGET_STRATEGY = TargetStrategy.MANUAL.value
+WATCH_CONDITION_CHOICES = tuple(item.value for item in WatchCondition)
+
+
+def parse_target_strategy(value: str) -> TargetStrategy:
+    """Decode one public target strategy behind the CLI adapter boundary."""
+    return TargetStrategy(value)
+
+
+def parse_watch_condition(value: str) -> WatchCondition:
+    """Decode one public Watch condition behind the CLI adapter boundary."""
+    return WatchCondition(value)
+
+
+def parse_absolute_rfc3339(value: str) -> datetime:
+    """Parse one strict absolute RFC 3339 timestamp and normalize it to UTC."""
+    if not isinstance(value, str) or _RFC3339_TIMESTAMP.fullmatch(value) is None:
+        msg = "Watch deadline must be an absolute RFC 3339 timestamp"
+        raise ValueError(msg)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        msg = "Watch deadline must be an absolute RFC 3339 timestamp"
+        raise ValueError(msg) from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        msg = "Watch deadline must be an absolute RFC 3339 timestamp"
+        raise ValueError(msg)
+    return parsed.astimezone(UTC)
+
+
+def canonical_absolute_rfc3339(value: str) -> str:
+    """Return one strict absolute RFC 3339 input in canonical UTC form."""
+    return parse_absolute_rfc3339(value).isoformat().replace("+00:00", "Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,8 +350,7 @@ def emit_lifecycle_result(
                 ensure_ascii=False,
                 separators=(",", ":"),
                 sort_keys=True,
-            ),
-            err=destination_error,
+            )
         )
     else:
         for line in _result_lines(mapping):
@@ -341,8 +381,7 @@ def emit_composition(
                 ensure_ascii=False,
                 separators=(",", ":"),
                 sort_keys=True,
-            ),
-            err=exit_class != 0,
+            )
         )
     else:
         for line in _human_lines("composition", mapping):
