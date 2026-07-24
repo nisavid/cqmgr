@@ -58,23 +58,25 @@ def _write(action: QuotaPreferenceWriteAction) -> QuotaPreferenceWrite:
 def _response(
     request: QuotaPreferenceWrite,
     *,
-    contact_value: str = "resolved@example.com",
+    contact_value: str | None = "resolved@example.com",
 ) -> cloudquotas_v1.QuotaPreference:
-    return cloudquotas_v1.QuotaPreference(
+    response = cloudquotas_v1.QuotaPreference(
         name=request.preference_identity,
         service=request.slice_identity.service,
         quota_id=request.slice_identity.quota_id,
         dimensions=dict(request.slice_identity.dimensions.items),
         quota_config=cloudquotas_v1.QuotaConfig(preferred_value=request.target.value),
-        contact_email=contact_value,
     )
+    if contact_value is not None:
+        response.contact_email = contact_value
+    return response
 
 
 class _ScriptedMutationClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, object, object, float]] = []
         self.error: BaseException | None = None
-        self.contact_value = "resolved@example.com"
+        self.contact_value: str | None = "resolved@example.com"
 
     async def create_quota_preference(
         self,
@@ -111,7 +113,7 @@ class _ScriptedReadClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, object, object, float]] = []
         self.error: BaseException | None = None
-        self.contact_value = "resolved@example.com"
+        self.contact_value: str | None = "resolved@example.com"
 
     async def get_quota_preference(
         self,
@@ -185,8 +187,8 @@ def test_official_unknown_resolution_is_read_only_and_retry_free() -> None:
     assert resolution is UnknownWriteResolution.ACCEPTED
 
 
-def test_official_conclusive_errors_are_failed_without_retry() -> None:
-    """Provider conflicts and not-found reconciliation remain conclusive."""
+def test_official_conclusive_dispatch_errors_are_failed_without_retry() -> None:
+    """Provider dispatch conflicts and rejections remain conclusive."""
     client = _ScriptedMutationClient()
     client.error = google_exceptions.Aborted("conflict")
     request = _write(QuotaPreferenceWriteAction.AMEND)
@@ -194,15 +196,6 @@ def test_official_conclusive_errors_are_failed_without_retry() -> None:
     result = asyncio.run(OfficialQuotaPreferenceWriter(client).dispatch(request))  # type: ignore[arg-type]
     assert not result.accepted
     assert result.outcome == StableSymbol("conflicting")
-
-    resolver_client = _ScriptedReadClient()
-    resolver_client.error = google_exceptions.NotFound("missing")
-    resolution = asyncio.run(
-        OfficialQuotaPreferenceUnknownResolver(resolver_client).resolve_unknown(  # type: ignore[arg-type]
-            request
-        )
-    )
-    assert resolution is UnknownWriteResolution.FAILED
 
     client.error = google_exceptions.BadRequest("invalid")
     rejected = asyncio.run(
@@ -238,24 +231,87 @@ def test_unknown_resolver_requires_a_positive_read_deadline() -> None:
         )
 
 
-def test_response_contact_must_match_the_bound_dispatch_contact() -> None:
-    """A stale contact cannot prove dispatch acceptance or unknown resolution."""
-    mutation_client = _ScriptedMutationClient()
-    mutation_client.contact_value = "stale@example.com"
-    read_client = _ScriptedReadClient()
-    read_client.contact_value = "stale@example.com"
+@pytest.mark.parametrize(
+    "action",
+    [QuotaPreferenceWriteAction.CREATE, QuotaPreferenceWriteAction.AMEND],
+)
+def test_dispatch_accepts_real_shaped_response_without_input_only_contact(
+    action: QuotaPreferenceWriteAction,
+) -> None:
+    """Create and amend accept provider responses that omit contact_email."""
+    client = _ScriptedMutationClient()
+    client.contact_value = None
+    request = _write(action)
+
+    result = asyncio.run(OfficialQuotaPreferenceWriter(client).dispatch(request))  # type: ignore[arg-type]
+
+    provider_request = client.calls[0][1]
+    assert isinstance(
+        provider_request,
+        (
+            cloudquotas_v1.CreateQuotaPreferenceRequest,
+            cloudquotas_v1.UpdateQuotaPreferenceRequest,
+        ),
+    )
+    assert provider_request.quota_preference.contact_email == "resolved@example.com"
+    assert result.accepted
+    assert result.outcome == StableSymbol("submitted")
+
+
+def test_unknown_resolution_accepts_response_without_input_only_contact() -> None:
+    """Get can prove acceptance when its response omits contact_email."""
+    client = _ScriptedReadClient()
+    client.contact_value = None
     request = _write(QuotaPreferenceWriteAction.AMEND)
 
-    dispatch = asyncio.run(
-        OfficialQuotaPreferenceWriter(mutation_client).dispatch(request)  # type: ignore[arg-type]
-    )
     resolution = asyncio.run(
-        OfficialQuotaPreferenceUnknownResolver(read_client).resolve_unknown(request)  # type: ignore[arg-type]
+        OfficialQuotaPreferenceUnknownResolver(client).resolve_unknown(request)  # type: ignore[arg-type]
     )
 
-    assert not dispatch.accepted
-    assert dispatch.outcome == StableSymbol("conflicting")
-    assert resolution is UnknownWriteResolution.FAILED
+    assert resolution is UnknownWriteResolution.ACCEPTED
+
+
+def test_unknown_resolution_keeps_immediate_not_found_unresolved() -> None:
+    """An immediate missing read cannot conclusively reject an uncertain write."""
+    client = _ScriptedReadClient()
+    client.error = google_exceptions.NotFound("not yet visible")
+    request = _write(QuotaPreferenceWriteAction.CREATE)
+
+    resolution = asyncio.run(
+        OfficialQuotaPreferenceUnknownResolver(client).resolve_unknown(request)  # type: ignore[arg-type]
+    )
+
+    assert resolution is UnknownWriteResolution.UNRESOLVED
+
+
+def test_unknown_resolution_keeps_nonmatching_response_unresolved() -> None:
+    """A nonmatching read cannot conclusively reject an uncertain write."""
+    client = _ScriptedReadClient()
+    client.contact_value = None
+    request = replace(
+        _write(QuotaPreferenceWriteAction.AMEND),
+        target=QuotaQuantity(9, QuotaUnit("1")),
+    )
+
+    resolution = asyncio.run(
+        OfficialQuotaPreferenceUnknownResolver(client).resolve_unknown(request)  # type: ignore[arg-type]
+    )
+
+    assert resolution is UnknownWriteResolution.UNRESOLVED
+
+
+def test_dispatch_rejects_nonmatching_response_as_conflicting() -> None:
+    """A response for a different target does not prove dispatch acceptance."""
+    client = _ScriptedMutationClient()
+    request = replace(
+        _write(QuotaPreferenceWriteAction.AMEND),
+        target=QuotaQuantity(9, QuotaUnit("1")),
+    )
+
+    result = asyncio.run(OfficialQuotaPreferenceWriter(client).dispatch(request))  # type: ignore[arg-type]
+
+    assert not result.accepted
+    assert result.outcome == StableSymbol("conflicting")
 
 
 def test_writer_and_resolver_expose_disjoint_adapter_boundaries() -> None:

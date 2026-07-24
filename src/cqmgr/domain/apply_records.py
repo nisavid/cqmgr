@@ -350,6 +350,34 @@ class ApplyRecord:
             revision=self.revision + 1,
         )
 
+    def stop_remaining_unattempted(self, now: datetime) -> ApplyRecord:
+        """Close every still-pending child after a proven pre-write failure."""
+        require_utc(now, "now")
+        if self.state is not ApplyRecordState.IN_PROGRESS:
+            msg = "terminal Apply cannot stop pending children"
+            raise ValueError(msg)
+        if any(
+            child.dispatch_intent_at is not None and child.disposition is None
+            for child in self.children
+        ):
+            msg = "unresolved dispatch intent cannot become unattempted"
+            raise ValueError(msg)
+        if all(child.disposition is not None for child in self.children):
+            msg = "Apply has no pending children to stop"
+            raise ValueError(msg)
+        return replace(
+            self,
+            children=tuple(
+                replace(child, disposition=ApplyChildDisposition.UNATTEMPTED)
+                if child.disposition is None
+                else child
+                for child in self.children
+            ),
+            state=ApplyRecordState.FAILED,
+            finished_at=now,
+            revision=self.revision + 1,
+        )
+
     def resolve_unknown(
         self,
         child_id: str,

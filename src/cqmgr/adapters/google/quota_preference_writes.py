@@ -173,11 +173,11 @@ class OfficialQuotaPreferenceUnknownResolver:
                 timeout=self._timeout_seconds,
             )
         except google_exceptions.NotFound:
-            return UnknownWriteResolution.FAILED
+            return UnknownWriteResolution.UNRESOLVED
         return (
             UnknownWriteResolution.ACCEPTED
             if _matches(response, request)
-            else UnknownWriteResolution.FAILED
+            else UnknownWriteResolution.UNRESOLVED
         )
 
 
@@ -219,5 +219,4 @@ def _matches(
         and response.quota_id == request.slice_identity.quota_id
         and dict(response.dimensions) == dict(request.slice_identity.dimensions.items)
         and response.quota_config.preferred_value == request.target.value
-        and response.contact_email == request.contact_value
     )

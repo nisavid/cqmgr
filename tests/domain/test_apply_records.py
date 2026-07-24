@@ -328,3 +328,39 @@ def test_pre_dispatch_recovery_and_stop_preserve_exact_dispatch_evidence() -> No
     assert stopped.state is ApplyRecordState.FAILED
     with pytest.raises(ValueError, match="cannot stop"):
         record.record_dispatch_intent("direct", NOW).stop_unattempted(NOW)
+
+
+def test_stop_remaining_unattempted_requires_proven_pre_write_state() -> None:
+    """Only pending children without unresolved intent can close as unattempted."""
+    first_accepted = (
+        _record()
+        .record_dispatch_intent("direct", NOW)
+        .record_outcome(
+            "direct",
+            ApplyChildDisposition.ACCEPTED,
+            StableSymbol("submitted"),
+            NOW,
+        )
+    )
+    stopped = first_accepted.stop_remaining_unattempted(NOW)
+
+    assert stopped.state is ApplyRecordState.FAILED
+    assert tuple(child.disposition for child in stopped.children) == (
+        ApplyChildDisposition.ACCEPTED,
+        ApplyChildDisposition.UNATTEMPTED,
+    )
+    with pytest.raises(ValueError, match="terminal Apply"):
+        stopped.stop_remaining_unattempted(NOW)
+    with pytest.raises(ValueError, match="unresolved dispatch intent"):
+        _record().record_dispatch_intent("direct", NOW).stop_remaining_unattempted(NOW)
+
+    all_accepted = first_accepted.record_dispatch_intent(
+        "companion", NOW
+    ).record_outcome(
+        "companion",
+        ApplyChildDisposition.ACCEPTED,
+        StableSymbol("submitted"),
+        NOW,
+    )
+    with pytest.raises(ValueError, match="no pending children"):
+        all_accepted.stop_remaining_unattempted(NOW)
