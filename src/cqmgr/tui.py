@@ -23,5 +23,5 @@ def build_app() -> CloudQuotaManagerApp:
 
 
 def run() -> None:
-    """Import Textual only after bootstrap confirms an interactive terminal."""
+    """Build and run the app; the CLI validates interactivity first."""
     build_app().run()
