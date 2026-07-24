@@ -45,6 +45,14 @@ from cqmgr.domain.accelerator_overlay import (
     ProvisioningModel,
 )
 from cqmgr.domain.apply_records import ApplyChildDisposition
+from cqmgr.domain.diagnostics import (
+    Diagnostic,
+    DiagnosticCode,
+    DiagnosticPhase,
+    DiagnosticSource,
+    RetryDisposition,
+    Severity,
+)
 from cqmgr.domain.plans import PlanKind, TargetStrategy
 from cqmgr.domain.quotas import (
     EffectiveQuotaSliceIdentity,
@@ -53,6 +61,7 @@ from cqmgr.domain.quotas import (
     QuotaScope,
     QuotaUnit,
 )
+from cqmgr.domain.redaction import RedactedText
 from cqmgr.domain.results import (
     Completeness,
     ExitClass,
@@ -194,6 +203,34 @@ def test_watch_copy_cli_keeps_initial_and_resume_forms_disjoint() -> None:
     assert "--resume" in resumed
     assert "--intent-id" not in resumed
     assert "--condition" not in resumed
+
+
+@pytest.mark.parametrize(
+    "deadline",
+    [
+        "",
+        "2026-07-25 00:00:00+00:00",
+        "2026-07-25T00:00:00",
+        "2026-07-25T00:00:00+0000",
+        "2026-02-30T00:00:00Z",
+    ],
+)
+def test_watch_copy_cli_rejects_non_rfc3339_deadlines(deadline: str) -> None:
+    """Copy CLI accepts the same strict absolute timestamp grammar as execution."""
+    with pytest.raises(ValueError, match="RFC 3339"):
+        request_watch_copy_cli(deadline=deadline, resume="resume")
+
+
+def test_watch_copy_cli_normalizes_absolute_deadline_to_utc() -> None:
+    """Copied Watch commands use one canonical UTC RFC 3339 timestamp."""
+    command = request_watch_copy_cli(
+        deadline="2026-07-25T01:30:00+01:30",
+        resume="resume",
+    )
+
+    arguments = shlex.split(command)
+    deadline_index = arguments.index("--deadline")
+    assert arguments[deadline_index + 1] == "2026-07-25T00:00:00Z"
 
 
 def test_workload_preview_copy_cli_retains_shape_strategy_and_manual_targets() -> None:
@@ -655,6 +692,47 @@ def test_lifecycle_result_uses_canonical_json_and_required_human_facts(
     assert "Ordered children: accelerator, companion" in human.out
 
 
+def test_rejected_structured_result_stays_valid_json_on_stdout(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Rejected structured output retains diagnostics in-band on stdout."""
+    result = OperationResult(
+        operation=OperationName("plan.review"),
+        resource_scope=SCOPE,
+        boundary=OperationBoundary(StableSymbol("plan-reviewed"), reached=False),
+        outcome=Outcome(
+            StableSymbol("rejected-precondition"),
+            ExitClass.REJECTED_PRECONDITION,
+        ),
+        completeness=Completeness.complete(),
+        started_at=NOW,
+        finished_at=NOW,
+        data=None,
+        diagnostics=(
+            Diagnostic(
+                code=DiagnosticCode("plan-expired"),
+                severity=Severity.ERROR,
+                phase=DiagnosticPhase("plan-review"),
+                source=DiagnosticSource("local-plan"),
+                retry=RetryDisposition.AFTER_NEW_PREVIEW,
+                message=RedactedText("Plan expiry has elapsed."),
+            ),
+        ),
+    )
+
+    exit_class = emit_lifecycle_result(
+        result,
+        LifecyclePresentation(output="json", no_color=True, quiet=True),
+    )
+    captured = capsys.readouterr()
+
+    payload = json.loads(captured.out)
+    assert exit_class == int(ExitClass.REJECTED_PRECONDITION)
+    assert captured.err == ""
+    assert payload["outcome"]["exit_class"] == int(ExitClass.REJECTED_PRECONDITION)
+    assert payload["diagnostics"][0]["code"] == "plan-expired"
+
+
 def test_composition_presenter_emits_reached_and_rejected_results(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -687,6 +765,34 @@ def test_composition_presenter_emits_reached_and_rejected_results(
     assert human.out == ""
     assert "Reached: false" in human.err
     assert "Incapability reasons: missing-current-evidence" in human.err
+
+
+def test_rejected_structured_composition_stays_valid_json_on_stdout(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Rejected Compose JSON stays machine-readable without stderr fragments."""
+    request = ComposeRequest(
+        kind=PlanKind.SINGLE,
+        strategy=TargetStrategy.MANUAL,
+        resource_scope=SCOPE,
+        children=(),
+    )
+
+    exit_class = emit_composition(
+        Composition(
+            request=request,
+            reached=False,
+            incapability_reasons=("missing-current-evidence",),
+        ),
+        LifecyclePresentation(output="json", no_color=True, quiet=True),
+    )
+    captured = capsys.readouterr()
+
+    payload = json.loads(captured.out)
+    assert exit_class == REJECTED_COMPOSITION_EXIT
+    assert captured.err == ""
+    assert payload["reached"] is False
+    assert payload["incapability_reasons"] == ["missing-current-evidence"]
 
 
 def test_composition_presenter_rejects_untyped_values(

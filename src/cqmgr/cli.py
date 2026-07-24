@@ -6,12 +6,10 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import sys
 import time
 from collections.abc import Callable
 from contextvars import ContextVar
-from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast, override
@@ -25,6 +23,10 @@ from cqmgr.adapters.cli.audit import (
 )
 from cqmgr.adapters.cli.group import CanonicalAliasGroup
 from cqmgr.adapters.cli.lifecycle import (
+    DEFAULT_TARGET_STRATEGY,
+    MANUAL_TARGET_STRATEGY,
+    TARGET_STRATEGY_CHOICES,
+    WATCH_CONDITION_CHOICES,
     LifecycleCliRuntime,
     LifecyclePresentation,
     PlanReferenceInput,
@@ -34,6 +36,9 @@ from cqmgr.adapters.cli.lifecycle import (
     emit_composition,
     emit_lifecycle_result,
     emit_watch_event,
+    parse_absolute_rfc3339,
+    parse_target_strategy,
+    parse_watch_condition,
     read_quota_contact,
 )
 from cqmgr.adapters.cli.local import LocalPresentation, emit_local_result
@@ -65,8 +70,6 @@ from cqmgr.bootstrap import (
     build_read_only_operations,
     classify_invocation,
 )
-from cqmgr.domain.plans import TargetStrategy
-from cqmgr.domain.status import WatchCondition
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Sequence
@@ -86,10 +89,6 @@ _ACKNOWLEDGEMENT_CODES = (
     "decrease-below-usage",
     "decrease-over-ten-percent",
     "unlimited-transition",
-)
-_RFC3339_TIMESTAMP = re.compile(
-    r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?"
-    r"(?:Z|[+-]\d{2}:\d{2})\Z"
 )
 
 
@@ -345,7 +344,7 @@ def _request_composition_input(  # noqa: C901, PLR0912, PLR0913
                 or location is None
                 or len(targets) != 1
                 or "=" in targets[0]
-                or target_strategy not in {None, TargetStrategy.MANUAL.value}
+                or target_strategy not in {None, MANUAL_TARGET_STRATEGY}
                 or any(compute_values)
                 or any(tpu_values)
                 or candidates
@@ -360,7 +359,7 @@ def _request_composition_input(  # noqa: C901, PLR0912, PLR0913
                 location,
                 parse_dimensions(dimensions),
             )
-            strategy = TargetStrategy.MANUAL
+            strategy = parse_target_strategy(MANUAL_TARGET_STRATEGY)
             parsed_targets: tuple[tuple[str | None, str], ...] = ((None, targets[0]),)
         else:
             if service is not None or quota_id is not None or location is not None:
@@ -403,14 +402,14 @@ def _request_composition_input(  # noqa: C901, PLR0912, PLR0913
                     locations=candidates,
                     all_compatible=all_compatible_locations,
                 )
-            strategy = TargetStrategy(target_strategy or TargetStrategy.MINIMUM.value)
-            parsed_targets = (
-                _manual_targets(targets) if strategy is TargetStrategy.MANUAL else ()
-            )
-            if strategy is TargetStrategy.MANUAL and not parsed_targets:
+            selected_strategy = target_strategy or DEFAULT_TARGET_STRATEGY
+            strategy = parse_target_strategy(selected_strategy)
+            manual_strategy = selected_strategy == MANUAL_TARGET_STRATEGY
+            parsed_targets = _manual_targets(targets) if manual_strategy else ()
+            if manual_strategy and not parsed_targets:
                 message = "manual workload strategy requires child targets"
                 raise ValueError(message)  # noqa: TRY301
-            if strategy is not TargetStrategy.MANUAL and targets:
+            if not manual_strategy and targets:
                 message = "derived workload strategies do not accept targets"
                 raise ValueError(message)  # noqa: TRY301
         return RequestCompositionInput(
@@ -444,22 +443,6 @@ async def _apply_lifecycle_async(
 ) -> None:
     result = await runtime.operations.apply(request)  # type: ignore[arg-type]
     _emit_lifecycle(result, presentation)
-
-
-def _absolute_deadline(value: str) -> datetime:
-    """Parse one absolute RFC 3339 timestamp and normalize it to UTC."""
-    if _RFC3339_TIMESTAMP.fullmatch(value) is None:
-        message = "Watch deadline must be an absolute RFC 3339 timestamp"
-        raise click.UsageError(message)
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError as error:
-        message = "Watch deadline must be an absolute RFC 3339 timestamp"
-        raise click.UsageError(message) from error
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        message = "Watch deadline must be an absolute RFC 3339 timestamp"
-        raise click.UsageError(message)
-    return parsed.astimezone(UTC)
 
 
 async def _watch_lifecycle_async(
@@ -1127,9 +1110,9 @@ def _request_input_options[CommandT: Callable[..., Any]](
     )(decorated)
     decorated = click.option(
         "--target-strategy",
-        type=click.Choice(tuple(item.value for item in TargetStrategy)),
+        type=click.Choice(TARGET_STRATEGY_CHOICES),
         default=None,
-        show_default=TargetStrategy.MINIMUM.value,
+        show_default=DEFAULT_TARGET_STRATEGY,
     )(decorated)
     decorated = click.option("--target", "targets", multiple=True)(decorated)
     decorated = click.option("--dimension", "dimensions", multiple=True)(decorated)
@@ -1333,7 +1316,7 @@ def request_preview(  # noqa: PLR0913
     default=None,
 )
 @click.option("--deadline", required=True)
-@click.option("--condition", type=click.Choice(("granted", "fulfilled")))
+@click.option("--condition", type=click.Choice(WATCH_CONDITION_CHOICES))
 @click.option("--resume")
 @click.option("--intent-id")
 def request_watch(  # noqa: PLR0913
@@ -1350,9 +1333,9 @@ def request_watch(  # noqa: PLR0913
     try:
         value = WatchCliInput(
             intent_id=intent_id,
-            condition=None if condition is None else WatchCondition(condition),
+            condition=None if condition is None else parse_watch_condition(condition),
             resume=resume,
-            deadline=_absolute_deadline(deadline),
+            deadline=parse_absolute_rfc3339(deadline),
         )
         runtime = build_lifecycle_cli_runtime()
         request_value = runtime.requests.watch(value)
@@ -1385,8 +1368,8 @@ def plan_review(
     quiet: bool,
 ) -> None:
     """Review one Plan without provider mutation."""
-    runtime = build_lifecycle_cli_runtime()
     value = _plan_reference(digest, plan_file)
+    runtime = build_lifecycle_cli_runtime()
     _emit_lifecycle(
         runtime.operations.review(runtime.requests.review(value)),
         LifecyclePresentation(output, no_color, quiet),
@@ -1408,8 +1391,8 @@ def plan_apply(  # noqa: PLR0913
     quiet: bool,
 ) -> None:
     """Apply one reviewed Plan in its bound non-atomic child order."""
-    runtime = build_lifecycle_cli_runtime()
     value = _plan_reference(digest, plan_file)
+    runtime = build_lifecycle_cli_runtime()
     request_value = runtime.requests.apply(value, acknowledge_resource_scope)
     asyncio.run(
         _apply_lifecycle_async(

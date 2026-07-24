@@ -274,6 +274,47 @@ def test_plan_review_and_apply_dispatch_exact_reference_and_acknowledgement(
     assert [name for name, _ in facade.calls] == ["review", "apply"]
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["plan", "review"],
+        [
+            "plan",
+            "review",
+            "--plan",
+            "digest",
+            "--plan-file",
+            "request.plan",
+        ],
+        [
+            "plan",
+            "apply",
+            "--acknowledge-resource-scope",
+            "projects/123",
+        ],
+        [
+            "plan",
+            "apply",
+            "--plan",
+            "digest",
+            "--plan-file",
+            "request.plan",
+            "--acknowledge-resource-scope",
+            "projects/123",
+        ],
+    ],
+)
+def test_plan_selector_usage_fails_before_runtime_construction(
+    arguments: list[str],
+) -> None:
+    """Missing or conflicting Plan references remain usage errors while gated."""
+    result = CliRunner().invoke(cli_module.main, arguments)
+
+    assert result.exit_code == USAGE_EXIT
+    assert "exactly one digest or path" in result.output
+    assert "lifecycle operations are unavailable" not in result.output
+
+
 def test_compute_preview_preserves_workload_shape_and_default_strategy(
     monkeypatch: MonkeyPatch,
 ) -> None:
