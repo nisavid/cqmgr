@@ -31,6 +31,7 @@ class PlanRepositoryStatus(StrEnum):
     DISPATCHED = "dispatched"
     CONSUMED = "consumed"
     QUARANTINED = "quarantined"
+    INVALIDATED = "invalidated"
     MISSING = "missing"
     CONFLICT = "conflict"
     EXPIRED = "expired"
@@ -141,6 +142,14 @@ class PlanRepository(Protocol):
     ) -> PlanRepositoryOutcome:
         """Durably consume the plan immediately before dispatch."""
 
+    def resume_dispatched(
+        self,
+        digest: str,
+        authentication_key: SecretValue,
+        now: datetime,
+    ) -> PlanRepositoryOutcome:
+        """Recover authenticated authority for a prepared or consumed Apply."""
+
     def complete(
         self,
         lease: PlanLease,
@@ -157,3 +166,12 @@ class PlanRepository(Protocol):
         now: datetime,
     ) -> PlanRepositoryOutcome:
         """Quarantine an interrupted or ambiguous dispatch."""
+
+    def invalidate(
+        self,
+        lease: PlanLease,
+        reason: StableSymbol,
+        authentication_key: SecretValue,
+        now: datetime,
+    ) -> PlanRepositoryOutcome:
+        """Persist terminal no-write invalidation after failed revalidation."""

@@ -671,7 +671,7 @@ def test_plan_rejects_cross_scope_unit_and_binding_inconsistency() -> None:
             "direct accelerator rank",
         ),
         (
-            lambda: replace(_plan(), scope_breadth_rank=5),
+            lambda: replace(_plan(), scope_breadth_rank=4),
             "scope breadth rank",
         ),
     ],
@@ -721,6 +721,7 @@ def test_review_validation_and_every_ledger_state_fail_closed() -> None:
         (PlanLedgerState.DISPATCHED, PlanIncapability.LEASED),
         (PlanLedgerState.CONSUMED, PlanIncapability.CONSUMED),
         (PlanLedgerState.QUARANTINED, PlanIncapability.QUARANTINED),
+        (PlanLedgerState.INVALIDATED, PlanIncapability.INVALIDATED),
     ):
         review = review_plan(plan, state=state, **common)
         assert PlanIncapability.UNACKNOWLEDGED in review.incapability_reasons

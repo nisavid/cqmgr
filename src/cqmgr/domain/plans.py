@@ -51,6 +51,7 @@ class PlanLedgerState(StrEnum):
     DISPATCHED = "dispatched"
     CONSUMED = "consumed"
     QUARANTINED = "quarantined"
+    INVALIDATED = "invalidated"
 
 
 class PlanKind(StrEnum):
@@ -78,6 +79,7 @@ class PlanIncapability(StrEnum):
     LEASED = "leased"
     CONSUMED = "consumed"
     QUARANTINED = "quarantined"
+    INVALIDATED = "invalidated"
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,7 +210,7 @@ class QuotaRequestPlanChild:
         if self.direct_accelerator_rank not in {0, 1}:
             msg = "plan child direct accelerator rank is unsupported"
             raise ValueError(msg)
-        if self.scope_breadth_rank not in {0, 1, 2, 3, 4}:
+        if self.scope_breadth_rank not in {0, 1, 2, 3}:
             msg = "plan child scope breadth rank is unsupported"
             raise ValueError(msg)
         _require_tuple_of(self.warnings, StableSymbol, "warnings")
@@ -453,7 +455,7 @@ class QuotaRequestPlan:
         if self.direct_accelerator_rank not in {0, 1}:
             msg = "single plan direct accelerator rank is unsupported"
             raise ValueError(msg)
-        if self.scope_breadth_rank not in {0, 1, 2, 3, 4}:
+        if self.scope_breadth_rank not in {0, 1, 2, 3}:
             msg = "single plan scope breadth rank is unsupported"
             raise ValueError(msg)
 
@@ -512,7 +514,7 @@ class PlanReview:
     incapability_reasons: tuple[PlanIncapability, ...]
 
 
-def review_plan(  # noqa: C901, PLR0913
+def review_plan(  # noqa: C901, PLR0912, PLR0913
     plan: QuotaPlan,
     *,
     digest: str,
@@ -554,6 +556,8 @@ def review_plan(  # noqa: C901, PLR0913
         reasons.append(PlanIncapability.CONSUMED)
     elif state is PlanLedgerState.QUARANTINED:
         reasons.append(PlanIncapability.QUARANTINED)
+    elif state is PlanLedgerState.INVALIDATED:
+        reasons.append(PlanIncapability.INVALIDATED)
     return PlanReview(
         plan=plan,
         digest=digest,

@@ -75,10 +75,14 @@ class PlanLedgerRecord:
         ):
             msg = "consumed state requires only its exact lease token"
             raise ValueError(msg)
-        if self.state is PlanLedgerState.QUARANTINED and (
-            self.lease_expires_at is not None or self.reason is None
-        ):
-            msg = "quarantined state requires a reason and no live deadline"
+        if self.state in {
+            PlanLedgerState.QUARANTINED,
+            PlanLedgerState.INVALIDATED,
+        } and (self.lease_expires_at is not None or self.reason is None):
+            msg = (
+                f"{self.state.value} terminal blocked state requires a reason "
+                "and no live deadline"
+            )
             raise ValueError(msg)
 
     @classmethod
@@ -90,6 +94,19 @@ class PlanLedgerRecord:
     def quarantined(cls, reason: StableSymbol) -> PlanLedgerRecord:
         """Build a terminal fail-closed state without dispatch authority."""
         return cls(PlanLedgerState.QUARANTINED, reason=reason)
+
+    def invalidate(self, *, token: str, reason: StableSymbol) -> PlanLedgerTransition:
+        """Permanently invalidate one leased plan before dispatch."""
+        if self.state is not PlanLedgerState.LEASED or self.lease_token != token:
+            return PlanLedgerTransition(PlanLedgerDecision.CONFLICT, self)
+        return PlanLedgerTransition(
+            PlanLedgerDecision.ACCEPTED,
+            PlanLedgerRecord(
+                PlanLedgerState.INVALIDATED,
+                lease_token=token,
+                reason=reason,
+            ),
+        )
 
     def recover(self, now: datetime) -> PlanLedgerTransition:
         """Release stale pre-dispatch work and quarantine ambiguous dispatch."""
@@ -168,6 +185,8 @@ class PlanLedgerRecord:
 
     def quarantine(self, *, token: str, reason: StableSymbol) -> PlanLedgerTransition:
         """Permanently block one leased or dispatched ambiguous plan."""
+        if self.state is PlanLedgerState.QUARANTINED and self.lease_token == token:
+            return PlanLedgerTransition(PlanLedgerDecision.IDEMPOTENT, self)
         if (
             self.state
             not in {
