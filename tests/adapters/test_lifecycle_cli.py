@@ -709,10 +709,10 @@ def test_lifecycle_result_uses_canonical_json_and_required_human_facts(
     assert "Acting principal:" not in human.out
 
 
-def test_rejected_structured_result_stays_valid_json_on_stdout(
+def test_rejected_result_preserves_ordered_diagnostics_in_both_modes(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Rejected structured output retains diagnostics in-band on stdout."""
+    """Rejected output keeps diagnostics in-band or safe and ordered on stderr."""
     result = OperationResult(
         operation=OperationName("plan.review"),
         resource_scope=SCOPE,
@@ -734,20 +734,47 @@ def test_rejected_structured_result_stays_valid_json_on_stdout(
                 retry=RetryDisposition.AFTER_NEW_PREVIEW,
                 message=RedactedText("Plan expiry has elapsed."),
             ),
+            Diagnostic(
+                code=DiagnosticCode("scope-mismatch"),
+                severity=Severity.ERROR,
+                phase=DiagnosticPhase("plan-review"),
+                source=DiagnosticSource("operator-input"),
+                retry=RetryDisposition.NEVER,
+                message=RedactedText("Use the bound resource scope."),
+            ),
         ),
     )
 
-    exit_class = emit_lifecycle_result(
+    structured_exit = emit_lifecycle_result(
         result,
         LifecyclePresentation(output="json", no_color=True, quiet=True),
     )
-    captured = capsys.readouterr()
+    structured = capsys.readouterr()
+    human_exit = emit_lifecycle_result(
+        result,
+        LifecyclePresentation(output="human", no_color=True, quiet=True),
+    )
+    human = capsys.readouterr()
 
-    payload = json.loads(captured.out)
-    assert exit_class == int(ExitClass.REJECTED_PRECONDITION)
-    assert captured.err == ""
+    payload = json.loads(structured.out)
+    assert structured_exit == human_exit == int(ExitClass.REJECTED_PRECONDITION)
+    assert structured.err == ""
     assert payload["outcome"]["exit_class"] == int(ExitClass.REJECTED_PRECONDITION)
     assert payload["diagnostics"][0]["code"] == "plan-expired"
+    assert payload["diagnostics"][1]["code"] == "scope-mismatch"
+    assert human.out == ""
+    assert "Diagnostic plan-expired (error)" in human.err
+    assert (
+        "Diagnostic context: local-plan; plan-review; retry after-new-preview"
+        in human.err
+    )
+    assert "Guidance: Plan expiry has elapsed." in human.err
+    assert "Diagnostic scope-mismatch (error)" in human.err
+    assert "Diagnostic context: operator-input; plan-review; retry never" in human.err
+    assert "Guidance: Use the bound resource scope." in human.err
+    assert human.err.index("Diagnostic plan-expired") < human.err.index(
+        "Diagnostic scope-mismatch"
+    )
 
 
 def test_composition_presenter_emits_reached_and_rejected_results(
@@ -882,6 +909,16 @@ def test_watch_jsonl_is_one_self_contained_record_and_human_names_condition(
         observed_at=NOW,
         subject=subject,
         aggregate=aggregate,
+        diagnostics=(
+            Diagnostic(
+                code=DiagnosticCode("watch-observation-delayed"),
+                severity=Severity.WARNING,
+                phase=DiagnosticPhase("watch"),
+                source=DiagnosticSource("quota-preference"),
+                retry=RetryDisposition.AFTER_BACKOFF,
+                message=RedactedText("Continue watching after a backoff."),
+            ),
+        ),
     )
 
     emit_watch_event(
@@ -901,5 +938,11 @@ def test_watch_jsonl_is_one_self_contained_record_and_human_names_condition(
     assert payload["sequence"] == 0
     assert payload["resume"] == "cqmgr.watch-resume/v1:opaque"
     assert payload["aggregate"]["accepted_children"] == 1
+    assert payload["diagnostics"][0]["code"] == "watch-observation-delayed"
     assert "Condition: granted" in human.out
     assert "Disposition: pending" in human.out
+    assert "Diagnostic watch-observation-delayed (warning)" in human.err
+    assert (
+        "Diagnostic context: quota-preference; watch; retry after-backoff" in human.err
+    )
+    assert "Guidance: Continue watching after a backoff." in human.err

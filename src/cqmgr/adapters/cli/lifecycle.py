@@ -355,6 +355,8 @@ def emit_lifecycle_result(
     else:
         for line in _result_lines(mapping):
             click.echo(line, err=destination_error)
+        for line in _diagnostic_lines(mapping["diagnostics"]):
+            click.echo(line, err=True)
     return int(result.outcome.exit_class)
 
 
@@ -415,6 +417,8 @@ def emit_watch_event(
         return
     for line in _watch_lines(mapping):
         click.echo(line)
+    for line in _diagnostic_lines(mapping["diagnostics"]):
+        click.echo(line, err=True)
 
 
 def _result_lines(mapping: Mapping[str, Any]) -> tuple[str, ...]:
@@ -441,6 +445,26 @@ def _result_lines(mapping: Mapping[str, Any]) -> tuple[str, ...]:
     if identity_evidence is not None:
         lines.extend(_human_lines("identity_evidence", identity_evidence))
     lines.extend(_human_lines("data", mapping["data"]))
+    return tuple(lines)
+
+
+def _diagnostic_lines(value: object) -> tuple[str, ...]:
+    """Render ordered safe diagnostic facts and recovery guidance."""
+    if not isinstance(value, list):
+        msg = "lifecycle diagnostics must be a list"
+        raise TypeError(msg)
+    lines: list[str] = []
+    for item in value:
+        diagnostic = _as_mapping(item)
+        lines.extend(
+            (
+                f"Diagnostic {diagnostic['code']} ({diagnostic['severity']})",
+                "Diagnostic context: "
+                f"{diagnostic['source']}; {diagnostic['phase']}; "
+                f"retry {diagnostic['retry']}",
+                f"Guidance: {diagnostic['message']}",
+            )
+        )
     return tuple(lines)
 
 

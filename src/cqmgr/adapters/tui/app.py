@@ -1243,6 +1243,9 @@ class CloudQuotaManagerApp(App[None]):
         )
 
     def _leave_lifecycle_route(self) -> None:
+        if self._lifecycle_state.apply_in_progress:
+            self._set_status("APPLY IN PROGRESS — route exit is deferred")
+            return
         route = self._lifecycle_state.route
         bound_scope = self._lifecycle_state.bound_scope
         affected = self._lifecycle_state.affected_selectors
