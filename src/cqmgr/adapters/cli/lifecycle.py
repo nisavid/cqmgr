@@ -33,7 +33,11 @@ from cqmgr.domain.status import WatchCondition
 if TYPE_CHECKING:
     from cqmgr.application.operations.apply import ApplyRequest
     from cqmgr.application.operations.lifecycle import LifecycleOperations
+    from cqmgr.application.operations.lifecycle_apply import (
+        EphemeralApplyContactRefresher,
+    )
     from cqmgr.application.operations.lifecycle_requests import (
+        InstallationTrustSource,
         LifecycleCompositionIntent,
         LifecycleRequestOperations,
     )
@@ -46,7 +50,9 @@ if TYPE_CHECKING:
         QuotaInspectSelector,
         ReadOnlyScopeInput,
     )
+    from cqmgr.application.operations.trust import LoadedInstallationTrust
     from cqmgr.application.operations.watch import WatchRequest
+    from cqmgr.application.ports.plans import DecodedPlan, PlanCodec, PlanRepository
     from cqmgr.domain.accelerator_overlay import (
         CloudTpuSliceRequirement,
         ComputeInstanceRequirement,
@@ -328,6 +334,18 @@ class LifecycleCliRequestFactory(Protocol):
         ...
 
 
+class LifecycleCliClock(Protocol):
+    """Clock surface required for one-shot and monotonic lifecycle inputs."""
+
+    def now(self) -> datetime:
+        """Return current aware UTC time."""
+        ...
+
+    def monotonic(self) -> float:
+        """Return current process-local monotonic seconds."""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class LifecycleCliRuntime:
     """Injected shared facade plus the sole protected request-construction seam."""
@@ -335,6 +353,169 @@ class LifecycleCliRuntime:
     operations: LifecycleOperations
     requests: LifecycleCliRequestFactory
     preparation: LifecycleRequestOperations | None = None
+
+
+class ProtectedLifecycleCliRequestFactory:
+    """Build Review, Apply, and Watch requests from active local authority."""
+
+    def __init__(
+        self,
+        *,
+        trust: InstallationTrustSource,
+        repository: PlanRepository,
+        codec: PlanCodec,
+        contacts: EphemeralApplyContactRefresher,
+        clock: LifecycleCliClock,
+    ) -> None:
+        """Bind read-only plan lookup and explicit protected runtime inputs."""
+        self._trust = trust
+        self._repository = repository
+        self._codec = codec
+        self._contacts = contacts
+        self._clock = clock
+
+    def compose(self, value: RequestCompositionInput) -> ComposeRequest:
+        """Reject the obsolete synchronous evidence path."""
+        del value
+        message = "Compose requires async lifecycle preparation"
+        raise RuntimeError(message)
+
+    def preview(self, value: RequestCompositionInput) -> PreviewRequest:
+        """Reject the obsolete synchronous evidence path."""
+        del value
+        message = "Preview requires async lifecycle preparation"
+        raise RuntimeError(message)
+
+    def review(self, value: PlanReferenceInput) -> PlanReviewRequest:
+        """Review local digests with authority and exports without requiring it."""
+        from cqmgr.application.operations.plans import (  # noqa: PLC0415
+            PlanReviewRequest,
+        )
+        from cqmgr.application.operations.trust import TrustLoadError  # noqa: PLC0415
+
+        try:
+            trust = self._trust.load()
+        except TrustLoadError:
+            if value.digest is not None:
+                raise
+            return PlanReviewRequest(
+                value.digest,
+                value.path,
+                None,
+                "installation-authority-unavailable",
+                self._clock.now(),
+            )
+        return PlanReviewRequest(
+            value.digest,
+            value.path,
+            trust.authentication_key if value.digest is not None else None,
+            trust.installation_id,
+            self._clock.now(),
+        )
+
+    def apply(
+        self,
+        value: PlanReferenceInput,
+        acknowledgement: str,
+        *,
+        quota_contact: SecretValue | None = None,
+    ) -> ApplyRequest:
+        """Authenticate one local/exported Plan and rebind protected input."""
+        from cqmgr.application.configuration import (  # noqa: PLC0415
+            parse_resource_scope_name,
+        )
+        from cqmgr.application.operations.apply import ApplyRequest  # noqa: PLC0415
+
+        trust = self._trust.load()
+        decoded = self._load_apply_plan(value, trust)
+        plan = decoded.plan
+        if plan.installation_id != trust.installation_id or not decoded.authenticate(
+            trust.authentication_key.reveal()
+        ):
+            message = "Apply Plan is not authenticated by this installation"
+            raise RuntimeError(message)
+        if plan.contact_binding.source.value != "per-operation-input":
+            message = "Apply contact source is not supported by this runtime"
+            raise RuntimeError(message)
+        if quota_contact is None:
+            message = "Apply requires --quota-contact-stdin for this Plan"
+            raise RuntimeError(message)
+        self._contacts.register(
+            plan.contact_binding,
+            quota_contact,
+            trust.authentication_key,
+        )
+        return ApplyRequest(
+            digest=decoded.digest,
+            authentication_key=trust.authentication_key,
+            local_installation_id=trust.installation_id,
+            resource_scope_acknowledgement=parse_resource_scope_name(acknowledgement),
+            principal=plan.principal,
+            contact_binding=plan.contact_binding,
+            contact_value=quota_contact.reveal().decode("utf-8"),
+            now=self._clock.now(),
+        )
+
+    def watch(self, value: WatchCliInput) -> WatchRequest:
+        """Bind active trust and convert an absolute deadline to monotonic time."""
+        from cqmgr.application.operations.watch import WatchRequest  # noqa: PLC0415
+        from cqmgr.application.ports.coordination import (  # noqa: PLC0415
+            CancellationToken,
+        )
+
+        trust = self._trust.load()
+        remaining = (value.deadline - self._clock.now()).total_seconds()
+        return WatchRequest(
+            intent_id=value.intent_id,
+            condition=value.condition,
+            resume=value.resume,
+            authentication_key=trust.authentication_key,
+            installation_id=trust.installation_id,
+            deadline=self._clock.monotonic() + remaining,
+            cancellation=CancellationToken(),
+        )
+
+    def _load_apply_plan(
+        self,
+        value: PlanReferenceInput,
+        trust: LoadedInstallationTrust,
+    ) -> DecodedPlan:
+        """Load and locally import one exact authenticated Apply plan."""
+        from cqmgr.application.ports.plans import (  # noqa: PLC0415
+            EncodedPlan,
+            PlanRepositoryStatus,
+        )
+
+        if value.digest is not None:
+            loaded = self._repository.load(
+                value.digest,
+                trust.authentication_key,
+                self._clock.now(),
+            )
+        else:
+            if value.path is None:  # pragma: no cover - validated input
+                message = "Apply requires one Plan reference"
+                raise RuntimeError(message)
+            loaded = self._repository.read_export(value.path)
+        if (
+            loaded.status is not PlanRepositoryStatus.AVAILABLE
+            or loaded.plan_bytes is None
+        ):
+            message = "Apply Plan is unavailable"
+            raise RuntimeError(message)
+        decoded = self._codec.decode(loaded.plan_bytes)
+        if value.digest is None:
+            imported = self._repository.store(
+                EncodedPlan(loaded.plan_bytes, decoded.digest),
+                trust.authentication_key,
+            )
+            if imported.status not in {
+                PlanRepositoryStatus.STORED,
+                PlanRepositoryStatus.CONFLICT,
+            }:
+                message = "Apply Plan could not be imported"
+                raise RuntimeError(message)
+        return decoded
 
 
 def read_quota_contact(stream: BinaryIO) -> SecretValue:

@@ -145,7 +145,14 @@ class _Preparation:
         self.preview = preview
         self.intents: list[tuple[object, float]] = []
 
-    async def prepare(self, intent: object, *, deadline: float) -> object:
+    async def prepare(
+        self,
+        intent: object,
+        *,
+        deadline: float,
+        require_preview: bool,
+    ) -> object:
+        assert require_preview
         self.intents.append((intent, deadline))
         return SimpleNamespace(
             composition=("async-compose-request", intent),

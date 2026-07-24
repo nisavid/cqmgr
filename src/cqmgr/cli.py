@@ -66,6 +66,7 @@ from cqmgr.application.ports.configuration import ConfigurationRepositoryError
 from cqmgr.bootstrap import (
     InvocationKind,
     build_audit_operations,
+    build_lifecycle_runtime,
     build_local_operations,
     build_quota_cursor_operations,
     build_read_only_operations,
@@ -260,14 +261,18 @@ def _provider_deadline() -> float:
 
 
 def build_lifecycle_cli_runtime() -> LifecycleCliRuntime:
-    """Fail closed until the production bootstrap supplies protected inputs."""
-    message = "lifecycle operations are unavailable in this installation"
-    raise click.ClickException(message)
+    """Compose production lifecycle operations without initializing authority."""
+    try:
+        return build_lifecycle_runtime()
+    except (OSError, RuntimeError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
 
 
 def _prepare_lifecycle_requests(
     runtime: LifecycleCliRuntime,
     value: RequestCompositionInput,
+    *,
+    require_preview: bool,
 ) -> PreparedLifecycleRequests | None:
     """Resolve fresh async evidence when the production preparation seam exists."""
     if runtime.preparation is None:
@@ -277,6 +282,7 @@ def _prepare_lifecycle_requests(
             runtime.preparation.prepare(
                 value.to_intent(),
                 deadline=_provider_deadline(),
+                require_preview=require_preview,
             )
         )
     except (TypeError, ValueError, RuntimeError) as error:
@@ -1303,7 +1309,7 @@ def request_compose(  # noqa: PLR0913
         plan_out=None,
     )
     runtime = build_lifecycle_cli_runtime()
-    prepared = _prepare_lifecycle_requests(runtime, value)
+    prepared = _prepare_lifecycle_requests(runtime, value, require_preview=False)
     request_value = (
         runtime.requests.compose(value) if prepared is None else prepared.composition
     )
@@ -1376,7 +1382,7 @@ def request_preview(  # noqa: PLR0913
         plan_out=plan_out,
     )
     runtime = build_lifecycle_cli_runtime()
-    prepared = _prepare_lifecycle_requests(runtime, value)
+    prepared = _prepare_lifecycle_requests(runtime, value, require_preview=True)
     if prepared is None:
         request_value = runtime.requests.preview(value)
     else:
