@@ -24,7 +24,7 @@ from cqmgr.application.operations.contacts import (
 from cqmgr.application.operations.lifecycle_apply import (
     ApplyRefreshError,
 )
-from cqmgr.application.operations.trust import LoadedInstallationTrust
+from cqmgr.application.operations.trust import LoadedInstallationTrust, TrustLoadError
 from cqmgr.application.ports.plans import (
     EncodedPlan,
     PlanRepositoryOutcome,
@@ -61,6 +61,12 @@ class _Trust:
             KEY,
             keyring_mutation_capable=True,
         )
+
+
+class _MissingTrust:
+    def load(self) -> LoadedInstallationTrust:
+        message = "installation authority unavailable"
+        raise TrustLoadError(message)
 
 
 class _Clock:
@@ -116,6 +122,10 @@ class _Repository:
     def __init__(self) -> None:
         self.loaded: list[str] = []
         self.stored: list[EncodedPlan] = []
+        self.load_status = PlanRepositoryStatus.AVAILABLE
+        self.export_status = PlanRepositoryStatus.EXPORTED
+        self.store_status = PlanRepositoryStatus.STORED
+        self.plan_bytes: bytes | None = b"portable-plan"
 
     def load(
         self,
@@ -127,15 +137,15 @@ class _Repository:
         assert now == NOW
         self.loaded.append(digest)
         return PlanRepositoryOutcome(
-            PlanRepositoryStatus.AVAILABLE,
-            plan_bytes=b"portable-plan",
+            self.load_status,
+            plan_bytes=self.plan_bytes,
         )
 
     def read_export(self, path: Path) -> PlanRepositoryOutcome:
         assert path == Path("request.plan")
         return PlanRepositoryOutcome(
-            PlanRepositoryStatus.EXPORTED,
-            plan_bytes=b"portable-plan",
+            self.export_status,
+            plan_bytes=self.plan_bytes,
         )
 
     def store(
@@ -145,7 +155,7 @@ class _Repository:
     ) -> PlanRepositoryOutcome:
         assert authentication_key is KEY
         self.stored.append(encoded)
-        return PlanRepositoryOutcome(PlanRepositoryStatus.STORED)
+        return PlanRepositoryOutcome(self.store_status)
 
 
 class _MissingConsumptionMarkers:
@@ -314,3 +324,89 @@ def test_watch_uses_active_trust_and_absolute_deadline() -> None:
     assert request.authentication_key is KEY
     assert request.installation_id == "installation-test"
     assert request.deadline == WATCH_DEADLINE
+
+
+def test_obsolete_synchronous_composition_paths_fail_closed() -> None:
+    """Protected composition requires the async evidence preparation boundary."""
+    factory, _ = _factory()
+
+    with pytest.raises(RuntimeError, match="Compose requires async"):
+        factory.compose(cast("Any", object()))
+    with pytest.raises(RuntimeError, match="Preview requires async"):
+        factory.preview(cast("Any", object()))
+
+
+def test_review_binds_authority_only_to_local_digest() -> None:
+    """Export Review remains portable while local Review carries active authority."""
+    factory, _ = _factory()
+
+    local = factory.review(PlanReferenceInput(DIGEST, None))
+    exported = factory.review(PlanReferenceInput(None, Path("request.plan")))
+
+    assert local.authentication_key is KEY
+    assert local.local_installation_id == "installation-test"
+    assert exported.authentication_key is None
+    assert exported.local_installation_id == "installation-test"
+
+
+def test_export_review_survives_missing_authority_but_digest_review_does_not() -> None:
+    """Missing local trust is representable for exports and terminal for digests."""
+    _, repository = _factory()
+    factory = ProtectedLifecycleCliRequestFactory(
+        trust=_MissingTrust(),
+        repository=cast("Any", repository),
+        codec=cast("Any", _Codec(object())),
+        contacts=cast("Any", _Contacts()),
+        clock=_Clock(),
+    )
+
+    exported = factory.review(PlanReferenceInput(None, Path("request.plan")))
+    assert exported.authentication_key is None
+    assert exported.local_installation_id == "installation-authority-unavailable"
+
+    with pytest.raises(TrustLoadError, match="authority unavailable"):
+        factory.review(PlanReferenceInput(DIGEST, None))
+
+
+@pytest.mark.parametrize(
+    ("reference", "status"),
+    [
+        (PlanReferenceInput(DIGEST, None), PlanRepositoryStatus.MISSING),
+        (
+            PlanReferenceInput(None, Path("request.plan")),
+            PlanRepositoryStatus.MISSING,
+        ),
+    ],
+)
+def test_apply_rejects_unavailable_local_and_exported_plans(
+    reference: PlanReferenceInput,
+    status: PlanRepositoryStatus,
+) -> None:
+    """Apply requires the exact repository status for each Plan reference kind."""
+    factory, repository = _factory()
+    repository.load_status = status
+    repository.export_status = status
+
+    with pytest.raises(RuntimeError, match="Plan is unavailable"):
+        asyncio.run(
+            factory.apply(
+                reference,
+                "projects/123",
+                quota_contact=CONTACT,
+            )
+        )
+
+
+def test_apply_rejects_failed_portable_import() -> None:
+    """An authenticated export must become a valid local record before Apply."""
+    factory, repository = _factory()
+    repository.store_status = PlanRepositoryStatus.FAILED
+
+    with pytest.raises(RuntimeError, match="could not be imported"):
+        asyncio.run(
+            factory.apply(
+                PlanReferenceInput(None, Path("request.plan")),
+                "projects/123",
+                quota_contact=CONTACT,
+            )
+        )
