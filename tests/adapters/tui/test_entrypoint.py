@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import cqmgr.tui as tui_module
@@ -12,21 +13,32 @@ if TYPE_CHECKING:
     import pytest
 
 
-def test_build_app_keeps_lifecycle_fail_closed_without_explicit_injection(
+def test_build_app_injects_precomposed_production_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Default TUI startup never synthesizes installation trust or mutation ports."""
+    """Default TUI receives one production operation and preparation graph."""
     read_only = object()
     audit = object()
+    lifecycle = object()
+    preparation = object()
     monkeypatch.setattr(bootstrap, "build_read_only_operations", lambda: read_only)
     monkeypatch.setattr(bootstrap, "build_audit_operations", lambda: audit)
+    monkeypatch.setattr(
+        bootstrap,
+        "build_lifecycle_runtime",
+        lambda: SimpleNamespace(
+            operations=lifecycle,
+            preparation=preparation,
+        ),
+    )
 
     app = tui_module.build_app()
 
     assert isinstance(app, CloudQuotaManagerApp)
     assert app.read_only is read_only
     assert app.audit is audit
-    assert app.lifecycle is None
+    assert app.lifecycle is lifecycle
+    assert app.lifecycle_preparation is preparation
     assert not hasattr(app, "apply")
     assert not hasattr(app, "mutation")
 

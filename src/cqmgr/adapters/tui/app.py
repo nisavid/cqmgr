@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast, override
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, DataTable, Footer, Input, Static
+from textual.widgets import Button, Checkbox, DataTable, Footer, Input, Static
 
 from cqmgr.adapters.cli.copy_cli import (
     obtainability_all_compatible_copy_cli,
@@ -24,6 +24,7 @@ from cqmgr.adapters.cli.copy_cli import (
     quota_inspect_copy_cli,
     quota_list_copy_cli,
     quota_resolve_copy_cli,
+    request_exact_copy_cli,
 )
 from cqmgr.adapters.cli.read_only_requests import (
     parse_cloud_tpu_slice_requirement,
@@ -36,6 +37,7 @@ from cqmgr.application.operations.audit import (
     AuditListData,
     AuditVerifyData,
 )
+from cqmgr.application.operations.lifecycle_requests import LifecycleCompositionIntent
 from cqmgr.application.operations.obtainability import (
     PreparedObtainabilityComparison,
     candidates_from_resolved_workload,
@@ -51,6 +53,7 @@ from cqmgr.application.operations.read_only import (
 )
 from cqmgr.application.operations.watch import WatchStartError
 from cqmgr.application.ports.coordination import CancellationToken
+from cqmgr.application.ports.secrets import SecretValue
 from cqmgr.domain.accelerator_overlay import (
     CloudTpuSliceRequirement,
     ComputeInstanceRequirement,
@@ -70,6 +73,7 @@ from cqmgr.domain.obtainability import (
     ObtainabilityComparison,
     SpotMachineConfiguration,
 )
+from cqmgr.domain.plans import TargetStrategy
 from cqmgr.domain.quota_queries import QuotaQueryFilters, QuotaQueryItem
 
 if TYPE_CHECKING:
@@ -87,6 +91,9 @@ if TYPE_CHECKING:
         ApplyRequest,
     )
     from cqmgr.application.operations.lifecycle import LifecycleOperations
+    from cqmgr.application.operations.lifecycle_requests import (
+        LifecycleRequestOperations,
+    )
     from cqmgr.application.operations.plans import (
         ComposeRequest,
         Composition,
@@ -509,6 +516,7 @@ class CloudQuotaManagerApp(App[None]):
         audit: AuditOperationsLike,
         *,
         lifecycle: LifecycleOperations | None = None,
+        lifecycle_preparation: LifecycleRequestOperations | None = None,
         scope_input: ReadOnlyScopeInput = _DEFAULT_SCOPE_INPUT,
         scope_locked: bool = False,
         no_color: bool = False,
@@ -530,6 +538,7 @@ class CloudQuotaManagerApp(App[None]):
         self.read_only = read_only
         self.audit = audit
         self.lifecycle = lifecycle
+        self.lifecycle_preparation = lifecycle_preparation
         self.scope_input = scope_input
         self.scope_locked = scope_locked
         self._monotonic = monotonic
@@ -656,6 +665,11 @@ class CloudQuotaManagerApp(App[None]):
                     yield Button("Resolve workload", id="workload-submit")
                 yield Button("Back to quota ledger", id="detail-back")
                 yield Button(
+                    "Compose quota request",
+                    id="quota-compose-request",
+                    disabled=True,
+                )
+                yield Button(
                     "Compare Spot obtainability",
                     id="workload-obtainability",
                     classes="hidden",
@@ -683,6 +697,25 @@ class CloudQuotaManagerApp(App[None]):
                 markup=False,
             )
             with Vertical(id="lifecycle-controls"):
+                with Vertical(id="lifecycle-compose-input", classes="hidden"):
+                    yield Input(
+                        placeholder="Absolute target in the provider native unit",
+                        id="lifecycle-target",
+                    )
+                    yield Input(
+                        placeholder="Comma-separated acknowledgement codes",
+                        id="lifecycle-acknowledgements",
+                    )
+                    yield Input(
+                        placeholder="Quota contact (protected; never displayed)",
+                        id="lifecycle-contact",
+                        password=True,
+                    )
+                    yield Checkbox("Expert request path", id="lifecycle-expert")
+                    yield Button(
+                        "Compose exact request",
+                        id="lifecycle-compose",
+                    )
                 yield Input(
                     placeholder="Type the exact resource scope to acknowledge Apply",
                     id="apply-scope-acknowledgement",
@@ -1224,6 +1257,7 @@ class CloudQuotaManagerApp(App[None]):
             "lifecycle-copy",
         ):
             self.query_one(f"#{button_id}", Button).disabled = True
+        self.query_one("#lifecycle-compose-input").add_class("hidden")
         acknowledgement = self.query_one("#apply-scope-acknowledgement", Input)
         acknowledgement.value = ""
         acknowledgement.disabled = True
@@ -1679,6 +1713,124 @@ class CloudQuotaManagerApp(App[None]):
             self._set_status("PREVIEW UNAVAILABLE — complete the request first")
             return
         self.open_preview(request, copy_cli=self._lifecycle_copy_cli())
+
+    def _open_selected_quota_composition(self) -> None:
+        """Open explicit exact-slice inputs without inventing mutation intent."""
+        selection = self.selected_quota
+        if (
+            selection is None
+            or self.lifecycle is None
+            or self.lifecycle_preparation is None
+        ):
+            self._set_status(
+                "COMPOSE UNAVAILABLE — select complete quota evidence first"
+            )
+            return
+        self._enter_lifecycle_route(
+            LifecycleRoute.COMPOSE,
+            selection.item.identity.resource_scope,
+        )
+        self.query_one("#lifecycle-compose-input").remove_class("hidden")
+        self.query_one("#lifecycle-target", Input).value = ""
+        self.query_one("#lifecycle-acknowledgements", Input).value = ""
+        self.query_one("#lifecycle-contact", Input).value = ""
+        self.query_one("#lifecycle-expert", Checkbox).value = False
+        self.query_one("#lifecycle-detail", Static).update(
+            "Compose exact quota request\n"
+            f"Service: {selection.selector.service}\n"
+            f"Quota ID: {selection.selector.quota_id}\n"
+            f"Location: {selection.selector.location}\n"
+            "Enter one absolute native-unit target. Expert mode never supplies "
+            "validation, scope confirmation, or named acknowledgements."
+        )
+        self.query_one("#lifecycle-target", Input).focus()
+        self._set_status("COMPOSE INPUT — complete the exact request")
+
+    def _submit_selected_quota_composition(self) -> None:
+        """Prepare one exact request asynchronously from current provider evidence."""
+        selection = self.selected_quota
+        preparation = self.lifecycle_preparation
+        if selection is None or preparation is None:
+            self._set_status("COMPOSE UNAVAILABLE — request preparation is unavailable")
+            return
+        target = self.query_one("#lifecycle-target", Input).value.strip()
+        if not target:
+            self._set_status("INVALID REQUEST — absolute target is required")
+            return
+        acknowledgements = tuple(
+            item.strip()
+            for item in self.query_one(
+                "#lifecycle-acknowledgements",
+                Input,
+            ).value.split(",")
+            if item.strip()
+        )
+        contact_text = self.query_one("#lifecycle-contact", Input).value
+        contact = SecretValue(contact_text.encode()) if contact_text else None
+        expert = self.query_one("#lifecycle-expert", Checkbox).value
+        intent = LifecycleCompositionIntent(
+            scope_input=ReadOnlyScopeInput(
+                explicit_resource_scope=selection.item.identity.resource_scope,
+            ),
+            selector=selection.selector,
+            workload=None,
+            target_strategy=TargetStrategy.MANUAL,
+            targets=((None, target),),
+            acknowledgements=acknowledgements,
+            expert=expert,
+            quota_contact=contact,
+        )
+        self.query_one("#lifecycle-compose", Button).disabled = True
+        self._set_status("PREPARING — refreshing exact quota evidence")
+        self.run_worker(
+            self._prepare_selected_quota_composition(intent),
+            group="lifecycle-compose",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _prepare_selected_quota_composition(
+        self,
+        intent: LifecycleCompositionIntent,
+    ) -> None:
+        """Await shared preparation and open the existing composition renderer."""
+        preparation = self.lifecycle_preparation
+        if preparation is None:  # pragma: no cover - guarded by submission
+            return
+        try:
+            prepared = await preparation.prepare(
+                intent,
+                deadline=self._deadline(),
+                require_preview=intent.quota_contact is not None,
+            )
+            selector = intent.selector
+            if selector is None:  # pragma: no cover - exact route owns selector
+                return
+            copy_cli = request_exact_copy_cli(
+                "preview" if prepared.preview is not None else "compose",
+                prepared.composition.resource_scope,
+                service=selector.service,
+                quota_id=selector.quota_id,
+                location=selector.location,
+                dimensions=selector.dimensions,
+                target=intent.targets[0][1],
+                acknowledgements=intent.acknowledgements,
+                expert=intent.expert,
+                quota_contact_stdin=intent.quota_contact is not None,
+            )
+            self.open_compose(
+                prepared.composition,
+                preview=prepared.preview,
+                copy_cli=copy_cli,
+            )
+        except (TypeError, ValueError, RuntimeError) as error:
+            self.query_one("#lifecycle-detail", Static).update(
+                f"Compose unavailable\nReason: {error}\n"
+                "No provider mutation was attempted."
+            )
+            self._set_status("COMPOSE REJECTED — refresh or correct the request")
+        finally:
+            self.query_one("#lifecycle-compose", Button).disabled = False
 
     def _submit_lifecycle_apply(self) -> None:
         request = self._lifecycle_state.pending_apply
@@ -2723,6 +2875,10 @@ class CloudQuotaManagerApp(App[None]):
             self._apply_filters()
         elif button_id == "detail-back":
             self.action_return_to_ledger()
+        elif button_id == "quota-compose-request":
+            self._open_selected_quota_composition()
+        elif button_id == "lifecycle-compose":
+            self._submit_selected_quota_composition()
         elif button_id == "lifecycle-back":
             self._leave_lifecycle_route()
         elif button_id == "lifecycle-preview":
@@ -3875,6 +4031,11 @@ class CloudQuotaManagerApp(App[None]):
         elif isinstance(data, ReadOnlyFailureData):
             lines.append(f"Reason: {data.reason}")
         self.query_one("#quota-detail", Static).update("\n".join(lines))
+        self.query_one("#quota-compose-request", Button).disabled = not (
+            isinstance(data, QuotaInspectData)
+            and self.lifecycle is not None
+            and self.lifecycle_preparation is not None
+        )
         self._set_status(self._result_status(result))
 
     @classmethod

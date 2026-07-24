@@ -12,11 +12,12 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, override
 
 from click.testing import CliRunner
 from textual.filter import Monochrome, NoColor
-from textual.widgets import Button, DataTable, Input, Static
+from textual.widgets import Button, Checkbox, DataTable, Input, Static
 
 import cqmgr.cli as cli_module
 from cqmgr.adapters.serialization.results import operation_result_mapping
@@ -33,6 +34,10 @@ from cqmgr.application.operations.audit import (
     AuditInspectData,
     AuditListData,
     AuditVerifyData,
+)
+from cqmgr.application.operations.lifecycle_requests import (
+    LifecycleCompositionIntent,
+    bind_protected_contact,
 )
 from cqmgr.application.operations.plans import (
     ComposeChild,
@@ -1297,6 +1302,64 @@ class ScriptedLifecycleOperations:
         self.watch_calls.append(request)
         for event in self.watch_events:
             yield event
+
+
+class ScriptedLifecyclePreparation:
+    """Record one Textual intent and return exact typed prepared requests."""
+
+    def __init__(self, item: QuotaQueryItem) -> None:
+        self.item = item
+        self.intents: list[LifecycleCompositionIntent] = []
+
+    async def prepare(
+        self,
+        intent: LifecycleCompositionIntent,
+        *,
+        deadline: float,
+        require_preview: bool,
+    ) -> Any:
+        assert deadline > 0
+        assert require_preview
+        self.intents.append(intent)
+        effective = self.item.effective_value
+        assert effective is not None
+        target = QuotaQuantity(int(intent.targets[0][1]), effective.unit)
+        composition = ComposeRequest(
+            PlanKind.SINGLE,
+            TargetStrategy.MANUAL,
+            self.item.identity.resource_scope,
+            (
+                ComposeChild(
+                    child_id="single",
+                    slice_identity=self.item.identity,
+                    effective=effective,
+                    usage=self.item.usage_value,
+                    workload=None,
+                    direct_accelerator_rank=0,
+                    scope_breadth_rank=1,
+                    manual_target=target,
+                    observed_at=self.item.evidence_observed_at,
+                ),
+            ),
+            expert=intent.expert,
+            acknowledgements=intent.acknowledgements,
+        )
+        contact = intent.quota_contact
+        assert contact is not None
+        key = SecretValue(b"k" * 32)
+        preview = PreviewRequest(
+            composition,
+            PlanPrincipal("principal://accounts/123"),
+            bind_protected_contact(contact, key),
+            "installation-42",
+            key,
+            True,
+            True,
+            True,
+            "exact-slice",
+            NOW,
+        )
+        return SimpleNamespace(composition=composition, preview=preview)
 
 
 class DelayedApplyLifecycleOperations(ScriptedLifecycleOperations):
@@ -2704,6 +2767,59 @@ def test_plan_review_and_watch_preserve_incapability_and_mixed_grant_evidence(  
             assert watch_event.aggregate.disposition is WatchDisposition.UNMET
             await pilot.click("#lifecycle-back")
             assert request.cancellation.cancelled
+
+    asyncio.run(scenario())
+
+
+def test_selected_quota_composes_through_async_preparation() -> None:
+    """The real TUI entry action preserves expert, acknowledgements, and contact."""
+
+    async def scenario() -> None:
+        browse = _browse_result()
+        assert isinstance(browse.data, QuotaBrowseData)
+        item = browse.data.items[0]
+        preparation = ScriptedLifecyclePreparation(item)
+        lifecycle = ScriptedLifecycleOperations(_apply_result())
+        operations = ScriptedReadOnlyOperations(browse)
+        app = CloudQuotaManagerApp(
+            operations,
+            ScriptedAuditOperations(),
+            lifecycle=lifecycle,  # type: ignore[arg-type]
+            lifecycle_preparation=preparation,  # type: ignore[arg-type]
+        )
+
+        async with app.run_test(size=(110, 60)) as pilot:
+            await pilot.pause()
+            app._select_quota(item)  # noqa: SLF001 - exercise selected route
+            await pilot.pause()
+            assert not app.query_one("#quota-compose-request", Button).disabled
+
+            await pilot.click("#quota-compose-request")
+            app.query_one("#lifecycle-target", Input).value = "8"
+            app.query_one(
+                "#lifecycle-acknowledgements", Input
+            ).value = "decrease-over-ten-percent"
+            app.query_one("#lifecycle-contact", Input).value = "operator@example.com"
+            app.query_one("#lifecycle-expert", Checkbox).value = True
+            await pilot.click("#lifecycle-compose")
+            await pilot.pause()
+
+            assert len(preparation.intents) == 1
+            intent = preparation.intents[0]
+            assert intent.expert
+            assert intent.acknowledgements == ("decrease-over-ten-percent",)
+            assert intent.quota_contact is not None
+            assert intent.quota_contact.reveal() == b"operator@example.com"
+            assert lifecycle.compose_calls[0].expert
+            assert not app.query_one("#lifecycle-preview", Button).disabled
+            rendered = str(_static(app, "#lifecycle-detail").content)
+            assert "Expert mode: yes" in rendered
+            assert "operator@example.com" not in rendered
+            copied = str(_static(app, "#lifecycle-copy-cli").content)
+            assert "--expert" in copied
+            assert "--acknowledge decrease-over-ten-percent" in copied
+            assert "--quota-contact-stdin" in copied
+            assert "operator@example.com" not in copied
 
     asyncio.run(scenario())
 
