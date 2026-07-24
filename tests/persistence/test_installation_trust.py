@@ -30,10 +30,13 @@ REFERENCE = SecretStoreReference.generate(
     INSTALLATION_ID,
     SecretPurpose.PLAN_AUTHENTICATION,
 )
+KEY_COMMITMENT = bytes.fromhex(
+    "5e318f8cf9cbe249a30812b8ca132d691ded7a91991413558db5758575f5e01f"
+)
 
 
 def _trust(phase: InstallationTrustPhase) -> InstallationTrust:
-    return InstallationTrust(INSTALLATION_ID, REFERENCE, phase)
+    return InstallationTrust(INSTALLATION_ID, REFERENCE, KEY_COMMITMENT, phase)
 
 
 def test_trust_repository_creates_and_transitions_private_state(tmp_path: Path) -> None:
@@ -58,6 +61,7 @@ def test_trust_repository_creates_and_transitions_private_state(tmp_path: Path) 
     contents = path.read_text()
     assert "installation-test" in contents
     assert REFERENCE.item_id in contents
+    assert KEY_COMMITMENT.hex() in contents
     assert "kkkk" not in contents
 
 
@@ -78,7 +82,7 @@ def test_trust_repository_rejects_recreation_and_wrong_phase(tmp_path: Path) -> 
 def test_trust_repository_rejects_tampered_or_newer_state(tmp_path: Path) -> None:
     """Unknown schemas and inconsistent key references are never interpreted."""
     path = tmp_path / "trust.toml"
-    path.write_text('schema = "cqmgr.installation-trust/v2"\n')
+    path.write_text('schema = "cqmgr.installation-trust/v3"\n')
     repository = TomlInstallationTrustRepository(path)
 
     with pytest.raises(InstallationTrustPersistenceError, match="unsupported"):
@@ -87,13 +91,53 @@ def test_trust_repository_rejects_tampered_or_newer_state(tmp_path: Path) -> Non
     path.write_text(
         "\n".join(
             (
-                'schema = "cqmgr.installation-trust/v1"',
+                'schema = "cqmgr.installation-trust/v2"',
                 'installation_id = "other-installation"',
                 f'key_service = "{REFERENCE.service}"',
                 f'key_item_id = "{REFERENCE.item_id}"',
+                f'key_commitment = "{KEY_COMMITMENT.hex()}"',
                 'phase = "active"',
             )
         )
     )
     with pytest.raises(InstallationTrustPersistenceError, match="match"):
         repository.load()
+
+
+def test_trust_repository_rejects_uncommitted_v1_state(tmp_path: Path) -> None:
+    """A pre-commitment record has no safe implicit migration authority."""
+    path = tmp_path / "trust.toml"
+    path.write_text(
+        "\n".join(
+            (
+                'schema = "cqmgr.installation-trust/v1"',
+                f'installation_id = "{INSTALLATION_ID}"',
+                f'key_service = "{REFERENCE.service}"',
+                f'key_item_id = "{REFERENCE.item_id}"',
+                'phase = "active"',
+            )
+        )
+    )
+
+    with pytest.raises(InstallationTrustPersistenceError, match="unsupported"):
+        TomlInstallationTrustRepository(path).load()
+
+
+def test_trust_repository_rejects_invalid_key_commitment(tmp_path: Path) -> None:
+    """Malformed commitments cannot become retained installation authority."""
+    path = tmp_path / "trust.toml"
+    path.write_text(
+        "\n".join(
+            (
+                'schema = "cqmgr.installation-trust/v2"',
+                f'installation_id = "{INSTALLATION_ID}"',
+                f'key_service = "{REFERENCE.service}"',
+                f'key_item_id = "{REFERENCE.item_id}"',
+                'key_commitment = "not-a-sha256-digest"',
+                'phase = "active"',
+            )
+        )
+    )
+
+    with pytest.raises(InstallationTrustPersistenceError, match="commitment"):
+        TomlInstallationTrustRepository(path).load()

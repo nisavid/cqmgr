@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
     )
 
 _AUTHENTICATION_KEY_BYTES = 32
+_AUTHENTICATION_KEY_COMMITMENT_BYTES = 32
 
 
 class InstallationTrustPhase(StrEnum):
@@ -38,6 +40,7 @@ class InstallationTrust:
 
     installation_id: str
     authentication_key_reference: SecretStoreReference
+    authentication_key_commitment: bytes
     phase: InstallationTrustPhase
 
     def __post_init__(self) -> None:
@@ -63,6 +66,13 @@ class InstallationTrust:
             is not SecretPurpose.PLAN_AUTHENTICATION
         ):
             msg = "installation trust key must authenticate plans"
+            raise ValueError(msg)
+        if (
+            not isinstance(self.authentication_key_commitment, bytes)
+            or len(self.authentication_key_commitment)
+            != _AUTHENTICATION_KEY_COMMITMENT_BYTES
+        ):
+            msg = "installation trust key commitment must be a SHA-256 digest"
             raise ValueError(msg)
         if not isinstance(self.phase, InstallationTrustPhase):
             msg = "installation trust phase must be typed"
@@ -112,6 +122,11 @@ type TrustMaterial = tuple[str, SecretStoreReference, SecretValue]
 type TrustMaterialGenerator = Callable[[], TrustMaterial]
 
 
+def _authentication_key_commitment(key: SecretValue) -> bytes:
+    """Return the non-secret commitment bound to one generated key."""
+    return hashlib.sha256(key.reveal()).digest()
+
+
 class InstallationTrustLoader:
     """Load active trust without any secret creation or recovery authority."""
 
@@ -144,7 +159,12 @@ class InstallationTrustLoader:
                 "it will not be recreated"
             )
             raise TrustLoadError(message)
-        if len(outcome.secret.reveal()) != _AUTHENTICATION_KEY_BYTES:
+        if len(
+            outcome.secret.reveal()
+        ) != _AUTHENTICATION_KEY_BYTES or not hmac.compare_digest(
+            _authentication_key_commitment(outcome.secret),
+            trust.authentication_key_commitment,
+        ):
             message = "installation trust key is inconsistent"
             raise TrustLoadError(message)
         return LoadedInstallationTrust(
@@ -191,6 +211,7 @@ class TrustInitializationOperations:
                 trust = InstallationTrust(
                     installation_id,
                     reference,
+                    _authentication_key_commitment(key),
                     InstallationTrustPhase.PREPARED,
                 )
             except (TypeError, ValueError):
@@ -222,6 +243,10 @@ class TrustInitializationOperations:
                 existing.status is SecretStoreStatus.AVAILABLE
                 and existing.secret is not None
                 and len(existing.secret.reveal()) == _AUTHENTICATION_KEY_BYTES
+                and hmac.compare_digest(
+                    _authentication_key_commitment(existing.secret),
+                    trust.authentication_key_commitment,
+                )
             ):
                 active = replace(trust, phase=InstallationTrustPhase.ACTIVE)
                 self._repository.transition(
