@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from cqmgr.application.ports.apply import (
     ApplyRevalidation,
@@ -232,6 +232,23 @@ class ApplyPlanOperations:
         if _revalidation_drift(plan, request, refreshed):
             return self._invalidate_after_preflight(plan, request)
 
+        lease_outcome = self._repository.acquire_lease(
+            request.digest,
+            request.authentication_key,
+            request.now,
+        )
+        if (
+            lease_outcome.status is not PlanRepositoryStatus.LEASED
+            or lease_outcome.lease is None
+        ):
+            return _result(
+                request,
+                reached=False,
+                outcome="plan-lease-failed",
+                exit_class=ExitClass.STALE_OR_CONFLICTING,
+                resource_scope=plan.resource_scope,
+            )
+        lease = lease_outcome.lease
         record = _apply_record(plan, request)
         audit_record_ids: list[str] = []
         try:
@@ -263,25 +280,6 @@ class ApplyPlanOperations:
                 resource_scope=plan.resource_scope,
                 audit_record_ids=tuple(audit_record_ids),
             )
-        lease_outcome = self._repository.acquire_lease(
-            request.digest,
-            request.authentication_key,
-            request.now,
-        )
-        if (
-            lease_outcome.status is not PlanRepositoryStatus.LEASED
-            or lease_outcome.lease is None
-        ):
-            return _result(
-                request,
-                reached=False,
-                outcome="plan-lease-failed",
-                exit_class=ExitClass.STALE_OR_CONFLICTING,
-                resource_scope=plan.resource_scope,
-                intent_id=record.intent_id,
-                audit_record_ids=tuple(audit_record_ids),
-            )
-        lease = lease_outcome.lease
         consumed = self._repository.mark_dispatched(
             lease,
             request.authentication_key,
@@ -357,16 +355,16 @@ class ApplyPlanOperations:
                 ApplyChildDisposition.UNKNOWN,
                 ApplyChildDisposition.UNATTEMPTED,
             }:
-                return _result_for_record(
-                    request,
+                return self._critical_unknown(
                     plan.resource_scope,
+                    lease,
+                    request,
                     record,
-                    reached=False,
-                    outcome=record.state.value,
-                    exit_class=ExitClass.OPERATIONAL_FAILURE,
-                    audit_record_ids=tuple(audit_record_ids),
+                    audit_record_ids,
+                    reconciliation_identity=child.preference_identity,
                 )
             planned_child = planned_by_id[child.child_id]
+            durable_before_intent = record
             write = QuotaPreferenceWrite(
                 child_id=child.child_id,
                 slice_identity=child.slice_identity,
@@ -398,7 +396,8 @@ class ApplyPlanOperations:
                         plan.resource_scope,
                         lease,
                         request,
-                        record,
+                        durable_before_intent,
+                        write.preference_identity,
                         audit_record_ids,
                     )
             except BaseException:  # noqa: BLE001
@@ -406,7 +405,8 @@ class ApplyPlanOperations:
                     plan.resource_scope,
                     lease,
                     request,
-                    record,
+                    durable_before_intent,
+                    write.preference_identity,
                     audit_record_ids,
                 )
 
@@ -505,7 +505,7 @@ class ApplyPlanOperations:
             exit_class=ExitClass.SUCCESS,
         )
 
-    async def _resume(  # noqa: C901, PLR0911
+    async def _resume(  # noqa: C901, PLR0911, PLR0912
         self,
         record: ApplyRecord,
         request: ApplyRequest,
@@ -534,6 +534,56 @@ class ApplyPlanOperations:
                 outcome="apply-recovery-unavailable",
                 exit_class=ExitClass.STALE_OR_CONFLICTING,
                 audit_record_ids=(),
+            )
+        if record.state in {
+            ApplyRecordState.ACCEPTED,
+            ApplyRecordState.FAILED,
+        }:
+            if resumed.status is not PlanRepositoryStatus.DISPATCHED:
+                return self._critical_unknown(
+                    record.resource_scope,
+                    resumed.lease,
+                    request,
+                    record,
+                    [],
+                )
+            if record.state is ApplyRecordState.ACCEPTED:
+                return self._finish(
+                    record.resource_scope,
+                    resumed.lease,
+                    request,
+                    record,
+                    [],
+                    outcome="applied",
+                    exit_class=ExitClass.SUCCESS,
+                )
+            failed = next(
+                (
+                    child
+                    for child in record.children
+                    if child.disposition is ApplyChildDisposition.FAILED
+                ),
+                None,
+            )
+            if failed is None:
+                return self._finish(
+                    record.resource_scope,
+                    resumed.lease,
+                    request,
+                    record,
+                    [],
+                    outcome="dispatch-intent-persistence-failed",
+                    exit_class=ExitClass.OPERATIONAL_FAILURE,
+                )
+            provider_outcome = cast("StableSymbol", failed.provider_outcome)
+            return self._finish(
+                record.resource_scope,
+                resumed.lease,
+                request,
+                record,
+                [],
+                outcome=provider_outcome.value,
+                exit_class=_failure_exit(provider_outcome),
             )
         plan: QuotaPlan | None = None
         try:
@@ -841,14 +891,25 @@ class ApplyPlanOperations:
             quarantine_identity=write.preference_identity,
         )
 
-    def _pre_dispatch_failure(
+    def _pre_dispatch_failure(  # noqa: PLR0913
         self,
         resource_scope: ResourceScope,
         lease: PlanLease,
         request: ApplyRequest,
         record: ApplyRecord,
+        reconciliation_identity: str,
         audit_record_ids: list[str],
     ) -> OperationResult[ApplyData]:
+        terminal = record.stop_remaining_unattempted(request.now)
+        if not self._save(terminal, request):
+            return self._critical_unknown(
+                resource_scope,
+                lease,
+                request,
+                record,
+                audit_record_ids,
+                reconciliation_identity=reconciliation_identity,
+            )
         if not self._quarantine(
             lease,
             request,
@@ -858,31 +919,31 @@ class ApplyPlanOperations:
                 resource_scope,
                 lease,
                 request,
-                record,
+                terminal,
                 audit_record_ids,
+                reconciliation_identity=reconciliation_identity,
             )
-        if not any(child.dispatch_intent_at is not None for child in record.children):
-            record = record.stop_unattempted(request.now)
-            self._save(record, request)
         return _result_for_record(
             request,
             resource_scope,
-            record,
+            terminal,
             reached=False,
             outcome="dispatch-intent-persistence-failed",
             exit_class=ExitClass.OPERATIONAL_FAILURE,
             audit_record_ids=tuple(audit_record_ids),
         )
 
-    def _critical_unknown(
+    def _critical_unknown(  # noqa: PLR0913
         self,
         resource_scope: ResourceScope,
         lease: PlanLease,
         request: ApplyRequest,
         record: ApplyRecord,
         audit_record_ids: list[str],
+        *,
+        reconciliation_identity: str | None = None,
     ) -> OperationResult[ApplyData]:
-        quarantine_identity = next(
+        quarantine_identity = reconciliation_identity or next(
             (
                 child.preference_identity
                 for child in reversed(record.children)
@@ -907,7 +968,7 @@ class ApplyPlanOperations:
             ),
             exit_class=ExitClass.OPERATIONAL_FAILURE,
             audit_record_ids=tuple(audit_record_ids),
-            quarantine_identity=quarantine_identity if quarantined else None,
+            quarantine_identity=quarantine_identity,
         )
 
     def _record_critical_evidence(
