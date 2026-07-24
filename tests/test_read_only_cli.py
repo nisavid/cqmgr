@@ -253,7 +253,7 @@ def test_obtainability_command_preserves_exact_candidates_and_request_shape(
     assert candidate.zones == ("us-central1-a", "us-central1-b")
     assert candidate.machine.gpu == GpuAttachment("nvidia-tesla-t4", 2)
     assert candidate.distribution_shape is DistributionShape.ANY_SINGLE_ZONE
-    assert options["support"].current_advice_supported is True  # type: ignore[union-attr]
+    assert "support" not in options
     assert operations.close_calls == 1
 
 
@@ -297,6 +297,7 @@ def test_obtainability_all_compatible_delegates_a_spot_workload(
     )
     assert options["machine"].machine_type == "a3-highgpu-8g"  # type: ignore[union-attr]
     assert options["distribution_shape"] is DistributionShape.ANY_SINGLE_ZONE
+    assert "support" not in options
 
 
 def test_quota_list_help_exposes_the_complete_v1_query_surface() -> None:

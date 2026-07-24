@@ -34,7 +34,6 @@ from cqmgr.application.configuration import (
     InterfaceSettingKey,
     parse_resource_scope_name,
 )
-from cqmgr.application.operations.obtainability import AdviceSupport
 from cqmgr.application.operations.quotas import QuotaBrowseRequest
 from cqmgr.application.operations.read_only import (
     QuotaInspectSelector,
@@ -776,14 +775,6 @@ def obtainability_compare(  # noqa: PLR0913
             candidate,
             all_compatible=all_compatible_locations,
         )
-        custom_machine = (
-            machine_type.startswith("custom-") or "-custom-" in machine_type
-        )
-        tpu_machine = machine_type.startswith(("ct", "tpu-"))
-        support = AdviceSupport(
-            current_advice_supported=not custom_machine and not tpu_machine,
-            history_supported=not custom_machine and not tpu_machine,
-        )
         candidates = (
             ()
             if all_compatible_locations
@@ -818,7 +809,6 @@ def obtainability_compare(  # noqa: PLR0913
                 machine=machine,
                 distribution_shape=shape,
                 deadline=_provider_deadline(),
-                support=support,
                 scope_input=scope_input,
             ),
             presentation,
@@ -829,7 +819,6 @@ def obtainability_compare(  # noqa: PLR0913
         lambda: operations.compare_obtainability(
             candidates,
             deadline=_provider_deadline(),
-            support=support,
             scope_input=scope_input,
         ),
         presentation,

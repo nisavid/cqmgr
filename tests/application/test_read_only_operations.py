@@ -17,7 +17,6 @@ from cqmgr.adapters.google.identity import (
 )
 from cqmgr.adapters.persistence.coordination import SharedBudgetCoordinator
 from cqmgr.application.configuration import ConfigSnapshot, Profile, SelectionState
-from cqmgr.application.operations.obtainability import AdviceSupport
 from cqmgr.application.operations.quotas import (
     QuotaBrowseData,
     QuotaInspectData,
@@ -73,6 +72,7 @@ from cqmgr.domain.identity import (
 )
 from cqmgr.domain.obtainability import (
     DistributionShape,
+    ObtainabilityCandidate,
     ObtainabilityComparison,
     SpotMachineConfiguration,
 )
@@ -515,6 +515,58 @@ def _resolved_spot_workload() -> ResolvedWorkloadRequirement:
     )
 
 
+def test_explicit_obtainability_resolves_exact_candidates_before_comparison() -> None:
+    """The facade derives eligibility from one exact explicit resolver request."""
+    candidate = ObtainabilityCandidate(
+        "us-central1",
+        ("us-central1-a",),
+        SpotMachineConfiguration("a3-highgpu-8g"),
+        2,
+        DistributionShape.ANY_SINGLE_ZONE,
+    )
+    base = _resolved_spot_workload()
+    requirement = ComputeInstanceRequirement(
+        "a3-highgpu-8g",
+        2,
+        ProvisioningModel.SPOT,
+        CandidateLocations(("us-central1-a",)),
+    )
+    resolved = ResolvedWorkloadRequirement(
+        requirement,
+        base.locations,
+        all_compatible_locations_exhaustive=None,
+    )
+    workload_operations = RecordingWorkloadOperations(
+        result(
+            "quota.resolve",
+            resolved,
+            resource_scope=scope("123456789"),
+        )
+    )
+    obtainability = RecordingObtainabilityOperations()
+    facade, *_ = service(
+        selection=SelectionState(direct_resource_scope=scope("123456789")),
+        workloads=workload_operations,
+        obtainability=obtainability,
+    )
+
+    returned = asyncio.run(
+        facade.compare_obtainability(
+            (candidate,),
+            deadline=42.5,
+        )
+    )
+
+    assert returned.outcome.exit_class is ExitClass.SUCCESS
+    assert len(workload_operations.requests) == 1
+    resolution_request = workload_operations.requests[0]
+    assert resolution_request.requirement == requirement  # type: ignore[attr-defined]
+    comparison_request = obtainability.requests[0]
+    assert comparison_request.candidates == (candidate,)  # type: ignore[attr-defined]
+    assert comparison_request.eligibility.queryable(candidate.candidate_id)  # type: ignore[attr-defined]
+    assert comparison_request.resolver_provenance is resolved  # type: ignore[attr-defined]
+
+
 def test_all_compatible_obtainability_reuses_provider_context_and_resolver() -> None:
     """The facade resolves and compares within one provider-scoped invocation."""
     resolved = _resolved_spot_workload()
@@ -540,7 +592,6 @@ def test_all_compatible_obtainability_reuses_provider_context_and_resolver() -> 
             machine=SpotMachineConfiguration("a3-highgpu-8g"),
             distribution_shape=DistributionShape.ANY_SINGLE_ZONE,
             deadline=42.5,
-            support=AdviceSupport(),
         )
     )
 
@@ -569,7 +620,6 @@ def test_all_compatible_unconfigured_result_preserves_context_diagnostics() -> N
             machine=SpotMachineConfiguration("a3-highgpu-8g"),
             distribution_shape=DistributionShape.ANY,
             deadline=42.5,
-            support=AdviceSupport(),
         )
     )
 
@@ -622,7 +672,6 @@ def test_all_compatible_resolution_failure_merges_context_diagnostics() -> None:
             machine=SpotMachineConfiguration("a3-highgpu-8g"),
             distribution_shape=DistributionShape.ANY,
             deadline=42.5,
-            support=AdviceSupport(),
         )
     )
 
@@ -666,7 +715,6 @@ def test_all_compatible_empty_expansion_merges_context_diagnostics() -> None:
             machine=SpotMachineConfiguration("a3-highgpu-8g"),
             distribution_shape=DistributionShape.ANY,
             deadline=42.5,
-            support=AdviceSupport(),
         )
     )
 

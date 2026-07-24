@@ -288,6 +288,27 @@ class UnrankedReason(StrEnum):
     PRICE_NON_ATTRIBUTABLE = "price-non-attributable"
     PRICE_INCOMPLETE_MACHINE = "price-incomplete-machine-request"
     CURRENT_PRICE_UNAVAILABLE = "current-price-unavailable"
+    CATALOG_UNSUPPORTED = "configuration-not-cataloged"
+    SPOT_UNSUPPORTED = "spot-unsupported"
+    NON_COMPUTE_MANAGEMENT_PLANE = "non-compute-management-plane"
+
+
+@dataclass(frozen=True, slots=True)
+class PreemptionP90Derivation:
+    """The exact complete interval set and nearest-rank selection."""
+
+    intervals: tuple[PreemptionInterval, ...]
+    nearest_rank: int
+    selected_rate: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentPriceDerivation:
+    """The exact applicable per-VM interval and request multiplication."""
+
+    interval: PriceInterval
+    vm_count: int
+    total_request_hourly_price_usd: Decimal
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,6 +324,39 @@ class RankedCandidate:
     rank: int | None
     unranked_reasons: tuple[UnrankedReason, ...]
     no_capacity_guarantee: bool = field(default=True, init=False)
+
+    @property
+    def preemption_derivation(self) -> PreemptionP90Derivation | None:
+        """Return the retained 30-bucket nearest-rank derivation when complete."""
+        if self.preemption_p90 is None or self.history is None:
+            return None
+        return PreemptionP90Derivation(
+            self.history.preemption,
+            _P90_NEAREST_RANK_INDEX + 1,
+            self.preemption_p90,
+        )
+
+    @property
+    def price_derivation(self) -> CurrentPriceDerivation | None:
+        """Return the one interval used for exact total-request price."""
+        if (
+            self.total_request_hourly_price_usd is None
+            or self.history is None
+            or self.advice is None
+        ):
+            return None
+        applicable = tuple(
+            interval
+            for interval in self.history.prices
+            if interval.contains(self.advice.retrieved_at)
+        )
+        if len(applicable) != 1:
+            return None
+        return CurrentPriceDerivation(
+            applicable[0],
+            self.candidate.vm_count,
+            self.total_request_hourly_price_usd,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,6 +394,29 @@ class ObtainabilityComparison:
             msg = "resolver provenance must be a ResolvedWorkloadRequirement or None"
             raise TypeError(msg)
         _require_nonempty(self.preview_status, "preview_status")
+
+    @property
+    def tied_candidate_ids(self) -> frozenset[str]:
+        """Identify exact rank-component ties before canonical identity ordering."""
+        groups: dict[
+            tuple[ObtainabilityBand | None, Decimal | None, Decimal | None],
+            list[str],
+        ] = {}
+        for assessment in self.candidates:
+            if assessment.unranked_reasons:
+                continue
+            components = (
+                assessment.band,
+                assessment.preemption_p90,
+                assessment.total_request_hourly_price_usd,
+            )
+            groups.setdefault(components, []).append(assessment.candidate.candidate_id)
+        return frozenset(
+            candidate_id
+            for identities in groups.values()
+            if len(identities) > 1
+            for candidate_id in identities
+        )
 
 
 @dataclass(frozen=True, slots=True)

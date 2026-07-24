@@ -85,6 +85,7 @@ from cqmgr.domain.obtainability import (
     ObtainabilityCandidate,
     ObtainabilityComparison,
     ObtainabilityProductCoverage,
+    PreemptionInterval,
     PriceInterval,
     RankedCandidate,
     SpotMachineConfiguration,
@@ -117,7 +118,9 @@ from cqmgr.domain.status import QuotaRequestStatus, Reconciliation
 if TYPE_CHECKING:
     import pytest
 
-    from cqmgr.application.operations.obtainability import AdviceSupport
+    from cqmgr.application.operations.obtainability import (
+        PreparedObtainabilityComparison,
+    )
     from cqmgr.application.ports.coordination import CancellationToken
 
 NOW = datetime(2026, 7, 23, 20, tzinfo=UTC)
@@ -341,7 +344,14 @@ def _obtainability_result() -> OperationResult[ObtainabilityComparison]:
     history = CapacityHistory(
         machine.machine_type,
         candidate.endpoint_region,
-        (),
+        tuple(
+            PreemptionInterval(
+                NOW - timedelta(days=30 - index),
+                NOW - timedelta(days=29 - index),
+                Decimal("0.12"),
+            )
+            for index in range(30)
+        ),
         (
             PriceInterval(
                 NOW - timedelta(days=1),
@@ -694,6 +704,9 @@ class ScriptedReadOnlyOperations:
         self.obtainability_all_calls: list[
             tuple[ComputeInstanceRequirement, dict[str, Any]]
         ] = []
+        self.obtainability_prepared_calls: list[
+            tuple[PreparedObtainabilityComparison, dict[str, Any]]
+        ] = []
         self.resolve_result: OperationResult[ResolvedWorkloadRequirement] | None = None
         self.closed = False
 
@@ -787,13 +800,11 @@ class ScriptedReadOnlyOperations:
             data=ResolvedWorkloadRequirement(requirement, locations, exhaustive),
         )
 
-    async def compare_obtainability(  # noqa: PLR0913
+    async def compare_obtainability(
         self,
         candidates: tuple[ObtainabilityCandidate, ...],
         *,
         deadline: float,
-        support: AdviceSupport,
-        catalog_coverage: tuple[object, ...] = (),
         cancellation: CancellationToken | None = None,
         scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
     ) -> OperationResult[ObtainabilityComparison]:
@@ -802,8 +813,6 @@ class ScriptedReadOnlyOperations:
                 candidates,
                 {
                     "deadline": deadline,
-                    "support": support,
-                    "catalog_coverage": catalog_coverage,
                     "cancellation": cancellation,
                     "scope_input": scope_input,
                 },
@@ -818,8 +827,6 @@ class ScriptedReadOnlyOperations:
         machine: SpotMachineConfiguration,
         distribution_shape: DistributionShape,
         deadline: float,
-        support: AdviceSupport,
-        catalog_coverage: tuple[object, ...] = (),
         cancellation: CancellationToken | None = None,
         scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
     ) -> OperationResult[ObtainabilityComparison]:
@@ -830,8 +837,26 @@ class ScriptedReadOnlyOperations:
                     "machine": machine,
                     "distribution_shape": distribution_shape,
                     "deadline": deadline,
-                    "support": support,
-                    "catalog_coverage": catalog_coverage,
+                    "cancellation": cancellation,
+                    "scope_input": scope_input,
+                },
+            )
+        )
+        return self.obtainability_result
+
+    async def compare_obtainability_prepared(
+        self,
+        prepared_comparison: PreparedObtainabilityComparison,
+        *,
+        deadline: float,
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[ObtainabilityComparison]:
+        self.obtainability_prepared_calls.append(
+            (
+                prepared_comparison,
+                {
+                    "deadline": deadline,
                     "cancellation": cancellation,
                     "scope_input": scope_input,
                 },
@@ -1117,23 +1142,19 @@ class DelayedObtainabilityOperations(ScriptedReadOnlyOperations):
         self.compare_returned = asyncio.Event()
 
     @override
-    async def compare_obtainability(
+    async def compare_obtainability_prepared(
         self,
-        candidates: tuple[ObtainabilityCandidate, ...],
+        prepared_comparison: PreparedObtainabilityComparison,
         *,
         deadline: float,
-        support: AdviceSupport,
-        catalog_coverage: tuple[object, ...] = (),
         cancellation: CancellationToken | None = None,
         scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
     ) -> OperationResult[ObtainabilityComparison]:
         self.compare_started.set()
         await self.release_compare.wait()
-        result = await super().compare_obtainability(
-            candidates,
+        result = await super().compare_obtainability_prepared(
+            prepared_comparison,
             deadline=deadline,
-            support=support,
-            catalog_coverage=catalog_coverage,
             cancellation=cancellation,
             scope_input=scope_input,
         )
@@ -1294,8 +1315,9 @@ def test_obtainability_standalone_explicit_candidates_share_typed_cli_semantics(
             _button(app, "#obtainability-compare").press()
             await pilot.pause()
 
-            assert len(operations.obtainability_calls) == 1
-            candidates, options = operations.obtainability_calls[0]
+            assert len(operations.obtainability_prepared_calls) == 1
+            prepared, options = operations.obtainability_prepared_calls[0]
+            candidates = prepared.candidates
             assert len(candidates) == 1
             assert candidates[0].endpoint_region == "us-central1"
             assert candidates[0].zones == ("us-central1-a", "us-central1-b")
@@ -1307,11 +1329,17 @@ def test_obtainability_standalone_explicit_candidates_share_typed_cli_semantics(
 
             detail = str(_static(app, "#obtainability-detail").content)
             assert "Candidate identity: sha256:" in detail
-            assert "Provider candidate score: 0.8 (high)" in detail
+            assert "Ranked candidates: 1" in detail
+            assert "Unranked candidates: 0" in detail
+            assert "Obtainability score: 0.8 (high)" in detail
             assert "Recommended shard: us-central1-a" in detail
             assert "Rank: 1" in detail
             assert "30-day p90 preemption: 0.12" in detail
+            assert "Preemption interval:" in detail
+            assert "P90 derivation: nearest-rank 27 of 30 = 0.12" in detail
             assert "Total-request hourly price: USD 6.50" in detail
+            assert "Price interval:" in detail
+            assert "Price derivation: USD 3.25 x 2 VMs = USD 6.50 per hour" in detail
             assert "Capacity guarantee: no" in detail
             assert app.last_copied_cli is not None
             assert app.last_copied_cli.startswith("cqmgr obtainability compare ")
@@ -1320,6 +1348,49 @@ def test_obtainability_standalone_explicit_candidates_share_typed_cli_semantics(
                 in app.last_copied_cli
             )
             assert "--all-compatible-locations" not in app.last_copied_cli
+
+    asyncio.run(scenario())
+
+
+def test_copy_cli_is_scoped_to_each_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sibling workspace can never copy another workspace's command."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+        copied: list[str] = []
+        monkeypatch.setattr(app, "copy_to_clipboard", copied.append)
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause()
+            quota_command = app.last_copied_cli
+            assert quota_command is not None
+            assert quota_command.startswith("cqmgr quota list ")
+
+            await pilot.click("#workspace-obtainability")
+            await pilot.pause()
+            assert app.last_copied_cli is None
+            assert "unavailable" in str(_static(app, "#obtainability-copy-cli").content)
+            await pilot.click("#obtainability-copy")
+            assert copied == []
+
+            _input(app, "#obtainability-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#obtainability-vm-count").value = "2"
+            _input(app, "#obtainability-distribution").value = "any-single-zone"
+            _input(app, "#obtainability-candidates").value = "us-central1=us-central1-a"
+            await pilot.click("#obtainability-compare")
+            await pilot.pause()
+            obtainability_command = app.last_copied_cli
+            assert obtainability_command is not None
+            assert obtainability_command.startswith("cqmgr obtainability compare ")
+
+            await pilot.click("#workspace-quotas")
+            await pilot.pause()
+            assert app.last_copied_cli == quota_command
+            await pilot.click("#copy-cli")
+            assert copied == [quota_command]
 
     asyncio.run(scenario())
 
@@ -1374,11 +1445,22 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields() ->
             _button(app, "#obtainability-compare").press()
             await pilot.pause()
 
-            assert len(operations.obtainability_calls) == 1
-            candidates, _options = operations.obtainability_calls[0]
+            assert len(operations.obtainability_prepared_calls) == 1
+            prepared, _options = operations.obtainability_prepared_calls[0]
+            candidates = prepared.candidates
             assert candidates[0].zones == ("us-central1-a",)
             assert "Return context: Quotas / Resolve / Compute instance" in str(
                 _static(app, "#obtainability-detail").content
+            )
+
+            _input(app, "#obtainability-candidates").value = "us-central1=us-central1-b"
+            await pilot.pause()
+            _button(app, "#obtainability-compare").press()
+            await pilot.pause()
+            assert len(operations.obtainability_prepared_calls) == 1
+            assert (
+                "confirm inherited fields"
+                in str(_static(app, "#status-line").content).casefold()
             )
 
             _button(app, "#obtainability-return").press()
@@ -1441,16 +1523,34 @@ def test_all_compatible_obtainability_expansion_is_visible_and_explicit() -> Non
             _button(app, "#obtainability-compare-all").press()
             await pilot.pause()
 
-            assert len(operations.obtainability_all_calls) == 1
-            submitted, options = operations.obtainability_all_calls[0]
-            assert isinstance(submitted.locations, AllCompatibleLocations)
-            assert options["distribution_shape"] is DistributionShape.BALANCED
+            assert len(operations.obtainability_prepared_calls) == 1
+            prepared, _options = operations.obtainability_prepared_calls[0]
+            assert isinstance(
+                prepared.resolver_provenance.requirement.locations,
+                AllCompatibleLocations,
+            )
+            assert all(
+                candidate.distribution_shape is DistributionShape.BALANCED
+                for candidate in prepared.candidates
+            )
+            assert len(operations.resolve_calls) == 1
             expansion = str(_static(app, "#obtainability-expansion").content)
             assert "us-central1-a" in expansion
             assert "us-east1-b" in expansion
             assert app.last_copied_cli is not None
-            assert "--all-compatible-locations" in app.last_copied_cli
-            assert "--candidate" not in app.last_copied_cli
+            assert "--all-compatible-locations" not in app.last_copied_cli
+            assert "--candidate" in app.last_copied_cli
+
+            _input(app, "#obtainability-vm-count").value = "3"
+            await pilot.pause()
+            _button(app, "#obtainability-compare-all").press()
+            await pilot.pause()
+            assert len(operations.resolve_calls) == 2
+            assert len(operations.obtainability_prepared_calls) == 1
+            assert (
+                "confirm candidate expansion"
+                in str(_static(app, "#status-line").content).casefold()
+            )
 
     asyncio.run(scenario())
 
@@ -1502,6 +1602,8 @@ def test_obtainability_snapshot_preserves_incomplete_evidence_ties_and_n1_limits
                 "Exact rank-component tie: yes; canonical candidate identity "
                 "breaks the tie"
             ) in snapshot
+            assert "Ranked candidates: 2" in snapshot
+            assert "Unranked candidates: 1" in snapshot
             assert "Unranked reasons: history-unsupported-n1-attached-gpu" in snapshot
             assert (
                 "Coverage reasons: capacityHistory does not support N1 attached GPUs"
@@ -2302,8 +2404,9 @@ def test_obtainability_tui_and_cli_consume_the_same_typed_result(
     assert json.loads(cli.stdout) == operation_result_mapping(
         operations.obtainability_result
     )
-    tui_candidates, tui_options = operations.obtainability_calls[0]
-    cli_candidates, cli_options = operations.obtainability_calls[1]
+    tui_prepared, tui_options = operations.obtainability_prepared_calls[0]
+    tui_candidates = tui_prepared.candidates
+    cli_candidates, cli_options = operations.obtainability_calls[0]
     assert tui_candidates == cli_candidates
     assert (
         tui_options["scope_input"].explicit_resource_scope
