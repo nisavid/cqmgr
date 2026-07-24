@@ -309,6 +309,7 @@ class CloudQuotaManagerApp(App[None]):
         self._cancellation: CancellationToken | None = None
         self._provider_generation = 0
         self._workspace_generation = 0
+        self._audit_operation_generation = 0
 
     @override
     def compose(self) -> ComposeResult:
@@ -725,8 +726,10 @@ class CloudQuotaManagerApp(App[None]):
         if workspace not in {"quotas", "obtainability", "audit"}:
             return
         self._workspace_generation += 1
-        generation = self._workspace_generation
-        if workspace == "audit":
+        workspace_generation = self._workspace_generation
+        if workspace == "audit" or (
+            self.active_workspace == "quotas" and workspace != "quotas"
+        ):
             self._claim_provider_view()
         self.active_workspace = workspace
         for name in ("quotas", "obtainability", "audit"):
@@ -735,16 +738,24 @@ class CloudQuotaManagerApp(App[None]):
             button = self.query_one(f"#workspace-{name}", Button)
             button.set_class(name == workspace, "active-workspace")
         if workspace == "audit":
+            operation_generation = self._claim_audit_operation()
             self.run_worker(
-                self._load_audit(generation),
+                self._load_audit(workspace_generation, operation_generation),
                 group="audit-load",
                 exclusive=True,
                 exit_on_error=False,
             )
 
-    async def _load_audit(self, generation: int) -> None:
+    async def _load_audit(
+        self,
+        workspace_generation: int,
+        operation_generation: int,
+    ) -> None:
         result = await self.audit.list(AuditQuery())
-        if not self._owns_workspace_view("audit", generation):
+        if not self._owns_audit_operation(
+            workspace_generation,
+            operation_generation,
+        ):
             return
         self.last_result = result
         table = self.query_one("#audit-table", DataTable)
@@ -764,6 +775,20 @@ class CloudQuotaManagerApp(App[None]):
         return (
             generation == self._workspace_generation
             and self.active_workspace == workspace
+        )
+
+    def _claim_audit_operation(self) -> int:
+        self._audit_operation_generation += 1
+        return self._audit_operation_generation
+
+    def _owns_audit_operation(
+        self,
+        workspace_generation: int,
+        operation_generation: int,
+    ) -> bool:
+        return (
+            self._owns_workspace_view("audit", workspace_generation)
+            and operation_generation == self._audit_operation_generation
         )
 
     def action_focus_filters(self) -> None:
@@ -811,8 +836,12 @@ class CloudQuotaManagerApp(App[None]):
         elif button_id == "workload-submit":
             self._submit_workload()
         elif button_id == "audit-verify":
+            operation_generation = self._claim_audit_operation()
             self.run_worker(
-                self._verify_audit(self._workspace_generation),
+                self._verify_audit(
+                    self._workspace_generation,
+                    operation_generation,
+                ),
                 group="audit-verify",
                 exclusive=True,
                 exit_on_error=False,
@@ -935,10 +964,12 @@ class CloudQuotaManagerApp(App[None]):
             if item is not None:
                 self._select_quota(item)
         elif event.data_table.id == "audit-table":
+            operation_generation = self._claim_audit_operation()
             self.run_worker(
                 self._inspect_audit(
                     str(event.row_key.value),
                     self._workspace_generation,
+                    operation_generation,
                 ),
                 group="audit-inspect",
                 exclusive=True,
@@ -1044,9 +1075,17 @@ class CloudQuotaManagerApp(App[None]):
             lines.append(f"Reason: {data.reason}")
         return tuple(lines)
 
-    async def _inspect_audit(self, record_id: str, generation: int) -> None:
+    async def _inspect_audit(
+        self,
+        record_id: str,
+        workspace_generation: int,
+        operation_generation: int,
+    ) -> None:
         result = await self.audit.inspect(record_id)
-        if not self._owns_workspace_view("audit", generation):
+        if not self._owns_audit_operation(
+            workspace_generation,
+            operation_generation,
+        ):
             return
         self.last_result = result
         data = result.data
@@ -1068,10 +1107,17 @@ class CloudQuotaManagerApp(App[None]):
         self.query_one("#audit-detail", Static).update("\n".join(lines))
         self._set_status(self._result_status(result))
 
-    async def _verify_audit(self, generation: int) -> None:
+    async def _verify_audit(
+        self,
+        workspace_generation: int,
+        operation_generation: int,
+    ) -> None:
         """Verify the complete retained audit chain through the shared operation."""
         result = await self.audit.verify()
-        if not self._owns_workspace_view("audit", generation):
+        if not self._owns_audit_operation(
+            workspace_generation,
+            operation_generation,
+        ):
             return
         self.last_result = result
         data = result.data
