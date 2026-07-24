@@ -282,6 +282,33 @@ def test_workload_inputs_reject_incomplete_or_nonpositive_shapes(
         requirement()
 
 
+@pytest.mark.parametrize(
+    ("accelerator_type", "accelerator_count", "message"),
+    [
+        ("nvidia-tesla-t4", None, "must be supplied together"),
+        (None, 2, "must be supplied together"),
+        ("", 2, "attached_accelerator_type must be non-empty"),
+        ("nvidia-tesla-t4", 0, "attached_accelerator_count must be a positive"),
+        ("nvidia-tesla-t4", True, "attached_accelerator_count must be a positive"),
+    ],
+)
+def test_compute_attachment_requires_one_complete_exact_positive_shape(
+    accelerator_type: str | None,
+    accelerator_count: int | None,
+    message: str,
+) -> None:
+    """Optional Compute attachments are either absent or exact and complete."""
+    with pytest.raises(ValueError, match=message):
+        ComputeInstanceRequirement(
+            machine_type="n1-standard-16",
+            instance_count=1,
+            provisioning_model=ProvisioningModel.SPOT,
+            locations=CandidateLocations(("us-central1-a",)),
+            attached_accelerator_type=accelerator_type,
+            attached_accelerator_count=accelerator_count,
+        )
+
+
 def test_workload_inputs_reject_untyped_modes_and_incomplete_tpu_identity() -> None:
     """Workload shapes cannot normalize strings into domain enums or selectors."""
     candidate = CandidateLocations(("us-central1-a",))
@@ -620,6 +647,11 @@ def test_resolved_location_keeps_constraints_and_assessments_aligned() -> None:
     )
     with pytest.raises(ValueError, match="each exact constraint requirement"):
         replace(location, constraint_requirements=(replacement,))
+    with pytest.raises(ValueError, match="must be supplied together"):
+        replace(
+            location,
+            attached_accelerator_type="nvidia-tesla-t4",
+        )
 
 
 def test_unresolved_location_cannot_claim_resolved_quota_facts() -> None:
@@ -634,6 +666,12 @@ def test_unresolved_location_cannot_claim_resolved_quota_facts() -> None:
         replace(
             unresolved,
             constraint_requirements=compatible.constraint_requirements,
+        )
+    with pytest.raises(ValueError, match="cannot claim a proven attachment"):
+        replace(
+            unresolved,
+            attached_accelerator_type="nvidia-tesla-t4",
+            attached_accelerator_count=2,
         )
 
 
@@ -668,6 +706,32 @@ def test_resolved_requirement_preserves_candidate_order_and_coverage_semantics()
     assert exhaustive.all_compatible_locations_exhaustive is True
     with pytest.raises(TypeError, match="must state exhaustive"):
         replace(exhaustive, all_compatible_locations_exhaustive=None)
+
+
+def test_resolved_location_proves_only_its_exact_compute_attachment() -> None:
+    """Attachment proof requires exact retained type, count, and total demand."""
+    requirement = ComputeInstanceRequirement(
+        machine_type="n1-standard-16",
+        instance_count=4,
+        provisioning_model=ProvisioningModel.SPOT,
+        locations=CandidateLocations(("us-central1-a",)),
+        attached_accelerator_type="nvidia-tesla-t4",
+        attached_accelerator_count=2,
+    )
+    location = replace(
+        _compatible_location(),
+        attached_accelerator_type="nvidia-tesla-t4",
+        attached_accelerator_count=2,
+    )
+
+    assert location.proves_requested_compute_attachment(requirement)
+    assert not location.proves_requested_compute_attachment(
+        replace(requirement, attached_accelerator_count=1)
+    )
+    assert not replace(
+        location,
+        attached_accelerator_type="nvidia-tesla-p4",
+    ).proves_requested_compute_attachment(requirement)
 
 
 def test_overlay_public_operations_reject_untyped_boundary_values() -> None:

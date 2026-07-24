@@ -16,6 +16,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, DataTable, Footer, Input, Static
 
 from cqmgr.adapters.cli.copy_cli import (
+    obtainability_all_compatible_copy_cli,
     obtainability_compare_copy_cli,
     quota_inspect_copy_cli,
     quota_list_copy_cli,
@@ -56,6 +57,7 @@ from cqmgr.domain.accelerator_overlay import (
 from cqmgr.domain.audit import AuditQuery
 from cqmgr.domain.obtainability import (
     DistributionShape,
+    GpuAttachment,
     ObtainabilityCandidate,
     ObtainabilityComparison,
     SpotMachineConfiguration,
@@ -72,6 +74,7 @@ if TYPE_CHECKING:
     from cqmgr.domain.obtainability import RankedCandidate
     from cqmgr.domain.quotas import QuotaQuantity
     from cqmgr.domain.results import OperationResult
+    from cqmgr.domain.scopes import ResourceScope
 
 
 _DEFAULT_SCOPE_INPUT = ReadOnlyScopeInput()
@@ -447,6 +450,7 @@ class CloudQuotaManagerApp(App[None]):
         self.active_workspace = "quotas"
         self.current_query = ReadOnlyQuotaQuery()
         self.last_result: OperationResult[Any] | None = None
+        self._copy_cli_resource_scope = scope_input.explicit_resource_scope
         self._copy_cli_by_workspace: dict[str, WorkspaceCopyCli] = {}
         self.selected_quota: QuotaSelection | None = None
         self._quota_items: dict[str, QuotaQueryItem] = {}
@@ -523,6 +527,14 @@ class CloudQuotaManagerApp(App[None]):
                     yield Input(
                         placeholder="Machine type",
                         id="workload-machine-type",
+                    )
+                    yield Input(
+                        placeholder="Optional attached GPU type",
+                        id="workload-gpu-type",
+                    )
+                    yield Input(
+                        placeholder="Optional attached GPU count",
+                        id="workload-gpu-count",
                     )
                     yield Input(
                         placeholder="Cloud TPU accelerator type",
@@ -835,6 +847,8 @@ class CloudQuotaManagerApp(App[None]):
         self.query_one("#coverage-summary", Static).update("  ".join(lines))
 
     def _render_instrument(self, result: OperationResult[Any]) -> None:
+        if result.resource_scope is not None:
+            self._copy_cli_resource_scope = result.resource_scope
         scope = (
             result.resource_scope.canonical_name
             if result.resource_scope is not None
@@ -898,6 +912,38 @@ class CloudQuotaManagerApp(App[None]):
         copy_cli = WorkspaceCopyCli(self.active_workspace, command)
         self._copy_cli_by_workspace[self.active_workspace] = copy_cli
         self._sync_copy_cli_preview()
+
+    def _show_obtainability_copy_cli(
+        self,
+        candidates: tuple[ObtainabilityCandidate, ...],
+    ) -> None:
+        """Expose a safe equivalent command as soon as its fixed input is confirmed."""
+        scope: ResourceScope | None = self._copy_cli_resource_scope
+        if scope is None:
+            return
+        self._show_copy_cli(obtainability_compare_copy_cli(scope, candidates))
+
+    def _show_obtainability_all_compatible_copy_cli(
+        self,
+        draft: ObtainabilityFormDraft,
+    ) -> None:
+        """Expose the unresolved all-compatible mode without inventing candidates."""
+        scope: ResourceScope | None = self._copy_cli_resource_scope
+        if scope is None:
+            return
+        requirement = self._obtainability_requirement(
+            draft,
+            locations=(),
+            all_compatible=True,
+        )
+        self._show_copy_cli(
+            obtainability_all_compatible_copy_cli(
+                scope,
+                requirement,
+                machine=draft.machine,
+                distribution_shape=draft.distribution_shape,
+            )
+        )
 
     def _sync_copy_cli_preview(self) -> None:
         """Expose only the active workspace's canonical command."""
@@ -1029,6 +1075,8 @@ class CloudQuotaManagerApp(App[None]):
 
     def action_workspace(self, workspace: str) -> None:
         """Switch among the three sibling workspaces without losing inspector state."""
+        if workspace == "obtainability" and self.active_workspace != "obtainability":
+            self._prepare_standalone_obtainability()
         self._set_active_workspace(workspace)
 
     def _set_active_workspace(self, workspace: str) -> None:
@@ -1137,9 +1185,7 @@ class CloudQuotaManagerApp(App[None]):
         """Route explicit shell and filter controls."""
         button_id = event.button.id
         if button_id and button_id.startswith("workspace-"):
-            if button_id == "workspace-obtainability":
-                self._prepare_standalone_obtainability()
-            self._set_active_workspace(button_id.removeprefix("workspace-"))
+            self.action_workspace(button_id.removeprefix("workspace-"))
         elif button_id == "apply-filters" and self.active_workspace == "quotas":
             self._apply_filters()
         elif button_id == "detail-back":
@@ -1204,8 +1250,11 @@ class CloudQuotaManagerApp(App[None]):
                 return
             self._claim_provider_view()
             self._active_obtainability_fingerprint = None
-            self._active_obtainability_all_compatible = False
+            self._active_obtainability_all_compatible = (
+                current.all_compatible if current is not None else False
+            )
             self._active_obtainability_inputs.clear()
+            entry_mode = self._obtainability_state.entry_mode
             self._obtainability_state = replace(
                 self._obtainability_state,
                 pending_expansion=None,
@@ -1227,6 +1276,11 @@ class CloudQuotaManagerApp(App[None]):
             self._set_status(
                 "INPUT CHANGED — confirm the exact request before comparison"
             )
+            if current is not None and entry_mode is ObtainabilityEntryMode.STANDALONE:
+                if current.all_compatible:
+                    self._show_obtainability_all_compatible_copy_cli(current)
+                elif current.candidates:
+                    self._show_obtainability_copy_cli(current.candidates)
 
     def _apply_filters(self) -> None:
         if self.active_workspace != "quotas":
@@ -1258,6 +1312,8 @@ class CloudQuotaManagerApp(App[None]):
         )
         machine = self.query_one("#workload-machine-type", Input)
         machine.disabled = kind != "compute-instance"
+        for selector in ("#workload-gpu-type", "#workload-gpu-count"):
+            self.query_one(selector, Input).disabled = kind != "compute-instance"
         for selector in (
             "#workload-accelerator-type",
             "#workload-topology",
@@ -1304,6 +1360,14 @@ class CloudQuotaManagerApp(App[None]):
                     ).value.strip(),
                     locations=locations,
                     all_compatible=all_compatible,
+                    attached_accelerator_type=(
+                        self.query_one("#workload-gpu-type", Input).value.strip()
+                        or None
+                    ),
+                    attached_accelerator_count=(
+                        self.query_one("#workload-gpu-count", Input).value.strip()
+                        or None
+                    ),
                 )
             else:
                 requirement = parse_cloud_tpu_slice_requirement(
@@ -1366,8 +1430,14 @@ class CloudQuotaManagerApp(App[None]):
         self.query_one(
             "#obtainability-machine-type", Input
         ).value = requirement.machine_type
-        self.query_one("#obtainability-gpu-type", Input).value = ""
-        self.query_one("#obtainability-gpu-count", Input).value = ""
+        self.query_one("#obtainability-gpu-type", Input).value = (
+            requirement.attached_accelerator_type or ""
+        )
+        self.query_one("#obtainability-gpu-count", Input).value = (
+            ""
+            if requirement.attached_accelerator_count is None
+            else str(requirement.attached_accelerator_count)
+        )
         self.query_one("#obtainability-vm-count", Input).value = str(
             requirement.instance_count
         )
@@ -1385,14 +1455,29 @@ class CloudQuotaManagerApp(App[None]):
         try:
             candidates = parse_obtainability_candidates(
                 machine_type=requirement.machine_type,
-                gpu_type=None,
-                gpu_count=None,
+                gpu_type=requirement.attached_accelerator_type,
+                gpu_count=(
+                    None
+                    if requirement.attached_accelerator_count is None
+                    else str(requirement.attached_accelerator_count)
+                ),
                 vm_count=str(requirement.instance_count),
                 distribution_shape=DistributionShape.ANY.value,
                 candidates=candidate_values,
             )
             draft = ObtainabilityFormDraft(
-                SpotMachineConfiguration(requirement.machine_type),
+                SpotMachineConfiguration(
+                    requirement.machine_type,
+                    gpu=(
+                        None
+                        if requirement.attached_accelerator_type is None
+                        or requirement.attached_accelerator_count is None
+                        else GpuAttachment(
+                            requirement.attached_accelerator_type,
+                            requirement.attached_accelerator_count,
+                        )
+                    ),
+                ),
                 requirement.instance_count,
                 DistributionShape.ANY,
                 candidates,
@@ -1479,6 +1564,15 @@ class CloudQuotaManagerApp(App[None]):
             confirmed_fingerprint=draft.fingerprint,
             confirmed_candidate_ids=candidate_ids,
         )
+        candidates = (
+            state.pending_expansion.candidates
+            if state.pending_expansion is not None
+            else draft.candidates
+        )
+        if state.pending_all_compatible:
+            self._show_obtainability_all_compatible_copy_cli(draft)
+        else:
+            self._show_obtainability_copy_cli(candidates)
         self._set_status("CONFIRMED — inherited fields and candidate mode are explicit")
 
     def _submit_obtainability(self) -> None:
@@ -1540,6 +1634,7 @@ class CloudQuotaManagerApp(App[None]):
         cancellation = CancellationToken()
         self._cancellation = cancellation
         self._mark_obtainability_submission(draft)
+        self._show_obtainability_copy_cli(draft.candidates)
         self.run_worker(
             self._compare_obtainability(draft, cancellation, generation),
             group="obtainability-compare",
@@ -1551,16 +1646,15 @@ class CloudQuotaManagerApp(App[None]):
         """Resolve an all-compatible expansion before any comparison begins."""
         try:
             draft = self._decode_obtainability_form(all_compatible=True)
-            requirement = parse_compute_instance_requirement(
-                machine_type=draft.machine.machine_type,
-                instance_count=str(draft.vm_count),
-                provisioning_model=ProvisioningModel.SPOT.value,
+            requirement = self._obtainability_requirement(
+                draft,
                 locations=(),
                 all_compatible=True,
             )
         except (TypeError, ValueError) as error:
             self._set_status(f"INVALID OBTAINABILITY REQUEST — {error}")
             return
+        self._show_obtainability_all_compatible_copy_cli(draft)
         state = self._obtainability_state
         if (
             state.pending_expansion is None
@@ -1673,6 +1767,25 @@ class CloudQuotaManagerApp(App[None]):
             all_compatible,
         )
 
+    @staticmethod
+    def _obtainability_requirement(
+        draft: ObtainabilityFormDraft,
+        *,
+        locations: tuple[str, ...],
+        all_compatible: bool,
+    ) -> ComputeInstanceRequirement:
+        """Carry the exact optional attachment into resolver-owned proof."""
+        gpu = draft.machine.gpu
+        return parse_compute_instance_requirement(
+            machine_type=draft.machine.machine_type,
+            instance_count=str(draft.vm_count),
+            provisioning_model=ProvisioningModel.SPOT.value,
+            locations=locations,
+            all_compatible=all_compatible,
+            attached_accelerator_type=(None if gpu is None else gpu.accelerator_type),
+            attached_accelerator_count=None if gpu is None else str(gpu.count),
+        )
+
     async def _preview_obtainability_expansion(
         self,
         requirement: ComputeInstanceRequirement,
@@ -1739,10 +1852,8 @@ class CloudQuotaManagerApp(App[None]):
                 for location in (candidate.zones or (candidate.endpoint_region,))
             )
         )
-        requirement = parse_compute_instance_requirement(
-            machine_type=draft.machine.machine_type,
-            instance_count=str(draft.vm_count),
-            provisioning_model=ProvisioningModel.SPOT.value,
+        requirement = self._obtainability_requirement(
+            draft,
             locations=locations,
             all_compatible=False,
         )
@@ -1795,10 +1906,8 @@ class CloudQuotaManagerApp(App[None]):
                 for location in (candidate.zones or (candidate.endpoint_region,))
             )
         )
-        requirement = parse_compute_instance_requirement(
-            machine_type=draft.machine.machine_type,
-            instance_count=str(draft.vm_count),
-            provisioning_model=ProvisioningModel.SPOT.value,
+        requirement = self._obtainability_requirement(
+            draft,
             locations=locations,
             all_compatible=False,
         )
@@ -1858,12 +1967,14 @@ class CloudQuotaManagerApp(App[None]):
         self._render_instrument(result)
         self._render_obtainability_result(result)
         if result.resource_scope is not None:
-            command = obtainability_compare_copy_cli(
-                result.resource_scope,
-                prepared.candidates,
-            )
-            self._show_copy_cli(command)
-            self.query_one("#obtainability-copy-cli", Static).update(command)
+            if self._obtainability_state.pending_all_compatible:
+                try:
+                    draft = self._decode_obtainability_form(all_compatible=True)
+                except (TypeError, ValueError):
+                    return
+                self._show_obtainability_all_compatible_copy_cli(draft)
+            else:
+                self._show_obtainability_copy_cli(prepared.candidates)
 
     def _render_obtainability_result(self, result: OperationResult[Any]) -> None:
         data = result.data
@@ -1885,14 +1996,29 @@ class CloudQuotaManagerApp(App[None]):
         )
         if isinstance(data, ObtainabilityComparison):
             if data.resolver_provenance is not None:
-                compatible = tuple(
-                    location.location
-                    for location in data.resolver_provenance.locations
-                    if location.disposition is WorkloadLocationDisposition.COMPATIBLE
+                provenance = data.resolver_provenance
+                exhaustive = (
+                    "unavailable"
+                    if provenance.all_compatible_locations_exhaustive is None
+                    else str(provenance.all_compatible_locations_exhaustive).lower()
+                )
+                location_lines = tuple(
+                    f"{location.location}: {location.disposition.value}"
+                    + (
+                        f" ({location.failure_reason.value})"
+                        if location.failure_reason is not None
+                        else ""
+                    )
+                    for location in provenance.locations
                 )
                 self.query_one("#obtainability-expansion", Static).update(
-                    "Candidate expansion before comparison: "
-                    + (", ".join(compatible) or "none proven compatible")
+                    "Candidate expansion before comparison:\n"
+                    f"All-compatible locations exhaustive: {exhaustive}\n"
+                    + (
+                        "\n".join(location_lines)
+                        if location_lines
+                        else "No locations returned by the resolver."
+                    )
                 )
             lines.extend(
                 (

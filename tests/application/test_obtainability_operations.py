@@ -681,7 +681,7 @@ def test_ineligible_candidate_does_not_suppress_queryable_sibling() -> None:
 
 
 def test_location_ineligibility_does_not_change_product_coverage() -> None:
-    """Product support remains true when no requested location is queryable."""
+    """A rejected-only resolution cannot assert affirmative product coverage."""
     candidate = ObtainabilityCandidate(
         "us-central1",
         (),
@@ -717,9 +717,10 @@ def test_location_ineligibility_does_not_change_product_coverage() -> None:
         ObtainabilityProductCoverage(
             "a3-highgpu-8g",
             "compute.googleapis.com",
-            True,
-            True,
-            True,
+            False,
+            False,
+            False,
+            ("no-compatible-locations-proven",),
         ),
     )
     assert advice.requests == []
@@ -839,6 +840,113 @@ def test_unproven_n1_attachment_never_reaches_provider_readers() -> None:
         UnrankedReason.HISTORY_UNSUPPORTED_N1_GPU,
     )
     assert advice.requests == history.requests == []
+
+
+def test_proven_n1_attachment_queries_current_advice_without_history() -> None:
+    """Exact resolver attachment evidence permits current N1 advice only."""
+    candidate = ObtainabilityCandidate(
+        "us-central1",
+        ("us-central1-a",),
+        SpotMachineConfiguration(
+            "n1-standard-16",
+            gpu=GpuAttachment("nvidia-tesla-t4", 2),
+        ),
+        3,
+        DistributionShape.ANY_SINGLE_ZONE,
+    )
+    gpu = candidate.machine.gpu
+    assert gpu is not None
+    requirement = ComputeInstanceRequirement(
+        candidate.machine.machine_type,
+        candidate.vm_count,
+        ProvisioningModel.SPOT,
+        CandidateLocations(candidate.zones),
+        attached_accelerator_type=gpu.accelerator_type,
+        attached_accelerator_count=gpu.count,
+    )
+    base = _resolved_location(candidate.zones[0])
+    attachment_id = AcceleratorId("nvidia-t4")
+    attachment_quantity = gpu.count * candidate.vm_count
+    constraint = base.constraint_requirements[0]
+    assert base.constraint_set is not None
+    resolved = ResolvedWorkloadRequirement(
+        requirement,
+        (
+            replace(
+                base,
+                accelerator_id=attachment_id,
+                deployable_accelerator_quantity=attachment_quantity,
+                constraint_set=replace(
+                    base.constraint_set,
+                    accelerator_id=attachment_id,
+                ),
+                constraint_requirements=(
+                    replace(
+                        constraint,
+                        source_quantity=attachment_quantity,
+                        required=QuotaQuantity(
+                            attachment_quantity,
+                            constraint.required.unit,
+                        ),
+                    ),
+                ),
+                attached_accelerator_type=gpu.accelerator_type,
+                attached_accelerator_count=gpu.count,
+            ),
+        ),
+        None,
+    )
+    advice = ScriptedReader([_read(CapacityAdvice(Decimal("0.8"), "3600s", (), NOW))])
+    history: ScriptedReader[CapacityHistory] = ScriptedReader([])
+
+    result = asyncio.run(
+        ObtainabilityOperations(advice, history, clock=lambda: NOW).compare(
+            _request((candidate,), resolved=resolved)
+        )
+    )
+
+    assert result.outcome.exit_class is ExitClass.SUCCESS
+    assert result.data.catalog_coverage == (
+        ObtainabilityProductCoverage(
+            "n1-standard-16+nvidia-tesla-t4x2",
+            "compute.googleapis.com",
+            True,
+            True,
+            False,
+            ("history-unsupported-n1-attached-gpu",),
+        ),
+    )
+    assert result.data.candidates[0].advice is not None
+    assert result.data.candidates[0].unranked_reasons == (
+        UnrankedReason.HISTORY_UNSUPPORTED_N1_GPU,
+    )
+    assert len(advice.requests) == 1
+    assert history.requests == []
+
+    for mismatched_machine in (
+        SpotMachineConfiguration("n1-standard-16"),
+        SpotMachineConfiguration(
+            "n1-standard-16",
+            gpu=GpuAttachment("nvidia-tesla-t4", 1),
+        ),
+    ):
+        mismatched = replace(candidate, machine=mismatched_machine)
+        mismatched_advice: ScriptedReader[CapacityAdvice] = ScriptedReader([])
+        mismatched_history: ScriptedReader[CapacityHistory] = ScriptedReader([])
+
+        rejected = asyncio.run(
+            ObtainabilityOperations(
+                mismatched_advice,
+                mismatched_history,
+                clock=lambda: NOW,
+            ).compare(_request((mismatched,), resolved=resolved))
+        )
+
+        assert rejected.outcome.exit_class is ExitClass.REJECTED_PRECONDITION
+        assert UnrankedReason.CATALOG_UNSUPPORTED in (
+            rejected.data.candidates[0].unranked_reasons
+        )
+        assert mismatched_advice.requests == mismatched_history.requests == []
 
 
 def test_advice_permission_failure_retains_independent_history() -> None:

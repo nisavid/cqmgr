@@ -1274,7 +1274,9 @@ def test_workload_routes_decode_both_shapes_and_preserve_canonical_copy_cli() ->
             await pilot.pause()
 
             await pilot.click("#resolve-compute")
-            _input(app, "#workload-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#workload-machine-type").value = "n1-standard-16"
+            _input(app, "#workload-gpu-type").value = "nvidia-tesla-t4"
+            _input(app, "#workload-gpu-count").value = "2"
             _input(app, "#workload-count").value = "2"
             _input(app, "#workload-provisioning").value = "spot"
             _input(app, "#workload-locations").value = "us-central1-a, us-east1-b"
@@ -1283,8 +1285,10 @@ def test_workload_routes_decode_both_shapes_and_preserve_canonical_copy_cli() ->
 
             compute, compute_options = operations.resolve_calls[0]
             assert isinstance(compute, ComputeInstanceRequirement)
-            assert compute.machine_type == "a3-highgpu-8g"
+            assert compute.machine_type == "n1-standard-16"
             assert compute.instance_count == 2
+            assert compute.attached_accelerator_type == "nvidia-tesla-t4"
+            assert compute.attached_accelerator_count == 2
             assert isinstance(compute.locations, CandidateLocations)
             assert compute.locations.values == ("us-central1-a", "us-east1-b")
             assert compute_options["scope_input"] == ReadOnlyScopeInput()
@@ -1292,6 +1296,10 @@ def test_workload_routes_decode_both_shapes_and_preserve_canonical_copy_cli() ->
             assert app.last_copied_cli.startswith(
                 "cqmgr quota resolve compute-instance "
             )
+            assert "--attached-accelerator-type nvidia-tesla-t4" in (
+                app.last_copied_cli
+            )
+            assert "--attached-accelerator-count 2" in app.last_copied_cli
             assert "Location: us-central1-a" in str(
                 _static(app, "#quota-detail").content
             )
@@ -1428,6 +1436,49 @@ def test_copy_cli_is_scoped_to_each_workspace(
     asyncio.run(scenario())
 
 
+def test_fully_specified_obtainability_exposes_copy_cli_before_provider_result() -> (
+    None
+):
+    """A safe equivalent command does not wait for provider advice."""
+
+    async def scenario() -> None:
+        operations = DelayedObtainabilityOperations()
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            _input(app, "#obtainability-machine-type").value = "n1-standard-16"
+            _input(app, "#obtainability-gpu-type").value = "nvidia-tesla-t4"
+            _input(app, "#obtainability-gpu-count").value = "2"
+            _input(app, "#obtainability-vm-count").value = "2"
+            _input(app, "#obtainability-distribution").value = "any-single-zone"
+            _input(app, "#obtainability-candidates").value = "us-central1=us-central1-a"
+            await pilot.pause()
+
+            command = app.last_copied_cli
+            assert command is not None
+            assert command.startswith("cqmgr obtainability compare ")
+            assert "--resource-scope projects/123456789" in command
+            assert "--gpu-type nvidia-tesla-t4" in command
+            assert "--candidate us-central1=us-central1-a" in command
+            assert app.last_result is None
+
+            _button(app, "#obtainability-compare").press()
+            await asyncio.wait_for(operations.compare_started.wait(), timeout=3)
+            requirement, _options = operations.resolve_calls[-1]
+            assert isinstance(requirement, ComputeInstanceRequirement)
+            assert requirement.attached_accelerator_type == "nvidia-tesla-t4"
+            assert requirement.attached_accelerator_count == 2
+            assert app.last_copied_cli == command
+
+            operations.release_compare.set()
+            await asyncio.wait_for(operations.compare_returned.wait(), timeout=3)
+            await pilot.pause()
+
+    asyncio.run(scenario())
+
+
 def test_obtainability_edit_clears_stale_state_and_supersedes_active_result() -> None:
     """An input edit synchronously owns the workspace before workers return."""
 
@@ -1446,12 +1497,15 @@ def test_obtainability_edit_clears_stale_state_and_supersedes_active_result() ->
             await pilot.pause()
 
             assert app.last_result is operations.obtainability_result
-            assert app.last_copied_cli is not None
+            initial_command = app.last_copied_cli
+            assert initial_command is not None
 
             _input(app, "#obtainability-vm-count").value = "3"
             await pilot.pause()
             assert app.last_result is None
-            assert app.last_copied_cli is None
+            assert app.last_copied_cli is not None
+            assert app.last_copied_cli != initial_command
+            assert "--vm-count 3" in app.last_copied_cli
             _button(app, "#obtainability-compare").press()
             await asyncio.wait_for(operations.compare_started.wait(), timeout=3)
 
@@ -1462,7 +1516,8 @@ def test_obtainability_edit_clears_stale_state_and_supersedes_active_result() ->
             await pilot.pause()
 
             assert app.last_result is None
-            assert app.last_copied_cli is None
+            assert app.last_copied_cli is not None
+            assert "--vm-count 4" in app.last_copied_cli
             assert "Complete the fixed request" in str(
                 _static(app, "#obtainability-detail").content
             )
@@ -1471,15 +1526,18 @@ def test_obtainability_edit_clears_stale_state_and_supersedes_active_result() ->
     asyncio.run(scenario())
 
 
-def test_contextual_obtainability_requires_confirmation_of_inherited_fields() -> None:
+def test_contextual_obtainability_requires_confirmation_of_inherited_fields(  # noqa: PLR0915
+) -> None:
     """A resolved Spot shape stays visible and cannot compare before confirmation."""
 
-    async def scenario() -> None:
+    async def scenario() -> None:  # noqa: PLR0915
         requirement = ComputeInstanceRequirement(
-            "a3-highgpu-8g",
+            "n1-standard-16",
             2,
             ProvisioningModel.SPOT,
             CandidateLocations(("us-central1-a",)),
+            attached_accelerator_type="nvidia-tesla-t4",
+            attached_accelerator_count=2,
         )
         operations = ScriptedReadOnlyOperations(_browse_result())
         operations.resolve_result = _resolved_compute_result(
@@ -1491,7 +1549,9 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields() ->
         async with app.run_test(size=(140, 42)) as pilot:
             await pilot.pause()
             await pilot.click("#resolve-compute")
-            _input(app, "#workload-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#workload-machine-type").value = "n1-standard-16"
+            _input(app, "#workload-gpu-type").value = "nvidia-tesla-t4"
+            _input(app, "#workload-gpu-count").value = "2"
             _input(app, "#workload-count").value = "2"
             _input(app, "#workload-provisioning").value = "spot"
             _input(app, "#workload-locations").value = "us-central1-a"
@@ -1501,7 +1561,9 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields() ->
             _button(app, "#workload-obtainability").press()
             await pilot.pause()
             assert app.active_workspace == "obtainability"
-            assert _input(app, "#obtainability-machine-type").value == "a3-highgpu-8g"
+            assert _input(app, "#obtainability-machine-type").value == "n1-standard-16"
+            assert _input(app, "#obtainability-gpu-type").value == "nvidia-tesla-t4"
+            assert _input(app, "#obtainability-gpu-count").value == "2"
             assert _input(app, "#obtainability-vm-count").value == "2"
             assert (
                 _input(app, "#obtainability-candidates").value
@@ -1512,6 +1574,12 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields() ->
             )
             assert len(operations.resolve_calls) == 1
 
+            await pilot.click("#workspace-obtainability")
+            await pilot.press("o")
+            assert "Inherited from Quotas / Resolve / Compute instance" in str(
+                _static(app, "#obtainability-breadcrumb").content
+            )
+
             await pilot.click("#obtainability-compare")
             assert operations.obtainability_calls == []
             assert "CONFIRM INHERITED FIELDS" in str(
@@ -1519,6 +1587,14 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields() ->
             )
 
             _button(app, "#obtainability-confirm").press()
+            await pilot.pause()
+            assert app.last_copied_cli is not None
+            assert "--candidate us-central1=us-central1-a" in app.last_copied_cli
+            assert "--gpu-type nvidia-tesla-t4" in app.last_copied_cli
+            assert "--gpu-count 2" in app.last_copied_cli
+            assert "Inherited from Quotas / Resolve / Compute instance" in str(
+                _static(app, "#obtainability-breadcrumb").content
+            )
             _button(app, "#obtainability-compare").press()
             await pilot.pause()
 
@@ -1528,6 +1604,10 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields() ->
             assert prepared.resolver_provenance is operations.resolve_result.data
             candidates = prepared.candidates
             assert candidates[0].zones == ("us-central1-a",)
+            assert candidates[0].machine.gpu == GpuAttachment(
+                "nvidia-tesla-t4",
+                2,
+            )
             assert "Return context: Quotas / Resolve / Compute instance" in str(
                 _static(app, "#obtainability-detail").content
             )
@@ -1550,10 +1630,12 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields() ->
     asyncio.run(scenario())
 
 
-def test_all_compatible_obtainability_expansion_is_visible_and_explicit() -> None:
+def test_all_compatible_obtainability_expansion_is_visible_and_explicit() -> (  # noqa: PLR0915
+    None
+):
     """All-compatible mode requires confirmation and retains resolver provenance."""
 
-    async def scenario() -> None:
+    async def scenario() -> None:  # noqa: PLR0915
         requirement = ComputeInstanceRequirement(
             "a3-highgpu-8g",
             2,
@@ -1597,6 +1679,9 @@ def test_all_compatible_obtainability_expansion_is_visible_and_explicit() -> Non
             assert "us-central1-a" in str(
                 _static(app, "#obtainability-expansion").content
             )
+            assert app.last_copied_cli is not None
+            assert "--all-compatible-locations" in app.last_copied_cli
+            assert "--candidate" not in app.last_copied_cli
 
             _button(app, "#obtainability-confirm").press()
             _button(app, "#obtainability-compare-all").press()
@@ -1617,16 +1702,21 @@ def test_all_compatible_obtainability_expansion_is_visible_and_explicit() -> Non
             assert "us-central1-a" in expansion
             assert "us-east1-b" in expansion
             assert app.last_copied_cli is not None
-            assert "--all-compatible-locations" not in app.last_copied_cli
-            assert "--candidate" in app.last_copied_cli
+            assert "--all-compatible-locations" in app.last_copied_cli
+            assert "--candidate" not in app.last_copied_cli
 
             _input(app, "#obtainability-candidates").value = "us-west1=us-west1-a"
             await pilot.pause()
             assert app.last_result is None
-            assert app.last_copied_cli is None
+            assert app.last_copied_cli is not None
+            assert "--all-compatible-locations" in app.last_copied_cli
+            assert "--candidate" not in app.last_copied_cli
 
             _input(app, "#obtainability-vm-count").value = "3"
             await pilot.pause()
+            assert app.last_copied_cli is not None
+            assert "--all-compatible-locations" in app.last_copied_cli
+            assert "--vm-count 3" in app.last_copied_cli
             _button(app, "#obtainability-compare-all").press()
             await pilot.pause()
             assert len(operations.resolve_calls) == 2
@@ -1694,6 +1784,90 @@ def test_obtainability_snapshot_preserves_incomplete_evidence_ties_and_n1_limits
                 in snapshot
             )
             assert "Capacity guarantee: no" in snapshot
+            assert "\x1b" not in snapshot
+
+    async def all_sizes() -> None:
+        await scenario((140, 42), "wide")
+        await scenario((100, 36), "medium")
+        await scenario((72, 28), "narrow")
+
+    asyncio.run(all_sizes())
+
+
+def test_obtainability_snapshot_retains_complete_resolver_provenance() -> None:
+    """Every resolver disposition and expansion limit remains visible without color."""
+
+    async def scenario(size: tuple[int, int], expected_layout: str) -> None:
+        requirement = ComputeInstanceRequirement(
+            "a3-highgpu-8g",
+            2,
+            ProvisioningModel.SPOT,
+            AllCompatibleLocations(),
+        )
+        rejected = tuple(
+            ResolvedWorkloadLocation(
+                location=location,
+                disposition=disposition,
+                accelerator_id=None,
+                owning_service=None,
+                management_plane=None,
+                supported_consumers=(),
+                quota_pool=None,
+                deployable_accelerator_quantity=None,
+                constraint_set=None,
+                constraint_requirements=(),
+                coverage=(),
+                failure_reason=reason,
+            )
+            for location, disposition, reason in (
+                (
+                    "us-east1-b",
+                    WorkloadLocationDisposition.INCOMPATIBLE,
+                    ResolutionFailureReason.UNSUPPORTED_COMPATIBILITY,
+                ),
+                (
+                    "us-west1-a",
+                    WorkloadLocationDisposition.INCOMPLETE,
+                    ResolutionFailureReason.MISSING_LOCATION_EVIDENCE,
+                ),
+            )
+        )
+        resolved = ResolvedWorkloadRequirement(
+            requirement,
+            (_compatible_compute_location("us-central1-a"), *rejected),
+            all_compatible_locations_exhaustive=False,
+        )
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        comparison = operations.obtainability_result.data
+        assert isinstance(comparison, ObtainabilityComparison)
+        operations.obtainability_result = replace(
+            operations.obtainability_result,
+            data=replace(comparison, resolver_provenance=resolved),
+        )
+        app = CloudQuotaManagerApp(
+            operations,
+            ScriptedAuditOperations(),
+            no_color=True,
+        )
+
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            _input(app, "#obtainability-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#obtainability-vm-count").value = "2"
+            _input(app, "#obtainability-distribution").value = "balanced"
+            _input(
+                app, "#obtainability-candidates"
+            ).value = "us-central1=us-central1-a,us-central1-b"
+            _button(app, "#obtainability-compare").press()
+            await pilot.pause()
+
+            snapshot = app.interface_snapshot()
+            assert f"layout={expected_layout}" in snapshot
+            assert "All-compatible locations exhaustive: false" in snapshot
+            assert "us-central1-a: compatible" in snapshot
+            assert "us-east1-b: incompatible (unsupported-compatibility)" in snapshot
+            assert "us-west1-a: incomplete (missing-location-evidence)" in snapshot
             assert "\x1b" not in snapshot
 
     async def all_sizes() -> None:

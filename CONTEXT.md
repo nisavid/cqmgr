@@ -226,9 +226,9 @@ _Avoid_: Availability, capacity
 
 **Compute instance requirement**:
 A workload-first Compute shape consisting of machine type, instance count,
-provisioning model, and explicit candidate locations or all compatible
-locations. Applicable accelerator attachment and quota-pool facts are derived
-from provider and catalog evidence.
+provisioning model, an optional exact attached accelerator type and count, and
+explicit candidate locations or all compatible locations. Provider and catalog
+evidence must prove any requested attachment and derives its quota-pool facts.
 _Avoid_: GPU quota row, capacity request
 
 **Cloud TPU slice requirement**:

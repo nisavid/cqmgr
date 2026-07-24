@@ -191,6 +191,15 @@ def quota_resolve_copy_cli(
                 str(requirement.instance_count),
             )
         )
+        if requirement.attached_accelerator_type is not None:
+            arguments.extend(
+                (
+                    "--attached-accelerator-type",
+                    requirement.attached_accelerator_type,
+                    "--attached-accelerator-count",
+                    str(requirement.attached_accelerator_count),
+                )
+            )
     else:
         arguments.extend(
             (
@@ -336,9 +345,21 @@ def obtainability_all_compatible_copy_cli(
     ):
         msg = "Copy CLI all-compatible comparison requires one Spot requirement"
         raise ValueError(msg)
+    machine_is_typed = isinstance(machine, SpotMachineConfiguration)
+    gpu = machine.gpu if machine_is_typed else None
+    attachment_matches = (
+        gpu is None
+        and requirement.attached_accelerator_type is None
+        and requirement.attached_accelerator_count is None
+    ) or (
+        gpu is not None
+        and gpu.accelerator_type == requirement.attached_accelerator_type
+        and gpu.count == requirement.attached_accelerator_count
+    )
     if (
-        not isinstance(machine, SpotMachineConfiguration)
+        not machine_is_typed
         or machine.machine_type != requirement.machine_type
+        or not attachment_matches
         or not isinstance(distribution_shape, DistributionShape)
     ):
         msg = "Copy CLI all-compatible shape must match the resolved requirement"

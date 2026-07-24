@@ -14,6 +14,7 @@ from click.testing import CliRunner
 import cqmgr.cli as cli_module
 from cqmgr.adapters.cli.copy_cli import (
     CopyCliPresentation,
+    obtainability_all_compatible_copy_cli,
     quota_inspect_copy_cli,
     quota_list_copy_cli,
     quota_resolve_copy_cli,
@@ -30,7 +31,11 @@ from cqmgr.domain.accelerator_overlay import (
     ProvisioningModel,
 )
 from cqmgr.domain.catalog import CatalogGroupId
-from cqmgr.domain.obtainability import DistributionShape, GpuAttachment
+from cqmgr.domain.obtainability import (
+    DistributionShape,
+    GpuAttachment,
+    SpotMachineConfiguration,
+)
 from cqmgr.domain.quota_queries import QuotaQueryFilters, QuotaSort, QuotaSortField
 from cqmgr.domain.quotas import NormalizedDimensions
 from cqmgr.domain.results import (
@@ -276,7 +281,11 @@ def test_obtainability_all_compatible_delegates_a_spot_workload(
             "--resource-scope",
             "projects/123",
             "--machine-type",
-            "a3-highgpu-8g",
+            "n1-standard-16",
+            "--gpu-type",
+            "nvidia-tesla-t4",
+            "--gpu-count",
+            "2",
             "--vm-count",
             "2",
             "--distribution-shape",
@@ -290,12 +299,14 @@ def test_obtainability_all_compatible_delegates_a_spot_workload(
     assert result.exit_code == 0, result.output
     requirement, options = operations.obtainability_calls[0]
     assert requirement == ComputeInstanceRequirement(
-        "a3-highgpu-8g",
+        "n1-standard-16",
         2,
         ProvisioningModel.SPOT,
         AllCompatibleLocations(),
+        attached_accelerator_type="nvidia-tesla-t4",
+        attached_accelerator_count=2,
     )
-    assert options["machine"].machine_type == "a3-highgpu-8g"  # type: ignore[union-attr]
+    assert options["machine"].machine_type == "n1-standard-16"  # type: ignore[union-attr]
     assert options["distribution_shape"] is DistributionShape.ANY_SINGLE_ZONE
     assert "support" not in options
 
@@ -632,10 +643,12 @@ def test_workload_copy_cli_round_trips_both_typed_shapes(
     scope = ResourceScope(ResourceScopeKind.PROJECT, "projects/123")
     requirements = (
         ComputeInstanceRequirement(
-            machine_type="a3-highgpu-8g",
+            machine_type="n1-standard-16",
             instance_count=2,
             provisioning_model=ProvisioningModel.SPOT,
             locations=AllCompatibleLocations(),
+            attached_accelerator_type="nvidia-tesla-t4",
+            attached_accelerator_count=2,
         ),
         CloudTpuSliceRequirement(
             accelerator_type="v6e-8",
@@ -663,6 +676,38 @@ def test_workload_copy_cli_round_trips_both_typed_shapes(
         result = CliRunner().invoke(main, command_arguments[1:])
         assert result.exit_code == 0, result.output
     assert tuple(call[0] for call in operations.resolve_calls) == requirements
+
+
+@pytest.mark.parametrize(
+    "machine",
+    [
+        SpotMachineConfiguration("n1-standard-16"),
+        SpotMachineConfiguration(
+            "n1-standard-16",
+            gpu=GpuAttachment("nvidia-tesla-t4", 1),
+        ),
+    ],
+)
+def test_all_compatible_copy_cli_rejects_attachment_mismatch(
+    machine: SpotMachineConfiguration,
+) -> None:
+    """Copy CLI cannot weaken or alter a resolver-owned attachment request."""
+    requirement = ComputeInstanceRequirement(
+        machine_type="n1-standard-16",
+        instance_count=2,
+        provisioning_model=ProvisioningModel.SPOT,
+        locations=AllCompatibleLocations(),
+        attached_accelerator_type="nvidia-tesla-t4",
+        attached_accelerator_count=2,
+    )
+
+    with pytest.raises(ValueError, match="shape must match"):
+        obtainability_all_compatible_copy_cli(
+            ResourceScope(ResourceScopeKind.PROJECT, "projects/123"),
+            requirement,
+            machine=machine,
+            distribution_shape=DistributionShape.ANY_SINGLE_ZONE,
+        )
 
 
 def test_exact_slice_copy_cli_round_trips_canonical_identity(

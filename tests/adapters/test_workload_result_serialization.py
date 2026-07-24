@@ -21,6 +21,7 @@ from cqmgr.domain.results import (
 )
 
 NOW = datetime(2026, 7, 23, tzinfo=UTC)
+ATTACHED_ACCELERATOR_COUNT = 2
 
 
 def _mapping(data: object) -> dict[str, object]:
@@ -58,7 +59,27 @@ def test_compute_instance_candidate_shape_has_stable_discriminators() -> None:
             "mode": "candidates",
             "values": ["us-central1-a", "us-east1-b"],
         },
+        "attached_accelerator_type": None,
+        "attached_accelerator_count": None,
     }
+
+
+def test_compute_instance_attachment_is_preserved_in_structured_output() -> None:
+    """Structured output retains the exact optional accelerator attachment."""
+    requirement = ComputeInstanceRequirement(
+        machine_type="n1-standard-16",
+        instance_count=3,
+        provisioning_model=ProvisioningModel.SPOT,
+        locations=CandidateLocations(("us-central1-a",)),
+        attached_accelerator_type="nvidia-tesla-t4",
+        attached_accelerator_count=ATTACHED_ACCELERATOR_COUNT,
+    )
+
+    data = _mapping(requirement)["data"]
+
+    assert isinstance(data, dict)
+    assert data["attached_accelerator_type"] == "nvidia-tesla-t4"
+    assert data["attached_accelerator_count"] == ATTACHED_ACCELERATOR_COUNT
 
 
 def test_cloud_tpu_slice_all_compatible_shape_has_stable_discriminators() -> None:
