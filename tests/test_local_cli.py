@@ -249,7 +249,8 @@ def test_profile_json_exposes_only_safe_os_keyring_reference_metadata(
     Path(environment["CQMGR_CONFIG_PATH"]).write_text(
         'schema = "cqmgr.config/v1"\n\n'
         "[profiles.primary]\n"
-        'quota_contact_keyring_reference = "cqmgr:quota-contact:primary"\n'
+        'quota_contact_keyring_reference = "cqmgr:quota-contact:v1:primary:'
+        'installation-test:item-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"\n'
     )
 
     result = CliRunner().invoke(
@@ -263,9 +264,9 @@ def test_profile_json_exposes_only_safe_os_keyring_reference_metadata(
         "quota_contact_keyring_reference"
     ]
     assert reference == {
-        "account": "quota-contact:primary",
+        "account": "item-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         "backend": "os-keyring",
-        "service": "cqmgr",
+        "service": "io.nisavid.cqmgr/installation-test/quota-contact",
     }
 
 

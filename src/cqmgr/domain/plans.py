@@ -26,7 +26,10 @@ PLAN_LIFETIME = timedelta(minutes=15)
 _LOWER_HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _MAXIMUM_CONTACT_SOURCE_IDENTITY_LENGTH = 256
 _PROFILE_CONTACT_SOURCE_IDENTITY = re.compile(
-    r"profile:[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z"
+    r"cqmgr:quota-contact:v1:"
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}:"
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}:"
+    r"item-[A-Za-z0-9_-]{32}\Z"
 )
 _DIRECT_USER_CONTACT_SOURCE_IDENTITY = re.compile(
     r"principal://[A-Za-z0-9][A-Za-z0-9._~-]*"

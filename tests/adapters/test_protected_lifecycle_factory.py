@@ -296,7 +296,7 @@ def test_apply_imports_exported_plan_from_local_repository(tmp_path: Path) -> No
 
 def test_apply_rejects_contact_that_does_not_match_plan() -> None:
     """Protected re-entry cannot silently change the Plan-bound contact."""
-    factory, _ = _factory()
+    factory, repository = _factory()
 
     with pytest.raises(ApplyRefreshError, match="does not match"):
         asyncio.run(
@@ -306,6 +306,7 @@ def test_apply_rejects_contact_that_does_not_match_plan() -> None:
                 quota_contact=SecretValue(b"other@example.com"),
             )
         )
+    assert repository.stored == []
 
 
 def test_watch_uses_active_trust_and_absolute_deadline() -> None:

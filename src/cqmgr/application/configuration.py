@@ -3,16 +3,30 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+import secrets
+from dataclasses import dataclass, field
 from enum import StrEnum
 
+from cqmgr.application.ports.secrets import (
+    SecretPurpose,
+    SecretStoreReference,
+)
 from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 
 CONFIG_SCHEMA = "cqmgr.config/v1"
 SELECTION_STATE_SCHEMA = "cqmgr.selection-state/v1"
 
 _PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
-_QUOTA_CONTACT_KEYRING_PREFIX = "cqmgr:quota-contact:"
+_QUOTA_CONTACT_KEYRING_PREFIX = "cqmgr:quota-contact:v1:"
+_QUOTA_CONTACT_KEYRING_COMPONENTS = 3
+
+
+def _generated_installation_id() -> str:
+    return f"installation-{secrets.token_urlsafe(18)}"
+
+
+def _generated_item_id() -> str:
+    return f"item-{secrets.token_urlsafe(24)}"
 
 
 class ConfigurationError(ValueError):
@@ -112,15 +126,35 @@ class QuotaContactKeyringReference:
     """Closed native-keyring item identity for one profile's quota contact."""
 
     profile_name: str
+    installation_id: str = field(default_factory=_generated_installation_id)
+    item_id: str = field(default_factory=_generated_item_id)
 
     def __post_init__(self) -> None:
-        """Restrict references to the same safe grammar as profile identity."""
+        """Restrict profile identity and reuse the native secret item grammar."""
         if (
             not isinstance(self.profile_name, str)
             or _PROFILE_NAME.fullmatch(self.profile_name) is None
         ):
             msg = "quota-contact keyring reference profile name is invalid"
             raise ValueError(msg)
+        SecretStoreReference(
+            self.installation_id,
+            SecretPurpose.QUOTA_CONTACT,
+            self.item_id,
+        )
+
+    @classmethod
+    def generate(
+        cls,
+        profile_name: str,
+        installation_id: str,
+    ) -> QuotaContactKeyringReference:
+        """Create one collision-resistant immutable profile item reference."""
+        generated = SecretStoreReference.generate(
+            installation_id,
+            SecretPurpose.QUOTA_CONTACT,
+        )
+        return cls(profile_name, generated.installation_id, generated.item_id)
 
     @classmethod
     def parse(cls, value: str) -> QuotaContactKeyringReference:
@@ -131,9 +165,13 @@ class QuotaContactKeyringReference:
         if not value.startswith(_QUOTA_CONTACT_KEYRING_PREFIX):
             msg = "quota-contact keyring reference must use the cqmgr keyring grammar"
             raise ValueError(msg)
-        profile_name = value.removeprefix(_QUOTA_CONTACT_KEYRING_PREFIX)
+        components = value.removeprefix(_QUOTA_CONTACT_KEYRING_PREFIX).split(":")
+        if len(components) != _QUOTA_CONTACT_KEYRING_COMPONENTS:
+            msg = "quota-contact keyring reference must use the cqmgr keyring grammar"
+            raise ValueError(msg)
+        profile_name, installation_id, item_id = components
         try:
-            reference = cls(profile_name)
+            reference = cls(profile_name, installation_id, item_id)
         except ValueError as error:
             msg = "quota-contact keyring reference must use the cqmgr keyring grammar"
             raise ValueError(msg) from error
@@ -149,18 +187,29 @@ class QuotaContactKeyringReference:
 
     @property
     def service(self) -> str:
-        """Return the fixed keyring service name."""
-        return "cqmgr"
+        """Return the installation-isolated keyring service name."""
+        return self._secret_reference.service
 
     @property
     def account(self) -> str:
-        """Return the non-secret keyring account identity."""
-        return f"quota-contact:{self.profile_name}"
+        """Return the opaque immutable keyring account identity."""
+        return self._secret_reference.username
 
     @property
     def canonical_name(self) -> str:
         """Return the validated persisted reference representation."""
-        return f"{_QUOTA_CONTACT_KEYRING_PREFIX}{self.profile_name}"
+        return (
+            f"{_QUOTA_CONTACT_KEYRING_PREFIX}{self.profile_name}:"
+            f"{self.installation_id}:{self.item_id}"
+        )
+
+    @property
+    def _secret_reference(self) -> SecretStoreReference:
+        return SecretStoreReference(
+            self.installation_id,
+            SecretPurpose.QUOTA_CONTACT,
+            self.item_id,
+        )
 
 
 @dataclass(frozen=True, slots=True)
