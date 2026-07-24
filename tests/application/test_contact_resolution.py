@@ -16,6 +16,7 @@ from cqmgr.application.configuration import (
 from cqmgr.application.operations.contacts import (
     ContactResolutionError,
     ProtectedContactResolver,
+    bind_protected_contact,
 )
 from cqmgr.application.operations.trust import LoadedInstallationTrust
 from cqmgr.application.ports.secrets import (
@@ -260,3 +261,167 @@ def test_apply_re_resolves_only_the_exact_plan_bound_source() -> None:
     with pytest.raises(ContactResolutionError, match="locked-or-cancelled"):
         asyncio.run(resolver.refresh_contact(preview.binding, NOW))
     assert identity.calls == 0
+
+
+def test_contact_resolver_rejects_nonpositive_identity_timeout() -> None:
+    """Identity lookup must always retain a finite positive timeout."""
+    _, configuration, selection, contacts, identity = _resolver()
+
+    with pytest.raises(ValueError, match="timeout must be positive"):
+        ProtectedContactResolver(
+            configuration,
+            selection,
+            contacts,
+            identity,
+            identity_timeout_seconds=0,
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        SecretValue(b"not-an-email"),
+        SecretValue(b"\xff"),
+    ],
+)
+def test_explicit_contact_must_be_one_utf8_email(value: SecretValue) -> None:
+    """Protected input is validated before any lower-precedence source is read."""
+    resolver, configuration, selection, _, identity = _resolver()
+
+    with pytest.raises(ContactResolutionError, match="valid UTF-8 email"):
+        asyncio.run(
+            resolver.resolve_preview(
+                explicit_value=value,
+                explicit_profile=None,
+                principal=PRINCIPAL,
+                trust=TRUST,
+            )
+        )
+
+    assert configuration.reads == selection.reads == identity.calls == 0
+
+
+def test_apply_requires_prepared_context_and_bound_explicit_value() -> None:
+    """Apply refresh cannot invent either an invocation or protected input."""
+    resolver, _, _, _, _ = _resolver()
+    binding = bind_protected_contact(EXPLICIT, KEY)
+
+    with pytest.raises(ContactResolutionError, match="source is unavailable"):
+        asyncio.run(resolver.refresh_contact(binding, NOW))
+    with pytest.raises(ContactResolutionError, match="Plan-bound per-operation"):
+        asyncio.run(
+            resolver.prepare_apply(
+                binding,
+                explicit_value=None,
+                principal=PRINCIPAL,
+                trust=TRUST,
+            )
+        )
+
+
+def test_selected_profile_must_remain_selected_at_apply() -> None:
+    """A Plan bound to selected-profile cannot silently follow selection drift."""
+    reference = QuotaContactKeyringReference("selected")
+    resolver, _, selection, _, _ = _resolver(
+        config=ConfigSnapshot(
+            profiles=(Profile("selected", quota_contact_keyring_reference=reference),)
+        ),
+        selection=SelectionState(selected_profile="selected"),
+        outcome=SecretStoreOutcome.available(PROFILE_CONTACT),
+    )
+    preview = asyncio.run(
+        resolver.resolve_preview(
+            explicit_value=None,
+            explicit_profile=None,
+            principal=PRINCIPAL,
+            trust=TRUST,
+        )
+    )
+    selection.state = SelectionState()
+
+    with pytest.raises(ContactResolutionError, match="profile changed"):
+        asyncio.run(
+            resolver.prepare_apply(
+                preview.binding,
+                explicit_value=None,
+                principal=PRINCIPAL,
+                trust=TRUST,
+            )
+        )
+
+
+def test_named_profile_errors_are_terminal() -> None:
+    """Missing profile metadata never falls through to selected or direct-user."""
+    resolver, _, selection, _, identity = _resolver()
+
+    with pytest.raises(ContactResolutionError, match="is unavailable"):
+        asyncio.run(
+            resolver.resolve_preview(
+                explicit_value=None,
+                explicit_profile="missing",
+                principal=PRINCIPAL,
+                trust=TRUST,
+            )
+        )
+
+    no_reference, _, _, _, _ = _resolver(
+        config=ConfigSnapshot(profiles=(Profile("named"),))
+    )
+    with pytest.raises(ContactResolutionError, match="no keyring reference"):
+        asyncio.run(
+            no_reference.resolve_preview(
+                explicit_value=None,
+                explicit_profile="named",
+                principal=PRINCIPAL,
+                trust=TRUST,
+            )
+        )
+    assert selection.reads == identity.calls == 0
+
+
+def test_profile_value_and_direct_principal_must_match_plan_binding() -> None:
+    """Apply rejects changed profile values and a different direct-user principal."""
+    reference = QuotaContactKeyringReference("named")
+    resolver, _, _, contacts, _ = _resolver(
+        config=ConfigSnapshot(
+            profiles=(Profile("named", quota_contact_keyring_reference=reference),)
+        ),
+        outcome=SecretStoreOutcome.available(PROFILE_CONTACT),
+    )
+    profile = asyncio.run(
+        resolver.resolve_preview(
+            explicit_value=None,
+            explicit_profile="named",
+            principal=PRINCIPAL,
+            trust=TRUST,
+        )
+    )
+    contacts.outcome = SecretStoreOutcome.available(SecretValue(b"changed@example.com"))
+    with pytest.raises(ContactResolutionError, match="does not match"):
+        asyncio.run(
+            resolver.prepare_apply(
+                profile.binding,
+                explicit_value=None,
+                principal=PRINCIPAL,
+                trust=TRUST,
+            )
+        )
+
+    direct, _, _, _, _ = _resolver()
+    direct_preview = asyncio.run(
+        direct.resolve_preview(
+            explicit_value=None,
+            explicit_profile=None,
+            principal=PRINCIPAL,
+            trust=TRUST,
+        )
+    )
+    with pytest.raises(ContactResolutionError, match="principal changed"):
+        asyncio.run(
+            direct.prepare_apply(
+                direct_preview.binding,
+                explicit_value=None,
+                principal=PlanPrincipal("principal://accounts/other"),
+                trust=TRUST,
+            )
+        )
