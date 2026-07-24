@@ -35,6 +35,7 @@ from cqmgr.domain.accelerator_overlay import (
     ComputeInstanceRequirement,
     ProvisioningModel,
     QuotaConstraintRequirement,
+    ResolutionFailureReason,
     ResolvedWorkloadLocation,
     ResolvedWorkloadRequirement,
     WorkloadLocationDisposition,
@@ -215,6 +216,44 @@ def _resolved_location(location: str) -> ResolvedWorkloadLocation:
     )
 
 
+def _resolved_candidates(
+    candidates: tuple[ObtainabilityCandidate, ...],
+) -> ResolvedWorkloadRequirement:
+    """Bind one fixed candidate set to compatible Spot Compute evidence."""
+    first = candidates[0]
+    locations = tuple(
+        dict.fromkeys(
+            location
+            for candidate in candidates
+            for location in candidate.zones or (candidate.endpoint_region,)
+        )
+    )
+    requirement = ComputeInstanceRequirement(
+        first.machine.machine_type,
+        first.vm_count,
+        ProvisioningModel.SPOT,
+        CandidateLocations(locations),
+    )
+    return ResolvedWorkloadRequirement(
+        requirement,
+        tuple(_resolved_location(location) for location in locations),
+        None,
+    )
+
+
+def _request(
+    candidates: tuple[ObtainabilityCandidate, ...],
+    *,
+    resolved: ResolvedWorkloadRequirement | None = None,
+) -> ObtainabilityCompareRequest:
+    """Build the mandatory resolver-bound application request."""
+    return ObtainabilityCompareRequest(
+        _context(),
+        candidates,
+        resolver_provenance=resolved or _resolved_candidates(candidates),
+    )
+
+
 def test_all_compatible_expansion_keeps_resolver_provenance_and_exact_zones() -> None:
     """Only resolver-proven compatible Compute locations become exact candidates."""
     requirement = ComputeInstanceRequirement(
@@ -244,24 +283,9 @@ def test_all_compatible_expansion_keeps_resolver_provenance_and_exact_zones() ->
         ("us-east1-b",),
     )
     assert all(item.vm_count == 2 for item in candidates)
-    result = asyncio.run(
-        ObtainabilityOperations(
-            ScriptedReader([]),
-            ScriptedReader([]),
-            clock=lambda: NOW,
-        ).compare(
-            ObtainabilityCompareRequest(
-                _context(),
-                candidates,
-                support=AdviceSupport(
-                    current_advice_supported=False,
-                    history_supported=False,
-                ),
-                resolver_provenance=resolved,
-            )
-        )
-    )
-    assert result.data.resolver_provenance is resolved
+    request = _request(candidates, resolved=resolved)
+
+    assert request.resolver_provenance is resolved
 
 
 def test_resolver_eligibility_gates_advice_and_retains_exact_coverage() -> None:
@@ -333,8 +357,8 @@ def test_resolver_eligibility_gates_advice_and_retains_exact_coverage() -> None:
     )
 
 
-def test_n1_attached_gpu_eligibility_keeps_exact_history_limit() -> None:
-    """Catalog presence does not imply unsupported N1 history coverage."""
+def test_unproven_attachments_are_not_resolver_eligible() -> None:
+    """Resolver inputs that omit attachments cannot authorize exact advice."""
     candidate = ObtainabilityCandidate(
         "us-central1",
         (),
@@ -364,14 +388,31 @@ def test_n1_attached_gpu_eligibility_keeps_exact_history_limit() -> None:
         ObtainabilityProductCoverage(
             "n1-standard-8+nvidia-tesla-t4x1",
             "compute.googleapis.com",
-            True,
-            True,
             False,
-            ("history-unsupported-n1-attached-gpu",),
+            False,
+            False,
+            ("configuration-not-cataloged-for-spot-compute",),
         ),
     )
     assert eligibility.candidates == (
-        ObtainabilityCandidateEligibility(candidate.candidate_id, True),
+        ObtainabilityCandidateEligibility(
+            candidate.candidate_id,
+            False,
+            (UnrankedReason.CATALOG_UNSUPPORTED,),
+        ),
+    )
+
+    local_ssd = replace(
+        candidate,
+        machine=SpotMachineConfiguration("n1-standard-8", local_ssd_count=1),
+    )
+    local_ssd_eligibility = eligibility_from_resolved_workload(
+        resolved,
+        (local_ssd,),
+    )
+
+    assert local_ssd_eligibility.candidates[0].reasons == (
+        UnrankedReason.CATALOG_UNSUPPORTED,
     )
 
 
@@ -416,6 +457,16 @@ def test_prepared_comparison_rejects_unbound_or_untyped_values() -> None:
         PreparedObtainabilityComparison(
             (mismatched,),
             prepared.eligibility,
+            resolved,
+        )
+    fabricated = replace(
+        prepared.eligibility,
+        support=AdviceSupport(False, False),
+    )
+    with pytest.raises(ValueError, match="match resolver evidence"):
+        PreparedObtainabilityComparison(
+            (candidate,),
+            fabricated,
             resolved,
         )
 
@@ -532,26 +583,26 @@ def test_ineligible_candidate_never_reaches_advice_or_history_readers() -> None:
         1,
         DistributionShape.ANY,
     )
-    eligibility = ObtainabilityEligibility(
-        AdviceSupport(),
-        (
-            ObtainabilityProductCoverage(
-                "uncataloged-machine",
-                "compute.googleapis.com",
-                False,
-                False,
-                False,
-                ("configuration-not-cataloged-for-spot-compute",),
-            ),
-        ),
-        (
-            ObtainabilityCandidateEligibility(
-                candidate.candidate_id,
-                False,
-                (UnrankedReason.CATALOG_UNSUPPORTED,),
+    base = _resolved_candidates((candidate,))
+    resolved = replace(
+        base,
+        locations=(
+            replace(
+                base.locations[0],
+                disposition=WorkloadLocationDisposition.INCOMPATIBLE,
+                accelerator_id=None,
+                owning_service=None,
+                management_plane=None,
+                supported_consumers=(),
+                quota_pool=None,
+                deployable_accelerator_quantity=None,
+                constraint_set=None,
+                constraint_requirements=(),
+                failure_reason=ResolutionFailureReason.UNSUPPORTED_COMPATIBILITY,
             ),
         ),
     )
+    eligibility = eligibility_from_resolved_workload(resolved, (candidate,))
     advice: ScriptedReader[CapacityAdvice] = ScriptedReader([])
     history: ScriptedReader[CapacityHistory] = ScriptedReader([])
 
@@ -560,13 +611,7 @@ def test_ineligible_candidate_never_reaches_advice_or_history_readers() -> None:
             advice,
             history,
             clock=lambda: NOW,
-        ).compare(
-            ObtainabilityCompareRequest(
-                _context(),
-                (candidate,),
-                eligibility=eligibility,
-            )
-        )
+        ).compare(_request((candidate,), resolved=resolved))
     )
 
     assert advice.requests == []
@@ -574,39 +619,56 @@ def test_ineligible_candidate_never_reaches_advice_or_history_readers() -> None:
     assert result.data.catalog_coverage == eligibility.catalog_coverage
     assert result.data.candidates[0].unranked_reasons == (
         UnrankedReason.CATALOG_UNSUPPORTED,
+        UnrankedReason.NON_COMPUTE_MANAGEMENT_PLANE,
         UnrankedReason.CURRENT_ADVICE_UNSUPPORTED,
         UnrankedReason.HISTORY_UNSUPPORTED,
     )
 
 
-def test_current_and_history_ports_are_independently_disableable() -> None:
-    """Disabling current advice does not prevent a supported history read."""
-    candidate = ObtainabilityCandidate(
+def test_ineligible_candidate_does_not_suppress_queryable_sibling() -> None:
+    """Candidate coverage remains independent within one fixed comparison."""
+    eligible = ObtainabilityCandidate(
         "us-central1",
         (),
         SpotMachineConfiguration("a3-highgpu-8g"),
         1,
         DistributionShape.ANY,
     )
-    advice: ScriptedReader[CapacityAdvice] = ScriptedReader([])
+    ineligible = replace(eligible, endpoint_region="us-east1")
+    base = _resolved_candidates((eligible, ineligible))
+    unresolved = replace(
+        base.locations[1],
+        disposition=WorkloadLocationDisposition.INCOMPATIBLE,
+        accelerator_id=None,
+        owning_service=None,
+        management_plane=None,
+        supported_consumers=(),
+        quota_pool=None,
+        deployable_accelerator_quantity=None,
+        constraint_set=None,
+        constraint_requirements=(),
+        failure_reason=ResolutionFailureReason.UNSUPPORTED_COMPATIBILITY,
+    )
+    resolved = replace(base, locations=(base.locations[0], unresolved))
+    advice = ScriptedReader([_read(CapacityAdvice(Decimal("0.8"), "3600s", (), NOW))])
     history = ScriptedReader([_read(_history("a3-highgpu-8g", "1.00"))])
 
     result = asyncio.run(
         ObtainabilityOperations(advice, history, clock=lambda: NOW).compare(
-            ObtainabilityCompareRequest(
-                _context(),
-                (candidate,),
-                support=AdviceSupport(
-                    current_advice_supported=False,
-                    history_supported=True,
-                ),
-            )
+            _request((eligible, ineligible), resolved=resolved)
         )
     )
 
-    assert advice.requests == []
-    assert len(history.requests) == 1
-    assert result.data.candidates[0].history is not None
+    assert result.outcome.exit_class is ExitClass.SUCCESS
+    assert len(advice.requests) == 1
+    assert advice.requests[0].candidate == eligible  # type: ignore[union-attr]
+    assessed = {item.candidate.candidate_id: item for item in result.data.candidates}
+    assert assessed[eligible.candidate_id].advice is not None
+    assert assessed[ineligible.candidate_id].advice is None
+    assert (
+        UnrankedReason.CATALOG_UNSUPPORTED
+        in assessed[ineligible.candidate_id].unranked_reasons
+    )
 
 
 def test_compare_ranks_complete_candidates_and_preserves_regional_score() -> None:
@@ -641,7 +703,7 @@ def test_compare_ranks_complete_candidates_and_preserves_regional_score() -> Non
 
     result = asyncio.run(
         ObtainabilityOperations(advice, history, clock=lambda: NOW).compare(
-            ObtainabilityCompareRequest(_context(), (first, second))
+            _request((first, second))
         )
     )
 
@@ -666,25 +728,17 @@ def test_unsupported_cataloged_hardware_stays_visible_without_provider_calls() -
     advice: ScriptedReader[CapacityAdvice] = ScriptedReader([])
     history: ScriptedReader[CapacityHistory] = ScriptedReader([])
     coverage = ObtainabilityProductCoverage(
-        product_id="tpu-v6e",
+        product_id="ct6e-standard-4t",
         service="compute.googleapis.com",
         cataloged=True,
         current_advice_supported=False,
         history_supported=False,
-        reasons=("tpu-advice-unsupported",),
+        reasons=("current-advice-unsupported-for-machine-configuration",),
     )
 
     result = asyncio.run(
         ObtainabilityOperations(advice, history, clock=lambda: NOW).compare(
-            ObtainabilityCompareRequest(
-                _context(),
-                (candidate,),
-                support=AdviceSupport(
-                    current_advice_supported=False,
-                    history_supported=False,
-                ),
-                catalog_coverage=(coverage,),
-            )
+            _request((candidate,))
         )
     )
 
@@ -697,8 +751,8 @@ def test_unsupported_cataloged_hardware_stays_visible_without_provider_calls() -
     assert advice.requests == history.requests == []
 
 
-def test_n1_attached_gpu_keeps_current_advice_and_exact_history_reason() -> None:
-    """N1 attached GPUs retain current advice without invented history."""
+def test_unproven_n1_attachment_never_reaches_provider_readers() -> None:
+    """The application gate fails closed until attachment-aware catalog proof exists."""
     candidate = ObtainabilityCandidate(
         "us-central1",
         ("us-central1-a",),
@@ -709,21 +763,24 @@ def test_n1_attached_gpu_keeps_current_advice_and_exact_history_reason() -> None
         3,
         DistributionShape.ANY_SINGLE_ZONE,
     )
-    advice = ScriptedReader([_read(CapacityAdvice(Decimal("0.8"), "3600s", (), NOW))])
+    advice: ScriptedReader[CapacityAdvice] = ScriptedReader([])
     history: ScriptedReader[CapacityHistory] = ScriptedReader([])
 
     result = asyncio.run(
         ObtainabilityOperations(advice, history, clock=lambda: NOW).compare(
-            ObtainabilityCompareRequest(_context(), (candidate,))
+            _request((candidate,))
         )
     )
 
-    assert result.outcome.exit_class is ExitClass.SUCCESS
-    assert result.data.candidates[0].advice is not None
+    assert result.outcome.exit_class is ExitClass.REJECTED_PRECONDITION
+    assert result.data.candidates[0].advice is None
     assert result.data.candidates[0].unranked_reasons == (
+        UnrankedReason.CATALOG_UNSUPPORTED,
+        UnrankedReason.CURRENT_ADVICE_UNSUPPORTED,
+        UnrankedReason.HISTORY_UNSUPPORTED,
         UnrankedReason.HISTORY_UNSUPPORTED_N1_GPU,
     )
-    assert history.requests == []
+    assert advice.requests == history.requests == []
 
 
 def test_advice_permission_failure_retains_independent_history() -> None:
@@ -758,7 +815,7 @@ def test_advice_permission_failure_retains_independent_history() -> None:
 
     result = asyncio.run(
         ObtainabilityOperations(advice, history, clock=lambda: NOW).compare(
-            ObtainabilityCompareRequest(_context(), (candidate,))
+            _request((candidate,))
         )
     )
 
@@ -796,7 +853,7 @@ def test_incomplete_history_is_a_typed_evidence_failure() -> None:
 
     result = asyncio.run(
         ObtainabilityOperations(advice, history, clock=lambda: NOW).compare(
-            ObtainabilityCompareRequest(_context(), (candidate,))
+            _request((candidate,))
         )
     )
 
@@ -816,54 +873,32 @@ def test_obtainability_request_rejects_mixed_or_untyped_comparisons() -> None:
     )
     second = replace(first, endpoint_region="us-east1", vm_count=2)
 
+    with pytest.raises(TypeError, match="resolver provenance"):
+        ObtainabilityCompareRequest(_context(), (first,))
     with pytest.raises(ValueError, match="typed candidates"):
         ObtainabilityCompareRequest(_context(), ())
     with pytest.raises(ValueError, match="unique"):
         ObtainabilityCompareRequest(_context(), (first, first))
     with pytest.raises(ValueError, match="keep one exact"):
         ObtainabilityCompareRequest(_context(), (first, second))
-    with pytest.raises(TypeError, match="support"):
-        ObtainabilityCompareRequest(
-            _context(),
-            (first,),
-            support=cast("AdviceSupport", "bad"),
-        )
-    with pytest.raises(TypeError, match="catalog coverage"):
-        ObtainabilityCompareRequest(
-            _context(),
-            (first,),
-            catalog_coverage=cast(
-                "tuple[ObtainabilityProductCoverage, ...]",
-                ("bad",),
-            ),
-        )
     with pytest.raises(TypeError, match="resolver provenance"):
         ObtainabilityCompareRequest(
             _context(),
             (first,),
             resolver_provenance=cast("ResolvedWorkloadRequirement", "bad"),
         )
-    with pytest.raises(TypeError, match="eligibility must be typed"):
+    mismatched = _resolved_candidates((first,))
+    with pytest.raises(ValueError, match="request shapes must match"):
         ObtainabilityCompareRequest(
             _context(),
             (first,),
-            eligibility=cast("ObtainabilityEligibility", "bad"),
-        )
-    mismatched_eligibility = ObtainabilityEligibility(
-        AdviceSupport(),
-        (),
-        (
-            ObtainabilityCandidateEligibility(
-                replace(first, endpoint_region="us-east1").candidate_id,
-                True,
+            resolver_provenance=replace(
+                mismatched,
+                requirement=replace(
+                    cast("ComputeInstanceRequirement", mismatched.requirement),
+                    instance_count=2,
+                ),
             ),
-        ),
-    )
-    with pytest.raises(ValueError, match="bind every candidate in order"):
-        ObtainabilityCompareRequest(
-            _context(),
-            (first,),
-            eligibility=mismatched_eligibility,
         )
     with pytest.raises(TypeError, match="flags"):
         AdviceSupport(current_advice_supported=cast("bool", 1))

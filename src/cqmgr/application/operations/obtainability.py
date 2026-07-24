@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from cqmgr.application.ports.obtainability import (
     CapacityAdviceReadRequest,
@@ -137,6 +137,12 @@ class PreparedObtainabilityComparison:
         ) != tuple(candidate.candidate_id for candidate in self.candidates):
             msg = "prepared comparison eligibility must bind candidates in order"
             raise ValueError(msg)
+        if self.eligibility != eligibility_from_resolved_workload(
+            self.resolver_provenance,
+            self.candidates,
+        ):
+            msg = "prepared comparison eligibility must match resolver evidence"
+            raise ValueError(msg)
 
 
 def prepare_obtainability_comparison(
@@ -151,7 +157,7 @@ def prepare_obtainability_comparison(
     )
 
 
-def eligibility_from_resolved_workload(  # noqa: C901 - explicit eligibility matrix
+def eligibility_from_resolved_workload(  # noqa: C901, PLR0912
     resolved: ResolvedWorkloadRequirement,
     candidates: tuple[ObtainabilityCandidate, ...],
 ) -> ObtainabilityEligibility:
@@ -189,6 +195,8 @@ def eligibility_from_resolved_workload(  # noqa: C901 - explicit eligibility mat
         reasons: list[UnrankedReason] = []
         if requirement.provisioning_model is not ProvisioningModel.SPOT:
             reasons.append(UnrankedReason.SPOT_UNSUPPORTED)
+        if candidate.machine.gpu is not None or candidate.machine.local_ssd_count:
+            reasons.append(UnrankedReason.CATALOG_UNSUPPORTED)
         required_locations = candidate.zones or (candidate.endpoint_region,)
         locations = tuple(
             resolved_by_location.get(location) for location in required_locations
@@ -270,10 +278,7 @@ class ObtainabilityCompareRequest:
 
     context: ProviderReadContext
     candidates: tuple[ObtainabilityCandidate, ...]
-    support: AdviceSupport = AdviceSupport()
-    catalog_coverage: tuple[ObtainabilityProductCoverage, ...] = ()
     resolver_provenance: ResolvedWorkloadRequirement | None = None
-    eligibility: ObtainabilityEligibility | None = None
 
     def __post_init__(self) -> None:
         """Require at least one unique candidate and one fixed machine request shape."""
@@ -300,30 +305,21 @@ class ObtainabilityCompareRequest:
         if len(shapes) != 1:
             msg = "obtainability comparison must keep one exact VM request fixed"
             raise ValueError(msg)
-        if not isinstance(self.support, AdviceSupport):
-            msg = "comparison support must use AdviceSupport"
-            raise TypeError(msg)
-        if not isinstance(self.catalog_coverage, tuple) or any(
-            not isinstance(item, ObtainabilityProductCoverage)
-            for item in self.catalog_coverage
-        ):
-            msg = "comparison catalog coverage must be typed"
-            raise TypeError(msg)
-        if self.resolver_provenance is not None and not isinstance(
-            self.resolver_provenance,
-            ResolvedWorkloadRequirement,
-        ):
+        if not isinstance(self.resolver_provenance, ResolvedWorkloadRequirement):
             msg = "comparison resolver provenance must be typed"
             raise TypeError(msg)
-        if self.eligibility is not None:
-            if not isinstance(self.eligibility, ObtainabilityEligibility):
-                msg = "comparison eligibility must be typed"
-                raise TypeError(msg)
-            if tuple(
-                candidate.candidate_id for candidate in self.eligibility.candidates
-            ) != tuple(candidate.candidate_id for candidate in self.candidates):
-                msg = "comparison eligibility must bind every candidate in order"
-                raise ValueError(msg)
+        eligibility_from_resolved_workload(
+            self.resolver_provenance,
+            self.candidates,
+        )
+
+    @property
+    def eligibility(self) -> ObtainabilityEligibility:
+        """Derive the only provider-query gate from bound resolver evidence."""
+        return eligibility_from_resolved_workload(
+            cast("ResolvedWorkloadRequirement", self.resolver_provenance),
+            self.candidates,
+        )
 
 
 class ObtainabilityOperations:
@@ -359,17 +355,11 @@ class ObtainabilityOperations:
         missing_sources: list[str] = []
         forced_reasons: dict[str, tuple[UnrankedReason, ...]] = {}
         eligibility = request.eligibility
-        support = request.support if eligibility is None else eligibility.support
+        support = eligibility.support
         for candidate in request.candidates:
             history: CapacityHistory | None = None
-            reasons = list(
-                ()
-                if eligibility is None
-                else eligibility.reasons_for(candidate.candidate_id)
-            )
-            queryable = eligibility is None or eligibility.queryable(
-                candidate.candidate_id
-            )
+            reasons = list(eligibility.reasons_for(candidate.candidate_id))
+            queryable = eligibility.queryable(candidate.candidate_id)
             if not queryable:
                 advice = None
                 history = None
@@ -483,12 +473,9 @@ class ObtainabilityOperations:
             item.code.value == "provider-read-authorization-failed"
             for item in diagnostics
         )
-        unsupported = not support.current_advice_supported or (
-            eligibility is not None
-            and not any(
-                eligibility.queryable(candidate.candidate_id)
-                for candidate in request.candidates
-            )
+        unsupported = not support.current_advice_supported or not any(
+            eligibility.queryable(candidate.candidate_id)
+            for candidate in request.candidates
         )
         if unsupported:
             outcome = Outcome(
@@ -541,11 +528,7 @@ class ObtainabilityOperations:
             finished_at=self._clock(),
             data=ObtainabilityComparison(
                 candidates,
-                catalog_coverage=(
-                    request.catalog_coverage
-                    if eligibility is None
-                    else eligibility.catalog_coverage
-                ),
+                catalog_coverage=eligibility.catalog_coverage,
                 resolver_provenance=request.resolver_provenance,
             ),
             diagnostics=tuple(diagnostics),
