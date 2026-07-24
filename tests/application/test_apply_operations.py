@@ -556,15 +556,24 @@ class _ScriptedResolver:
     def __init__(
         self,
         resolution: UnknownWriteResolution = UnknownWriteResolution.UNRESOLVED,
+        *,
+        etag: str | None = None,
+        trace_id: str | None = None,
     ) -> None:
         self.resolution = resolution
+        self.etag = etag
+        self.trace_id = trace_id
         self.requests: list[QuotaPreferenceWrite] = []
 
     async def resolve_unknown(
         self, request: QuotaPreferenceWrite
     ) -> QuotaPreferenceUnknownResolutionResult:
         self.requests.append(request)
-        return QuotaPreferenceUnknownResolutionResult(self.resolution)
+        return QuotaPreferenceUnknownResolutionResult(
+            self.resolution,
+            self.etag,
+            self.trace_id,
+        )
 
 
 def _refreshed(child: QuotaRequestPlanChild) -> RefreshedApplyChild:
@@ -1359,6 +1368,8 @@ def test_unknown_first_child_is_never_retried_and_later_child_is_unattempted() -
     writer = _ScriptedWriter(TimeoutError("scripted transport loss"))
     resolver = _ScriptedResolver(
         resolution=UnknownWriteResolution.ACCEPTED,
+        etag="resolved-etag",
+        trace_id="resolved-trace",
     )
 
     result, repository, records, _audit = _apply(
@@ -1380,6 +1391,8 @@ def test_unknown_first_child_is_never_retried_and_later_child_is_unattempted() -
     assert resolver.requests == writer.requests
     assert records.record.children[0].unknown_resolution is None
     assert records.resolutions[0].resolution is UnknownDispatchResolution.ACCEPTED
+    assert records.resolutions[0].lineage_etag == "resolved-etag"
+    assert records.resolutions[0].lineage_trace_id == "resolved-trace"
 
 
 def test_unknown_resolution_audit_failure_returns_contained_critical_unknown() -> None:

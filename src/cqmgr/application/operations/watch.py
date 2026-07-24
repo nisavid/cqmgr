@@ -664,7 +664,7 @@ class WatchOperations:
             raise
         except CoordinationDeadlineExceededError as error:
             raise _error("watch-timeout", ExitClass.TIMEOUT) from error
-        except BaseException as error:
+        except Exception as error:
             raise _error(
                 "watch-observation-failed", ExitClass.OPERATIONAL_FAILURE
             ) from error

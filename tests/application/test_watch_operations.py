@@ -981,6 +981,39 @@ def test_midstream_observation_failure_emits_one_incomplete_terminal() -> None:
     asyncio.run(run())
 
 
+def test_observation_does_not_translate_process_shutdown() -> None:
+    """Process-level shutdown signals propagate instead of becoming Watch results."""
+
+    class OperatorAbort(BaseException):
+        pass
+
+    async def run() -> None:
+        submitted = _status(Reconciliation.RECONCILING)
+        reader = _Reader({"direct": [submitted], "companion": [submitted]})
+
+        async def abort(_request: WatchObservationRequest) -> WatchObservation:
+            raise OperatorAbort
+
+        reader.observe = abort  # type: ignore[method-assign]
+        operations, clock, _budgets, _checkpoints = _operations(reader)
+
+        with pytest.raises(OperatorAbort):
+            await _collect(
+                operations,
+                WatchRequest(
+                    intent_id=_record().intent_id,
+                    condition=WatchCondition.GRANTED,
+                    resume=None,
+                    authentication_key=KEY,
+                    installation_id="installation-123",
+                    deadline=clock.monotonic() + 3,
+                    cancellation=CancellationToken(),
+                ),
+            )
+
+    asyncio.run(run())
+
+
 def test_terminal_checkpoint_failure_reuses_last_durable_resume() -> None:
     """A material-event checkpoint failure emits one resumable terminal."""
 
