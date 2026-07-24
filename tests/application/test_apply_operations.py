@@ -1012,9 +1012,7 @@ def test_partial_unknown_apply_preserves_every_child_plan_safety_fact() -> None:
         direct.warnings,
         companion.warnings,
     )
-    assert tuple(
-        child.required_acknowledgements for child in result.data.children
-    ) == (
+    assert tuple(child.required_acknowledgements for child in result.data.children) == (
         direct.required_acknowledgements,
         companion.required_acknowledgements,
     )
@@ -1066,9 +1064,7 @@ def test_pre_dispatch_failure_preserves_authenticated_plan_safety_facts() -> Non
         ) -> ApplyRecordRepositoryOutcome:
             if record.revision == 1 and not self.failed:
                 self.failed = True
-                return ApplyRecordRepositoryOutcome(
-                    ApplyRecordRepositoryStatus.FAILED
-                )
+                return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.FAILED)
             return super().save(record, _key)
 
     base = _plan()
