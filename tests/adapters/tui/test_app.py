@@ -562,6 +562,43 @@ class DelayedAuditOperations(ScriptedAuditOperations):
         return _audit_result(self.records)
 
 
+class DelayedAuditWorkerOperations(ScriptedAuditOperations):
+    """Delay Audit detail workers until the user has left their workspace."""
+
+    def __init__(self, records: tuple[AuditRecord, ...] = ()) -> None:
+        super().__init__(records)
+        self.inspect_started = asyncio.Event()
+        self.release_inspect = asyncio.Event()
+        self.inspect_returned = asyncio.Event()
+        self.verify_started = asyncio.Event()
+        self.release_verify = asyncio.Event()
+        self.verify_returned = asyncio.Event()
+
+    @override
+    async def inspect(self, record_id: str) -> OperationResult[AuditInspectData]:
+        self.inspect_started.set()
+        await self.release_inspect.wait()
+        result = await super().inspect(record_id)
+        self.inspect_returned.set()
+        return result
+
+    @override
+    async def verify(
+        self,
+        *,
+        from_record_id: str | None = None,
+        through_record_id: str | None = None,
+    ) -> OperationResult[AuditVerifyData]:
+        self.verify_started.set()
+        await self.release_verify.wait()
+        result = await super().verify(
+            from_record_id=from_record_id,
+            through_record_id=through_record_id,
+        )
+        self.verify_returned.set()
+        return result
+
+
 class SupersededReadOnlyOperations(ScriptedReadOnlyOperations):
     """Hold the first read until the TUI cancels it, then complete the refresh."""
 
@@ -1082,6 +1119,77 @@ def test_quota_workspace_owns_state_over_older_audit_load() -> None:
             assert str(_static(app, "#status-line").content) == quota_status
             assert str(_static(app, "#instrument-bar").content) == quota_instrument
             assert app.last_copied_cli == quota_copy_cli
+
+    asyncio.run(scenario())
+
+
+def test_quota_workspace_owns_state_over_older_audit_inspection() -> None:
+    """An older Audit inspection cannot replace the active quota operation."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        audit = DelayedAuditWorkerOperations((AUDIT_RECORD,))
+        app = CloudQuotaManagerApp(operations, audit)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-audit")
+            await pilot.pause()
+
+            _table(app, "#audit-table").focus()
+            await pilot.press("enter")
+            await audit.inspect_started.wait()
+
+            await pilot.click("#workspace-quotas")
+            app.action_refresh()
+            await pilot.pause()
+            quota_result = app.last_result
+            assert quota_result is operations.result
+            quota_status = str(_static(app, "#status-line").content)
+            audit_detail = str(_static(app, "#audit-detail").content)
+
+            audit.release_inspect.set()
+            await audit.inspect_returned.wait()
+            await pilot.pause()
+
+            assert app.active_workspace == "quotas"
+            assert app.last_result is quota_result
+            assert str(_static(app, "#status-line").content) == quota_status
+            assert str(_static(app, "#audit-detail").content) == audit_detail
+
+    asyncio.run(scenario())
+
+
+def test_quota_workspace_owns_state_over_older_audit_verification() -> None:
+    """An older Audit verification cannot replace the active quota operation."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        audit = DelayedAuditWorkerOperations((AUDIT_RECORD,))
+        app = CloudQuotaManagerApp(operations, audit)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-audit")
+            await pilot.pause()
+
+            _button(app, "#audit-verify").press()
+            await audit.verify_started.wait()
+
+            await pilot.click("#workspace-quotas")
+            app.action_refresh()
+            await pilot.pause()
+            quota_result = app.last_result
+            assert quota_result is operations.result
+            quota_status = str(_static(app, "#status-line").content)
+            audit_detail = str(_static(app, "#audit-detail").content)
+
+            audit.release_verify.set()
+            await audit.verify_returned.wait()
+            await pilot.pause()
+
+            assert app.active_workspace == "quotas"
+            assert app.last_result is quota_result
+            assert str(_static(app, "#status-line").content) == quota_status
+            assert str(_static(app, "#audit-detail").content) == audit_detail
 
     asyncio.run(scenario())
 
