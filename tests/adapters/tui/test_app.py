@@ -114,6 +114,7 @@ from cqmgr.domain.obtainability import (
 )
 from cqmgr.domain.plans import (
     ContactBinding,
+    EvidenceBinding,
     PlanKind,
     PlanLedgerState,
     PlanPrincipal,
@@ -1339,6 +1340,8 @@ def _apply_result() -> OperationResult[ApplyData]:
             ),
             provider_outcome=provider_outcome,
             unknown_resolution=resolution,
+            trace_id=f"trace-{child_id}",
+            audit_record_ids=(f"audit-{child_id}",),
         )
         for index, (
             child_id,
@@ -1366,6 +1369,25 @@ def _apply_result() -> OperationResult[ApplyData]:
             kind=PlanKind.BUNDLE,
             intent_id="intent-42",
             children=children,
+            audit_record_ids=("audit-apply",),
+        ),
+        diagnostics=(
+            Diagnostic(
+                code=DiagnosticCode("dispatch-partial"),
+                severity=Severity.WARNING,
+                phase=DiagnosticPhase("provider-write"),
+                source=DiagnosticSource("cloud-quotas"),
+                retry=RetryDisposition.AFTER_REFRESH,
+                message=RedactedText("One child requires reconciliation."),
+            ),
+        ),
+        provenance=(
+            Provenance(
+                StableSymbol("cloud-quotas"),
+                NOW,
+                StableSymbol("all-dispatched-children"),
+                request_identity=RedactedText("intent-42"),
+            ),
         ),
     )
 
@@ -1378,10 +1400,10 @@ def _plan_child(child_id: str, *, direct_rank: int) -> QuotaRequestPlanChild:
         effective=QuotaQuantity(4, UNIT),
         usage=QuotaQuantity(2, UNIT),
         workload=QuotaQuantity(4, UNIT),
-        prior_desired=None,
-        granted=None,
-        preference_name=None,
-        preference_etag=None,
+        prior_desired=QuotaQuantity(6, UNIT),
+        granted=QuotaQuantity(5, UNIT),
+        preference_name=f"preferences/{child_id}",
+        preference_etag=f"etag-{child_id}",
         target_strategy=TargetStrategy.MINIMUM,
         target_derivation=StableSymbol("usage-plus-workload"),
         direct_accelerator_rank=direct_rank,
@@ -1389,7 +1411,13 @@ def _plan_child(child_id: str, *, direct_rank: int) -> QuotaRequestPlanChild:
         warnings=(StableSymbol("remaining-bottleneck"),),
         required_acknowledgements=(),
         acknowledgements=(),
-        evidence=(),
+        evidence=(
+            EvidenceBinding(
+                StableSymbol("effective-quota"),
+                "sha256:" + ("e" * 64),
+                NOW - timedelta(seconds=30),
+            ),
+        ),
     )
 
 
@@ -1435,6 +1463,24 @@ def _review_result() -> OperationResult[PlanReviewData]:
         started_at=NOW,
         finished_at=NOW,
         data=PlanReviewData(review),
+        diagnostics=(
+            Diagnostic(
+                code=DiagnosticCode("plan-inapplicable"),
+                severity=Severity.WARNING,
+                phase=DiagnosticPhase("plan-review"),
+                source=DiagnosticSource("local-plan"),
+                retry=RetryDisposition.AFTER_NEW_PREVIEW,
+                message=RedactedText("The retained plan cannot be applied."),
+            ),
+        ),
+        provenance=(
+            Provenance(
+                StableSymbol("local-plan"),
+                NOW,
+                StableSymbol("authenticated-bytes"),
+                lifecycle_or_preview_status=RedactedText("consumed"),
+            ),
+        ),
     )
 
 
@@ -1571,7 +1617,9 @@ def test_wide_shell_opens_federated_quota_inspector_with_semantic_evidence() -> 
     asyncio.run(scenario())
 
 
-def test_single_no_op_preview_preserves_drift_expert_and_contact_placeholders() -> None:
+def test_single_no_op_preview_preserves_drift_expert_and_contact_placeholders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Single Preview keeps expert evidence and protected contact input explicit."""
 
     async def scenario() -> None:
@@ -1646,6 +1694,8 @@ def test_single_no_op_preview_preserves_drift_expert_and_contact_placeholders() 
             "cqmgr request preview --resource-scope projects/123456789 "
             "--quota-contact-stdin"
         )
+        copied: list[str] = []
+        monkeypatch.setattr(app, "copy_to_clipboard", copied.append)
 
         async with app.run_test(size=(110, 38)) as pilot:
             await pilot.pause()
@@ -1664,6 +1714,13 @@ def test_single_no_op_preview_preserves_drift_expert_and_contact_placeholders() 
             assert str(_static(app, "#lifecycle-copy-cli").content) == command
             assert "--quota-contact-stdin" in command
             assert not _button(app, "#lifecycle-copy").disabled
+            instruction = str(_static(app, "#lifecycle-copy-instruction").content)
+            assert "provide exactly one protected quota-contact line" in instruction
+            assert instruction not in command
+            copied_command = app._lifecycle_copy_cli()  # noqa: SLF001
+            assert copied_command is not None
+            app.copy_to_clipboard(copied_command)
+            assert copied == [command]
 
             app._submit_lifecycle_preview()  # noqa: SLF001 - exercise route dispatch
             await pilot.pause()
@@ -1677,10 +1734,11 @@ def test_single_no_op_preview_preserves_drift_expert_and_contact_placeholders() 
     asyncio.run(scenario())
 
 
-def test_bundle_compose_and_non_atomic_apply_keep_scope_and_children_explicit() -> None:
+def test_bundle_compose_and_non_atomic_apply_keep_scope_and_children_explicit(  # noqa: PLR0915
+) -> None:
     """Compose and Apply keep every gate and ordered child outcome visible."""
 
-    async def scenario() -> None:
+    async def scenario() -> None:  # noqa: PLR0915
         no_op = ComposeChild(
             child_id="settled",
             slice_identity=_mutation_slice("QUOTA-SETTLED"),
@@ -1716,14 +1774,20 @@ def test_bundle_compose_and_non_atomic_apply_keep_scope_and_children_explicit() 
         )
         result = _apply_result()
         lifecycle = ScriptedLifecycleOperations(result)
+        operations = ScriptedReadOnlyOperations(_browse_result())
         app = CloudQuotaManagerApp(
-            ScriptedReadOnlyOperations(_browse_result()),
+            operations,
             ScriptedAuditOperations(),
             lifecycle=lifecycle,  # type: ignore[arg-type]
         )
 
         async with app.run_test(size=(120, 42)) as pilot:
             await pilot.pause()
+            app._select_quota(operations.result.data.items[0])  # noqa: SLF001
+            await pilot.pause()
+            selected_before = app.selected_quota
+            assert selected_before is not None
+            operations.inspect_calls.clear()
             composition = app.open_compose(compose_request)
 
             assert composition.reached
@@ -1769,22 +1833,47 @@ def test_bundle_compose_and_non_atomic_apply_keep_scope_and_children_explicit() 
             assert "Disposition: accepted" in detail
             assert "Disposition: failed" in detail
             assert "Provider outcome: unchanged" in detail
+            assert "Dimensions: region=us-central1" in detail
+            assert "ETag: etag-0" in detail
+            assert "Trace ID: trace-direct" in detail
+            assert "Unknown resolution: accepted" in detail
+            assert "Audit record IDs: audit-direct" in detail
+            assert "Audit record IDs: audit-apply" in detail
+            assert "Diagnostic: warning dispatch-partial" in detail
+            assert "Provenance: cloud-quotas" in detail
             assert "Disposition: unknown" in detail
             assert "Disposition: unattempted" in detail
             assert "Accepted children remain accepted" in detail
             assert not result.succeeded
 
             await pilot.click("#lifecycle-back")
+            await pilot.pause()
             assert not app.scope_locked
             assert not app.query_one("#quota-workbench").has_class("hidden")
+            assert app.current_query == ReadOnlyQuotaQuery()
+            assert app.selected_quota is not None
+            assert app.selected_quota.selector == selected_before.selector
+            assert {
+                selector.quota_id for selector, _options in operations.inspect_calls
+            } == {
+                "QUOTA-0",
+                "QUOTA-1",
+                "QUOTA-2",
+                "QUOTA-3",
+            }
+            assert "REFRESHED — 4/4 affected slices" in str(
+                _static(app, "#status-line").content
+            )
+            assert _table(app, "#quota-ledger").has_focus
 
     asyncio.run(scenario())
 
 
-def test_plan_review_and_watch_preserve_incapability_and_mixed_grant_evidence() -> None:
+def test_plan_review_and_watch_preserve_incapability_and_mixed_grant_evidence(  # noqa: PLR0915
+) -> None:
     """Review and Watch retain exact trust reasons and orthogonal child state."""
 
-    async def scenario() -> None:
+    async def scenario() -> None:  # noqa: PLR0915
         review_result = _review_result()
         watch_event = _watch_terminal_event()
         lifecycle = ScriptedLifecycleOperations(
@@ -1818,6 +1907,18 @@ def test_plan_review_and_watch_preserve_incapability_and_mixed_grant_evidence() 
             assert "expired" in detail
             assert "foreign-or-unauthenticated" in detail
             assert "ordered and non-atomic" in detail
+            assert "Dimensions: region=us-central1" in detail
+            assert "Effective: 4 1" in detail
+            assert "Usage: 2 1" in detail
+            assert "Workload: 4 1" in detail
+            assert "Prior desired: 6 1" in detail
+            assert "Granted: 5 1" in detail
+            assert "Preference: preferences/direct" in detail
+            assert "Preference ETag: etag-direct" in detail
+            assert "Evidence effective-quota" in detail
+            assert "Age: 30.0 seconds" in detail
+            assert "Diagnostic: warning plan-inapplicable" in detail
+            assert "Provenance: local-plan" in detail
             copied_review = str(_static(app, "#lifecycle-copy-cli").content)
             assert copied_review.startswith("cqmgr plan review --plan sha256:")
 
