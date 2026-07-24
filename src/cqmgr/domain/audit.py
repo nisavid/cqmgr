@@ -39,6 +39,11 @@ class AuditFactName(StrEnum):
 
     PREFERENCE = "preference"
     PREFERENCE_IDENTITY = "preference-identity"
+    EXACT_SLICE = "exact-slice"
+    TARGET = "target"
+    ETAG = "etag"
+    ACTION = "action"
+    DISPOSITION = "disposition"
     PLAN_DIGEST = "plan-digest"
     PLAN_SUBJECT = "plan-subject"
     PLAN_CHILD = "plan-child"
