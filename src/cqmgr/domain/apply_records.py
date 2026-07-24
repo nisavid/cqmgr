@@ -51,6 +51,8 @@ class UnknownResolutionEvidence:
     resolution: UnknownDispatchResolution
     recorded_at: datetime
     checkpoint: int = 1
+    lineage_etag: str | None = None
+    lineage_trace_id: str | None = None
 
     def __post_init__(self) -> None:
         """Require exact single-assignment journal evidence."""
@@ -64,8 +66,18 @@ class UnknownResolutionEvidence:
             msg = "resolution must be an UnknownDispatchResolution"
             raise TypeError(msg)
         require_utc(self.recorded_at, "recorded_at")
-        if self.checkpoint != 1:
-            msg = "V1 unknown resolution checkpoint must be one"
+        if (
+            isinstance(self.checkpoint, bool)
+            or not isinstance(self.checkpoint, int)
+            or self.checkpoint < 1
+        ):
+            msg = "unknown resolution checkpoint must be a positive integer"
+            raise ValueError(msg)
+        _require_lineage(self.lineage_etag, self.lineage_trace_id)
+        if self.resolution is not UnknownDispatchResolution.ACCEPTED and (
+            self.lineage_etag is not None or self.lineage_trace_id is not None
+        ):
+            msg = "only accepted unknown resolution may retain lineage"
             raise ValueError(msg)
 
 
@@ -85,6 +97,9 @@ class ApplyChildRecord:
     outcome_recorded_at: datetime | None = None
     unknown_resolution: UnknownDispatchResolution | None = None
     resolution_recorded_at: datetime | None = None
+    accepted_etag: str | None = None
+    accepted_trace_id: str | None = None
+    baseline: QuotaQuantity | None = None
 
     def __post_init__(self) -> None:  # noqa: C901, PLR0912
         """Reject impossible child histories."""
@@ -97,6 +112,12 @@ class ApplyChildRecord:
         if not isinstance(self.target, QuotaQuantity):
             msg = "Apply child target must be a QuotaQuantity"
             raise TypeError(msg)
+        if self.baseline is not None and (
+            not isinstance(self.baseline, QuotaQuantity)
+            or self.baseline.unit != self.target.unit
+        ):
+            msg = "Apply child baseline must match the target unit"
+            raise ValueError(msg)
         if (
             not isinstance(self.preference_identity, str)
             or not self.preference_identity
@@ -158,6 +179,16 @@ class ApplyChildRecord:
         if self.resolution_recorded_at is not None and self.unknown_resolution is None:
             msg = "resolution timestamp requires unknown resolution evidence"
             raise ValueError(msg)
+        _require_lineage(self.accepted_etag, self.accepted_trace_id)
+        if (self.accepted_etag is not None or self.accepted_trace_id is not None) and (
+            self.disposition is not ApplyChildDisposition.ACCEPTED
+            and not (
+                self.disposition is ApplyChildDisposition.UNKNOWN
+                and self.unknown_resolution is UnknownDispatchResolution.ACCEPTED
+            )
+        ):
+            msg = "accepted lineage requires accepted dispatch evidence"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,8 +204,9 @@ class ApplyRecord:
     state: ApplyRecordState = ApplyRecordState.IN_PROGRESS
     finished_at: datetime | None = None
     revision: int = 0
+    creation_sequence: int | None = None
 
-    def __post_init__(self) -> None:  # noqa: C901
+    def __post_init__(self) -> None:  # noqa: C901, PLR0912
         """Require a complete, ordered, internally coherent Apply subject."""
         if not isinstance(self.intent_id, str) or not self.intent_id:
             msg = "Apply intent_id must be non-empty"
@@ -191,6 +223,13 @@ class ApplyRecord:
         require_utc(self.created_at, "created_at")
         if not isinstance(self.children, tuple) or not self.children:
             msg = "Apply record requires ordered children"
+            raise ValueError(msg)
+        if self.creation_sequence is not None and (
+            isinstance(self.creation_sequence, bool)
+            or not isinstance(self.creation_sequence, int)
+            or self.creation_sequence < 1
+        ):
+            msg = "Apply creation sequence must be a positive integer"
             raise ValueError(msg)
         if any(
             not isinstance(child, ApplyChildRecord)
@@ -237,12 +276,15 @@ class ApplyRecord:
         updated = replace(child, dispatch_intent_at=now)
         return self._replace_child(index, updated)
 
-    def record_outcome(
+    def record_outcome(  # noqa: PLR0913
         self,
         child_id: str,
         disposition: ApplyChildDisposition,
         provider_outcome: StableSymbol,
         now: datetime,
+        *,
+        accepted_etag: str | None = None,
+        accepted_trace_id: str | None = None,
     ) -> ApplyRecord:
         """Record exactly one terminal result for a dispatched child."""
         require_utc(now, "now")
@@ -263,6 +305,8 @@ class ApplyRecord:
             disposition=disposition,
             provider_outcome=provider_outcome,
             outcome_recorded_at=now,
+            accepted_etag=accepted_etag,
+            accepted_trace_id=accepted_trace_id,
         )
         return self._replace_child(index, updated)
 
@@ -383,6 +427,9 @@ class ApplyRecord:
         child_id: str,
         resolution: UnknownDispatchResolution,
         now: datetime,
+        *,
+        accepted_etag: str | None = None,
+        accepted_trace_id: str | None = None,
     ) -> ApplyRecord:
         """Append single-assignment read-after-unknown proof."""
         require_utc(now, "now")
@@ -402,6 +449,16 @@ class ApplyRecord:
                 child,
                 unknown_resolution=resolution,
                 resolution_recorded_at=now,
+                accepted_etag=(
+                    accepted_etag
+                    if resolution is UnknownDispatchResolution.ACCEPTED
+                    else None
+                ),
+                accepted_trace_id=(
+                    accepted_trace_id
+                    if resolution is UnknownDispatchResolution.ACCEPTED
+                    else None
+                ),
             ),
         )
 
@@ -416,3 +473,10 @@ class ApplyRecord:
         children = list(self.children)
         children[index] = child
         return replace(self, children=tuple(children), revision=self.revision + 1)
+
+
+def _require_lineage(etag: str | None, trace_id: str | None) -> None:
+    for name, value in (("etag", etag), ("trace_id", trace_id)):
+        if value is not None and (not isinstance(value, str) or not value):
+            msg = f"accepted lineage {name} must be None or non-empty"
+            raise ValueError(msg)

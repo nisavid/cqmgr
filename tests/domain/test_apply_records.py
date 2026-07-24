@@ -66,7 +66,9 @@ def _record() -> ApplyRecord:
         ("child_id", "", ValueError, "child_id"),
         ("resolution", "accepted", TypeError, "UnknownDispatchResolution"),
         ("recorded_at", NOW.replace(tzinfo=None), ValueError, "aware UTC"),
-        ("checkpoint", 2, ValueError, "checkpoint"),
+        ("checkpoint", 0, ValueError, "checkpoint"),
+        ("lineage_etag", "", ValueError, "lineage etag"),
+        ("lineage_trace_id", "", ValueError, "lineage trace_id"),
     ],
 )
 def test_unknown_resolution_evidence_rejects_cross_wired_journal_values(
@@ -81,12 +83,22 @@ def test_unknown_resolution_evidence_rejects_cross_wired_journal_values(
         "direct",
         UnknownDispatchResolution.ACCEPTED,
         NOW,
+        lineage_etag="resolution-etag",
     )
+    assert evidence.lineage_etag == "resolution-etag"
     with pytest.raises(error, match=message):
         replace(
             evidence,
             **{field_name: value},  # type: ignore[bad-argument-type]
         )
+
+    if field_name == "resolution":
+        with pytest.raises(ValueError, match="only accepted"):
+            replace(
+                evidence,
+                resolution=UnknownDispatchResolution.FAILED,
+                lineage_etag="rejected-lineage",
+            )
 
 
 def test_ordered_apply_record_preserves_accepted_then_failed_and_unattempted() -> None:
@@ -98,6 +110,7 @@ def test_ordered_apply_record_preserves_accepted_then_failed_and_unattempted() -
         ApplyChildDisposition.ACCEPTED,
         StableSymbol("submitted"),
         NOW,
+        accepted_etag="accepted-etag",
     )
     record = record.record_dispatch_intent("companion", NOW)
     record = record.record_outcome(
@@ -113,6 +126,7 @@ def test_ordered_apply_record_preserves_accepted_then_failed_and_unattempted() -
         ApplyChildDisposition.ACCEPTED,
         ApplyChildDisposition.FAILED,
     )
+    assert record.children[0].accepted_etag == "accepted-etag"
 
 
 def test_interrupted_dispatch_becomes_unknown_and_never_dispatches_again() -> None:
@@ -159,6 +173,8 @@ def test_unknown_resolution_is_append_only_and_single_assignment() -> None:
         ("disposition", "accepted", TypeError, "disposition"),
         ("provider_outcome", "submitted", TypeError, "provider_outcome"),
         ("unknown_resolution", "accepted", TypeError, "unknown resolution"),
+        ("accepted_etag", "", ValueError, "lineage"),
+        ("accepted_trace_id", "", ValueError, "lineage"),
         (
             "resolution_recorded_at",
             NOW,
@@ -198,6 +214,11 @@ def test_apply_child_rejects_impossible_terminal_histories() -> None:
             unknown_resolution=UnknownDispatchResolution.ACCEPTED,
             resolution_recorded_at=NOW,
         )
+    with pytest.raises(ValueError, match="accepted lineage"):
+        replace(
+            child,
+            accepted_etag="provider-etag",
+        )
 
 
 @pytest.mark.parametrize(
@@ -209,6 +230,9 @@ def test_apply_child_rejects_impossible_terminal_histories() -> None:
         ("resource_scope", "scope", TypeError, "resource_scope"),
         ("created_at", NOW.replace(tzinfo=None), ValueError, "aware UTC"),
         ("children", (), ValueError, "children"),
+        ("creation_sequence", True, ValueError, "creation sequence"),
+        ("creation_sequence", "1", ValueError, "creation sequence"),
+        ("creation_sequence", 0, ValueError, "creation sequence"),
         ("state", "accepted", TypeError, "state"),
         ("finished_at", NOW.replace(tzinfo=None), ValueError, "aware UTC"),
         ("revision", True, TypeError, "revision"),

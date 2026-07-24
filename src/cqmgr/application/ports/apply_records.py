@@ -57,13 +57,16 @@ class ApplyRecordRepository(Protocol):
         """Commit exactly the next monotonic revision."""
         ...
 
-    def append_unknown_resolution(
+    def append_unknown_resolution(  # noqa: PLR0913
         self,
         intent_id: str,
         child_id: str,
         resolution: UnknownDispatchResolution,
         recorded_at: datetime,
         authentication_key: SecretValue,
+        *,
+        lineage_etag: str | None = None,
+        lineage_trace_id: str | None = None,
     ) -> ApplyRecordRepositoryOutcome:
         """Append one authenticated single-assignment resolution."""
         ...
@@ -74,4 +77,13 @@ class ApplyRecordRepository(Protocol):
         authentication_key: SecretValue,
     ) -> ApplyRecordRepositoryOutcome:
         """Load the append-only resolution checkpoint independently."""
+        ...
+
+    def find_superseding_record(
+        self,
+        selected_intent_id: str,
+        preference_identities: frozenset[str],
+        authentication_key: SecretValue,
+    ) -> ApplyRecordRepositoryOutcome:
+        """Find the earliest later local dispatch for an exact preference set."""
         ...

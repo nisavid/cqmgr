@@ -10,6 +10,7 @@ import re
 import secrets
 import stat
 from contextlib import suppress
+from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -49,6 +50,59 @@ _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
 _MINIMUM_KEY_BYTES = 32
 _DIMENSION_PAIR_SIZE = 2
+_RECORD_FIELDS = frozenset(
+    {
+        "intent_id",
+        "plan_digest",
+        "kind",
+        "resource_scope",
+        "created_at",
+        "state",
+        "finished_at",
+        "revision",
+        "children",
+    }
+)
+_RECORD_SEQUENCE_FIELD = frozenset({"creation_sequence"})
+_LEGACY_CHILD_FIELDS = frozenset(
+    {
+        "child_id",
+        "slice_identity",
+        "target",
+        "preference_identity",
+        "etag",
+        "preference_existed",
+        "dispatch_intent_at",
+        "disposition",
+        "provider_outcome",
+        "outcome_recorded_at",
+        "unknown_resolution",
+        "resolution_recorded_at",
+    }
+)
+_CHILD_LINEAGE_FIELDS = frozenset({"accepted_etag", "accepted_trace_id"})
+_CHILD_BASELINE_FIELD = frozenset({"baseline"})
+_LEGACY_RESOLUTION_FIELDS = frozenset(
+    {
+        "intent_id",
+        "child_id",
+        "resolution",
+        "recorded_at",
+        "checkpoint",
+    }
+)
+_RESOLUTION_LINEAGE_FIELDS = frozenset({"lineage_etag", "lineage_trace_id"})
+_SLICE_FIELDS = frozenset(
+    {
+        "resource_scope",
+        "service",
+        "quota_id",
+        "dimensions",
+        "quota_scope",
+    }
+)
+_SCOPE_FIELDS = frozenset({"kind", "canonical_name"})
+_QUANTITY_FIELDS = frozenset({"value", "unit"})
 
 
 class LocalApplyRecordRepository:
@@ -89,17 +143,37 @@ class LocalApplyRecordRepository:
             return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.FAILED)
         return self._with_lock(lambda: self._create_locked(path, record, key))
 
-    def _create_locked(
+    def _create_locked(  # noqa: PLR0911
         self, path: Path, record: ApplyRecord, key: bytes
     ) -> ApplyRecordRepositoryOutcome:
         if path.exists():
             existing = self._read(path, key)
-            if existing == record:
+            if (
+                existing is not None
+                and replace(existing, creation_sequence=None) == record
+            ):
                 return ApplyRecordRepositoryOutcome(
                     ApplyRecordRepositoryStatus.STORED,
                     existing,
                 )
             return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.CONFLICT)
+        try:
+            retained = tuple(
+                self._read(candidate, key)
+                for candidate in sorted(self._root.glob("*.json"))
+            )
+        except OSError:
+            return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.FAILED)
+        if any(item is None for item in retained):
+            return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.CONFLICT)
+        sequences = tuple(
+            item.creation_sequence
+            for item in retained
+            if item is not None and item.creation_sequence is not None
+        )
+        if len(sequences) != len(set(sequences)):
+            return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.CONFLICT)
+        record = replace(record, creation_sequence=max(sequences, default=0) + 1)
         try:
             _publish(path, _encode(record, key), replace=False)
         except OSError:
@@ -142,13 +216,16 @@ class LocalApplyRecordRepository:
             return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.FAILED)
         return self._with_lock(lambda: self._save_locked(path, record, key))
 
-    def append_unknown_resolution(
+    def append_unknown_resolution(  # noqa: PLR0913
         self,
         intent_id: str,
         child_id: str,
         resolution: UnknownDispatchResolution,
         recorded_at: datetime,
         authentication_key: SecretValue,
+        *,
+        lineage_etag: str | None = None,
+        lineage_trace_id: str | None = None,
     ) -> ApplyRecordRepositoryOutcome:
         """Append one child resolution without replacing Apply state."""
         try:
@@ -160,6 +237,8 @@ class LocalApplyRecordRepository:
                 child_id,
                 resolution,
                 recorded_at,
+                lineage_etag=lineage_etag,
+                lineage_trace_id=lineage_trace_id,
             )
         except (TypeError, ValueError):
             return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.FAILED)
@@ -182,12 +261,23 @@ class LocalApplyRecordRepository:
         restrict_windows_acl(path.parent)
         if path.exists():
             existing = self._read_resolution(path, key)
-            if existing == evidence:
+            if existing is not None and replace(existing, checkpoint=1) == evidence:
                 return ApplyRecordRepositoryOutcome(
                     ApplyRecordRepositoryStatus.STORED,
-                    resolutions=(evidence,),
+                    resolutions=(existing,),
                 )
             return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.CONFLICT)
+        retained = self._load_resolutions_locked(path.parent, key)
+        if retained.status is not ApplyRecordRepositoryStatus.AVAILABLE:
+            return retained
+        evidence = replace(
+            evidence,
+            checkpoint=max(
+                (item.checkpoint for item in retained.resolutions),
+                default=0,
+            )
+            + 1,
+        )
         try:
             _publish(path, _encode_resolution(evidence, key), replace=False)
         except OSError:
@@ -210,6 +300,96 @@ class LocalApplyRecordRepository:
             return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.FAILED)
         return self._with_lock(lambda: self._load_resolutions_locked(directory, key))
 
+    def find_superseding_record(
+        self,
+        selected_intent_id: str,
+        preference_identities: frozenset[str],
+        authentication_key: SecretValue,
+    ) -> ApplyRecordRepositoryOutcome:
+        """Find the earliest later authenticated Apply that may have dispatched."""
+        if (
+            not isinstance(preference_identities, frozenset)
+            or not preference_identities
+            or any(
+                not isinstance(identity, str) or not identity
+                for identity in preference_identities
+            )
+        ):
+            return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.FAILED)
+        try:
+            key = _key_bytes(authentication_key)
+            selected_path = self._path(selected_intent_id)
+        except (TypeError, ValueError):
+            return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.FAILED)
+        return self._with_lock(
+            lambda: self._find_superseding_record_locked(
+                selected_path,
+                preference_identities,
+                key,
+            )
+        )
+
+    def _find_superseding_record_locked(  # noqa: PLR0911
+        self,
+        selected_path: Path,
+        preference_identities: frozenset[str],
+        key: bytes,
+    ) -> ApplyRecordRepositoryOutcome:
+        if not selected_path.exists():
+            return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.MISSING)
+        try:
+            records = tuple(
+                self._read(path, key) for path in sorted(self._root.glob("*.json"))
+            )
+        except OSError:
+            return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.FAILED)
+        if any(record is None for record in records):
+            return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.CONFLICT)
+        authenticated = tuple(record for record in records if record is not None)
+        selected = next(
+            (
+                record
+                for record in authenticated
+                if self._path(record.intent_id) == selected_path
+            ),
+            None,
+        )
+        if selected is None:
+            return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.CONFLICT)
+        sequences = tuple(
+            record.creation_sequence
+            for record in authenticated
+            if record.creation_sequence is not None
+        )
+        if len(sequences) != len(set(sequences)):
+            return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.CONFLICT)
+        superseding = tuple(
+            record
+            for record in authenticated
+            if record.intent_id != selected.intent_id
+            and _created_after(record, selected)
+            and any(
+                child.preference_identity in preference_identities
+                and child.dispatch_intent_at is not None
+                and child.disposition is not ApplyChildDisposition.FAILED
+                for child in record.children
+            )
+        )
+        if not superseding:
+            return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.MISSING)
+        earliest = min(
+            superseding,
+            key=lambda record: (
+                record.creation_sequence is None,
+                record.creation_sequence or 0,
+                record.intent_id,
+            ),
+        )
+        return ApplyRecordRepositoryOutcome(
+            ApplyRecordRepositoryStatus.AVAILABLE,
+            earliest,
+        )
+
     def _load_resolutions_locked(
         self,
         directory: Path,
@@ -226,9 +406,19 @@ class LocalApplyRecordRepository:
             return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.FAILED)
         if any(item is None for item in evidence):
             return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.CONFLICT)
+        ordered = tuple(
+            sorted(
+                (item for item in evidence if item is not None),
+                key=lambda item: item.checkpoint,
+            )
+        )
+        if tuple(item.checkpoint for item in ordered) != tuple(
+            range(1, len(ordered) + 1)
+        ):
+            return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.CONFLICT)
         return ApplyRecordRepositoryOutcome(
             ApplyRecordRepositoryStatus.AVAILABLE,
-            resolutions=tuple(item for item in evidence if item is not None),
+            resolutions=ordered,
         )
 
     def _save_locked(
@@ -242,9 +432,12 @@ class LocalApplyRecordRepository:
             return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.FAILED)
         if existing is None:
             return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.CONFLICT)
+        if record.creation_sequence is None:
+            record = replace(record, creation_sequence=existing.creation_sequence)
         if (
             existing.intent_id != record.intent_id
             or existing.plan_digest != record.plan_digest
+            or existing.creation_sequence != record.creation_sequence
             or record.revision != existing.revision + 1
         ):
             return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.CONFLICT)
@@ -327,12 +520,15 @@ class LocalApplyRecordRepository:
                 supplied,
             ):
                 return None
+            _require_resolution_fields(mapping)
             return UnknownResolutionEvidence(
                 intent_id=_string(mapping["intent_id"]),
                 child_id=_string(mapping["child_id"]),
                 resolution=UnknownDispatchResolution(_string(mapping["resolution"])),
                 recorded_at=_time(mapping["recorded_at"]),
                 checkpoint=_integer(mapping["checkpoint"]),
+                lineage_etag=_optional_string(mapping.get("lineage_etag")),
+                lineage_trace_id=_optional_string(mapping.get("lineage_trace_id")),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -360,6 +556,15 @@ def _encode(record: ApplyRecord, key: bytes) -> bytes:
     ).encode()
 
 
+def _created_after(candidate: ApplyRecord, selected: ApplyRecord) -> bool:
+    """Compare authenticated repository order and fail closed for legacy peers."""
+    if selected.creation_sequence is None:
+        return True
+    if candidate.creation_sequence is None:
+        return False
+    return candidate.creation_sequence > selected.creation_sequence
+
+
 def _encode_resolution(
     evidence: UnknownResolutionEvidence,
     key: bytes,
@@ -370,6 +575,8 @@ def _encode_resolution(
         "resolution": evidence.resolution.value,
         "recorded_at": _format_time(evidence.recorded_at),
         "checkpoint": evidence.checkpoint,
+        "lineage_etag": evidence.lineage_etag,
+        "lineage_trace_id": evidence.lineage_trace_id,
     }
     envelope = {
         "schema": _SCHEMA,
@@ -392,6 +599,7 @@ def _record_mapping(record: ApplyRecord) -> dict[str, object]:
             "canonical_name": record.resource_scope.canonical_name,
         },
         "created_at": _format_time(record.created_at),
+        "creation_sequence": record.creation_sequence,
         "state": record.state.value,
         "finished_at": (
             None if record.finished_at is None else _format_time(record.finished_at)
@@ -418,6 +626,14 @@ def _record_mapping(record: ApplyRecord) -> dict[str, object]:
                     "value": child.target.value,
                     "unit": child.target.unit.symbol,
                 },
+                "baseline": (
+                    None
+                    if child.baseline is None
+                    else {
+                        "value": child.baseline.value,
+                        "unit": child.baseline.unit.symbol,
+                    }
+                ),
                 "preference_identity": child.preference_identity,
                 "etag": child.etag,
                 "preference_existed": child.preference_existed,
@@ -449,6 +665,8 @@ def _record_mapping(record: ApplyRecord) -> dict[str, object]:
                     if child.resolution_recorded_at is None
                     else _format_time(child.resolution_recorded_at)
                 ),
+                "accepted_etag": child.accepted_etag,
+                "accepted_trace_id": child.accepted_trace_id,
             }
             for child in record.children
         ],
@@ -456,7 +674,11 @@ def _record_mapping(record: ApplyRecord) -> dict[str, object]:
 
 
 def _decode_record(raw: dict[str, object]) -> ApplyRecord:
+    if set(raw) not in {_RECORD_FIELDS, _RECORD_FIELDS | _RECORD_SEQUENCE_FIELD}:
+        msg = "Apply record fields do not match V1"
+        raise ValueError(msg)
     scope_raw = _mapping(raw["resource_scope"])
+    _require_exact_fields(scope_raw, _SCOPE_FIELDS)
     children_raw = raw["children"]
     if not isinstance(children_raw, list):
         msg = "Apply children must be a list"
@@ -467,6 +689,11 @@ def _decode_record(raw: dict[str, object]) -> ApplyRecord:
         kind=PlanKind(_string(raw["kind"])),
         resource_scope=_scope(scope_raw),
         created_at=_time(raw["created_at"]),
+        creation_sequence=(
+            None
+            if raw.get("creation_sequence") is None
+            else _integer(raw["creation_sequence"])
+        ),
         children=tuple(_decode_child(_mapping(child)) for child in children_raw),
         state=ApplyRecordState(_string(raw["state"])),
         finished_at=_optional_time(raw["finished_at"]),
@@ -475,8 +702,22 @@ def _decode_record(raw: dict[str, object]) -> ApplyRecord:
 
 
 def _decode_child(raw: dict[str, object]) -> ApplyChildRecord:
+    if set(raw) not in {
+        _LEGACY_CHILD_FIELDS,
+        _LEGACY_CHILD_FIELDS | _CHILD_BASELINE_FIELD,
+        _LEGACY_CHILD_FIELDS | _CHILD_LINEAGE_FIELDS,
+        _LEGACY_CHILD_FIELDS | _CHILD_LINEAGE_FIELDS | _CHILD_BASELINE_FIELD,
+    }:
+        msg = "Apply child fields do not match V1"
+        raise ValueError(msg)
     slice_raw = _mapping(raw["slice_identity"])
+    _require_exact_fields(slice_raw, _SLICE_FIELDS)
+    _require_exact_fields(_mapping(slice_raw["resource_scope"]), _SCOPE_FIELDS)
     target_raw = _mapping(raw["target"])
+    _require_exact_fields(target_raw, _QUANTITY_FIELDS)
+    baseline_raw = raw.get("baseline")
+    if baseline_raw is not None:
+        _require_exact_fields(_mapping(baseline_raw), _QUANTITY_FIELDS)
     dimensions = slice_raw["dimensions"]
     if not isinstance(dimensions, list):
         msg = "Apply dimensions must be a list"
@@ -502,6 +743,14 @@ def _decode_child(raw: dict[str, object]) -> ApplyChildRecord:
             _integer(target_raw["value"]),
             QuotaUnit(_string(target_raw["unit"])),
         ),
+        baseline=(
+            None
+            if baseline_raw is None
+            else QuotaQuantity(
+                _integer(_mapping(baseline_raw)["value"]),
+                QuotaUnit(_string(_mapping(baseline_raw)["unit"])),
+            )
+        ),
         preference_identity=_string(raw["preference_identity"]),
         etag=_optional_string(raw["etag"]),
         preference_existed=_boolean(raw["preference_existed"]),
@@ -523,10 +772,13 @@ def _decode_child(raw: dict[str, object]) -> ApplyChildRecord:
             else UnknownDispatchResolution(_string(raw["unknown_resolution"]))
         ),
         resolution_recorded_at=_optional_time(raw["resolution_recorded_at"]),
+        accepted_etag=_optional_string(raw.get("accepted_etag")),
+        accepted_trace_id=_optional_string(raw.get("accepted_trace_id")),
     )
 
 
 def _scope(raw: dict[str, object]) -> ResourceScope:
+    _require_exact_fields(raw, _SCOPE_FIELDS)
     return ResourceScope(
         ResourceScopeKind(_string(raw["kind"])),
         _string(raw["canonical_name"]),
@@ -612,6 +864,24 @@ def _mapping(value: object) -> dict[str, object]:
         msg = "Apply field must be an object"
         raise TypeError(msg)
     return value
+
+
+def _require_exact_fields(
+    mapping: dict[str, object],
+    fields: frozenset[str],
+) -> None:
+    if set(mapping) != fields:
+        msg = "Apply object fields do not match V1"
+        raise ValueError(msg)
+
+
+def _require_resolution_fields(mapping: dict[str, object]) -> None:
+    if set(mapping) not in {
+        _LEGACY_RESOLUTION_FIELDS,
+        _LEGACY_RESOLUTION_FIELDS | _RESOLUTION_LINEAGE_FIELDS,
+    }:
+        msg = "resolution fields do not match V1"
+        raise ValueError(msg)
 
 
 def _string(value: object) -> str:

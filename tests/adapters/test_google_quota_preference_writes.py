@@ -1,6 +1,7 @@
 """Hermetic official Cloud Quotas write and reconciliation adapter tests."""
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import replace
 
 import pytest
@@ -12,8 +13,10 @@ from cqmgr.adapters.google.quota_preference_writes import (
     OfficialQuotaPreferenceWriter,
 )
 from cqmgr.application.ports.provider_writes import (
+    QuotaPreferenceUnknownResolutionResult,
     QuotaPreferenceWrite,
     QuotaPreferenceWriteAction,
+    QuotaPreferenceWriteResult,
     UnknownWriteResolution,
 )
 from cqmgr.domain.quotas import (
@@ -29,6 +32,54 @@ from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 SCOPE = ResourceScope(ResourceScopeKind.PROJECT, "projects/123456789")
 IDENTITY = "projects/123456789/locations/global/quotaPreferences/cqmgr-deterministic"
 DEFAULT_TIMEOUT_SECONDS = 30.0
+
+
+@pytest.mark.parametrize(
+    ("factory", "error"),
+    [
+        (
+            lambda: QuotaPreferenceWriteResult(
+                accepted=False,
+                outcome=StableSymbol("rejected"),
+                etag="not-accepted",
+            ),
+            "only accepted",
+        ),
+        (
+            lambda: QuotaPreferenceUnknownResolutionResult("accepted"),  # type: ignore[arg-type]
+            "must be typed",
+        ),
+        (
+            lambda: QuotaPreferenceUnknownResolutionResult(
+                UnknownWriteResolution.FAILED,
+                trace_id="not-accepted",
+            ),
+            "only accepted",
+        ),
+        (
+            lambda: QuotaPreferenceWriteResult(
+                accepted=True,
+                outcome=StableSymbol("submitted"),
+                etag="",
+            ),
+            "lineage etag",
+        ),
+        (
+            lambda: QuotaPreferenceUnknownResolutionResult(
+                UnknownWriteResolution.ACCEPTED,
+                trace_id="",
+            ),
+            "lineage trace_id",
+        ),
+    ],
+)
+def test_provider_write_lineage_rejects_cross_wired_evidence(
+    factory: Callable[[], object],
+    error: str,
+) -> None:
+    """Only accepted, typed provider outcomes may carry valid lineage."""
+    with pytest.raises((TypeError, ValueError), match=error):
+        factory()
 
 
 def _write(action: QuotaPreferenceWriteAction) -> QuotaPreferenceWrite:
@@ -65,7 +116,11 @@ def _response(
         service=request.slice_identity.service,
         quota_id=request.slice_identity.quota_id,
         dimensions=dict(request.slice_identity.dimensions.items),
-        quota_config=cloudquotas_v1.QuotaConfig(preferred_value=request.target.value),
+        quota_config=cloudquotas_v1.QuotaConfig(
+            preferred_value=request.target.value,
+            trace_id="provider-trace",
+        ),
+        etag="provider-etag",
     )
     if contact_value is not None:
         response.contact_email = contact_value
@@ -151,6 +206,8 @@ def test_official_create_binds_identity_and_disables_retry() -> None:
         cloudquotas_v1.QuotaSafetyCheck.QUOTA_DECREASE_PERCENTAGE_TOO_HIGH,
     )
     assert result.accepted
+    assert result.etag == "provider-etag"
+    assert result.trace_id == "provider-trace"
 
 
 def test_official_amend_uses_current_etag_and_validate_only_false() -> None:
@@ -184,7 +241,11 @@ def test_official_unknown_resolution_is_read_only_and_retry_free() -> None:
     assert retry is None
     assert isinstance(provider_request, cloudquotas_v1.GetQuotaPreferenceRequest)
     assert provider_request.name == IDENTITY
-    assert resolution is UnknownWriteResolution.ACCEPTED
+    assert resolution == QuotaPreferenceUnknownResolutionResult(
+        UnknownWriteResolution.ACCEPTED,
+        etag="provider-etag",
+        trace_id="provider-trace",
+    )
 
 
 def test_official_conclusive_dispatch_errors_are_failed_without_retry() -> None:
@@ -268,7 +329,11 @@ def test_unknown_resolution_accepts_response_without_input_only_contact() -> Non
         OfficialQuotaPreferenceUnknownResolver(client).resolve_unknown(request)  # type: ignore[arg-type]
     )
 
-    assert resolution is UnknownWriteResolution.ACCEPTED
+    assert resolution == QuotaPreferenceUnknownResolutionResult(
+        UnknownWriteResolution.ACCEPTED,
+        etag="provider-etag",
+        trace_id="provider-trace",
+    )
 
 
 def test_unknown_resolution_keeps_immediate_not_found_unresolved() -> None:
@@ -281,7 +346,9 @@ def test_unknown_resolution_keeps_immediate_not_found_unresolved() -> None:
         OfficialQuotaPreferenceUnknownResolver(client).resolve_unknown(request)  # type: ignore[arg-type]
     )
 
-    assert resolution is UnknownWriteResolution.UNRESOLVED
+    assert resolution == QuotaPreferenceUnknownResolutionResult(
+        UnknownWriteResolution.UNRESOLVED
+    )
 
 
 def test_unknown_resolution_keeps_nonmatching_response_unresolved() -> None:
@@ -297,7 +364,9 @@ def test_unknown_resolution_keeps_nonmatching_response_unresolved() -> None:
         OfficialQuotaPreferenceUnknownResolver(client).resolve_unknown(request)  # type: ignore[arg-type]
     )
 
-    assert resolution is UnknownWriteResolution.UNRESOLVED
+    assert resolution == QuotaPreferenceUnknownResolutionResult(
+        UnknownWriteResolution.UNRESOLVED
+    )
 
 
 def test_dispatch_rejects_nonmatching_response_as_conflicting() -> None:

@@ -71,6 +71,8 @@ class QuotaPreferenceWriteResult:
 
     accepted: bool
     outcome: StableSymbol
+    etag: str | None = None
+    trace_id: str | None = None
 
     def __post_init__(self) -> None:
         """Require one conclusive typed provider result."""
@@ -80,6 +82,10 @@ class QuotaPreferenceWriteResult:
         if not isinstance(self.outcome, StableSymbol):
             msg = "write result outcome must be a StableSymbol"
             raise TypeError(msg)
+        _require_lineage(self.etag, self.trace_id)
+        if not self.accepted and (self.etag is not None or self.trace_id is not None):
+            msg = "only accepted writes may retain provider lineage"
+            raise ValueError(msg)
 
 
 class UnknownWriteResolution(StrEnum):
@@ -88,6 +94,34 @@ class UnknownWriteResolution(StrEnum):
     ACCEPTED = "accepted"
     FAILED = "failed"
     UNRESOLVED = "unresolved"
+
+
+@dataclass(frozen=True, slots=True)
+class QuotaPreferenceUnknownResolutionResult:
+    """One read-after-unknown classification with accepted lineage evidence."""
+
+    resolution: UnknownWriteResolution
+    etag: str | None = None
+    trace_id: str | None = None
+
+    def __post_init__(self) -> None:
+        """Require lineage only when provider acceptance is proven."""
+        if not isinstance(self.resolution, UnknownWriteResolution):
+            msg = "unknown write resolution must be typed"
+            raise TypeError(msg)
+        _require_lineage(self.etag, self.trace_id)
+        if self.resolution is not UnknownWriteResolution.ACCEPTED and (
+            self.etag is not None or self.trace_id is not None
+        ):
+            msg = "only accepted unknown resolution may retain lineage"
+            raise ValueError(msg)
+
+
+def _require_lineage(etag: str | None, trace_id: str | None) -> None:
+    for name, value in (("etag", etag), ("trace_id", trace_id)):
+        if value is not None and (not isinstance(value, str) or not value):
+            msg = f"provider lineage {name} must be None or non-empty"
+            raise ValueError(msg)
 
 
 class QuotaPreferenceWriter(Protocol):
@@ -105,6 +139,6 @@ class QuotaPreferenceUnknownResolver(Protocol):
 
     async def resolve_unknown(
         self, request: QuotaPreferenceWrite
-    ) -> UnknownWriteResolution:
+    ) -> QuotaPreferenceUnknownResolutionResult:
         """Classify bound intent acceptance without issuing another write."""
         ...
