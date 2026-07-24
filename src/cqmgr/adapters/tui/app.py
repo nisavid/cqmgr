@@ -9,6 +9,7 @@ import shlex
 import time
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast, override
 
 from textual.app import App, ComposeResult
@@ -25,6 +26,12 @@ from cqmgr.adapters.cli.copy_cli import (
     quota_list_copy_cli,
     quota_resolve_copy_cli,
     request_exact_copy_cli,
+)
+from cqmgr.adapters.cli.lifecycle import (
+    PlanReferenceInput,
+    WatchCliInput,
+    parse_absolute_rfc3339,
+    parse_watch_condition,
 )
 from cqmgr.adapters.cli.read_only_requests import (
     parse_cloud_tpu_slice_requirement,
@@ -77,13 +84,14 @@ from cqmgr.domain.plans import TargetStrategy
 from cqmgr.domain.quota_queries import QuotaQueryFilters, QuotaQueryItem
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
     from datetime import datetime
 
     from textual import events
     from textual.binding import BindingType
     from textual.worker import Worker
 
+    from cqmgr.adapters.cli.lifecycle import LifecycleCliRequestFactory
     from cqmgr.application.operations.apply import (
         ApplyChildData,
         ApplyData,
@@ -113,6 +121,7 @@ if TYPE_CHECKING:
 
 
 _DEFAULT_SCOPE_INPUT = ReadOnlyScopeInput()
+_DIRECT_AND_COMPANION_COUNT = 2
 
 
 class ReadOnlyOperationsLike(Protocol):
@@ -517,6 +526,8 @@ class CloudQuotaManagerApp(App[None]):
         *,
         lifecycle: LifecycleOperations | None = None,
         lifecycle_preparation: LifecycleRequestOperations | None = None,
+        lifecycle_requests: LifecycleCliRequestFactory | None = None,
+        lifecycle_shutdown: Callable[[], Awaitable[None]] | None = None,
         scope_input: ReadOnlyScopeInput = _DEFAULT_SCOPE_INPUT,
         scope_locked: bool = False,
         no_color: bool = False,
@@ -539,6 +550,9 @@ class CloudQuotaManagerApp(App[None]):
         self.audit = audit
         self.lifecycle = lifecycle
         self.lifecycle_preparation = lifecycle_preparation
+        self.lifecycle_requests = lifecycle_requests
+        self._lifecycle_shutdown = lifecycle_shutdown
+        self._shutdown_complete = False
         self.scope_input = scope_input
         self.scope_locked = scope_locked
         self._monotonic = monotonic
@@ -559,6 +573,10 @@ class CloudQuotaManagerApp(App[None]):
         self._workspace_generation = 0
         self._audit_operation_generation = 0
         self._resolved_compute: ResolvedWorkloadRequirement | None = None
+        self._resolved_workload: ResolvedWorkloadRequirement | None = None
+        self._lifecycle_workload: (
+            ComputeInstanceRequirement | CloudTpuSliceRequirement | None
+        ) = None
         self._obtainability_state = ObtainabilityWorkflowState()
         self._active_obtainability_fingerprint: (
             ObtainabilityRequestFingerprint | None
@@ -670,6 +688,11 @@ class CloudQuotaManagerApp(App[None]):
                     disabled=True,
                 )
                 yield Button(
+                    "Compose resolved workload request",
+                    id="workload-compose-request",
+                    classes="hidden",
+                )
+                yield Button(
                     "Compare Spot obtainability",
                     id="workload-obtainability",
                     classes="hidden",
@@ -699,8 +722,15 @@ class CloudQuotaManagerApp(App[None]):
             with Vertical(id="lifecycle-controls"):
                 with Vertical(id="lifecycle-compose-input", classes="hidden"):
                     yield Input(
-                        placeholder="Absolute target in the provider native unit",
+                        placeholder=(
+                            "Exact target, or comma-separated CHILD=TARGET values"
+                        ),
                         id="lifecycle-target",
+                    )
+                    yield Input(
+                        value=TargetStrategy.MANUAL.value,
+                        placeholder="manual, minimum, or preserve-headroom",
+                        id="lifecycle-target-strategy",
                     )
                     yield Input(
                         placeholder="Comma-separated acknowledgement codes",
@@ -713,8 +743,43 @@ class CloudQuotaManagerApp(App[None]):
                     )
                     yield Checkbox("Expert request path", id="lifecycle-expert")
                     yield Button(
-                        "Compose exact request",
+                        "Compose request",
                         id="lifecycle-compose",
+                    )
+                with Vertical(id="lifecycle-plan-input", classes="hidden"):
+                    yield Input(
+                        placeholder="Local Plan digest",
+                        id="lifecycle-plan-digest",
+                    )
+                    yield Input(
+                        placeholder="Portable Plan file path",
+                        id="lifecycle-plan-path",
+                    )
+                    yield Input(
+                        placeholder="Quota contact for Apply (protected)",
+                        id="lifecycle-apply-contact",
+                        password=True,
+                    )
+                    yield Button("Review Plan", id="lifecycle-review")
+                    yield Button(
+                        "Prepare protected Apply",
+                        id="lifecycle-prepare-apply",
+                        disabled=True,
+                    )
+                with Vertical(id="lifecycle-watch-input", classes="hidden"):
+                    yield Input(placeholder="Apply intent ID", id="lifecycle-intent-id")
+                    yield Input(
+                        value="granted",
+                        placeholder="granted, reconciled, or terminal",
+                        id="lifecycle-watch-condition",
+                    )
+                    yield Input(
+                        placeholder="Absolute RFC 3339 deadline",
+                        id="lifecycle-watch-deadline",
+                    )
+                    yield Button(
+                        "Prepare Watch",
+                        id="lifecycle-prepare-watch",
                     )
                 yield Input(
                     placeholder="Type the exact resource scope to acknowledge Apply",
@@ -858,7 +923,13 @@ class CloudQuotaManagerApp(App[None]):
         pending_watch = self._lifecycle_state.pending_watch
         if pending_watch is not None:
             pending_watch.cancellation.cancel()
-        await self.read_only.aclose()
+        if self._shutdown_complete:
+            return
+        self._shutdown_complete = True
+        if self._lifecycle_shutdown is not None:
+            await self._lifecycle_shutdown()
+        else:
+            await self.read_only.aclose()
 
     def on_resize(self, event: events.Resize) -> None:
         """Adapt shell structure at the documented terminal widths."""
@@ -1106,6 +1177,12 @@ class CloudQuotaManagerApp(App[None]):
         result = lifecycle.preview(request)
         self.last_result = result
         self._render_preview(result)
+        if result.data.plan_digest is not None and self.lifecycle_requests is not None:
+            self.query_one("#lifecycle-plan-input").remove_class("hidden")
+            self.query_one(
+                "#lifecycle-plan-digest", Input
+            ).value = result.data.plan_digest
+            self.query_one("#lifecycle-plan-path", Input).value = ""
         self._set_lifecycle_copy_cli(copy_cli)
         return result
 
@@ -1130,15 +1207,33 @@ class CloudQuotaManagerApp(App[None]):
                 )
             )
         self._render_plan_review(result)
+        if review is not None and self.lifecycle_requests is not None:
+            self.query_one("#lifecycle-plan-input").remove_class("hidden")
+            self.query_one("#lifecycle-plan-digest", Input).value = review.digest
+            self.query_one("#lifecycle-plan-path", Input).value = ""
+            self.query_one("#apply-scope-acknowledgement", Input).disabled = False
+            self.query_one(
+                "#lifecycle-prepare-apply", Button
+            ).disabled = not review.apply_capability
         self._set_lifecycle_copy_cli(
             plan_review_copy_cli(digest=request.digest, path=request.path)
         )
         return result
 
-    def prepare_apply(self, request: ApplyRequest) -> None:
+    def prepare_apply(
+        self,
+        request: ApplyRequest,
+        *,
+        preserve_acknowledgement: bool = False,
+    ) -> None:
         """Require a fresh typed scope acknowledgement before dispatch."""
         self._require_lifecycle()
         scope = request.resource_scope_acknowledgement
+        preserved_acknowledgement = (
+            self.query_one("#apply-scope-acknowledgement", Input).value
+            if preserve_acknowledgement
+            else ""
+        )
         self._enter_lifecycle_route(LifecycleRoute.APPLY, scope)
         self._lifecycle_state.pending_apply = request
         self._lifecycle_state.affected_selectors = (
@@ -1148,10 +1243,12 @@ class CloudQuotaManagerApp(App[None]):
             "#apply-scope-acknowledgement",
             Input,
         )
-        acknowledgement.value = ""
+        acknowledgement.value = preserved_acknowledgement
         acknowledgement.disabled = False
         acknowledgement.focus()
-        self.query_one("#lifecycle-apply", Button).disabled = True
+        self.query_one("#lifecycle-apply", Button).disabled = (
+            acknowledgement.value != scope.canonical_name
+        )
         self.query_one("#lifecycle-detail", Static).update(
             "Apply confirmation\n"
             f"Bound resource scope: {scope.canonical_name}\n"
@@ -1258,6 +1355,8 @@ class CloudQuotaManagerApp(App[None]):
         ):
             self.query_one(f"#{button_id}", Button).disabled = True
         self.query_one("#lifecycle-compose-input").add_class("hidden")
+        self.query_one("#lifecycle-plan-input").add_class("hidden")
+        self.query_one("#lifecycle-watch-input").add_class("hidden")
         acknowledgement = self.query_one("#apply-scope-acknowledgement", Input)
         acknowledgement.value = ""
         acknowledgement.disabled = True
@@ -1730,8 +1829,12 @@ class CloudQuotaManagerApp(App[None]):
             LifecycleRoute.COMPOSE,
             selection.item.identity.resource_scope,
         )
+        self._lifecycle_workload = None
         self.query_one("#lifecycle-compose-input").remove_class("hidden")
         self.query_one("#lifecycle-target", Input).value = ""
+        self.query_one(
+            "#lifecycle-target-strategy", Input
+        ).value = TargetStrategy.MANUAL.value
         self.query_one("#lifecycle-acknowledgements", Input).value = ""
         self.query_one("#lifecycle-contact", Input).value = ""
         self.query_one("#lifecycle-expert", Checkbox).value = False
@@ -1746,17 +1849,112 @@ class CloudQuotaManagerApp(App[None]):
         self.query_one("#lifecycle-target", Input).focus()
         self._set_status("COMPOSE INPUT — complete the exact request")
 
+    def _open_resolved_workload_composition(self) -> None:
+        """Open one already-resolved typed workload without reinterpreting it."""
+        resolved = self._resolved_workload
+        if (
+            resolved is None
+            or self.lifecycle is None
+            or self.lifecycle_preparation is None
+        ):
+            self._set_status(
+                "COMPOSE UNAVAILABLE — resolve one complete workload first"
+            )
+            return
+        compatible = tuple(
+            location
+            for location in resolved.locations
+            if location.disposition is WorkloadLocationDisposition.COMPATIBLE
+        )
+        if len(compatible) != 1 or not compatible[0].constraint_requirements:
+            self._set_status(
+                "COMPOSE UNAVAILABLE — select exactly one compatible location"
+            )
+            return
+        scope = compatible[0].constraint_requirements[0].identity.resource_scope
+        self._enter_lifecycle_route(LifecycleRoute.COMPOSE, scope)
+        self._lifecycle_workload = resolved.requirement
+        self.query_one("#lifecycle-compose-input").remove_class("hidden")
+        child_ids = tuple(
+            "direct"
+            if index == 0
+            else (
+                "companion"
+                if (
+                    len(compatible[0].constraint_requirements)
+                    == _DIRECT_AND_COMPANION_COUNT
+                )
+                else f"companion-{index}"
+            )
+            for index in range(len(compatible[0].constraint_requirements))
+        )
+        self.query_one("#lifecycle-target", Input).value = ", ".join(
+            f"{child_id}=" for child_id in child_ids
+        )
+        self.query_one(
+            "#lifecycle-target-strategy", Input
+        ).value = TargetStrategy.MANUAL.value
+        self.query_one("#lifecycle-acknowledgements", Input).value = ""
+        self.query_one("#lifecycle-contact", Input).value = ""
+        self.query_one("#lifecycle-expert", Checkbox).value = False
+        self.query_one("#lifecycle-detail", Static).update(
+            "Compose resolved workload request\n"
+            f"Requirement: {resolved.requirement.kind.value}\n"
+            f"Selected location: {compatible[0].location}\n"
+            "Manual targets must name every displayed child. Derived strategies "
+            "must leave targets empty."
+        )
+        self.query_one("#lifecycle-target", Input).focus()
+        self._set_status("COMPOSE INPUT — complete the resolved workload request")
+
     def _submit_selected_quota_composition(self) -> None:
-        """Prepare one exact request asynchronously from current provider evidence."""
+        """Prepare one exact or resolved-workload request asynchronously."""
         selection = self.selected_quota
         preparation = self.lifecycle_preparation
-        if selection is None or preparation is None:
+        workload = self._lifecycle_workload
+        if preparation is None or (selection is None and workload is None):
             self._set_status("COMPOSE UNAVAILABLE — request preparation is unavailable")
             return
         target = self.query_one("#lifecycle-target", Input).value.strip()
-        if not target:
-            self._set_status("INVALID REQUEST — absolute target is required")
+        try:
+            strategy = TargetStrategy(
+                self.query_one("#lifecycle-target-strategy", Input).value.strip()
+            )
+        except ValueError:
+            self._set_status("INVALID REQUEST — target strategy is unsupported")
             return
+        if workload is None:
+            if selection is None:  # pragma: no cover - guarded above
+                return
+            if not target:
+                self._set_status("INVALID REQUEST — absolute target is required")
+                return
+            targets = ((None, target),)
+            selector = selection.selector
+        else:
+            selector = None
+            if strategy is TargetStrategy.MANUAL:
+                entries = tuple(entry.strip() for entry in target.split(","))
+                parsed = tuple(entry.partition("=") for entry in entries)
+                if not parsed or any(
+                    not separator or not child.strip() or not value.strip()
+                    for child, separator, value in parsed
+                ):
+                    self._set_status(
+                        "INVALID REQUEST — manual workload targets use CHILD=VALUE"
+                    )
+                    return
+                targets = tuple(
+                    (child.strip(), value.strip())
+                    for child, _separator, value in parsed
+                )
+            else:
+                if target:
+                    self._set_status(
+                        "INVALID REQUEST — derived workload strategy has no targets"
+                    )
+                    return
+                targets = ()
         acknowledgements = tuple(
             item.strip()
             for item in self.query_one(
@@ -1770,12 +1968,12 @@ class CloudQuotaManagerApp(App[None]):
         expert = self.query_one("#lifecycle-expert", Checkbox).value
         intent = LifecycleCompositionIntent(
             scope_input=ReadOnlyScopeInput(
-                explicit_resource_scope=selection.item.identity.resource_scope,
+                explicit_resource_scope=self._lifecycle_state.bound_scope,
             ),
-            selector=selection.selector,
-            workload=None,
-            target_strategy=TargetStrategy.MANUAL,
-            targets=((None, target),),
+            selector=selector,
+            workload=workload,
+            target_strategy=strategy,
+            targets=targets,
             acknowledgements=acknowledgements,
             expert=expert,
             quota_contact=contact,
@@ -1804,19 +2002,21 @@ class CloudQuotaManagerApp(App[None]):
                 require_preview=intent.quota_contact is not None,
             )
             selector = intent.selector
-            if selector is None:  # pragma: no cover - exact route owns selector
-                return
-            copy_cli = request_exact_copy_cli(
-                "preview" if prepared.preview is not None else "compose",
-                prepared.composition.resource_scope,
-                service=selector.service,
-                quota_id=selector.quota_id,
-                location=selector.location,
-                dimensions=selector.dimensions,
-                target=intent.targets[0][1],
-                acknowledgements=intent.acknowledgements,
-                expert=intent.expert,
-                quota_contact_stdin=intent.quota_contact is not None,
+            copy_cli = (
+                request_exact_copy_cli(
+                    "preview" if prepared.preview is not None else "compose",
+                    prepared.composition.resource_scope,
+                    service=selector.service,
+                    quota_id=selector.quota_id,
+                    location=selector.location,
+                    dimensions=selector.dimensions,
+                    target=intent.targets[0][1],
+                    acknowledgements=intent.acknowledgements,
+                    expert=intent.expert,
+                    quota_contact_stdin=intent.quota_contact is not None,
+                )
+                if selector is not None
+                else None
             )
             self.open_compose(
                 prepared.composition,
@@ -1831,6 +2031,111 @@ class CloudQuotaManagerApp(App[None]):
             self._set_status("COMPOSE REJECTED — refresh or correct the request")
         finally:
             self.query_one("#lifecycle-compose", Button).disabled = False
+
+    def _plan_reference_from_inputs(self) -> PlanReferenceInput:
+        digest = self.query_one("#lifecycle-plan-digest", Input).value.strip()
+        path = self.query_one("#lifecycle-plan-path", Input).value.strip()
+        return PlanReferenceInput(
+            digest=digest or None,
+            path=None if not path else Path(path),
+        )
+
+    def _submit_lifecycle_review(self) -> None:
+        """Construct and run Review only from current operator-entered reference."""
+        requests = self.lifecycle_requests
+        if requests is None:
+            self._set_status("REVIEW UNAVAILABLE — protected requests are unavailable")
+            return
+        try:
+            reference = self._plan_reference_from_inputs()
+            request = requests.review(reference)
+            self.open_plan_review(request)
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            self.query_one("#lifecycle-detail", Static).update(
+                f"Plan Review unavailable\nReason: {error}"
+            )
+            self._set_status("REVIEW REJECTED — correct or refresh the Plan reference")
+
+    def _prepare_lifecycle_apply_from_inputs(self) -> None:
+        """Build Apply only after fresh protected contact and exact scope input."""
+        requests = self.lifecycle_requests
+        if requests is None:
+            self._set_status("APPLY UNAVAILABLE — protected requests are unavailable")
+            return
+        acknowledgement = self.query_one("#apply-scope-acknowledgement", Input).value
+        contact_text = self.query_one("#lifecycle-apply-contact", Input).value
+        contact = SecretValue(contact_text.encode()) if contact_text else None
+        try:
+            reference = self._plan_reference_from_inputs()
+        except (TypeError, ValueError) as error:
+            self.query_one("#lifecycle-detail", Static).update(
+                f"Apply unavailable\nReason: {error}\n"
+                "No provider mutation was attempted."
+            )
+            self._set_status("APPLY REJECTED — correct the protected inputs")
+            return
+        self.query_one("#lifecycle-prepare-apply", Button).disabled = True
+        self.run_worker(
+            self._prepare_lifecycle_apply_request(
+                reference,
+                acknowledgement,
+                contact,
+            ),
+            group="lifecycle-prepare-apply",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _prepare_lifecycle_apply_request(
+        self,
+        reference: PlanReferenceInput,
+        acknowledgement: str,
+        contact: SecretValue | None,
+    ) -> None:
+        """Await protected profile/direct-user resolution before confirmation."""
+        requests = self.lifecycle_requests
+        if requests is None:  # pragma: no cover - guarded by button handler
+            return
+        try:
+            request = await requests.apply(
+                reference,
+                acknowledgement,
+                quota_contact=contact,
+            )
+            self.prepare_apply(request, preserve_acknowledgement=True)
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            self.query_one("#lifecycle-detail", Static).update(
+                f"Apply unavailable\nReason: {error}\n"
+                "No provider mutation was attempted."
+            )
+            self._set_status("APPLY REJECTED — correct the protected inputs")
+        finally:
+            if self._lifecycle_state.route is LifecycleRoute.PLAN_REVIEW:
+                self.query_one("#lifecycle-prepare-apply", Button).disabled = False
+
+    def _prepare_lifecycle_watch_from_inputs(self) -> None:
+        """Build Watch from one explicit intent, condition, and absolute deadline."""
+        requests = self.lifecycle_requests
+        scope = self._lifecycle_state.bound_scope
+        if requests is None or scope is None:
+            self._set_status("WATCH UNAVAILABLE — durable Apply context is unavailable")
+            return
+        intent_id = self.query_one("#lifecycle-intent-id", Input).value.strip()
+        condition = self.query_one("#lifecycle-watch-condition", Input).value.strip()
+        deadline = self.query_one("#lifecycle-watch-deadline", Input).value.strip()
+        try:
+            value = WatchCliInput(
+                intent_id=intent_id or None,
+                condition=parse_watch_condition(condition),
+                resume=None,
+                deadline=parse_absolute_rfc3339(deadline),
+            )
+            self.prepare_watch(requests.watch(value), bound_scope=scope)
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            self.query_one("#lifecycle-detail", Static).update(
+                f"Watch unavailable\nReason: {error}"
+            )
+            self._set_status("WATCH REJECTED — correct the explicit Watch inputs")
 
     def _submit_lifecycle_apply(self) -> None:
         request = self._lifecycle_state.pending_apply
@@ -1873,6 +2178,15 @@ class CloudQuotaManagerApp(App[None]):
         )
         self._render_apply_result(result)
         self._set_status(self._result_status(result))
+        if self.lifecycle_requests is not None and result.data.intent_id is not None:
+            self.query_one("#lifecycle-watch-input").remove_class("hidden")
+            self.query_one("#lifecycle-intent-id", Input).value = result.data.intent_id
+            self.query_one("#lifecycle-watch-condition", Input).value = "granted"
+            self.query_one("#lifecycle-watch-deadline", Input).value = ""
+            self._set_status(
+                "APPLY RETAINED — enter an absolute deadline to prepare Watch"
+            )
+            return
         self._leave_lifecycle_route()
 
     def _record_apply_progress(
@@ -2863,7 +3177,7 @@ class CloudQuotaManagerApp(App[None]):
             title="Keyboard help",
         )
 
-    def on_button_pressed(  # noqa: C901, PLR0912
+    def on_button_pressed(  # noqa: C901, PLR0912, PLR0915
         self,
         event: Button.Pressed,
     ) -> None:
@@ -2877,14 +3191,22 @@ class CloudQuotaManagerApp(App[None]):
             self.action_return_to_ledger()
         elif button_id == "quota-compose-request":
             self._open_selected_quota_composition()
+        elif button_id == "workload-compose-request":
+            self._open_resolved_workload_composition()
         elif button_id == "lifecycle-compose":
             self._submit_selected_quota_composition()
         elif button_id == "lifecycle-back":
             self._leave_lifecycle_route()
         elif button_id == "lifecycle-preview":
             self._submit_lifecycle_preview()
+        elif button_id == "lifecycle-review":
+            self._submit_lifecycle_review()
+        elif button_id == "lifecycle-prepare-apply":
+            self._prepare_lifecycle_apply_from_inputs()
         elif button_id == "lifecycle-apply":
             self._submit_lifecycle_apply()
+        elif button_id == "lifecycle-prepare-watch":
+            self._prepare_lifecycle_watch_from_inputs()
         elif button_id == "lifecycle-watch":
             self._submit_lifecycle_watch()
         elif button_id == "lifecycle-copy":
@@ -4165,13 +4487,27 @@ class CloudQuotaManagerApp(App[None]):
         self.query_one("#workload-form").add_class("hidden")
         self.query_one("#quota-detail").remove_class("hidden")
         self.query_one("#workload-obtainability").add_class("hidden")
+        self.query_one("#workload-compose-request").add_class("hidden")
         self._resolved_compute = None
+        self._resolved_workload = None
         lines = [
             "Workload resolution",
             f"Outcome: {result.outcome.code.value}",
             "Complete: " + ("yes" if result.completeness.is_complete else "no"),
         ]
         if isinstance(result.data, ResolvedWorkloadRequirement):
+            if (
+                result.completeness.is_complete
+                and self.lifecycle is not None
+                and self.lifecycle_preparation is not None
+                and sum(
+                    location.disposition is WorkloadLocationDisposition.COMPATIBLE
+                    for location in result.data.locations
+                )
+                == 1
+            ):
+                self._resolved_workload = result.data
+                self.query_one("#workload-compose-request").remove_class("hidden")
             lines.append(f"Requirement: {result.data.requirement.kind.value}")
             for location in result.data.locations:
                 lines.extend(
