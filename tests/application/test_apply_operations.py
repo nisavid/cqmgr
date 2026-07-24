@@ -1637,8 +1637,35 @@ def test_recovery_quarantines_terminal_record_without_dispatched_authority() -> 
     assert repository.state is PlanLedgerState.QUARANTINED
 
 
-def test_recovery_quarantines_child_outcome_without_aggregate_terminal_fsync() -> None:
-    """A stopping child outcome without aggregate closure never resumes dispatch."""
+def test_recovery_quarantines_stopping_evidence_without_dispatched_authority() -> None:
+    """In-progress stopping evidence also requires a crossed dispatch barrier."""
+    plan = _plan()
+    repository = _MemoryPlanRepository(plan)
+    repository.acquire_lease(
+        repository.encoded.digest,
+        KEY,
+        NOW + timedelta(minutes=1),
+    )
+    records = _MemoryApplyRecords()
+    records.record = _recovery_record(plan).record_dispatch_intent(
+        "direct",
+        NOW + timedelta(minutes=1),
+    )
+
+    result, repository, *_ = _apply(
+        plan,
+        _ScriptedWriter(),
+        records=records,
+        repository=repository,
+        revalidator=_UnexpectedRevalidator(),
+    )
+
+    assert result.outcome.code == StableSymbol("critical-unknown")
+    assert repository.state is PlanLedgerState.QUARANTINED
+
+
+def test_recovery_quarantines_when_stopping_outcome_cannot_be_finalized() -> None:
+    """A failed aggregate-finalization fsync preserves fail-closed containment."""
     plan = _plan()
     repository = _MemoryPlanRepository(plan)
     repository.acquire_lease(
@@ -1658,6 +1685,42 @@ def test_recovery_quarantines_child_outcome_without_aggregate_terminal_fsync() -
             NOW + timedelta(minutes=1),
         )
     )
+    records.fail_on_revision = records.record.revision + 1
+
+    result, repository, *_ = _apply(
+        plan,
+        _ScriptedWriter(),
+        records=records,
+        repository=repository,
+        revalidator=_UnexpectedRevalidator(),
+    )
+
+    assert result.outcome.code == StableSymbol("critical-unknown")
+    assert repository.state is PlanLedgerState.QUARANTINED
+
+
+def test_recovery_quarantines_in_progress_unattempted_child() -> None:
+    """An impossible pending record never advances to provider dispatch."""
+    plan = _plan()
+    repository = _MemoryPlanRepository(plan)
+    repository.acquire_lease(
+        repository.encoded.digest,
+        KEY,
+        NOW + timedelta(minutes=1),
+    )
+    repository.state = PlanLedgerState.DISPATCHED
+    records = _MemoryApplyRecords()
+    recovery = _recovery_record(plan)
+    records.record = replace(
+        recovery,
+        children=(
+            replace(
+                recovery.children[0],
+                disposition=ApplyChildDisposition.UNATTEMPTED,
+            ),
+            recovery.children[1],
+        ),
+    )
     writer = _ScriptedWriter()
 
     result, repository, *_ = _apply(
@@ -1670,10 +1733,6 @@ def test_recovery_quarantines_child_outcome_without_aggregate_terminal_fsync() -
     assert result.outcome.code == StableSymbol("critical-unknown")
     assert repository.state is PlanLedgerState.QUARANTINED
     assert writer.requests == []
-    assert (
-        result.data.quarantine_identity
-        == records.record.children[0].preference_identity
-    )
 
 
 def test_top_level_and_evidence_identity_drift_are_whole_bundle_failures() -> None:
@@ -1754,6 +1813,74 @@ def test_recovery_marks_intent_without_outcome_unknown_without_redispatch() -> N
         ApplyChildDisposition.UNKNOWN,
         ApplyChildDisposition.UNATTEMPTED,
     )
+
+
+@pytest.mark.parametrize(
+    "resolution",
+    [
+        UnknownWriteResolution.ACCEPTED,
+        UnknownWriteResolution.FAILED,
+        UnknownWriteResolution.UNRESOLVED,
+    ],
+)
+def test_recovery_reconciles_unresolved_intent_before_changed_etag_revalidation(
+    resolution: UnknownWriteResolution,
+) -> None:
+    """The uncertain write itself cannot become pre-resolution drift."""
+    plan = _single_plan()
+    repository = _MemoryPlanRepository(plan)
+    repository.acquire_lease(
+        repository.encoded.digest,
+        KEY,
+        NOW + timedelta(minutes=1),
+    )
+    repository.state = PlanLedgerState.DISPATCHED
+    records = _MemoryApplyRecords()
+    records.record = _recovery_record(plan).record_dispatch_intent(
+        "single",
+        NOW + timedelta(minutes=1),
+    )
+    changed = _valid_revalidation(plan)
+    changed = replace(
+        changed,
+        children=(replace(changed.children[0], preference_etag="changed-after-write"),),
+    )
+
+    class ChangedEtagRevalidator(_ScriptedRevalidator):
+        calls = 0
+
+        @override
+        async def refresh(self, _plan: QuotaPlan, _now: datetime) -> ApplyRevalidation:
+            self.calls += 1
+            return await super().refresh(_plan, _now)
+
+    revalidator = ChangedEtagRevalidator(changed)
+    resolver = _ScriptedResolver(resolution)
+
+    result, repository, records, _audit = _apply(
+        plan,
+        _ScriptedWriter(),
+        records=records,
+        repository=repository,
+        revalidator=revalidator,
+        unknown_resolver=resolver,
+    )
+
+    assert result.outcome.code == StableSymbol("unknown-dispatch")
+    assert repository.state is PlanLedgerState.QUARANTINED
+    assert revalidator.calls == 0
+    assert len(resolver.requests) == 1
+    if resolution is UnknownWriteResolution.UNRESOLVED:
+        assert records.resolutions == []
+        assert result.data.children[0].unknown_resolution is None
+    else:
+        expected = UnknownDispatchResolution(resolution.value)
+        assert records.resolutions[0].resolution is expected
+        assert result.data.children[0].unknown_resolution is expected
+        if resolution is UnknownWriteResolution.ACCEPTED:
+            assert (
+                records.resolutions[0].resolution is UnknownDispatchResolution.ACCEPTED
+            )
 
 
 def test_recovery_resumes_only_next_child_after_durable_prior_acceptance() -> None:
@@ -2283,6 +2410,120 @@ def test_real_repositories_complete_terminal_record_after_process_crash(
         plan_repository.load(encoded.digest, KEY, request.now).state
         is PlanLedgerState.CONSUMED
     )
+
+
+@pytest.mark.parametrize(
+    ("disposition", "provider_result", "expected_outcome", "ledger_state"),
+    [
+        (
+            ApplyChildDisposition.FAILED,
+            QuotaPreferenceWriteResult(
+                accepted=False,
+                outcome=StableSymbol("provider-rejected"),
+            ),
+            StableSymbol("provider-rejected"),
+            PlanLedgerState.CONSUMED,
+        ),
+        (
+            ApplyChildDisposition.UNKNOWN,
+            TimeoutError("scripted transport loss"),
+            StableSymbol("unknown-dispatch"),
+            PlanLedgerState.QUARANTINED,
+        ),
+    ],
+)
+def test_real_repositories_finalize_persisted_stopping_outcome_after_crash(
+    tmp_path: Path,
+    disposition: ApplyChildDisposition,
+    provider_result: QuotaPreferenceWriteResult | BaseException,
+    expected_outcome: StableSymbol,
+    ledger_state: PlanLedgerState,
+) -> None:
+    """A child outcome fsync is sufficient to finish safely after restart."""
+
+    class SimulatedProcessCrash(BaseException):
+        """Stop after the child outcome fsync and before aggregate finalization."""
+
+    class CrashAfterStoppingOutcomeSave(LocalApplyRecordRepository):
+        @override
+        def save(
+            self, record: ApplyRecord, authentication_key: SecretValue
+        ) -> ApplyRecordRepositoryOutcome:
+            outcome = super().save(record, authentication_key)
+            if (
+                outcome.status is ApplyRecordRepositoryStatus.STORED
+                and record.state is ApplyRecordState.IN_PROGRESS
+                and any(child.disposition is disposition for child in record.children)
+            ):
+                raise SimulatedProcessCrash
+            return outcome
+
+    plan = _plan()
+    encoded = PlanCodec.encode(plan, KEY.reveal())
+    consumption_store = _MemoryConsumptionStore()
+    plan_root = tmp_path / "plans"
+    apply_root = tmp_path / "apply"
+    plan_repository = LocalPlanRepository(plan_root, consumption_store)
+    assert plan_repository.store(encoded, KEY).status is PlanRepositoryStatus.STORED
+    request = ApplyRequest(
+        digest=encoded.digest,
+        authentication_key=KEY,
+        local_installation_id="installation-123",
+        resource_scope_acknowledgement=SCOPE,
+        principal=PRINCIPAL,
+        contact_binding=CONTACT,
+        contact_value="operator@example.com",
+        now=NOW + timedelta(minutes=1),
+    )
+    first = ApplyPlanOperations(
+        repository=plan_repository,
+        apply_records=CrashAfterStoppingOutcomeSave(apply_root),
+        audit=cast("AuditJournal", _MemoryAuditJournal()),
+        codec=cast("PlanCodecPort", PlanCodec()),
+        revalidator=cast(
+            "ApplyRevalidator",
+            _ScriptedRevalidator(_valid_revalidation(plan)),
+        ),
+        writer=_ScriptedWriter(provider_result),
+        unknown_resolver=_ScriptedResolver(),
+    )
+
+    with pytest.raises(SimulatedProcessCrash):
+        asyncio.run(first.apply(request))
+
+    interrupted = LocalApplyRecordRepository(apply_root).load(encoded.digest, KEY)
+    assert interrupted.record is not None
+    assert interrupted.record.state is ApplyRecordState.IN_PROGRESS
+    assert interrupted.record.children[0].disposition is disposition
+    restarted_writer = _FailFastWriter()
+    restarted_records = LocalApplyRecordRepository(apply_root)
+    restarted = ApplyPlanOperations(
+        repository=LocalPlanRepository(plan_root, consumption_store),
+        apply_records=restarted_records,
+        audit=cast("AuditJournal", _MemoryAuditJournal()),
+        codec=cast("PlanCodecPort", PlanCodec()),
+        revalidator=cast("ApplyRevalidator", _UnexpectedRevalidator()),
+        writer=cast("QuotaPreferenceWriter", restarted_writer),
+        unknown_resolver=_ScriptedResolver(UnknownWriteResolution.ACCEPTED),
+    )
+
+    result = asyncio.run(restarted.apply(request))
+    durable = restarted_records.load(encoded.digest, KEY)
+
+    assert result.outcome.code == expected_outcome
+    assert restarted_writer.calls == 0
+    assert durable.record is not None
+    assert durable.record.state is ApplyRecordState(disposition.value)
+    assert durable.record.children[1].disposition is (ApplyChildDisposition.UNATTEMPTED)
+    assert plan_repository.load(encoded.digest, KEY, request.now).state is ledger_state
+    if disposition is ApplyChildDisposition.UNKNOWN:
+        assert result.data.children[0].unknown_resolution is (
+            UnknownDispatchResolution.ACCEPTED
+        )
+        resolutions = restarted_records.load_unknown_resolutions(encoded.digest, KEY)
+        assert resolutions.resolutions[0].resolution is (
+            UnknownDispatchResolution.ACCEPTED
+        )
 
 
 @pytest.mark.parametrize("terminal_save_succeeds", [True, False])

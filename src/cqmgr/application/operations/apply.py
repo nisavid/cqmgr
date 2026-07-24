@@ -604,6 +604,95 @@ class ApplyPlanOperations:
                 record,
                 [],
             )
+        stopping = next(
+            (
+                child
+                for child in record.children
+                if child.disposition
+                in {
+                    ApplyChildDisposition.FAILED,
+                    ApplyChildDisposition.UNKNOWN,
+                }
+            ),
+            None,
+        )
+        unresolved = next(
+            (
+                child
+                for child in record.children
+                if child.dispatch_intent_at is not None and child.disposition is None
+            ),
+            None,
+        )
+        if stopping is not None or unresolved is not None:
+            if resumed.status is not PlanRepositoryStatus.DISPATCHED:
+                return self._critical_unknown(
+                    record.resource_scope,
+                    resumed.lease,
+                    request,
+                    record,
+                    [],
+                )
+            if stopping is not None:
+                if stopping.disposition is ApplyChildDisposition.FAILED:
+                    record = record.finalize(request.now)
+                    if not self._save(record, request):
+                        return self._critical_unknown(
+                            record.resource_scope,
+                            resumed.lease,
+                            request,
+                            record,
+                            [],
+                        )
+                    provider_outcome = cast("StableSymbol", stopping.provider_outcome)
+                    return self._finish(
+                        record.resource_scope,
+                        resumed.lease,
+                        request,
+                        record,
+                        [],
+                        outcome=provider_outcome.value,
+                        exit_class=_failure_exit(provider_outcome),
+                    )
+                recovery_child = stopping
+            else:
+                recovery_child = cast("ApplyChildRecord", unresolved)
+            planned = next(
+                child
+                for child in plan.children
+                if child.child_id == recovery_child.child_id
+            )
+            write = QuotaPreferenceWrite(
+                child_id=recovery_child.child_id,
+                slice_identity=recovery_child.slice_identity,
+                target=recovery_child.target,
+                preference_identity=recovery_child.preference_identity,
+                action=(
+                    QuotaPreferenceWriteAction.AMEND
+                    if recovery_child.preference_existed
+                    else QuotaPreferenceWriteAction.CREATE
+                ),
+                current_etag=recovery_child.etag,
+                contact_value=request.contact_value,
+                acknowledgements=planned.acknowledgements,
+            )
+            if unresolved is not None:
+                return await self._unknown_dispatch(
+                    record.resource_scope,
+                    resumed.lease,
+                    request,
+                    record,
+                    write,
+                    [],
+                )
+            return await self._finish_unknown(
+                record.resource_scope,
+                resumed.lease,
+                request,
+                record,
+                write,
+                [],
+            )
         try:
             refreshed = await self._revalidator.refresh(plan, request.now)
         except BaseException:  # noqa: BLE001
@@ -665,42 +754,6 @@ class ApplyPlanOperations:
                     exit_class=ExitClass.OPERATIONAL_FAILURE,
                     audit_record_ids=(),
                 )
-        unresolved = next(
-            (
-                child
-                for child in record.children
-                if child.dispatch_intent_at is not None and child.disposition is None
-            ),
-            None,
-        )
-        if unresolved is not None:
-            planned = next(
-                child
-                for child in plan.children
-                if child.child_id == unresolved.child_id
-            )
-            write = QuotaPreferenceWrite(
-                child_id=unresolved.child_id,
-                slice_identity=unresolved.slice_identity,
-                target=unresolved.target,
-                preference_identity=unresolved.preference_identity,
-                action=(
-                    QuotaPreferenceWriteAction.AMEND
-                    if unresolved.preference_existed
-                    else QuotaPreferenceWriteAction.CREATE
-                ),
-                current_etag=unresolved.etag,
-                contact_value=refreshed.contact_value,
-                acknowledgements=planned.acknowledgements,
-            )
-            return await self._unknown_dispatch(
-                record.resource_scope,
-                resumed.lease,
-                request,
-                record,
-                write,
-                [],
-            )
         return await self._dispatch_children(
             plan,
             resumed.lease,
@@ -764,7 +817,7 @@ class ApplyPlanOperations:
             audit_record_ids=(audit_id,),
         )
 
-    async def _unknown_dispatch(  # noqa: PLR0911, PLR0913
+    async def _unknown_dispatch(  # noqa: PLR0913
         self,
         resource_scope: ResourceScope,
         lease: PlanLease,
@@ -812,6 +865,25 @@ class ApplyPlanOperations:
                 record,
                 audit_record_ids,
             )
+        return await self._finish_unknown(
+            resource_scope,
+            lease,
+            request,
+            record,
+            write,
+            audit_record_ids,
+        )
+
+    async def _finish_unknown(  # noqa: PLR0913
+        self,
+        resource_scope: ResourceScope,
+        lease: PlanLease,
+        request: ApplyRequest,
+        record: ApplyRecord,
+        write: QuotaPreferenceWrite,
+        audit_record_ids: list[str],
+    ) -> OperationResult[ApplyData]:
+        """Finalize, contain, and reconcile one durable unknown write."""
         record = record.finalize(request.now)
         if not self._save(record, request):
             return self._critical_unknown(
