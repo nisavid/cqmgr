@@ -14,6 +14,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, DataTable, Footer, Input, Static
 
 from cqmgr.adapters.cli.copy_cli import (
+    obtainability_all_compatible_copy_cli,
     obtainability_compare_copy_cli,
     quota_inspect_copy_cli,
     quota_list_copy_cli,
@@ -23,6 +24,7 @@ from cqmgr.adapters.cli.read_only_requests import (
     parse_cloud_tpu_slice_requirement,
     parse_compute_instance_requirement,
     parse_obtainability_candidates,
+    parse_obtainability_shape,
 )
 from cqmgr.application.operations.audit import (
     AuditInspectData,
@@ -40,14 +42,19 @@ from cqmgr.application.operations.read_only import (
 )
 from cqmgr.application.ports.coordination import CancellationToken
 from cqmgr.domain.accelerator_overlay import (
+    AllCompatibleLocations,
     CloudTpuSliceRequirement,
     ComputeInstanceRequirement,
+    ProvisioningModel,
     ResolvedWorkloadRequirement,
+    WorkloadLocationDisposition,
 )
 from cqmgr.domain.audit import AuditQuery
 from cqmgr.domain.obtainability import (
+    DistributionShape,
     ObtainabilityCandidate,
     ObtainabilityComparison,
+    SpotMachineConfiguration,
 )
 from cqmgr.domain.quota_queries import QuotaQueryFilters, QuotaQueryItem
 
@@ -111,6 +118,20 @@ class ReadOnlyOperationsLike(Protocol):
         scope_input: ReadOnlyScopeInput = _DEFAULT_SCOPE_INPUT,
     ) -> OperationResult[Any]:
         """Compare one explicit fixed-shape candidate set."""
+
+    async def compare_obtainability_all_compatible(  # noqa: PLR0913
+        self,
+        requirement: ComputeInstanceRequirement,
+        *,
+        machine: SpotMachineConfiguration,
+        distribution_shape: DistributionShape,
+        deadline: float,
+        support: AdviceSupport,
+        catalog_coverage: tuple[Any, ...] = (),
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = _DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[Any]:
+        """Resolve and compare one explicitly confirmed compatible expansion."""
 
     async def aclose(self) -> None:
         """Close invocation-scoped provider clients."""
@@ -366,6 +387,10 @@ class CloudQuotaManagerApp(App[None]):
         self._provider_generation = 0
         self._workspace_generation = 0
         self._audit_operation_generation = 0
+        self._resolved_compute: ResolvedWorkloadRequirement | None = None
+        self._obtainability_contextual = False
+        self._obtainability_confirmed = False
+        self._obtainability_all_pending = False
 
     @override
     def compose(self) -> ComposeResult:  # noqa: PLR0915
@@ -451,6 +476,11 @@ class CloudQuotaManagerApp(App[None]):
                     )
                     yield Button("Resolve workload", id="workload-submit")
                 yield Button("Back to quota ledger", id="detail-back")
+                yield Button(
+                    "Compare Spot obtainability",
+                    id="workload-obtainability",
+                    classes="hidden",
+                )
                 yield Button("Copy CLI", id="copy-cli")
                 yield Static(
                     "Copy CLI unavailable until an operation is fully specified.",
@@ -501,6 +531,15 @@ class CloudQuotaManagerApp(App[None]):
                     "Compare all compatible locations",
                     id="obtainability-compare-all",
                 )
+                yield Button(
+                    "Confirm inherited fields and candidate expansion",
+                    id="obtainability-confirm",
+                )
+                yield Static(
+                    "Candidate expansion: explicit candidates only.",
+                    id="obtainability-expansion",
+                    markup=False,
+                )
             with VerticalScroll(id="obtainability-result-pane"):
                 yield Static(
                     "Complete the fixed request and choose an explicit "
@@ -510,6 +549,11 @@ class CloudQuotaManagerApp(App[None]):
                     markup=False,
                 )
                 yield Button("Copy CLI", id="obtainability-copy")
+                yield Button(
+                    "Return to Quotas / Resolve / Compute instance",
+                    id="obtainability-return",
+                    classes="hidden",
+                )
                 yield Static(
                     "Copy CLI unavailable until a comparison is fully specified.",
                     id="obtainability-copy-cli",
@@ -940,10 +984,15 @@ class CloudQuotaManagerApp(App[None]):
             title="Keyboard help",
         )
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:  # noqa: C901
+    def on_button_pressed(  # noqa: C901, PLR0912
+        self,
+        event: Button.Pressed,
+    ) -> None:
         """Route explicit shell and filter controls."""
         button_id = event.button.id
         if button_id and button_id.startswith("workspace-"):
+            if button_id == "workspace-obtainability":
+                self._prepare_standalone_obtainability()
             self._set_active_workspace(button_id.removeprefix("workspace-"))
         elif button_id == "apply-filters" and self.active_workspace == "quotas":
             self._apply_filters()
@@ -955,6 +1004,8 @@ class CloudQuotaManagerApp(App[None]):
             self._open_workload_route("cloud-tpu-slice")
         elif button_id == "workload-submit" and self.active_workspace == "quotas":
             self._submit_workload()
+        elif button_id == "workload-obtainability":
+            self._open_contextual_obtainability()
         elif (
             button_id == "obtainability-compare"
             and self.active_workspace == "obtainability"
@@ -964,10 +1015,11 @@ class CloudQuotaManagerApp(App[None]):
             button_id == "obtainability-compare-all"
             and self.active_workspace == "obtainability"
         ):
-            self._set_status(
-                "CONFIRM EXPANSION — all-compatible comparison requires "
-                "explicit confirmation"
-            )
+            self._submit_obtainability_all()
+        elif button_id == "obtainability-confirm":
+            self._confirm_obtainability()
+        elif button_id == "obtainability-return":
+            self._set_active_workspace("quotas")
         elif button_id == "audit-verify" and self.active_workspace == "audit":
             operation_generation = self._claim_audit_operation()
             self.run_worker(
@@ -1097,8 +1149,87 @@ class CloudQuotaManagerApp(App[None]):
             exit_on_error=False,
         )
 
+    def _prepare_standalone_obtainability(self) -> None:
+        self._obtainability_contextual = False
+        self._obtainability_confirmed = False
+        self._obtainability_all_pending = False
+        self.query_one("#obtainability-breadcrumb", Static).update(
+            "Obtainability / Standalone\n"
+            "Fix one exact Spot VM request. Candidate locations never expand silently."
+        )
+        self.query_one("#obtainability-expansion", Static).update(
+            "Candidate expansion: explicit candidates only."
+        )
+        self.query_one("#obtainability-return").add_class("hidden")
+
+    def _open_contextual_obtainability(self) -> None:
+        resolved = self._resolved_compute
+        if resolved is None or not isinstance(
+            resolved.requirement,
+            ComputeInstanceRequirement,
+        ):
+            self._set_status(
+                "OBTAINABILITY UNAVAILABLE — resolve a supported Spot Compute shape"
+            )
+            return
+        requirement = resolved.requirement
+        self._obtainability_contextual = True
+        self._obtainability_confirmed = False
+        self._obtainability_all_pending = isinstance(
+            requirement.locations,
+            AllCompatibleLocations,
+        )
+        self.query_one(
+            "#obtainability-machine-type", Input
+        ).value = requirement.machine_type
+        self.query_one("#obtainability-vm-count", Input).value = str(
+            requirement.instance_count
+        )
+        self.query_one(
+            "#obtainability-distribution", Input
+        ).value = DistributionShape.ANY.value
+        compatible = tuple(
+            location.location
+            for location in resolved.locations
+            if location.disposition is WorkloadLocationDisposition.COMPATIBLE
+        )
+        candidate_values = tuple(
+            self._candidate_text(location) for location in compatible
+        )
+        self.query_one("#obtainability-candidates", Input).value = " ".join(
+            candidate_values
+        )
+        self.query_one("#obtainability-breadcrumb", Static).update(
+            "Obtainability / Contextual\n"
+            "Inherited from Quotas / Resolve / Compute instance\n"
+            "Confirm the complete inherited shape before provider advice."
+        )
+        self.query_one("#obtainability-expansion", Static).update(
+            "Candidate expansion: "
+            + (", ".join(compatible) if compatible else "none proven compatible")
+        )
+        self.query_one("#obtainability-return").remove_class("hidden")
+        self._set_active_workspace("obtainability")
+        self._set_status("CONFIRM INHERITED FIELDS — no advice query has started")
+
+    @staticmethod
+    def _candidate_text(location: str) -> str:
+        region, separator, suffix = location.rpartition("-")
+        return (
+            f"{region}={location}"
+            if separator == "-" and len(suffix) == 1 and suffix.isalpha()
+            else location
+        )
+
+    def _confirm_obtainability(self) -> None:
+        self._obtainability_confirmed = True
+        self._set_status("CONFIRMED — inherited fields and candidate mode are explicit")
+
     def _submit_obtainability(self) -> None:
         """Decode an explicit fixed request through the same parser as Click."""
+        if self._obtainability_contextual and not self._obtainability_confirmed:
+            self._set_status("CONFIRM INHERITED FIELDS — no advice query has started")
+            return
         machine_type = self.query_one(
             "#obtainability-machine-type",
             Input,
@@ -1137,6 +1268,144 @@ class CloudQuotaManagerApp(App[None]):
             exit_on_error=False,
         )
 
+    def _submit_obtainability_all(self) -> None:
+        """Resolve an all-compatible expansion before any comparison begins."""
+        try:
+            machine, count, shape = self._obtainability_shape()
+            requirement = parse_compute_instance_requirement(
+                machine_type=machine.machine_type,
+                instance_count=str(count),
+                provisioning_model=ProvisioningModel.SPOT.value,
+                locations=(),
+                all_compatible=True,
+            )
+        except (TypeError, ValueError) as error:
+            self._set_status(f"INVALID OBTAINABILITY REQUEST — {error}")
+            return
+        if not self._obtainability_all_pending:
+            self._obtainability_all_pending = True
+            self._obtainability_confirmed = False
+            generation = self._claim_provider_view()
+            cancellation = CancellationToken()
+            self._cancellation = cancellation
+            self.run_worker(
+                self._preview_obtainability_expansion(
+                    requirement,
+                    cancellation,
+                    generation,
+                ),
+                group="obtainability-expand",
+                exclusive=True,
+                exit_on_error=False,
+            )
+            return
+        if not self._obtainability_confirmed:
+            self._set_status("CONFIRM CANDIDATE EXPANSION — no comparison has started")
+            return
+        generation = self._claim_provider_view()
+        cancellation = CancellationToken()
+        self._cancellation = cancellation
+        self.run_worker(
+            self._compare_obtainability_all(
+                requirement,
+                machine,
+                shape,
+                cancellation,
+                generation,
+            ),
+            group="obtainability-compare",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    def _obtainability_shape(
+        self,
+    ) -> tuple[SpotMachineConfiguration, int, DistributionShape]:
+        gpu_type = self.query_one("#obtainability-gpu-type", Input).value.strip()
+        gpu_count = self.query_one("#obtainability-gpu-count", Input).value.strip()
+        return parse_obtainability_shape(
+            machine_type=self.query_one(
+                "#obtainability-machine-type",
+                Input,
+            ).value.strip(),
+            gpu_type=gpu_type or None,
+            gpu_count=gpu_count or None,
+            vm_count=self.query_one(
+                "#obtainability-vm-count",
+                Input,
+            ).value.strip(),
+            distribution_shape=self.query_one(
+                "#obtainability-distribution",
+                Input,
+            ).value.strip(),
+        )
+
+    async def _preview_obtainability_expansion(
+        self,
+        requirement: ComputeInstanceRequirement,
+        cancellation: CancellationToken,
+        generation: int,
+    ) -> None:
+        result = await self.read_only.resolve(
+            requirement,
+            deadline=self._deadline(),
+            cancellation=cancellation,
+            scope_input=self.scope_input,
+        )
+        if cancellation.cancelled or not self._owns_obtainability_view(generation):
+            return
+        data = result.data
+        if not isinstance(data, ResolvedWorkloadRequirement):
+            self._set_status(
+                "EXPANSION UNAVAILABLE — compatible locations were not resolved"
+            )
+            return
+        self._resolved_compute = data
+        compatible = tuple(
+            location.location
+            for location in data.locations
+            if location.disposition is WorkloadLocationDisposition.COMPATIBLE
+        )
+        self.query_one("#obtainability-expansion", Static).update(
+            "Candidate expansion before comparison: "
+            + (", ".join(compatible) or "none proven compatible")
+        )
+        self._set_status("CONFIRM CANDIDATE EXPANSION — no comparison has started")
+
+    async def _compare_obtainability_all(
+        self,
+        requirement: ComputeInstanceRequirement,
+        machine: SpotMachineConfiguration,
+        shape: DistributionShape,
+        cancellation: CancellationToken,
+        generation: int,
+    ) -> None:
+        if cancellation.cancelled or not self._owns_obtainability_view(generation):
+            return
+        result = await self.read_only.compare_obtainability_all_compatible(
+            requirement,
+            machine=machine,
+            distribution_shape=shape,
+            deadline=self._deadline(),
+            support=self._advice_support(machine.machine_type),
+            cancellation=cancellation,
+            scope_input=self.scope_input,
+        )
+        if cancellation.cancelled or not self._owns_obtainability_view(generation):
+            return
+        self.last_result = result
+        self._render_instrument(result)
+        self._render_obtainability_result(result)
+        if result.resource_scope is not None:
+            command = obtainability_all_compatible_copy_cli(
+                result.resource_scope,
+                requirement,
+                machine=machine,
+                distribution_shape=shape,
+            )
+            self._show_copy_cli(command)
+            self.query_one("#obtainability-copy-cli", Static).update(command)
+
     async def _compare_obtainability(
         self,
         candidates: tuple[ObtainabilityCandidate, ...],
@@ -1148,14 +1417,7 @@ class CloudQuotaManagerApp(App[None]):
         self._set_status("READING — comparing exact Spot VM candidates")
         first = candidates[0]
         machine_type = first.machine.machine_type
-        support = AdviceSupport(
-            current_advice_supported=not machine_type.startswith(
-                ("custom-", "ct", "tpu-")
-            )
-            and "-custom-" not in machine_type,
-            history_supported=not machine_type.startswith(("custom-", "ct", "tpu-"))
-            and "-custom-" not in machine_type,
-        )
+        support = self._advice_support(machine_type)
         try:
             result = await self.read_only.compare_obtainability(
                 candidates,
@@ -1186,6 +1448,17 @@ class CloudQuotaManagerApp(App[None]):
             self._show_copy_cli(command)
             self.query_one("#obtainability-copy-cli", Static).update(command)
 
+    @staticmethod
+    def _advice_support(machine_type: str) -> AdviceSupport:
+        supported = (
+            not machine_type.startswith(("custom-", "ct", "tpu-"))
+            and "-custom-" not in machine_type
+        )
+        return AdviceSupport(
+            current_advice_supported=supported,
+            history_supported=supported,
+        )
+
     def _render_obtainability_result(self, result: OperationResult[Any]) -> None:
         data = result.data
         lines = [
@@ -1194,6 +1467,16 @@ class CloudQuotaManagerApp(App[None]):
             "Complete: " + ("yes" if result.completeness.is_complete else "no"),
         ]
         if isinstance(data, ObtainabilityComparison):
+            if data.resolver_provenance is not None:
+                compatible = tuple(
+                    location.location
+                    for location in data.resolver_provenance.locations
+                    if location.disposition is WorkloadLocationDisposition.COMPATIBLE
+                )
+                self.query_one("#obtainability-expansion", Static).update(
+                    "Candidate expansion before comparison: "
+                    + (", ".join(compatible) or "none proven compatible")
+                )
             lines.extend(
                 (
                     f"Provider status: {data.preview_status}",
@@ -1201,6 +1484,8 @@ class CloudQuotaManagerApp(App[None]):
                     + ("no" if data.no_capacity_guarantee else "yes"),
                 )
             )
+            if self._obtainability_contextual:
+                lines.append("Return context: Quotas / Resolve / Compute instance")
             for coverage in data.catalog_coverage:
                 lines.extend(
                     (
@@ -1555,6 +1840,8 @@ class CloudQuotaManagerApp(App[None]):
     def _render_workload_result(self, result: OperationResult[Any]) -> None:
         self.query_one("#workload-form").add_class("hidden")
         self.query_one("#quota-detail").remove_class("hidden")
+        self.query_one("#workload-obtainability").add_class("hidden")
+        self._resolved_compute = None
         lines = [
             "Workload resolution",
             f"Outcome: {result.outcome.code.value}",
@@ -1577,6 +1864,17 @@ class CloudQuotaManagerApp(App[None]):
                 )
                 if location.failure_reason is not None:
                     lines.append(f"Reason: {location.failure_reason.value}")
+            requirement = result.data.requirement
+            if (
+                isinstance(requirement, ComputeInstanceRequirement)
+                and requirement.provisioning_model is ProvisioningModel.SPOT
+                and any(
+                    location.disposition is WorkloadLocationDisposition.COMPATIBLE
+                    for location in result.data.locations
+                )
+            ):
+                self._resolved_compute = result.data
+                self.query_one("#workload-obtainability").remove_class("hidden")
         elif isinstance(result.data, ReadOnlyFailureData):
             lines.append(f"Reason: {result.data.reason}")
         self.query_one("#quota-detail", Static).update("\n".join(lines))
