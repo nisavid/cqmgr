@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import shlex
 import time
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -87,7 +88,7 @@ if TYPE_CHECKING:
     )
     from cqmgr.application.operations.watch import WatchRequest
     from cqmgr.domain.obtainability import RankedCandidate
-    from cqmgr.domain.quotas import QuotaQuantity
+    from cqmgr.domain.quotas import EffectiveQuotaSliceIdentity, QuotaQuantity
     from cqmgr.domain.results import OperationResult
     from cqmgr.domain.scopes import ResourceScope
     from cqmgr.domain.watch import WatchStreamEvent
@@ -264,7 +265,9 @@ class LifecycleRouteState:
     pending_apply: ApplyRequest | None = None
     pending_watch: WatchRequest | None = None
     latest_resume: str | None = None
+    affected_selectors: tuple[QuotaInspectSelector, ...] = ()
     previous_scope_locked: bool = False
+    previous_focus_id: str | None = None
 
 
 class CloudQuotaManagerApp(App[None]):
@@ -540,6 +543,10 @@ class CloudQuotaManagerApp(App[None]):
         self._active_obtainability_all_compatible = False
         self._active_obtainability_inputs: dict[str, str] = {}
         self._lifecycle_state = LifecycleRouteState()
+        self._reviewed_constraints_by_digest: dict[
+            str,
+            tuple[QuotaInspectSelector, ...],
+        ] = {}
 
     @override
     def compose(self) -> ComposeResult:  # noqa: PLR0915
@@ -689,6 +696,7 @@ class CloudQuotaManagerApp(App[None]):
                 id="lifecycle-copy-cli",
                 markup=False,
             )
+            yield Static("", id="lifecycle-copy-instruction", markup=False)
         with Horizontal(id="obtainability-workspace", classes="hidden"):
             with VerticalScroll(id="obtainability-form"):
                 yield Static(
@@ -1064,6 +1072,15 @@ class CloudQuotaManagerApp(App[None]):
         review = result.data.review
         scope = review.plan.resource_scope if review is not None else None
         self._enter_lifecycle_route(LifecycleRoute.PLAN_REVIEW, scope)
+        if review is not None:
+            self._reviewed_constraints_by_digest[review.digest] = (
+                self._selectors_for_identities(
+                    tuple(
+                        constraint.slice_identity
+                        for constraint in review.plan.constraints
+                    )
+                )
+            )
         self._render_plan_review(result)
         self._set_lifecycle_copy_cli(
             plan_review_copy_cli(digest=request.digest, path=request.path)
@@ -1076,6 +1093,9 @@ class CloudQuotaManagerApp(App[None]):
         scope = request.resource_scope_acknowledgement
         self._enter_lifecycle_route(LifecycleRoute.APPLY, scope)
         self._lifecycle_state.pending_apply = request
+        self._lifecycle_state.affected_selectors = (
+            self._reviewed_constraints_by_digest.get(request.digest, ())
+        )
         acknowledgement = self.query_one(
             "#apply-scope-acknowledgement",
             Input,
@@ -1143,14 +1163,18 @@ class CloudQuotaManagerApp(App[None]):
             pending_watch.cancellation.cancel()
         if self._lifecycle_state.route is None:
             previous_lock = self.scope_locked
+            focused = self.focused
+            previous_focus_id = None if focused is None else focused.id
         else:
             previous_lock = self._lifecycle_state.previous_scope_locked
+            previous_focus_id = self._lifecycle_state.previous_focus_id
         self._claim_provider_view()
         self.active_workspace = "quotas"
         self._lifecycle_state = LifecycleRouteState(
             route=route,
             bound_scope=scope,
             previous_scope_locked=previous_lock,
+            previous_focus_id=previous_focus_id,
         )
         self.scope_locked = scope is not None
         self.query_one("#quota-workbench").add_class("hidden")
@@ -1184,6 +1208,7 @@ class CloudQuotaManagerApp(App[None]):
         self.query_one("#lifecycle-copy-cli", Static).update(
             "Copy CLI unavailable until an operation is fully specified."
         )
+        self.query_one("#lifecycle-copy-instruction", Static).update("")
 
     def _clear_lifecycle_route(self) -> None:
         pending_watch = self._lifecycle_state.pending_watch
@@ -1203,15 +1228,112 @@ class CloudQuotaManagerApp(App[None]):
         )
 
     def _leave_lifecycle_route(self) -> None:
+        route = self._lifecycle_state.route
+        affected = self._lifecycle_state.affected_selectors
+        previous_focus_id = self._lifecycle_state.previous_focus_id
         self._clear_lifecycle_route()
         self.query_one("#quota-workbench").remove_class("hidden")
         self.query_one("#instrument-bar", Static).update(
             self._offline_instrument_text()
         )
-        self._set_status("READY — returned to affected Quotas context")
+        if route is LifecycleRoute.APPLY and affected:
+            generation = self._claim_provider_view()
+            cancellation = CancellationToken()
+            self._cancellation = cancellation
+            self._set_status(f"REFRESHING — re-reading {len(affected)} affected slices")
+            self.run_worker(
+                self._reconcile_affected_slices(
+                    affected,
+                    self.current_query,
+                    self.selected_quota,
+                    previous_focus_id,
+                    cancellation,
+                    generation,
+                ),
+                group="post-apply-refresh",
+                exclusive=True,
+                exit_on_error=False,
+            )
+            return
+        self._set_status("READY — returned to Quotas")
         if self.selected_quota is not None:
             self.query_one("#quota-detail-pane").scroll_home(animate=False)
         self.query_one("#quota-ledger", DataTable).focus()
+
+    async def _reconcile_affected_slices(  # noqa: PLR0913
+        self,
+        selectors: tuple[QuotaInspectSelector, ...],
+        query: ReadOnlyQuotaQuery,
+        previous_selection: QuotaSelection | None,
+        previous_focus_id: str | None,
+        cancellation: CancellationToken,
+        generation: int,
+    ) -> None:
+        """Re-read every affected slice, then refresh the preserved ledger query."""
+        refreshed: list[tuple[QuotaInspectSelector, OperationResult[Any]]] = []
+        for selector in selectors:
+            if cancellation.cancelled or not self._owns_quota_view(generation):
+                return
+            result = await self.read_only.inspect(
+                selector,
+                deadline=self._deadline(),
+                cancellation=cancellation,
+                scope_input=self.scope_input,
+            )
+            refreshed.append((selector, result))
+        if cancellation.cancelled or not self._owns_quota_view(generation):
+            return
+        browse = await self.read_only.browse(
+            query,
+            deadline=self._deadline(),
+            cancellation=cancellation,
+            scope_input=self.scope_input,
+        )
+        if cancellation.cancelled or not self._owns_quota_view(generation):
+            return
+        self.last_result = browse
+        self._render_instrument(browse)
+        self._render_quota_result(browse)
+        self._restore_quota_selection(previous_selection, browse)
+        lines = [
+            "Post-Apply affected-slice refresh",
+            *(
+                f"{selector.service} / {selector.quota_id} / "
+                f"{selector.location}: {result.outcome.code.value}"
+                for selector, result in refreshed
+            ),
+        ]
+        self.query_one("#quota-detail", Static).update("\n".join(lines))
+        self._set_status(
+            f"REFRESHED — {len(refreshed)}/{len(selectors)} affected slices; "
+            "query and selection preserved"
+        )
+        if previous_focus_id is not None:
+            self.query_one(f"#{previous_focus_id}").focus()
+        else:
+            self.query_one("#quota-ledger", DataTable).focus()
+
+    def _restore_quota_selection(
+        self,
+        previous: QuotaSelection | None,
+        result: OperationResult[Any],
+    ) -> None:
+        if previous is None or not isinstance(result.data, QuotaBrowseData):
+            return
+        for index, item in enumerate(result.data.items):
+            selector = QuotaInspectSelector(
+                item.identity.service,
+                item.identity.quota_id,
+                item.location or "global",
+                item.identity.dimensions,
+            )
+            if selector == previous.selector:
+                self.selected_quota = QuotaSelection(item, selector)
+                self.query_one("#quota-ledger", DataTable).move_cursor(
+                    row=index,
+                    column=0,
+                )
+                return
 
     def _render_composition(self, composition: Composition) -> None:
         request = composition.request
@@ -1301,13 +1423,28 @@ class CloudQuotaManagerApp(App[None]):
                 )
             )
             for index, child in enumerate(plan.children, start=1):
+                dimensions = self._dimensions(child.slice_identity)
                 lines.extend(
                     (
                         f"{index}. {child.child_id}",
                         f"   Slice: {child.slice_identity.service} / "
                         f"{child.slice_identity.quota_id}",
+                        f"   Dimensions: {dimensions}",
                         f"   Target: {self._quantity(child.target)}",
+                        f"   Effective: {self._quantity(child.effective)}",
+                        f"   Usage: {self._quantity(child.usage)}",
+                        f"   Workload: {self._quantity(child.workload)}",
+                        f"   Prior desired: {self._quantity(child.prior_desired)}",
+                        f"   Granted: {self._quantity(child.granted)}",
                         f"   Derivation: {child.target_derivation.value}",
+                        f"   Preference: {child.preference_name or 'none'}",
+                        f"   Preference ETag: {child.preference_etag or 'none'}",
+                        "   Preference state: "
+                        + (
+                            "bound"
+                            if child.preference_name is not None
+                            else "not retained"
+                        ),
                         "   Warnings: "
                         + (", ".join(item.value for item in child.warnings) or "none"),
                         "   Acknowledgements: "
@@ -1317,22 +1454,68 @@ class CloudQuotaManagerApp(App[None]):
                         ),
                     )
                 )
+                for evidence in child.evidence:
+                    age = max(
+                        0.0,
+                        (result.finished_at - evidence.observed_at).total_seconds(),
+                    )
+                    lines.extend(
+                        (
+                            f"   Evidence {evidence.name.value}: "
+                            f"{evidence.value_digest}",
+                            f"      Observed: {evidence.observed_at.isoformat()}",
+                            f"      Age: {age} seconds",
+                        )
+                    )
             for index, child in enumerate(
                 getattr(plan, "no_op_children", ()),
                 start=1,
             ):
+                dimensions = self._dimensions(child.slice_identity)
                 lines.extend(
                     (
                         f"No-op {index}. {child.child_id}",
+                        f"   Slice: {child.slice_identity.service} / "
+                        f"{child.slice_identity.quota_id}",
+                        f"   Dimensions: {dimensions}",
                         f"   Target: {self._quantity(child.target)}",
+                        f"   Effective: {self._quantity(child.effective)}",
+                        f"   Usage: {self._quantity(child.usage)}",
+                        f"   Workload: {self._quantity(child.workload)}",
+                        f"   Prior desired: {self._quantity(child.prior_desired)}",
+                        f"   Granted: {self._quantity(child.granted)}",
                         f"   Derivation: {child.target_derivation.value}",
+                        f"   Preference: {child.preference_name or 'none'}",
+                        f"   Preference ETag: {child.preference_etag or 'none'}",
                         "   Disposition: verified no-op; no provider dispatch",
+                    )
+                )
+                for evidence in child.evidence:
+                    age = max(
+                        0.0,
+                        (result.finished_at - evidence.observed_at).total_seconds(),
+                    )
+                    lines.extend(
+                        (
+                            f"   Evidence {evidence.name.value}: "
+                            f"{evidence.value_digest}",
+                            f"      Observed: {evidence.observed_at.isoformat()}",
+                            f"      Age: {age} seconds",
+                        )
+                    )
+            for index, constraint in enumerate(plan.constraints, start=1):
+                identity = constraint.slice_identity
+                lines.extend(
+                    (
+                        f"Constraint {index}: {identity.service} / {identity.quota_id}",
+                        f"   Dimensions: {self._dimensions(identity)}",
                     )
                 )
             lines.append(
                 "Apply is ordered and non-atomic. Accepted earlier children are "
                 "not rolled back."
             )
+        lines.extend(self._result_fact_lines(result))
         self.query_one("#lifecycle-detail", Static).update("\n".join(lines))
         self._set_status(self._result_status(result))
 
@@ -1367,6 +1550,15 @@ class CloudQuotaManagerApp(App[None]):
         ):
             return
         self.last_result = result
+        self._lifecycle_state.affected_selectors = self._merge_selectors(
+            self._lifecycle_state.affected_selectors,
+            self._selectors_for_identities(
+                tuple(
+                    child.slice_identity
+                    for child in (*result.data.children, *result.data.verified_no_ops)
+                )
+            ),
+        )
         self._render_apply_result(result)
         self._set_status(self._result_status(result))
 
@@ -1388,8 +1580,10 @@ class CloudQuotaManagerApp(App[None]):
                     f"   Disposition: {child.disposition.value}",
                     f"   Slice: {child.slice_identity.service} / "
                     f"{child.slice_identity.quota_id}",
+                    f"   Dimensions: {self._dimensions(child.slice_identity)}",
                     f"   Target: {self._quantity(child.target)}",
                     f"   Preference: {child.preference_identity}",
+                    f"   ETag: {child.etag or 'none'}",
                     f"   Trace ID: {child.trace_id or 'none'}",
                     "   Provider outcome: "
                     + (
@@ -1397,6 +1591,14 @@ class CloudQuotaManagerApp(App[None]):
                         if child.provider_outcome
                         else "none"
                     ),
+                    "   Unknown resolution: "
+                    + (
+                        child.unknown_resolution.value
+                        if child.unknown_resolution is not None
+                        else "none"
+                    ),
+                    "   Audit record IDs: "
+                    + (", ".join(child.audit_record_ids) or "none"),
                     "   Watchable now: "
                     + self._yes_no(child.disposition is ApplyChildDisposition.ACCEPTED),
                 )
@@ -1405,17 +1607,43 @@ class CloudQuotaManagerApp(App[None]):
             lines.extend(
                 (
                     f"No-op {index}. {child.child_id}",
+                    f"   Slice: {child.slice_identity.service} / "
+                    f"{child.slice_identity.quota_id}",
+                    f"   Dimensions: {self._dimensions(child.slice_identity)}",
                     f"   Target: {self._quantity(child.target)}",
+                    f"   Effective: {self._quantity(child.effective)}",
+                    f"   Usage: {self._quantity(child.usage)}",
+                    f"   Workload: {self._quantity(child.workload)}",
+                    f"   Prior desired: {self._quantity(child.prior_desired)}",
+                    f"   Granted: {self._quantity(child.granted)}",
                     f"   Derivation: {child.target_derivation.value}",
+                    f"   Preference: {child.preference_name or 'none'}",
+                    f"   Preference ETag: {child.preference_etag or 'none'}",
                     "   Disposition: verified no-op; no provider dispatch",
                 )
             )
+            for evidence in child.evidence:
+                age = max(
+                    0.0,
+                    (result.finished_at - evidence.observed_at).total_seconds(),
+                )
+                lines.extend(
+                    (
+                        f"   Evidence {evidence.name.value}: {evidence.value_digest}",
+                        f"      Observed: {evidence.observed_at.isoformat()}",
+                        f"      Age: {age} seconds",
+                    )
+                )
         if data.quarantine_identity is not None:
             lines.append(f"Quarantine: {data.quarantine_identity}")
+        lines.append(
+            "Audit record IDs: " + (", ".join(data.audit_record_ids) or "none")
+        )
         lines.append(
             "Accepted children remain accepted. Failed, unknown, and unattempted "
             "children remain distinct."
         )
+        lines.extend(self._result_fact_lines(result))
         self.query_one("#lifecycle-detail", Static).update("\n".join(lines))
         self.query_one("#apply-scope-acknowledgement", Input).disabled = True
         self.query_one("#lifecycle-apply", Button).disabled = True
@@ -1525,7 +1753,156 @@ class CloudQuotaManagerApp(App[None]):
         self.query_one("#lifecycle-copy-cli", Static).update(
             command or "Copy CLI unavailable until an operation is fully specified."
         )
+        arguments = () if command is None else tuple(shlex.split(command))
+        self.query_one("#lifecycle-copy-instruction", Static).update(
+            (
+                "Before running this command, provide exactly one protected "
+                "quota-contact line on standard input. This instruction is "
+                "display-only and is not copied."
+            )
+            if "--quota-contact-stdin" in arguments
+            else ""
+        )
         self.query_one("#lifecycle-copy", Button).disabled = command is None
+
+    @classmethod
+    def _selectors_for_identities(
+        cls,
+        identities: tuple[EffectiveQuotaSliceIdentity, ...],
+    ) -> tuple[QuotaInspectSelector, ...]:
+        return cls._merge_selectors(
+            (),
+            tuple(
+                QuotaInspectSelector(
+                    identity.service,
+                    identity.quota_id,
+                    cls._slice_location(identity),
+                    identity.dimensions,
+                )
+                for identity in identities
+            ),
+        )
+
+    @staticmethod
+    def _merge_selectors(
+        first: tuple[QuotaInspectSelector, ...],
+        second: tuple[QuotaInspectSelector, ...],
+    ) -> tuple[QuotaInspectSelector, ...]:
+        merged: list[QuotaInspectSelector] = []
+        for selector in (*first, *second):
+            if selector not in merged:
+                merged.append(selector)
+        return tuple(merged)
+
+    @staticmethod
+    def _slice_location(identity: EffectiveQuotaSliceIdentity) -> str:
+        dimensions = dict(identity.dimensions.items)
+        return (
+            dimensions.get("zone")
+            or dimensions.get("region")
+            or dimensions.get("location")
+            or "global"
+        )
+
+    @staticmethod
+    def _dimensions(identity: EffectiveQuotaSliceIdentity) -> str:
+        return (
+            ", ".join(f"{key}={value}" for key, value in identity.dimensions.items)
+            or "none"
+        )
+
+    @staticmethod
+    def _result_fact_lines(result: OperationResult[Any]) -> tuple[str, ...]:
+        """Render every safe diagnostic and provenance field without flattening it."""
+        lines: list[str] = [
+            f"Operation: {result.operation.value}",
+            f"Boundary: {result.boundary.condition.value}",
+            "Boundary reached: " + ("yes" if result.boundary.reached else "no"),
+            "Complete: " + ("yes" if result.completeness.is_complete else "no"),
+            f"Started: {result.started_at.isoformat()}",
+            f"Finished: {result.finished_at.isoformat()}",
+        ]
+        lines.extend(
+            f"Evidence gap: {gap.source.value} / {gap.reason.value}"
+            for gap in result.completeness.gaps
+        )
+        identity = result.identity_evidence
+        if identity is not None:
+            lines.extend(
+                (
+                    f"Credential kind: {identity.credential_kind.value}",
+                    f"Identity verification: {identity.verification.value}",
+                    "Acting principal: "
+                    + (
+                        identity.acting_principal.value
+                        if identity.acting_principal is not None
+                        else "unavailable"
+                    ),
+                    "Impersonation chain: "
+                    + (
+                        ", ".join(
+                            principal.value
+                            for principal in identity.impersonation_chain
+                        )
+                        or "none"
+                    ),
+                )
+            )
+        for diagnostic in result.diagnostics:
+            lines.extend(
+                (
+                    f"Diagnostic: {diagnostic.severity.value} {diagnostic.code.value}",
+                    f"   Phase: {diagnostic.phase.value}",
+                    f"   Source: {diagnostic.source.value}",
+                    f"   Retry: {diagnostic.retry.value}",
+                    f"   Message: {diagnostic.message}",
+                    "   Field paths: "
+                    + (
+                        ", ".join(
+                            ".".join(path.segments) for path in diagnostic.field_paths
+                        )
+                        or "none"
+                    ),
+                )
+            )
+            metadata = diagnostic.provider_metadata
+            if metadata is not None:
+                lines.extend(
+                    (
+                        f"   HTTP status: {metadata.http_status or 'none'}",
+                        f"   gRPC status: {metadata.grpc_status or 'none'}",
+                        f"   Provider reason: {metadata.reason or 'none'}",
+                        "   Provider preference: "
+                        f"{metadata.preference_identity or 'none'}",
+                        f"   Provider ETag: {metadata.etag or 'none'}",
+                        f"   Provider trace: {metadata.trace_identity or 'none'}",
+                        f"   Provider request: {metadata.request_identity or 'none'}",
+                    )
+                )
+        for provenance in result.provenance:
+            lines.extend(
+                (
+                    f"Provenance: {provenance.source.value}",
+                    f"   Observed: {provenance.observed_at.isoformat()}",
+                    f"   Coverage: {provenance.coverage.value}",
+                    "   Interval start: "
+                    + (
+                        provenance.interval_started_at.isoformat()
+                        if provenance.interval_started_at is not None
+                        else "none"
+                    ),
+                    "   Interval finish: "
+                    + (
+                        provenance.interval_finished_at.isoformat()
+                        if provenance.interval_finished_at is not None
+                        else "none"
+                    ),
+                    "   Lifecycle or Preview status: "
+                    f"{provenance.lifecycle_or_preview_status or 'none'}",
+                    f"   Request identity: {provenance.request_identity or 'none'}",
+                )
+            )
+        return tuple(lines)
 
     @staticmethod
     def _quantity(value: QuotaQuantity | None) -> str:
