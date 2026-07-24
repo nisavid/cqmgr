@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import pytest
 
 from cqmgr import bootstrap
-from cqmgr.adapters.cli.lifecycle import ProtectedLifecycleCliRequestFactory
+from cqmgr.adapters.cli.lifecycle import (
+    LifecycleCliRuntime,
+    ProtectedLifecycleCliRequestFactory,
+)
 from cqmgr.application.operations.lifecycle_requests import LifecycleCompositionIntent
 from cqmgr.application.operations.read_only import (
     QuotaInspectSelector,
@@ -44,12 +47,29 @@ class _NoKeyringAccess:
 class _NoProviderAccess:
     def __init__(self) -> None:
         self.calls = 0
+        self.close_calls = 0
 
     async def inspect(self, *args: object, **kwargs: object) -> object:
         del args, kwargs
         self.calls += 1
         message = "missing trust must stop before provider reads"
         raise AssertionError(message)
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+
+
+class _RecordingLazyClient:
+    instances: ClassVar[list[_RecordingLazyClient]] = []
+
+    def __init__(self, factory: object, *, closer: object = None) -> None:
+        self.factory = factory
+        self.closer = closer
+        self.close_calls = 0
+        self.instances.append(self)
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
 
 
 def _environment(root: Path) -> dict[str, str]:
@@ -112,3 +132,52 @@ def test_lifecycle_bootstrap_is_lazy_and_missing_trust_stops_before_reads(
 
     assert read_only.calls == 0
     assert not (tmp_path / "trust.toml").exists()
+
+
+def test_lifecycle_runtime_shutdown_is_idempotent() -> None:
+    """One runtime invokes its owned shutdown graph at most once."""
+    close_calls = 0
+
+    async def shutdown() -> None:
+        nonlocal close_calls
+        close_calls += 1
+
+    runtime = LifecycleCliRuntime(
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        shutdown=shutdown,
+    )
+
+    asyncio.run(runtime.aclose())
+    asyncio.run(runtime.aclose())
+
+    assert close_calls == 1
+
+
+def test_lifecycle_bootstrap_owns_read_and_mutation_clients_once(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The runtime closes its hidden read graph and mutation proxy exactly once."""
+    read_only = _NoProviderAccess()
+    _RecordingLazyClient.instances = []
+    monkeypatch.setattr(
+        bootstrap,
+        "build_read_only_operations",
+        lambda _environment: read_only,
+    )
+    monkeypatch.setattr("keyring.get_keyring", _NoKeyringAccess)
+    monkeypatch.setattr(
+        "cqmgr.google_read_only.LazyClientProxy",
+        _RecordingLazyClient,
+    )
+
+    runtime = bootstrap.build_lifecycle_runtime(_environment(tmp_path))
+
+    assert runtime.read_only is read_only
+    assert len(_RecordingLazyClient.instances) == 1
+    asyncio.run(runtime.aclose())
+    asyncio.run(runtime.aclose())
+
+    assert read_only.close_calls == 1
+    assert _RecordingLazyClient.instances[0].close_calls == 1

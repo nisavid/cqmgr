@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 NOW = datetime(2026, 7, 24, 12, tzinfo=UTC)
 INSTANCE_COUNT = 2
 USAGE_EXIT = 2
+REVIEW_AND_APPLY_RUNTIME_COUNT = 2
 
 
 def _result(
@@ -63,6 +64,10 @@ def _result(
 class _Facade:
     def __init__(self) -> None:
         self.calls: list[tuple[str, object]] = []
+        self.close_calls = 0
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
 
     def compose(self, request: object) -> object:
         self.calls.append(("compose", request))
@@ -109,7 +114,7 @@ class _Factory:
         self.calls.append(("review", value))
         return ("review-request", value)
 
-    def apply(
+    async def apply(
         self,
         value: PlanReferenceInput,
         acknowledgement: str,
@@ -135,7 +140,11 @@ def _runtime(monkeypatch: MonkeyPatch) -> tuple[_Facade, _Factory]:
     monkeypatch.setattr(
         cli_module,
         "build_lifecycle_cli_runtime",
-        lambda: LifecycleCliRuntime(shared, factory),  # type: ignore[arg-type]
+        lambda: LifecycleCliRuntime(
+            shared,
+            factory,  # type: ignore[arg-type]
+            shutdown=facade.aclose,
+        ),
     )
     return facade, factory
 
@@ -179,6 +188,7 @@ def _async_runtime(
             shared,
             factory,  # type: ignore[arg-type]
             preparation,  # type: ignore[arg-type]
+            shutdown=facade.aclose,
         ),
     )
     return facade, factory, preparation
@@ -241,6 +251,7 @@ def test_watch_start_failure_emits_stable_error_and_exit(
     assert result.stdout == ""
     assert result.stderr == expected
     assert not isinstance(result.exception, WatchStartError)
+    assert facade.close_calls == 1
 
 
 def test_exact_preview_dispatches_through_shared_facade_without_contact_output(
@@ -285,6 +296,38 @@ def test_exact_preview_dispatches_through_shared_facade_without_contact_output(
     assert value.quota_contact.reveal() == b"operator@example.com"  # type: ignore[union-attr]
     assert value.plan_out == Path("request.plan")  # type: ignore[union-attr]
     assert facade.calls[0][0] == "preview"
+    assert facade.close_calls == 1
+
+
+def test_exact_compose_closes_shared_runtime(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Compose releases the runtime after successful presentation."""
+    facade, factory = _runtime(monkeypatch)
+    monkeypatch.setattr(cli_module, "emit_composition", lambda *_args: 0)
+
+    result = CliRunner().invoke(
+        cli_module.main,
+        [
+            "request",
+            "compose",
+            "--resource-scope",
+            "projects/123",
+            "--service",
+            "compute.googleapis.com",
+            "--quota-id",
+            "GPU-DIRECT",
+            "--location",
+            "us-central1",
+            "--target",
+            "8",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert factory.calls[0][0] == "compose"
+    assert facade.calls[0][0] == "compose"
+    assert facade.close_calls == 1
 
 
 def test_preview_uses_async_preparation_without_sync_factory(
@@ -327,6 +370,7 @@ def test_preview_uses_async_preparation_without_sync_factory(
     intent, deadline = preparation.intents[0]
     assert intent.expert is False  # type: ignore[union-attr]
     assert deadline > 0
+    assert facade.close_calls == 1
 
 
 def test_preview_async_preparation_fails_closed_without_contact(
@@ -359,6 +403,7 @@ def test_preview_async_preparation_fails_closed_without_contact(
     assert "resolvable protected quota contact" in result.output
     assert factory.calls == []
     assert facade.calls == []
+    assert facade.close_calls == 1
 
 
 def test_plan_review_and_apply_dispatch_exact_reference_and_acknowledgement(
@@ -403,6 +448,7 @@ def test_plan_review_and_apply_dispatch_exact_reference_and_acknowledgement(
         ),
     )
     assert [name for name, _ in facade.calls] == ["review", "apply"]
+    assert facade.close_calls == REVIEW_AND_APPLY_RUNTIME_COUNT
 
 
 @pytest.mark.parametrize(
@@ -460,6 +506,7 @@ def test_protected_factory_failures_emit_stable_click_errors(
     assert result.stderr == f"Error: {method} protected input is unavailable\n"
     assert "Traceback" not in result.output
     assert facade.calls == []
+    assert facade.close_calls == 1
 
 
 @pytest.mark.parametrize(
@@ -541,6 +588,7 @@ def test_compute_preview_preserves_workload_shape_and_default_strategy(
     assert value.target_strategy is TargetStrategy.MINIMUM
     assert value.targets == ()
     assert facade.calls[0][0] == "preview"
+    assert facade.close_calls == 1
 
 
 def test_watch_dispatches_absolute_deadline_and_non_tty_jsonl(
@@ -580,6 +628,7 @@ def test_watch_dispatches_absolute_deadline_and_non_tty_jsonl(
     )
     assert facade.calls[0][0] == "watch"
     assert presented[0][1].output == "jsonl"  # type: ignore[union-attr]
+    assert facade.close_calls == 1
 
 
 @pytest.mark.parametrize(

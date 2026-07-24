@@ -31,11 +31,11 @@ from cqmgr.domain.scopes import ResourceScope
 from cqmgr.domain.status import WatchCondition
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from cqmgr.application.operations.apply import ApplyRequest
+    from cqmgr.application.operations.contacts import ProtectedContactResolver
     from cqmgr.application.operations.lifecycle import LifecycleOperations
-    from cqmgr.application.operations.lifecycle_apply import (
-        EphemeralApplyContactRefresher,
-    )
     from cqmgr.application.operations.lifecycle_requests import (
         InstallationTrustSource,
         LifecycleCompositionIntent,
@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     )
     from cqmgr.application.operations.read_only import (
         QuotaInspectSelector,
+        ReadOnlyOperations,
         ReadOnlyScopeInput,
     )
     from cqmgr.application.operations.trust import LoadedInstallationTrust
@@ -319,7 +320,7 @@ class LifecycleCliRequestFactory(Protocol):
         """Resolve one public Plan reference for Review."""
         ...
 
-    def apply(
+    async def apply(
         self,
         value: PlanReferenceInput,
         acknowledgement: str,
@@ -346,13 +347,25 @@ class LifecycleCliClock(Protocol):
         ...
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class LifecycleCliRuntime:
-    """Injected shared facade plus the sole protected request-construction seam."""
+    """Injected lifecycle graph with one idempotent async shutdown owner."""
 
     operations: LifecycleOperations
     requests: LifecycleCliRequestFactory
     preparation: LifecycleRequestOperations | None = None
+    read_only: ReadOnlyOperations | None = None
+    shutdown: Callable[[], Awaitable[None]] | None = dataclass_field(
+        default=None,
+        repr=False,
+    )
+
+    async def aclose(self) -> None:
+        """Release the invocation-scoped read and client graph at most once."""
+        shutdown = self.shutdown
+        self.shutdown = None
+        if shutdown is not None:
+            await shutdown()
 
 
 class ProtectedLifecycleCliRequestFactory:
@@ -364,7 +377,7 @@ class ProtectedLifecycleCliRequestFactory:
         trust: InstallationTrustSource,
         repository: PlanRepository,
         codec: PlanCodec,
-        contacts: EphemeralApplyContactRefresher,
+        contacts: ProtectedContactResolver,
         clock: LifecycleCliClock,
     ) -> None:
         """Bind read-only plan lookup and explicit protected runtime inputs."""
@@ -413,7 +426,7 @@ class ProtectedLifecycleCliRequestFactory:
             self._clock.now(),
         )
 
-    def apply(
+    async def apply(
         self,
         value: PlanReferenceInput,
         acknowledgement: str,
@@ -434,16 +447,11 @@ class ProtectedLifecycleCliRequestFactory:
         ):
             message = "Apply Plan is not authenticated by this installation"
             raise RuntimeError(message)
-        if plan.contact_binding.source.value != "per-operation-input":
-            message = "Apply contact source is not supported by this runtime"
-            raise RuntimeError(message)
-        if quota_contact is None:
-            message = "Apply requires --quota-contact-stdin for this Plan"
-            raise RuntimeError(message)
-        self._contacts.register(
+        contact = await self._contacts.prepare_apply(
             plan.contact_binding,
-            quota_contact,
-            trust.authentication_key,
+            explicit_value=quota_contact,
+            principal=plan.principal,
+            trust=trust,
         )
         return ApplyRequest(
             digest=decoded.digest,
@@ -452,7 +460,7 @@ class ProtectedLifecycleCliRequestFactory:
             resource_scope_acknowledgement=parse_resource_scope_name(acknowledgement),
             principal=plan.principal,
             contact_binding=plan.contact_binding,
-            contact_value=quota_contact.reveal().decode("utf-8"),
+            contact_value=contact.value.reveal().decode("utf-8"),
             now=self._clock.now(),
         )
 
@@ -499,10 +507,7 @@ class ProtectedLifecycleCliRequestFactory:
                 raise RuntimeError(message)
             loaded = self._repository.read_export(value.path)
             expected_status = PlanRepositoryStatus.EXPORTED
-        if (
-            loaded.status is not expected_status
-            or loaded.plan_bytes is None
-        ):
+        if loaded.status is not expected_status or loaded.plan_bytes is None:
             message = "Apply Plan is unavailable"
             raise RuntimeError(message)
         decoded = self._codec.decode(loaded.plan_bytes)

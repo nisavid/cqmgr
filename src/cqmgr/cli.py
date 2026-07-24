@@ -10,6 +10,7 @@ import json
 import sys
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from contextvars import ContextVar
 from io import BytesIO
 from pathlib import Path
@@ -75,7 +76,7 @@ from cqmgr.bootstrap import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Sequence
+    from collections.abc import Awaitable, Iterator, Sequence
     from typing import BinaryIO
 
     from cqmgr.application.operations.lifecycle_requests import (
@@ -266,6 +267,17 @@ def build_lifecycle_cli_runtime() -> LifecycleCliRuntime:
         return build_lifecycle_runtime()
     except (OSError, RuntimeError, ValueError) as error:
         raise click.ClickException(str(error)) from error
+
+
+@contextmanager
+def _lifecycle_runtime_scope(
+    runtime: LifecycleCliRuntime,
+) -> Iterator[LifecycleCliRuntime]:
+    """Close one lifecycle graph after every successful or failed CLI leaf."""
+    try:
+        yield runtime
+    finally:
+        asyncio.run(runtime.aclose())
 
 
 def _prepare_lifecycle_requests(
@@ -479,9 +491,19 @@ def _emit_lifecycle(
 
 async def _apply_lifecycle_async(
     runtime: LifecycleCliRuntime,
-    request: object,
+    value: PlanReferenceInput,
+    acknowledgement: str,
+    quota_contact: SecretValue | None,
     presentation: LifecyclePresentation,
 ) -> None:
+    try:
+        request = await runtime.requests.apply(
+            value,
+            acknowledgement,
+            quota_contact=quota_contact,
+        )
+    except (OSError, TypeError, ValueError, RuntimeError) as error:
+        raise click.ClickException(str(error)) from error
     result = await runtime.operations.apply(request)  # type: ignore[arg-type]
     _emit_lifecycle(result, presentation)
 
@@ -1319,19 +1341,20 @@ def request_compose(  # noqa: PLR0913
         plan_out=None,
     )
     runtime = build_lifecycle_cli_runtime()
-    prepared = _prepare_lifecycle_requests(runtime, value, require_preview=False)
-    request_value = (
-        _protected_lifecycle_request(lambda: runtime.requests.compose(value))
-        if prepared is None
-        else prepared.composition
-    )
-    composition = runtime.operations.compose(request_value)
-    exit_class = emit_composition(
-        composition,
-        LifecyclePresentation(output, no_color, quiet),
-    )
-    if exit_class:
-        raise click.exceptions.Exit(exit_class)
+    with _lifecycle_runtime_scope(runtime):
+        prepared = _prepare_lifecycle_requests(runtime, value, require_preview=False)
+        request_value = (
+            _protected_lifecycle_request(lambda: runtime.requests.compose(value))
+            if prepared is None
+            else prepared.composition
+        )
+        composition = runtime.operations.compose(request_value)
+        exit_class = emit_composition(
+            composition,
+            LifecyclePresentation(output, no_color, quiet),
+        )
+        if exit_class:
+            raise click.exceptions.Exit(exit_class)
 
 
 @request.command(name="preview")
@@ -1394,20 +1417,21 @@ def request_preview(  # noqa: PLR0913
         plan_out=plan_out,
     )
     runtime = build_lifecycle_cli_runtime()
-    prepared = _prepare_lifecycle_requests(runtime, value, require_preview=True)
-    if prepared is None:
-        request_value = _protected_lifecycle_request(
-            lambda: runtime.requests.preview(value)
+    with _lifecycle_runtime_scope(runtime):
+        prepared = _prepare_lifecycle_requests(runtime, value, require_preview=True)
+        if prepared is None:
+            request_value = _protected_lifecycle_request(
+                lambda: runtime.requests.preview(value)
+            )
+        else:
+            request_value = prepared.preview
+            if request_value is None:
+                message = "Preview requires a resolvable protected quota contact"
+                raise click.ClickException(message)
+        _emit_lifecycle(
+            runtime.operations.preview(request_value),
+            LifecyclePresentation(output, no_color, quiet),
         )
-    else:
-        request_value = prepared.preview
-        if request_value is None:
-            message = "Preview requires a resolvable protected quota contact"
-            raise click.ClickException(message)
-    _emit_lifecycle(
-        runtime.operations.preview(request_value),
-        LifecyclePresentation(output, no_color, quiet),
-    )
 
 
 @request.command(name="watch")
@@ -1440,18 +1464,19 @@ def request_watch(  # noqa: PLR0913
             deadline=parse_absolute_rfc3339(deadline),
         )
         runtime = build_lifecycle_cli_runtime()
-        request_value = _protected_lifecycle_request(
-            lambda: runtime.requests.watch(value)
-        )
+        with _lifecycle_runtime_scope(runtime):
+            request_value = _protected_lifecycle_request(
+                lambda: runtime.requests.watch(value)
+            )
+            asyncio.run(
+                _watch_lifecycle_async(
+                    runtime,
+                    request_value,
+                    WatchPresentation(selected_output, no_color, quiet),
+                )
+            )
     except (TypeError, ValueError) as error:
         raise click.UsageError(str(error)) from error
-    asyncio.run(
-        _watch_lifecycle_async(
-            runtime,
-            request_value,
-            WatchPresentation(selected_output, no_color, quiet),
-        )
-    )
 
 
 @main.group(cls=CanonicalAliasGroup)
@@ -1474,11 +1499,14 @@ def plan_review(
     """Review one Plan without provider mutation."""
     value = _plan_reference(digest, plan_file)
     runtime = build_lifecycle_cli_runtime()
-    request_value = _protected_lifecycle_request(lambda: runtime.requests.review(value))
-    _emit_lifecycle(
-        runtime.operations.review(request_value),
-        LifecyclePresentation(output, no_color, quiet),
-    )
+    with _lifecycle_runtime_scope(runtime):
+        request_value = _protected_lifecycle_request(
+            lambda: runtime.requests.review(value)
+        )
+        _emit_lifecycle(
+            runtime.operations.review(request_value),
+            LifecyclePresentation(output, no_color, quiet),
+        )
 
 
 @plan.command(name="apply")
@@ -1500,21 +1528,17 @@ def plan_apply(  # noqa: PLR0913
     """Apply one reviewed Plan in its bound non-atomic child order."""
     value = _plan_reference(digest, plan_file)
     runtime = build_lifecycle_cli_runtime()
-    contact = _quota_contact_from_stdin(enabled=quota_contact_stdin)
-    request_value = _protected_lifecycle_request(
-        lambda: runtime.requests.apply(
-            value,
-            acknowledge_resource_scope,
-            quota_contact=contact,
+    with _lifecycle_runtime_scope(runtime):
+        contact = _quota_contact_from_stdin(enabled=quota_contact_stdin)
+        asyncio.run(
+            _apply_lifecycle_async(
+                runtime,
+                value,
+                acknowledge_resource_scope,
+                contact,
+                LifecyclePresentation(output, no_color, quiet),
+            )
         )
-    )
-    asyncio.run(
-        _apply_lifecycle_async(
-            runtime,
-            request_value,
-            LifecyclePresentation(output, no_color, quiet),
-        )
-    )
 
 
 @main.group(cls=CanonicalAliasGroup)
