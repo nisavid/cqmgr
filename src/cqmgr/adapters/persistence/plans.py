@@ -476,7 +476,11 @@ class LocalPlanRepository:
             except OSError:
                 return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
         if record.state is PlanLedgerState.QUARANTINED:
-            return _outcome_for_record(record, authenticated=True)
+            return _outcome_for_record(
+                record,
+                plan_bytes=plan_bytes,
+                authenticated=True,
+            )
         if (
             record.state is PlanLedgerState.AVAILABLE
             and marker_status is SecretStoreStatus.MISSING
