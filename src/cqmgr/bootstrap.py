@@ -18,7 +18,6 @@ if TYPE_CHECKING:
     from cqmgr.application.operations.quotas import QuotaOperations
     from cqmgr.application.operations.read_only import ReadOnlyOperations
     from cqmgr.application.operations.trust import TrustInitializationOperations
-    from cqmgr.application.ports.plans import PlanCodec as PlanCodecPort
 
 _LOCAL_GROUPS = frozenset(
     ("scope", "sc", "profile", "pf", "config", "cfg", "audit", "aud")
@@ -262,7 +261,7 @@ def build_lifecycle_runtime(  # noqa: PLR0915
     apply_records = LocalApplyRecordRepository(paths.apply_records)
     audit = FilesystemAuditJournal(paths.audit)
     codec = PlanCodec()
-    codec_port = cast("PlanCodecPort", codec)
+    codec_port = cast("Any", codec)
     read_only = build_read_only_operations(environment)
 
     adc = CachedADCRuntime(
