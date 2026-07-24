@@ -77,6 +77,9 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Sequence
     from typing import BinaryIO
 
+    from cqmgr.application.operations.lifecycle_requests import (
+        PreparedLifecycleRequests,
+    )
     from cqmgr.application.operations.local import LocalOperations
     from cqmgr.application.ports.secrets import SecretValue
 
@@ -260,6 +263,24 @@ def build_lifecycle_cli_runtime() -> LifecycleCliRuntime:
     """Fail closed until the production bootstrap supplies protected inputs."""
     message = "lifecycle operations are unavailable in this installation"
     raise click.ClickException(message)
+
+
+def _prepare_lifecycle_requests(
+    runtime: LifecycleCliRuntime,
+    value: RequestCompositionInput,
+) -> PreparedLifecycleRequests | None:
+    """Resolve fresh async evidence when the production preparation seam exists."""
+    if runtime.preparation is None:
+        return None
+    try:
+        return asyncio.run(
+            runtime.preparation.prepare(
+                value.to_intent(),
+                deadline=_provider_deadline(),
+            )
+        )
+    except (TypeError, ValueError, RuntimeError) as error:
+        raise click.ClickException(str(error)) from error
 
 
 def _quota_contact_from_stdin(*, enabled: bool) -> SecretValue | None:
@@ -1282,7 +1303,11 @@ def request_compose(  # noqa: PLR0913
         plan_out=None,
     )
     runtime = build_lifecycle_cli_runtime()
-    composition = runtime.operations.compose(runtime.requests.compose(value))
+    prepared = _prepare_lifecycle_requests(runtime, value)
+    request_value = (
+        runtime.requests.compose(value) if prepared is None else prepared.composition
+    )
+    composition = runtime.operations.compose(request_value)
     exit_class = emit_composition(
         composition,
         LifecyclePresentation(output, no_color, quiet),
@@ -1351,8 +1376,16 @@ def request_preview(  # noqa: PLR0913
         plan_out=plan_out,
     )
     runtime = build_lifecycle_cli_runtime()
+    prepared = _prepare_lifecycle_requests(runtime, value)
+    if prepared is None:
+        request_value = runtime.requests.preview(value)
+    else:
+        request_value = prepared.preview
+        if request_value is None:
+            message = "Preview requires a resolvable protected quota contact"
+            raise click.ClickException(message)
     _emit_lifecycle(
-        runtime.operations.preview(runtime.requests.preview(value)),
+        runtime.operations.preview(request_value),
         LifecyclePresentation(output, no_color, quiet),
     )
 

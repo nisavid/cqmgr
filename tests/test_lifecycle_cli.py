@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -132,6 +133,43 @@ def _runtime(monkeypatch: MonkeyPatch) -> tuple[_Facade, _Factory]:
     return facade, factory
 
 
+class _Preparation:
+    def __init__(self, *, preview: object | None) -> None:
+        self.preview = preview
+        self.intents: list[tuple[object, float]] = []
+
+    async def prepare(self, intent: object, *, deadline: float) -> object:
+        self.intents.append((intent, deadline))
+        return SimpleNamespace(
+            composition=("async-compose-request", intent),
+            preview=self.preview,
+        )
+
+
+def _async_runtime(
+    monkeypatch: MonkeyPatch,
+    *,
+    preview: object | None,
+) -> tuple[_Facade, _Factory, _Preparation]:
+    facade, factory = _runtime(monkeypatch)
+    preparation = _Preparation(preview=preview)
+    shared = LifecycleOperations(
+        facade,  # type: ignore[arg-type]
+        facade,  # type: ignore[arg-type]
+        facade,  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_lifecycle_cli_runtime",
+        lambda: LifecycleCliRuntime(
+            shared,
+            factory,  # type: ignore[arg-type]
+            preparation,  # type: ignore[arg-type]
+        ),
+    )
+    return facade, factory, preparation
+
+
 def test_lifecycle_groups_and_aliases_publish_only_canonical_paths() -> None:
     """Request and Plan leaves expose exact aliases without publishing aliases."""
     runner = CliRunner()
@@ -233,6 +271,80 @@ def test_exact_preview_dispatches_through_shared_facade_without_contact_output(
     assert value.quota_contact.reveal() == b"operator@example.com"  # type: ignore[union-attr]
     assert value.plan_out == Path("request.plan")  # type: ignore[union-attr]
     assert facade.calls[0][0] == "preview"
+
+
+def test_preview_uses_async_preparation_without_sync_factory(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The production seam resolves fresh evidence once before shared Preview."""
+    facade, factory, preparation = _async_runtime(
+        monkeypatch,
+        preview=("async-preview-request",),
+    )
+
+    result = CliRunner().invoke(
+        cli_module.main,
+        [
+            "request",
+            "preview",
+            "--resource-scope",
+            "projects/123",
+            "--service",
+            "compute.googleapis.com",
+            "--quota-id",
+            "GPU-DIRECT",
+            "--location",
+            "us-central1",
+            "--dimension",
+            "region=us-central1",
+            "--target",
+            "8",
+            "--quota-contact-stdin",
+            "--output",
+            "json",
+        ],
+        input="operator@example.com\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert factory.calls == []
+    assert facade.calls == [("preview", ("async-preview-request",))]
+    assert len(preparation.intents) == 1
+    intent, deadline = preparation.intents[0]
+    assert intent.expert is False  # type: ignore[union-attr]
+    assert deadline > 0
+
+
+def test_preview_async_preparation_fails_closed_without_contact(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Missing protected contact resolution never reaches Preview operations."""
+    facade, factory, _ = _async_runtime(monkeypatch, preview=None)
+
+    result = CliRunner().invoke(
+        cli_module.main,
+        [
+            "request",
+            "preview",
+            "--resource-scope",
+            "projects/123",
+            "--service",
+            "compute.googleapis.com",
+            "--quota-id",
+            "GPU-DIRECT",
+            "--location",
+            "us-central1",
+            "--dimension",
+            "region=us-central1",
+            "--target",
+            "8",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "resolvable protected quota contact" in result.output
+    assert factory.calls == []
+    assert facade.calls == []
 
 
 def test_plan_review_and_apply_dispatch_exact_reference_and_acknowledgement(
