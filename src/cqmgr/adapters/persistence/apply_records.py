@@ -10,7 +10,7 @@ import re
 import secrets
 import stat
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from cqmgr.adapters.persistence.native_plan_lock import NativePlanInterprocessLock
@@ -600,11 +600,7 @@ def _time(value: object) -> datetime:
     if not text.endswith("Z"):
         msg = "Apply time must use canonical UTC"
         raise ValueError(msg)
-    parsed = datetime.fromisoformat(f"{text[:-1]}+00:00")
-    if parsed.tzinfo != UTC:
-        msg = "Apply time must use UTC"
-        raise ValueError(msg)
-    return parsed
+    return datetime.fromisoformat(f"{text[:-1]}+00:00")
 
 
 def _optional_time(value: object) -> datetime | None:

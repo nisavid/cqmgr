@@ -44,6 +44,10 @@ class CloudQuotasMutationClient(Protocol):
         """Amend exactly one current preference."""
         ...
 
+
+class CloudQuotasQuotaPreferenceReadClient(Protocol):
+    """Narrow generated-client seam for read-after-unknown reconciliation."""
+
     async def get_quota_preference(
         self,
         request: cloudquotas_v1.GetQuotaPreferenceRequest,
@@ -56,7 +60,7 @@ class CloudQuotasMutationClient(Protocol):
 
 
 class OfficialQuotaPreferenceWriter:
-    """Create, amend, and reconcile exact quota preferences without retry."""
+    """Create or amend exact quota preferences without generic retry."""
 
     def __init__(
         self,
@@ -137,6 +141,23 @@ class OfficialQuotaPreferenceWriter:
             accepted=True,
             outcome=StableSymbol("submitted"),
         )
+
+
+class OfficialQuotaPreferenceUnknownResolver:
+    """Read one exact quota preference after dispatch uncertainty."""
+
+    def __init__(
+        self,
+        client: CloudQuotasQuotaPreferenceReadClient,
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> None:
+        """Bind one official read client with a positive per-call timeout."""
+        if timeout_seconds <= 0:
+            msg = "quota preference read timeout must be positive"
+            raise ValueError(msg)
+        self._client = client
+        self._timeout_seconds = timeout_seconds
 
     async def resolve_unknown(
         self,

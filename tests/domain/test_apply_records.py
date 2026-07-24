@@ -154,6 +154,7 @@ def test_unknown_resolution_is_append_only_and_single_assignment() -> None:
         ("target", "target", TypeError, "target"),
         ("preference_identity", "", ValueError, "preference_identity"),
         ("etag", "", ValueError, "etag"),
+        ("preference_existed", "false", TypeError, "preference_existed"),
         ("dispatch_intent_at", NOW.replace(tzinfo=None), ValueError, "aware UTC"),
         ("disposition", "accepted", TypeError, "disposition"),
         ("provider_outcome", "submitted", TypeError, "provider_outcome"),
@@ -316,3 +317,14 @@ def test_terminal_and_critical_transitions_are_stable() -> None:
             UnknownDispatchResolution.ACCEPTED,
             NOW,
         )
+
+
+def test_pre_dispatch_recovery_and_stop_preserve_exact_dispatch_evidence() -> None:
+    """No-intent recovery is stable and dispatched records cannot become no-write."""
+    record = _record()
+
+    assert record.recover_interrupted(NOW) is record
+    stopped = record.stop_unattempted(NOW)
+    assert stopped.state is ApplyRecordState.FAILED
+    with pytest.raises(ValueError, match="cannot stop"):
+        record.record_dispatch_intent("direct", NOW).stop_unattempted(NOW)

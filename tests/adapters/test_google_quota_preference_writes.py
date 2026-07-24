@@ -8,6 +8,7 @@ from google.api_core import exceptions as google_exceptions
 from google.cloud import cloudquotas_v1
 
 from cqmgr.adapters.google.quota_preference_writes import (
+    OfficialQuotaPreferenceUnknownResolver,
     OfficialQuotaPreferenceWriter,
 )
 from cqmgr.application.ports.provider_writes import (
@@ -69,7 +70,7 @@ def _response(
     )
 
 
-class _ScriptedClient:
+class _ScriptedMutationClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, object, object, float]] = []
         self.error: BaseException | None = None
@@ -105,6 +106,13 @@ class _ScriptedClient:
             contact_value=self.contact_value,
         )
 
+
+class _ScriptedReadClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object, object, float]] = []
+        self.error: BaseException | None = None
+        self.contact_value = "resolved@example.com"
+
     async def get_quota_preference(
         self,
         request: cloudquotas_v1.GetQuotaPreferenceRequest,
@@ -123,7 +131,7 @@ class _ScriptedClient:
 
 def test_official_create_binds_identity_and_disables_retry() -> None:
     """Create uses one deterministic ID and no generic retry or validation call."""
-    client = _ScriptedClient()
+    client = _ScriptedMutationClient()
     request = _write(QuotaPreferenceWriteAction.CREATE)
 
     result = asyncio.run(OfficialQuotaPreferenceWriter(client).dispatch(request))  # type: ignore[arg-type]
@@ -145,7 +153,7 @@ def test_official_create_binds_identity_and_disables_retry() -> None:
 
 def test_official_amend_uses_current_etag_and_validate_only_false() -> None:
     """Amend sends the current etag once with validation-only disabled."""
-    client = _ScriptedClient()
+    client = _ScriptedMutationClient()
     request = _write(QuotaPreferenceWriteAction.AMEND)
 
     result = asyncio.run(OfficialQuotaPreferenceWriter(client).dispatch(request))  # type: ignore[arg-type]
@@ -162,11 +170,11 @@ def test_official_amend_uses_current_etag_and_validate_only_false() -> None:
 
 def test_official_unknown_resolution_is_read_only_and_retry_free() -> None:
     """Unknown reconciliation performs exactly one bound get."""
-    client = _ScriptedClient()
+    client = _ScriptedReadClient()
     request = _write(QuotaPreferenceWriteAction.CREATE)
 
     resolution = asyncio.run(
-        OfficialQuotaPreferenceWriter(client).resolve_unknown(request)  # type: ignore[arg-type]
+        OfficialQuotaPreferenceUnknownResolver(client).resolve_unknown(request)  # type: ignore[arg-type]
     )
 
     method, provider_request, retry, _timeout = client.calls[0]
@@ -179,7 +187,7 @@ def test_official_unknown_resolution_is_read_only_and_retry_free() -> None:
 
 def test_official_conclusive_errors_are_failed_without_retry() -> None:
     """Provider conflicts and not-found reconciliation remain conclusive."""
-    client = _ScriptedClient()
+    client = _ScriptedMutationClient()
     client.error = google_exceptions.Aborted("conflict")
     request = _write(QuotaPreferenceWriteAction.AMEND)
 
@@ -187,10 +195,12 @@ def test_official_conclusive_errors_are_failed_without_retry() -> None:
     assert not result.accepted
     assert result.outcome == StableSymbol("conflicting")
 
-    client.calls.clear()
-    client.error = google_exceptions.NotFound("missing")
+    resolver_client = _ScriptedReadClient()
+    resolver_client.error = google_exceptions.NotFound("missing")
     resolution = asyncio.run(
-        OfficialQuotaPreferenceWriter(client).resolve_unknown(request)  # type: ignore[arg-type]
+        OfficialQuotaPreferenceUnknownResolver(resolver_client).resolve_unknown(  # type: ignore[arg-type]
+            request
+        )
     )
     assert resolution is UnknownWriteResolution.FAILED
 
@@ -204,7 +214,7 @@ def test_official_conclusive_errors_are_failed_without_retry() -> None:
 
 def test_writer_validates_timeout_and_omits_unneeded_safety_overrides() -> None:
     """The production adapter requires a deadline and sends only bound overrides."""
-    client = _ScriptedClient()
+    client = _ScriptedMutationClient()
     with pytest.raises(ValueError, match="timeout"):
         OfficialQuotaPreferenceWriter(client, timeout_seconds=0)  # type: ignore[arg-type]
     request = replace(
@@ -219,17 +229,44 @@ def test_writer_validates_timeout_and_omits_unneeded_safety_overrides() -> None:
     assert tuple(provider_request.ignore_safety_checks) == ()
 
 
+def test_unknown_resolver_requires_a_positive_read_deadline() -> None:
+    """The read-after-unknown boundary owns its deadline independently."""
+    with pytest.raises(ValueError, match="read timeout"):
+        OfficialQuotaPreferenceUnknownResolver(
+            _ScriptedReadClient(),  # type: ignore[arg-type]
+            timeout_seconds=0,
+        )
+
+
 def test_response_contact_must_match_the_bound_dispatch_contact() -> None:
     """A stale contact cannot prove dispatch acceptance or unknown resolution."""
-    client = _ScriptedClient()
-    client.contact_value = "stale@example.com"
+    mutation_client = _ScriptedMutationClient()
+    mutation_client.contact_value = "stale@example.com"
+    read_client = _ScriptedReadClient()
+    read_client.contact_value = "stale@example.com"
     request = _write(QuotaPreferenceWriteAction.AMEND)
 
-    dispatch = asyncio.run(OfficialQuotaPreferenceWriter(client).dispatch(request))  # type: ignore[arg-type]
+    dispatch = asyncio.run(
+        OfficialQuotaPreferenceWriter(mutation_client).dispatch(request)  # type: ignore[arg-type]
+    )
     resolution = asyncio.run(
-        OfficialQuotaPreferenceWriter(client).resolve_unknown(request)  # type: ignore[arg-type]
+        OfficialQuotaPreferenceUnknownResolver(read_client).resolve_unknown(request)  # type: ignore[arg-type]
     )
 
     assert not dispatch.accepted
     assert dispatch.outcome == StableSymbol("conflicting")
     assert resolution is UnknownWriteResolution.FAILED
+
+
+def test_writer_and_resolver_expose_disjoint_adapter_boundaries() -> None:
+    """Mutation and read-after-unknown construction remain independent."""
+    mutation_client = _ScriptedMutationClient()
+    read_client = _ScriptedReadClient()
+    writer = OfficialQuotaPreferenceWriter(mutation_client)  # type: ignore[arg-type]
+    resolver = OfficialQuotaPreferenceUnknownResolver(read_client)  # type: ignore[arg-type]
+
+    assert not hasattr(writer, "resolve_unknown")
+    assert not hasattr(resolver, "dispatch")
+    assert not hasattr(mutation_client, "get_quota_preference")
+    assert not hasattr(read_client, "create_quota_preference")
+    assert not hasattr(read_client, "update_quota_preference")

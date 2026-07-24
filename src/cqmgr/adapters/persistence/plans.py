@@ -10,7 +10,7 @@ import re
 import secrets
 import stat
 from contextlib import suppress
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from cqmgr.adapters.persistence.native_plan_lock import NativePlanInterprocessLock
@@ -215,7 +215,7 @@ class LocalPlanRepository:
             )
         return _outcome_for_record(record)
 
-    def _load_locked(  # noqa: C901, PLR0911
+    def _load_locked(  # noqa: PLR0911
         self, digest: str, digest_hex: str, key: bytes, now: datetime
     ) -> PlanRepositoryOutcome:
         plan_path = self._plans / f"{digest_hex}.plan"
@@ -260,12 +260,6 @@ class LocalPlanRepository:
                 key,
             )
             if marker_status is SecretStoreStatus.AVAILABLE:
-                if record.state in {
-                    PlanLedgerState.DISPATCHED,
-                    PlanLedgerState.CONSUMED,
-                    PlanLedgerState.QUARANTINED,
-                }:
-                    return _outcome_for_record(record, authenticated=True)
                 return PlanRepositoryOutcome(
                     PlanRepositoryStatus.QUARANTINED,
                     state=PlanLedgerState.QUARANTINED,
@@ -582,10 +576,7 @@ class LocalPlanRepository:
             key = _key_bytes(authentication_key)
         except (TypeError, ValueError):
             return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
-        try:
-            digest_hex = _digest_hex(lease.digest)
-        except (TypeError, ValueError):
-            return PlanRepositoryOutcome(PlanRepositoryStatus.MISSING)
+        digest_hex = _digest_hex(lease.digest)
         return self._with_lock(
             lambda: self._quarantine_locked(digest_hex, key, lease, reason)
         )
@@ -628,10 +619,7 @@ class LocalPlanRepository:
             key = _key_bytes(authentication_key)
         except (TypeError, ValueError):
             return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
-        try:
-            digest_hex = _digest_hex(lease.digest)
-        except (TypeError, ValueError):
-            return PlanRepositoryOutcome(PlanRepositoryStatus.MISSING)
+        digest_hex = _digest_hex(lease.digest)
         return self._with_lock(
             lambda: self._invalidate_locked(digest_hex, key, lease, reason)
         )
@@ -670,10 +658,7 @@ class LocalPlanRepository:
             key = _key_bytes(authentication_key)
         except (TypeError, ValueError):
             return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
-        try:
-            digest_hex = _digest_hex(lease.digest)
-        except (TypeError, ValueError):
-            return PlanRepositoryOutcome(PlanRepositoryStatus.MISSING)
+        digest_hex = _digest_hex(lease.digest)
         return self._with_lock(
             lambda: self._transition_with_lease_locked(
                 lease,
@@ -767,7 +752,7 @@ class LocalPlanRepository:
                         reason=StableSymbol("consumption-marker-conflict"),
                         authenticated=True,
                     )
-            elif target is PlanLedgerState.CONSUMED:
+            else:
                 marker_status = self._read_consumption_marker(
                     digest_hex,
                     decoded.plan.installation_id,
@@ -798,13 +783,11 @@ class LocalPlanRepository:
             PlanLedgerDecision.IDEMPOTENT,
         }:
             return PlanRepositoryOutcome(status, state=target)
-        if transition.decision is PlanLedgerDecision.CONFLICT:
-            return PlanRepositoryOutcome(
-                PlanRepositoryStatus.CONFLICT,
-                state=record.state,
-                reason=record.reason,
-            )
-        return _unavailable_for_record(record)
+        return PlanRepositoryOutcome(
+            PlanRepositoryStatus.CONFLICT,
+            state=record.state,
+            reason=record.reason,
+        )
 
     def _recover_record(
         self,
@@ -1015,10 +998,7 @@ def _ensure_private_directory(path: Path) -> None:
     candidate = path
     while not candidate.exists():
         missing.append(candidate)
-        parent = candidate.parent
-        if parent == candidate:
-            break
-        candidate = parent
+        candidate = candidate.parent
     path.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_DIRECTORY_MODE)
     for directory in reversed(missing):
         directory.chmod(_PRIVATE_DIRECTORY_MODE)
@@ -1091,7 +1071,7 @@ def _harden_existing_export(path: Path, data: bytes) -> PlanRepositoryOutcome:
 
 
 def _fsync_directory(path: Path) -> None:
-    if os.name == "nt":  # pragma: win32 cover
+    if os.name == "nt":  # pragma: no cover - covered by the Windows job
         return
     descriptor = os.open(path, os.O_RDONLY)
     try:
@@ -1110,11 +1090,7 @@ def _parse_optional_time(value: object) -> datetime | None:
     if not isinstance(value, str) or not value.endswith("Z"):
         msg = "plan ledger time must be canonical UTC"
         raise ValueError(msg)
-    parsed = datetime.fromisoformat(f"{value[:-1]}+00:00")
-    if parsed.tzinfo != UTC:
-        msg = "plan ledger time must be UTC"
-        raise ValueError(msg)
-    return parsed
+    return datetime.fromisoformat(f"{value[:-1]}+00:00")
 
 
 def _status_for_state(state: PlanLedgerState) -> PlanRepositoryStatus:
@@ -1137,8 +1113,8 @@ def _outcome_for_record(
 
 
 def _unavailable_for_record(record: _LedgerRecord) -> PlanRepositoryOutcome:
-    if record.state is PlanLedgerState.AVAILABLE:
-        status = PlanRepositoryStatus.CONFLICT
-    else:
-        status = _status_for_state(record.state)
-    return PlanRepositoryOutcome(status, state=record.state, reason=record.reason)
+    return PlanRepositoryOutcome(
+        _status_for_state(record.state),
+        state=record.state,
+        reason=record.reason,
+    )

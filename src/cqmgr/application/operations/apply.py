@@ -6,8 +6,12 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING
 
+from cqmgr.application.ports.apply import (
+    ApplyRevalidation,
+    ApplyRevalidator,
+)
 from cqmgr.application.ports.apply_records import ApplyRecordRepositoryStatus
 from cqmgr.application.ports.plans import PlanRepositoryStatus
 from cqmgr.application.ports.provider_writes import (
@@ -43,6 +47,11 @@ from cqmgr.domain.results import (
 if TYPE_CHECKING:
     from datetime import datetime
 
+    from cqmgr.application.ports.apply import (
+        ApplyContactRefresher,
+        ApplyEvidenceRefresher,
+        ApplyPrincipalRefresher,
+    )
     from cqmgr.application.ports.apply_records import ApplyRecordRepository
     from cqmgr.application.ports.audit import AuditJournal
     from cqmgr.application.ports.plans import PlanCodec, PlanLease, PlanRepository
@@ -57,48 +66,8 @@ if TYPE_CHECKING:
         PlanPrincipal,
         QuotaPlan,
     )
-    from cqmgr.domain.quotas import (
-        ConstraintReference,
-        EffectiveQuotaSliceIdentity,
-        QuotaQuantity,
-    )
+    from cqmgr.domain.quotas import EffectiveQuotaSliceIdentity, QuotaQuantity
     from cqmgr.domain.scopes import ResourceScope
-
-
-class ApplyRevalidator(Protocol):
-    """Resolve every mutation-gating fact in one complete pass."""
-
-    async def refresh(self, plan: QuotaPlan, now: datetime) -> ApplyRevalidation:
-        """Return fresh identity, contact, constraint, and child evidence."""
-        ...
-
-
-class ApplyPrincipalRefresher(Protocol):
-    """Re-resolve the current stable acting principal."""
-
-    async def refresh_principal(self, plan: QuotaPlan, now: datetime) -> PlanPrincipal:
-        """Return current principal and complete impersonation chain."""
-        ...
-
-
-class ApplyContactRefresher(Protocol):
-    """Re-resolve a bound contact source without persisting its value."""
-
-    async def refresh_contact(
-        self, binding: ContactBinding, now: datetime
-    ) -> ApplyContactRefresh:
-        """Return the current non-secret binding and ephemeral contact value."""
-        ...
-
-
-class ApplyEvidenceRefresher(Protocol):
-    """Refresh the complete constraint set and every ordered child."""
-
-    async def refresh_evidence(
-        self, plan: QuotaPlan, now: datetime
-    ) -> ApplyEvidenceRefresh:
-        """Return one complete current evidence pass."""
-        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,70 +82,6 @@ class ApplyRequest:
     contact_binding: ContactBinding
     contact_value: str = field(repr=False)
     now: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class RefreshedApplyChild:
-    """Fresh mutation-gating evidence for one exact planned child."""
-
-    child_id: str
-    slice_identity: EffectiveQuotaSliceIdentity
-    effective: QuotaQuantity
-    usage: QuotaQuantity | None
-    preference_name: str | None
-    preference_etag: str | None
-    evidence: tuple[EvidenceBinding, ...]
-    fresh: bool = True
-    complete: bool = True
-    ambiguous: bool = False
-    mutable: bool = True
-    ongoing_rollout: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class ApplyRevalidation:
-    """Fresh identity, contact, constraints, and every ordered child."""
-
-    resource_scope: ResourceScope
-    principal: PlanPrincipal
-    contact_binding: ContactBinding
-    contact_value: str = field(repr=False)
-    constraints: tuple[ConstraintReference, ...]
-    children: tuple[RefreshedApplyChild, ...]
-
-    def __post_init__(self) -> None:
-        """Keep the secret contact ephemeral and the refresh structurally complete."""
-        if not isinstance(self.contact_value, str) or not self.contact_value:
-            msg = "revalidated contact value must be non-empty"
-            raise ValueError(msg)
-        if not isinstance(self.constraints, tuple) or not isinstance(
-            self.children, tuple
-        ):
-            msg = "revalidated constraints and children must be tuples"
-            raise TypeError(msg)
-
-
-@dataclass(frozen=True, slots=True)
-class ApplyContactRefresh:
-    """Current contact binding plus an ephemeral provider contact value."""
-
-    binding: ContactBinding
-    value: str = field(repr=False)
-
-    def __post_init__(self) -> None:
-        """Reject incomplete current contact resolution."""
-        if not isinstance(self.value, str) or not self.value:
-            msg = "refreshed contact value must be non-empty"
-            raise ValueError(msg)
-
-
-@dataclass(frozen=True, slots=True)
-class ApplyEvidenceRefresh:
-    """One complete current scope, constraint, and ordered-child refresh."""
-
-    resource_scope: ResourceScope
-    constraints: tuple[ConstraintReference, ...]
-    children: tuple[RefreshedApplyChild, ...]
 
 
 class ComposedApplyRevalidator:
@@ -253,7 +158,7 @@ class ApplyPlanOperations:
         codec: PlanCodec,
         revalidator: ApplyRevalidator,
         writer: QuotaPreferenceWriter,
-        unknown_resolver: QuotaPreferenceUnknownResolver | None = None,
+        unknown_resolver: QuotaPreferenceUnknownResolver,
     ) -> None:
         """Bind durable local state and narrow external provider boundaries."""
         self._repository = repository
@@ -262,7 +167,7 @@ class ApplyPlanOperations:
         self._codec = codec
         self._revalidator = revalidator
         self._writer = writer
-        self._unknown_resolver = unknown_resolver or _WriterResolver(writer)
+        self._unknown_resolver = unknown_resolver
 
     async def apply(  # noqa: C901, PLR0911
         self, request: ApplyRequest
@@ -316,34 +221,16 @@ class ApplyPlanOperations:
                 exit_class=ExitClass.REJECTED_PRECONDITION,
                 resource_scope=plan.resource_scope,
             )
-        lease_outcome = self._repository.acquire_lease(
-            request.digest,
-            request.authentication_key,
-            request.now,
-        )
-        if (
-            lease_outcome.status is not PlanRepositoryStatus.LEASED
-            or lease_outcome.lease is None
-        ):
-            return _result(
-                request,
-                reached=False,
-                outcome="plan-lease-failed",
-                exit_class=ExitClass.STALE_OR_CONFLICTING,
-                resource_scope=plan.resource_scope,
-            )
-        lease = lease_outcome.lease
         try:
             refreshed = await self._revalidator.refresh(plan, request.now)
-        except BaseException:  # noqa: BLE001
-            return self._invalidate(
+        except Exception:  # noqa: BLE001
+            return self._invalidate_after_preflight(
                 plan,
-                lease,
                 request,
                 reason=StableSymbol("revalidation-incomplete"),
             )
         if _revalidation_drift(plan, request, refreshed):
-            return self._invalidate(plan, lease, request)
+            return self._invalidate_after_preflight(plan, request)
 
         record = _apply_record(plan, request)
         audit_record_ids: list[str] = []
@@ -376,6 +263,25 @@ class ApplyPlanOperations:
                 resource_scope=plan.resource_scope,
                 audit_record_ids=tuple(audit_record_ids),
             )
+        lease_outcome = self._repository.acquire_lease(
+            request.digest,
+            request.authentication_key,
+            request.now,
+        )
+        if (
+            lease_outcome.status is not PlanRepositoryStatus.LEASED
+            or lease_outcome.lease is None
+        ):
+            return _result(
+                request,
+                reached=False,
+                outcome="plan-lease-failed",
+                exit_class=ExitClass.STALE_OR_CONFLICTING,
+                resource_scope=plan.resource_scope,
+                intent_id=record.intent_id,
+                audit_record_ids=tuple(audit_record_ids),
+            )
+        lease = lease_outcome.lease
         consumed = self._repository.mark_dispatched(
             lease,
             request.authentication_key,
@@ -399,6 +305,37 @@ class ApplyPlanOperations:
             record,
             audit_record_ids,
             refreshed.contact_value,
+        )
+
+    def _invalidate_after_preflight(
+        self,
+        plan: QuotaPlan,
+        request: ApplyRequest,
+        *,
+        reason: StableSymbol | None = None,
+    ) -> OperationResult[ApplyData]:
+        """Acquire only the authority required to persist a no-write invalidation."""
+        lease_outcome = self._repository.acquire_lease(
+            request.digest,
+            request.authentication_key,
+            request.now,
+        )
+        if (
+            lease_outcome.status is not PlanRepositoryStatus.LEASED
+            or lease_outcome.lease is None
+        ):
+            return _result(
+                request,
+                reached=False,
+                outcome="plan-lease-failed",
+                exit_class=ExitClass.STALE_OR_CONFLICTING,
+                resource_scope=plan.resource_scope,
+            )
+        return self._invalidate(
+            plan,
+            lease_outcome.lease,
+            request,
+            reason=reason,
         )
 
     async def _dispatch_children(  # noqa: C901, PLR0911, PLR0913
@@ -1134,23 +1071,6 @@ class ApplyPlanOperations:
             sensitive_values=(request.contact_value,),
         )
         return retained.record_id
-
-
-class _WriterResolver:
-    """Use a combined scripted adapter without widening the mutation port."""
-
-    def __init__(self, writer: QuotaPreferenceWriter) -> None:
-        self._writer = writer
-
-    async def resolve_unknown(
-        self, request: QuotaPreferenceWrite
-    ) -> UnknownWriteResolution:
-        resolver = self._writer
-        method = getattr(resolver, "resolve_unknown", None)
-        if method is None:
-            return UnknownWriteResolution.UNRESOLVED
-        resolved: UnknownWriteResolution = await method(request)
-        return resolved
 
 
 def _request_drift(plan: QuotaPlan, request: ApplyRequest) -> bool:
