@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from cqmgr.application.operations.local import LocalOperations
     from cqmgr.application.operations.quotas import QuotaOperations
     from cqmgr.application.operations.read_only import ReadOnlyOperations
+    from cqmgr.application.operations.trust import TrustInitializationOperations
 
 _LOCAL_GROUPS = frozenset(
     ("scope", "sc", "profile", "pf", "config", "cfg", "audit", "aud")
@@ -40,11 +41,12 @@ class InvocationKind(StrEnum):
     HELP = "help"
     LOCAL = "local"
     TUI = "tui"
+    TRUST = "trust"
     PROVIDER = "provider"
     INVALID = "invalid"
 
 
-def classify_invocation(
+def classify_invocation(  # noqa: PLR0911
     arguments: Sequence[str],
     *,
     stdin_is_tty: bool,
@@ -62,6 +64,8 @@ def classify_invocation(
         return InvocationKind.HELP
     if command == "tui":
         return InvocationKind.HELP if "--help" in arguments else InvocationKind.TUI
+    if command == "trust":
+        return InvocationKind.HELP if "--help" in arguments else InvocationKind.TRUST
     if command in _LOCAL_GROUPS:
         return InvocationKind.HELP if "--help" in arguments else InvocationKind.LOCAL
     if command in _PROVIDER_GROUPS:
@@ -78,6 +82,7 @@ class RuntimePaths:
     audit: Path
     quota_snapshots: Path
     budgets: Path
+    trust: Path
 
 
 def _platform_paths(environment: Mapping[str, str]) -> RuntimePaths:
@@ -97,6 +102,7 @@ def _platform_paths(environment: Mapping[str, str]) -> RuntimePaths:
         audit=state_home / "cqmgr/audit",
         quota_snapshots=state_home / "cqmgr/quota-snapshots",
         budgets=state_home / "cqmgr/budgets",
+        trust=state_home / "cqmgr/trust.toml",
     )
 
 
@@ -121,6 +127,57 @@ def runtime_paths(environment: Mapping[str, str] | None = None) -> RuntimePaths:
         budgets=Path(
             source.get("CQMGR_BUDGET_PATH", str(defaults.budgets))
         ).expanduser(),
+        trust=Path(source.get("CQMGR_TRUST_PATH", str(defaults.trust))).expanduser(),
+    )
+
+
+def build_trust_initialization_operations(
+    environment: Mapping[str, str] | None = None,
+) -> TrustInitializationOperations:
+    """Compose the sole explicit native installation-trust creation path."""
+    import secrets  # noqa: PLC0415
+    from typing import Any, cast  # noqa: PLC0415
+
+    import keyring  # noqa: PLC0415
+
+    from cqmgr.adapters.persistence.installation_trust import (  # noqa: PLC0415
+        TomlInstallationTrustRepository,
+    )
+    from cqmgr.adapters.persistence.native_plan_lock import (  # noqa: PLC0415
+        NativePlanInterprocessLock,
+    )
+    from cqmgr.adapters.persistence.secrets import NativeSecretStore  # noqa: PLC0415
+    from cqmgr.application.operations.trust import (  # noqa: PLC0415
+        TrustInitializationOperations,
+    )
+    from cqmgr.application.ports.secrets import (  # noqa: PLC0415
+        SecretPurpose,
+        SecretStoreReference,
+        SecretValue,
+    )
+
+    path = runtime_paths(environment).trust
+    native_lock = NativePlanInterprocessLock(path.parent / ".native-plan-keyring.lock")
+    store = NativeSecretStore(
+        cast("Any", keyring.get_keyring()),
+        native_lock,
+    )
+
+    def material() -> tuple[str, SecretStoreReference, SecretValue]:
+        installation_id = f"installation-{secrets.token_urlsafe(18)}"
+        return (
+            installation_id,
+            SecretStoreReference.generate(
+                installation_id,
+                SecretPurpose.PLAN_AUTHENTICATION,
+            ),
+            SecretValue(secrets.token_bytes(32)),
+        )
+
+    return TrustInitializationOperations(
+        TomlInstallationTrustRepository(path),
+        store,
+        material=material,
     )
 
 

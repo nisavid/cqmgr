@@ -32,6 +32,8 @@ OPERATIONAL_FAILURE_EXIT = 9
         (("pf", "l"), False, False, InvocationKind.LOCAL),
         (("cfg", "get", "interface.no-color"), False, False, InvocationKind.LOCAL),
         (("tui",), True, True, InvocationKind.TUI),
+        (("trust", "init"), False, False, InvocationKind.TRUST),
+        (("trust", "--help"), False, False, InvocationKind.HELP),
         (("q", "l"), False, False, InvocationKind.PROVIDER),
         (("sco",), False, False, InvocationKind.INVALID),
         (("pro",), False, False, InvocationKind.INVALID),

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import time
 from collections.abc import Callable
@@ -68,6 +69,7 @@ from cqmgr.bootstrap import (
     build_local_operations,
     build_quota_cursor_operations,
     build_read_only_operations,
+    build_trust_initialization_operations,
     classify_invocation,
 )
 
@@ -304,6 +306,7 @@ def _request_composition_input(  # noqa: C901, PLR0912, PLR0913
     targets: tuple[str, ...],
     target_strategy: str | None,
     acknowledgements: tuple[str, ...],
+    expert: bool,
     quota_contact_stdin: bool,
     plan_out: Path | None,
     machine_type: str | None,
@@ -419,6 +422,7 @@ def _request_composition_input(  # noqa: C901, PLR0912, PLR0913
             target_strategy=strategy,
             targets=parsed_targets,
             acknowledgements=acknowledgements,
+            expert=expert,
             quota_contact=_quota_contact_from_stdin(enabled=quota_contact_stdin),
             plan_out=plan_out,
         )
@@ -509,6 +513,40 @@ def tui() -> None:
 @main.group(cls=CanonicalAliasGroup)
 def scope() -> None:
     """Inspect or change the local resource-scope selection."""
+
+
+@main.group(cls=CanonicalAliasGroup)
+def trust() -> None:
+    """Manage explicit installation-local signing trust."""
+
+
+@trust.command(name="init")
+@click.option(
+    "--output",
+    type=click.Choice(("human", "json"), case_sensitive=True),
+    default="human",
+    show_default=True,
+)
+def trust_init(output: str) -> None:
+    """Initialize installation signing trust once in the native keyring."""
+    operations = build_trust_initialization_operations()
+    result = operations.initialize()
+    if output == "json":
+        click.echo(
+            json.dumps(
+                {
+                    "initialized": result.initialized,
+                    "reason": result.reason,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    elif result.initialized:
+        click.echo("Installation trust initialized.")
+    if not result.initialized:
+        message = result.reason or "installation trust initialization failed"
+        raise click.ClickException(message)
 
 
 @scope.command(name="show")
@@ -1104,6 +1142,11 @@ def _request_input_options[CommandT: Callable[..., Any]](
         is_flag=True,
     )(decorated)
     decorated = click.option(
+        "--expert",
+        is_flag=True,
+        help="Enable expert-only request paths without bypassing safety gates.",
+    )(decorated)
+    decorated = click.option(
         "--acknowledge",
         multiple=True,
         type=click.Choice(_ACKNOWLEDGEMENT_CODES),
@@ -1134,6 +1177,7 @@ def _composition_from_options(  # noqa: PLR0913
     targets: tuple[str, ...],
     target_strategy: str | None,
     acknowledge: tuple[str, ...],
+    expert: bool,
     quota_contact_stdin: bool,
     machine_type: str | None,
     instance_count: str | None,
@@ -1158,6 +1202,7 @@ def _composition_from_options(  # noqa: PLR0913
         targets=targets,
         target_strategy=target_strategy,
         acknowledgements=acknowledge,
+        expert=expert,
         quota_contact_stdin=quota_contact_stdin,
         plan_out=plan_out,
         machine_type=machine_type,
@@ -1194,6 +1239,7 @@ def request_compose(  # noqa: PLR0913
     targets: tuple[str, ...],
     target_strategy: str | None,
     acknowledge: tuple[str, ...],
+    expert: bool,
     quota_contact_stdin: bool,
     machine_type: str | None,
     instance_count: str | None,
@@ -1220,6 +1266,7 @@ def request_compose(  # noqa: PLR0913
         targets=targets,
         target_strategy=target_strategy,
         acknowledge=acknowledge,
+        expert=expert,
         quota_contact_stdin=quota_contact_stdin,
         machine_type=machine_type,
         instance_count=instance_count,
@@ -1260,6 +1307,7 @@ def request_preview(  # noqa: PLR0913
     targets: tuple[str, ...],
     target_strategy: str | None,
     acknowledge: tuple[str, ...],
+    expert: bool,
     quota_contact_stdin: bool,
     machine_type: str | None,
     instance_count: str | None,
@@ -1287,6 +1335,7 @@ def request_preview(  # noqa: PLR0913
         targets=targets,
         target_strategy=target_strategy,
         acknowledge=acknowledge,
+        expert=expert,
         quota_contact_stdin=quota_contact_stdin,
         machine_type=machine_type,
         instance_count=instance_count,

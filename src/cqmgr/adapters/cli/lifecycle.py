@@ -136,6 +136,7 @@ class RequestCompositionInput:
     target_strategy: TargetStrategy
     targets: tuple[tuple[str | None, str], ...]
     acknowledgements: tuple[str, ...] = ()
+    expert: bool = False
     quota_contact: SecretValue | None = dataclass_field(
         default=None,
         repr=False,
@@ -176,6 +177,9 @@ class RequestCompositionInput:
         ):
             msg = "lifecycle targets must be nonempty public values"
             raise ValueError(msg)
+        if not isinstance(self.expert, bool):
+            msg = "lifecycle expert intent must be boolean"
+            raise TypeError(msg)
         if exact and (
             self.target_strategy is not TargetStrategy.MANUAL
             or len(self.targets) != 1

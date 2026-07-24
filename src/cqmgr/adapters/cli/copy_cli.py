@@ -103,6 +103,7 @@ def request_exact_copy_cli(  # noqa: PLR0913
     dimensions: NormalizedDimensions,
     target: str,
     acknowledgements: tuple[str, ...] = (),
+    expert: bool = False,
     quota_contact_stdin: bool = False,
     plan_out: Path | None = None,
     presentation: CopyCliPresentation | None = None,
@@ -124,6 +125,9 @@ def request_exact_copy_cli(  # noqa: PLR0913
         msg = "Copy CLI exact request dimensions must be NormalizedDimensions"
         raise TypeError(msg)
     _require_acknowledgements(acknowledgements)
+    if not isinstance(expert, bool):
+        msg = "Copy CLI expert intent must be boolean"
+        raise TypeError(msg)
     if not isinstance(quota_contact_stdin, bool):
         msg = "Copy CLI contact mode must be boolean"
         raise TypeError(msg)
@@ -155,6 +159,8 @@ def request_exact_copy_cli(  # noqa: PLR0913
     )
     arguments.extend(("--target", target))
     _repeat(arguments, "--acknowledge", acknowledgements)
+    if expert:
+        arguments.append("--expert")
     if quota_contact_stdin:
         arguments.append("--quota-contact-stdin")
     if plan_out is not None:
@@ -163,7 +169,7 @@ def request_exact_copy_cli(  # noqa: PLR0913
     return shlex.join(arguments)
 
 
-def request_workload_copy_cli(  # noqa: C901, PLR0912, PLR0913
+def request_workload_copy_cli(  # noqa: C901, PLR0912, PLR0913, PLR0915
     command: str,
     resource_scope: ResourceScope,
     requirement: ComputeInstanceRequirement | CloudTpuSliceRequirement,
@@ -171,6 +177,7 @@ def request_workload_copy_cli(  # noqa: C901, PLR0912, PLR0913
     target_strategy: TargetStrategy,
     targets: tuple[tuple[str, str], ...] = (),
     acknowledgements: tuple[str, ...] = (),
+    expert: bool = False,
     quota_contact_stdin: bool = False,
     plan_out: Path | None = None,
     presentation: CopyCliPresentation | None = None,
@@ -217,6 +224,9 @@ def request_workload_copy_cli(  # noqa: C901, PLR0912, PLR0913
         msg = "Copy CLI derived strategies do not accept child targets"
         raise ValueError(msg)
     _require_acknowledgements(acknowledgements)
+    if not isinstance(expert, bool):
+        msg = "Copy CLI expert intent must be boolean"
+        raise TypeError(msg)
     if not isinstance(quota_contact_stdin, bool):
         msg = "Copy CLI contact mode must be boolean"
         raise TypeError(msg)
@@ -282,6 +292,8 @@ def request_workload_copy_cli(  # noqa: C901, PLR0912, PLR0913
         tuple(f"{child_id}={value}" for child_id, value in targets),
     )
     _repeat(arguments, "--acknowledge", acknowledgements)
+    if expert:
+        arguments.append("--expert")
     if quota_contact_stdin:
         arguments.append("--quota-contact-stdin")
     if plan_out is not None:
