@@ -221,6 +221,7 @@ class ObtainabilityWorkflowState:
     entry_mode: ObtainabilityEntryMode = ObtainabilityEntryMode.STANDALONE
     pending_expansion: PreparedObtainabilityComparison | None = None
     pending_fingerprint: ObtainabilityRequestFingerprint | None = None
+    pending_all_compatible: bool = False
     confirmed_fingerprint: ObtainabilityRequestFingerprint | None = None
     confirmed_candidate_ids: tuple[str, ...] = ()
 
@@ -405,6 +406,14 @@ class CloudQuotaManagerApp(App[None]):
     _WIDE_MINIMUM = 120
     _MEDIUM_MINIMUM = 80
     _PROVIDER_OPERATION_SECONDS = 60.0
+    _OBTAINABILITY_INPUT_IDS = (
+        "obtainability-machine-type",
+        "obtainability-gpu-type",
+        "obtainability-gpu-count",
+        "obtainability-vm-count",
+        "obtainability-distribution",
+        "obtainability-candidates",
+    )
 
     def __init__(  # noqa: PLR0913 - complete surface composition contract
         self,
@@ -451,6 +460,11 @@ class CloudQuotaManagerApp(App[None]):
         self._audit_operation_generation = 0
         self._resolved_compute: ResolvedWorkloadRequirement | None = None
         self._obtainability_state = ObtainabilityWorkflowState()
+        self._active_obtainability_fingerprint: (
+            ObtainabilityRequestFingerprint | None
+        ) = None
+        self._active_obtainability_all_compatible = False
+        self._active_obtainability_inputs: dict[str, str] = {}
 
     @override
     def compose(self) -> ComposeResult:  # noqa: PLR0915
@@ -1169,23 +1183,50 @@ class CloudQuotaManagerApp(App[None]):
                 self.copy_to_clipboard(command)
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        """Invalidate confirmation whenever an Obtainability input changes."""
+        """Invalidate every provider-backed Obtainability artifact on edit."""
         input_id = event.input.id
-        state = self._obtainability_state
         if (
             input_id is not None
             and input_id.startswith("obtainability-")
-            and state.confirmed_fingerprint is not None
+            and self.active_workspace == "obtainability"
         ):
+            try:
+                current = self._decode_obtainability_form(
+                    all_compatible=self._active_obtainability_all_compatible,
+                )
+            except (TypeError, ValueError):
+                current = None
+            if (
+                current is not None
+                and current.fingerprint == self._active_obtainability_fingerprint
+                and self._active_obtainability_inputs.get(input_id) == event.value
+            ):
+                return
+            self._claim_provider_view()
+            self._active_obtainability_fingerprint = None
+            self._active_obtainability_all_compatible = False
+            self._active_obtainability_inputs.clear()
             self._obtainability_state = replace(
-                state,
+                self._obtainability_state,
+                pending_expansion=None,
+                pending_fingerprint=None,
+                pending_all_compatible=False,
                 confirmed_fingerprint=None,
                 confirmed_candidate_ids=(),
             )
-            if self.active_workspace == "obtainability":
-                self._set_status(
-                    "INPUT CHANGED — confirm the exact request before comparison"
-                )
+            self._copy_cli_by_workspace.pop("obtainability", None)
+            self.last_result = None
+            self.query_one("#instrument-bar", Static).update(
+                self._offline_instrument_text()
+            )
+            self.query_one("#obtainability-detail", Static).update(
+                "Complete the fixed request and choose an explicit candidate mode.\n"
+                "Obtainability is Preview evidence, not capacity."
+            )
+            self._sync_copy_cli_preview()
+            self._set_status(
+                "INPUT CHANGED — confirm the exact request before comparison"
+            )
 
     def _apply_filters(self) -> None:
         if self.active_workspace != "quotas":
@@ -1322,12 +1363,11 @@ class CloudQuotaManagerApp(App[None]):
             )
             return
         requirement = resolved.requirement
-        self._obtainability_state = ObtainabilityWorkflowState(
-            entry_mode=ObtainabilityEntryMode.CONTEXTUAL,
-        )
         self.query_one(
             "#obtainability-machine-type", Input
         ).value = requirement.machine_type
+        self.query_one("#obtainability-gpu-type", Input).value = ""
+        self.query_one("#obtainability-gpu-count", Input).value = ""
         self.query_one("#obtainability-vm-count", Input).value = str(
             requirement.instance_count
         )
@@ -1342,9 +1382,37 @@ class CloudQuotaManagerApp(App[None]):
         candidate_values = tuple(
             self._candidate_text(location) for location in compatible
         )
+        try:
+            candidates = parse_obtainability_candidates(
+                machine_type=requirement.machine_type,
+                gpu_type=None,
+                gpu_count=None,
+                vm_count=str(requirement.instance_count),
+                distribution_shape=DistributionShape.ANY.value,
+                candidates=candidate_values,
+            )
+            draft = ObtainabilityFormDraft(
+                SpotMachineConfiguration(requirement.machine_type),
+                requirement.instance_count,
+                DistributionShape.ANY,
+                candidates,
+                all_compatible=False,
+            )
+            prepared = prepare_obtainability_comparison(resolved, candidates)
+        except (TypeError, ValueError):
+            self._set_status(
+                "OBTAINABILITY UNAVAILABLE — no exact Spot Compute candidates"
+            )
+            return
+        self._obtainability_state = ObtainabilityWorkflowState(
+            entry_mode=ObtainabilityEntryMode.CONTEXTUAL,
+            pending_expansion=prepared,
+            pending_fingerprint=draft.fingerprint,
+        )
         self.query_one("#obtainability-candidates", Input).value = " ".join(
             candidate_values
         )
+        self._mark_obtainability_submission(draft)
         self.query_one("#obtainability-breadcrumb", Static).update(
             "Obtainability / Contextual\n"
             "Inherited from Quotas / Resolve / Compute instance\n"
@@ -1369,10 +1437,18 @@ class CloudQuotaManagerApp(App[None]):
 
     def _confirm_obtainability(self) -> None:
         state = self._obtainability_state
-        all_compatible = state.pending_expansion is not None
+        if (
+            state.entry_mode is ObtainabilityEntryMode.CONTEXTUAL
+            and state.pending_expansion is None
+        ):
+            self._set_status(
+                "PREPARE INHERITED FIELDS — resolve the edited request "
+                "before confirmation"
+            )
+            return
         try:
             draft = self._decode_obtainability_form(
-                all_compatible=all_compatible,
+                all_compatible=state.pending_all_compatible,
             )
         except (TypeError, ValueError) as error:
             self._set_status(f"INVALID OBTAINABILITY REQUEST — {error}")
@@ -1413,16 +1489,57 @@ class CloudQuotaManagerApp(App[None]):
             self._set_status(f"INVALID OBTAINABILITY REQUEST — {error}")
             return
         state = self._obtainability_state
-        if state.entry_mode is ObtainabilityEntryMode.CONTEXTUAL and (
-            state.confirmed_fingerprint != draft.fingerprint
-            or state.confirmed_candidate_ids
-            != tuple(candidate.candidate_id for candidate in draft.candidates)
-        ):
-            self._set_status("CONFIRM INHERITED FIELDS — no advice query has started")
+        if state.entry_mode is ObtainabilityEntryMode.CONTEXTUAL:
+            if (
+                state.pending_expansion is None
+                or state.pending_fingerprint != draft.fingerprint
+            ):
+                generation = self._claim_provider_view()
+                cancellation = CancellationToken()
+                self._cancellation = cancellation
+                self._mark_obtainability_submission(draft)
+                self.run_worker(
+                    self._preview_contextual_obtainability(
+                        draft,
+                        cancellation,
+                        generation,
+                    ),
+                    group="obtainability-expand",
+                    exclusive=True,
+                    exit_on_error=False,
+                )
+                return
+            confirmed_ids = tuple(
+                candidate.candidate_id
+                for candidate in state.pending_expansion.candidates
+            )
+            if (
+                state.confirmed_fingerprint != draft.fingerprint
+                or state.confirmed_candidate_ids != confirmed_ids
+            ):
+                self._set_status(
+                    "CONFIRM INHERITED FIELDS — no advice query has started"
+                )
+                return
+            generation = self._claim_provider_view()
+            cancellation = CancellationToken()
+            self._cancellation = cancellation
+            self._mark_obtainability_submission(draft)
+            self.run_worker(
+                self._compare_obtainability_prepared(
+                    state.pending_expansion,
+                    cancellation,
+                    generation,
+                ),
+                group="obtainability-compare",
+                exclusive=True,
+                exit_on_error=False,
+            )
             return
         generation = self._claim_provider_view()
         cancellation = CancellationToken()
         self._cancellation = cancellation
+        self._mark_obtainability_submission(draft)
         self.run_worker(
             self._compare_obtainability(draft, cancellation, generation),
             group="obtainability-compare",
@@ -1453,12 +1570,14 @@ class CloudQuotaManagerApp(App[None]):
                 state,
                 pending_expansion=None,
                 pending_fingerprint=None,
+                pending_all_compatible=False,
                 confirmed_fingerprint=None,
                 confirmed_candidate_ids=(),
             )
             generation = self._claim_provider_view()
             cancellation = CancellationToken()
             self._cancellation = cancellation
+            self._mark_obtainability_submission(draft)
             self.run_worker(
                 self._preview_obtainability_expansion(
                     requirement,
@@ -1483,6 +1602,7 @@ class CloudQuotaManagerApp(App[None]):
         generation = self._claim_provider_view()
         cancellation = CancellationToken()
         self._cancellation = cancellation
+        self._mark_obtainability_submission(draft)
         self.run_worker(
             self._compare_obtainability_prepared(
                 state.pending_expansion,
@@ -1493,6 +1613,15 @@ class CloudQuotaManagerApp(App[None]):
             exclusive=True,
             exit_on_error=False,
         )
+
+    def _mark_obtainability_submission(self, draft: ObtainabilityFormDraft) -> None:
+        """Keep already-submitted form events from superseding their own worker."""
+        self._active_obtainability_fingerprint = draft.fingerprint
+        self._active_obtainability_all_compatible = draft.all_compatible
+        self._active_obtainability_inputs = {
+            input_id: self.query_one(f"#{input_id}", Input).value
+            for input_id in self._OBTAINABILITY_INPUT_IDS
+        }
 
     def _decode_obtainability_form(
         self,
@@ -1582,6 +1711,7 @@ class CloudQuotaManagerApp(App[None]):
             self._obtainability_state,
             pending_expansion=prepared,
             pending_fingerprint=draft.fingerprint,
+            pending_all_compatible=True,
             confirmed_fingerprint=None,
             confirmed_candidate_ids=(),
         )
@@ -1594,6 +1724,61 @@ class CloudQuotaManagerApp(App[None]):
             + (", ".join(compatible) or "none proven compatible")
         )
         self._set_status("CONFIRM CANDIDATE EXPANSION — no comparison has started")
+
+    async def _preview_contextual_obtainability(
+        self,
+        draft: ObtainabilityFormDraft,
+        cancellation: CancellationToken,
+        generation: int,
+    ) -> None:
+        """Prepare one edited contextual request before operator confirmation."""
+        locations = tuple(
+            dict.fromkeys(
+                location
+                for candidate in draft.candidates
+                for location in (candidate.zones or (candidate.endpoint_region,))
+            )
+        )
+        requirement = parse_compute_instance_requirement(
+            machine_type=draft.machine.machine_type,
+            instance_count=str(draft.vm_count),
+            provisioning_model=ProvisioningModel.SPOT.value,
+            locations=locations,
+            all_compatible=False,
+        )
+        self._set_status("READING — preparing edited inherited fields")
+        result = await self.read_only.resolve(
+            requirement,
+            deadline=self._deadline(),
+            cancellation=cancellation,
+            scope_input=self.scope_input,
+        )
+        if cancellation.cancelled or not self._owns_obtainability_view(generation):
+            return
+        if not isinstance(result.data, ResolvedWorkloadRequirement):
+            self.last_result = result
+            self._render_instrument(result)
+            self._render_obtainability_result(result)
+            return
+        try:
+            prepared = prepare_obtainability_comparison(
+                result.data,
+                draft.candidates,
+            )
+        except (TypeError, ValueError):
+            self._set_status(
+                "PREPARATION UNAVAILABLE — exact candidates were not resolved"
+            )
+            return
+        self._obtainability_state = replace(
+            self._obtainability_state,
+            pending_expansion=prepared,
+            pending_fingerprint=draft.fingerprint,
+            pending_all_compatible=False,
+            confirmed_fingerprint=None,
+            confirmed_candidate_ids=(),
+        )
+        self._set_status("CONFIRM INHERITED FIELDS — no advice query has started")
 
     async def _compare_obtainability(
         self,

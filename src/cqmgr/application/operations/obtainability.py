@@ -190,7 +190,7 @@ def eligibility_from_resolved_workload(  # noqa: C901, PLR0912
         location.location: location for location in resolved.locations
     }
     candidate_eligibility: list[ObtainabilityCandidateEligibility] = []
-    cataloged = True
+    product_cataloged = False
     for candidate in candidates:
         reasons: list[UnrankedReason] = []
         if requirement.provisioning_model is not ProvisioningModel.SPOT:
@@ -217,7 +217,7 @@ def eligibility_from_resolved_workload(  # noqa: C901, PLR0912
             reasons.append(UnrankedReason.NON_COMPUTE_MANAGEMENT_PLANE)
         reasons = list(dict.fromkeys(reasons))
         queryable = not reasons
-        cataloged = cataloged and queryable
+        product_cataloged = product_cataloged or queryable
         candidate_eligibility.append(
             ObtainabilityCandidateEligibility(
                 candidate.candidate_id,
@@ -226,10 +226,10 @@ def eligibility_from_resolved_workload(  # noqa: C901, PLR0912
             )
         )
 
-    current_supported = cataloged and machine_support.current_advice_supported
-    history_supported = cataloged and machine_support.history_supported
+    current_supported = product_cataloged and machine_support.current_advice_supported
+    history_supported = product_cataloged and machine_support.history_supported
     coverage_reasons: tuple[str, ...]
-    if not cataloged:
+    if not product_cataloged:
         coverage_reasons = ("configuration-not-cataloged-for-spot-compute",)
     elif first.machine.is_n1_attached_gpu:
         coverage_reasons = ("history-unsupported-n1-attached-gpu",)
@@ -243,7 +243,7 @@ def eligibility_from_resolved_workload(  # noqa: C901, PLR0912
             ObtainabilityProductCoverage(
                 _product_id(first.machine),
                 "compute.googleapis.com",
-                cataloged,
+                product_cataloged,
                 current_supported,
                 history_supported,
                 coverage_reasons,

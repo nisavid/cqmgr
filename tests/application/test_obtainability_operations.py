@@ -660,6 +660,15 @@ def test_ineligible_candidate_does_not_suppress_queryable_sibling() -> None:
     )
 
     assert result.outcome.exit_class is ExitClass.SUCCESS
+    assert result.data.catalog_coverage == (
+        ObtainabilityProductCoverage(
+            "a3-highgpu-8g",
+            "compute.googleapis.com",
+            True,
+            True,
+            True,
+        ),
+    )
     assert len(advice.requests) == 1
     assert advice.requests[0].candidate == eligible  # type: ignore[union-attr]
     assessed = {item.candidate.candidate_id: item for item in result.data.candidates}

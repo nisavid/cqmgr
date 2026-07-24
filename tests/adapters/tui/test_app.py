@@ -1162,6 +1162,39 @@ class DelayedObtainabilityOperations(ScriptedReadOnlyOperations):
         return result
 
 
+class SecondDelayedObtainabilityOperations(ScriptedReadOnlyOperations):
+    """Hold the edited comparison shape for edit-race coverage."""
+
+    def __init__(self) -> None:
+        super().__init__(_browse_result())
+        self.compare_started = asyncio.Event()
+        self.release_compare = asyncio.Event()
+        self.compare_returned = asyncio.Event()
+
+    @override
+    async def compare_obtainability_prepared(
+        self,
+        prepared_comparison: PreparedObtainabilityComparison,
+        *,
+        deadline: float,
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[ObtainabilityComparison]:
+        delayed = prepared_comparison.candidates[0].vm_count == 3
+        if delayed:
+            self.compare_started.set()
+            await self.release_compare.wait()
+        result = await super().compare_obtainability_prepared(
+            prepared_comparison,
+            deadline=deadline,
+            cancellation=cancellation,
+            scope_input=scope_input,
+        )
+        if delayed:
+            self.compare_returned.set()
+        return result
+
+
 def test_wide_shell_opens_federated_quota_inspector_with_semantic_evidence() -> None:
     """The default workspace preserves provider truth and independent predicates."""
 
@@ -1395,6 +1428,49 @@ def test_copy_cli_is_scoped_to_each_workspace(
     asyncio.run(scenario())
 
 
+def test_obtainability_edit_clears_stale_state_and_supersedes_active_result() -> None:
+    """An input edit synchronously owns the workspace before workers return."""
+
+    async def scenario() -> None:
+        operations = SecondDelayedObtainabilityOperations()
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            _input(app, "#obtainability-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#obtainability-vm-count").value = "2"
+            _input(app, "#obtainability-distribution").value = "any-single-zone"
+            _input(app, "#obtainability-candidates").value = "us-central1=us-central1-a"
+            await pilot.click("#obtainability-compare")
+            await pilot.pause()
+
+            assert app.last_result is operations.obtainability_result
+            assert app.last_copied_cli is not None
+
+            _input(app, "#obtainability-vm-count").value = "3"
+            await pilot.pause()
+            assert app.last_result is None
+            assert app.last_copied_cli is None
+            _button(app, "#obtainability-compare").press()
+            await asyncio.wait_for(operations.compare_started.wait(), timeout=3)
+
+            _input(app, "#obtainability-vm-count").value = "4"
+            await pilot.pause()
+            operations.release_compare.set()
+            await asyncio.wait_for(operations.compare_returned.wait(), timeout=3)
+            await pilot.pause()
+
+            assert app.last_result is None
+            assert app.last_copied_cli is None
+            assert "Complete the fixed request" in str(
+                _static(app, "#obtainability-detail").content
+            )
+            assert "INPUT CHANGED" in str(_static(app, "#status-line").content)
+
+    asyncio.run(scenario())
+
+
 def test_contextual_obtainability_requires_confirmation_of_inherited_fields() -> None:
     """A resolved Spot shape stays visible and cannot compare before confirmation."""
 
@@ -1434,6 +1510,7 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields() ->
             assert "Inherited from Quotas / Resolve / Compute instance" in str(
                 _static(app, "#obtainability-breadcrumb").content
             )
+            assert len(operations.resolve_calls) == 1
 
             await pilot.click("#obtainability-compare")
             assert operations.obtainability_calls == []
@@ -1447,6 +1524,8 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields() ->
 
             assert len(operations.obtainability_prepared_calls) == 1
             prepared, _options = operations.obtainability_prepared_calls[0]
+            assert len(operations.resolve_calls) == 1
+            assert prepared.resolver_provenance is operations.resolve_result.data
             candidates = prepared.candidates
             assert candidates[0].zones == ("us-central1-a",)
             assert "Return context: Quotas / Resolve / Compute instance" in str(
@@ -1540,6 +1619,11 @@ def test_all_compatible_obtainability_expansion_is_visible_and_explicit() -> Non
             assert app.last_copied_cli is not None
             assert "--all-compatible-locations" not in app.last_copied_cli
             assert "--candidate" in app.last_copied_cli
+
+            _input(app, "#obtainability-candidates").value = "us-west1=us-west1-a"
+            await pilot.pause()
+            assert app.last_result is None
+            assert app.last_copied_cli is None
 
             _input(app, "#obtainability-vm-count").value = "3"
             await pilot.pause()
