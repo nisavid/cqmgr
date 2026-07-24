@@ -8,6 +8,7 @@ import sys
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+import pytest
 from click.testing import CliRunner
 
 import cqmgr.cli as cli_module
@@ -47,8 +48,6 @@ from cqmgr.domain.status import Reconciliation
 if TYPE_CHECKING:
     from pathlib import Path
 
-    import pytest
-
 USAGE_EXIT = 2
 
 
@@ -66,7 +65,7 @@ def test_copy_cli_canonical_paths_are_derived_from_the_alias_registry() -> None:
         "cloud-tpu-slice",
     ) == ("cqmgr", "quota", "resolve", "cloud-tpu-slice")
 
-    with __import__("pytest").raises(
+    with pytest.raises(
         ValueError,
         match="not registered",
     ):
