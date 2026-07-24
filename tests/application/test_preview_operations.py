@@ -31,6 +31,7 @@ from cqmgr.domain.plans import (
     PlanLedgerState,
     PlanPrincipal,
     QuotaRequestBundlePlan,
+    QuotaRequestPlan,
     TargetStrategy,
 )
 from cqmgr.domain.quotas import (
@@ -358,6 +359,89 @@ def test_mixed_bundle_plan_review_retains_verified_no_op_composition() -> None:
     assert review.data.review is not None
     assert isinstance(review.data.review.plan, QuotaRequestBundlePlan)
     assert review.data.review.plan.no_op_children == (no_op,)
+
+
+def test_single_preview_and_review_preserve_every_revalidation_fact() -> None:
+    """A single Plan binds the same current safety facts as a bundle child."""
+    evidence = EvidenceBinding(
+        StableSymbol("effective"),
+        "sha256:" + ("a" * 64),
+        NOW,
+    )
+    child = ComposeChild(
+        child_id="single",
+        slice_identity=_slice("GPUS-PER-GPU-FAMILY-per-project-region"),
+        effective=QuotaQuantity(7, UNIT),
+        usage=QuotaQuantity(3, UNIT),
+        workload=QuotaQuantity(4, UNIT),
+        preferred=QuotaQuantity(6, UNIT),
+        granted=QuotaQuantity(5, UNIT),
+        preference_name="projects/123456789/locations/us-central1/preferences/single",
+        preference_etag="etag-single",
+        manual_target=QuotaQuantity(8, UNIT),
+        direct_accelerator_rank=1,
+        scope_breadth_rank=3,
+        warnings=("manual-review-required",),
+        observed_at=NOW,
+        evidence=(evidence,),
+    )
+    repository = MemoryPlanRepository()
+    operations = _operations(repository, MemoryAuditJournal())
+    request = replace(
+        _preview_request(child),
+        composition=ComposeRequest(
+            kind=PlanKind.SINGLE,
+            strategy=TargetStrategy.MANUAL,
+            resource_scope=SCOPE,
+            children=(child,),
+        ),
+        normalized_workload="exact-slice",
+    )
+
+    preview = operations.preview(request)
+    review = operations.review(
+        PlanReviewRequest(
+            digest=preview.data.plan_digest,
+            path=None,
+            authentication_key=request.authentication_key,
+            local_installation_id=request.installation_id,
+            now=NOW,
+        )
+    )
+
+    assert isinstance(preview.data.plan, QuotaRequestPlan)
+    planned = preview.data.plan.children[0]
+    assert (
+        planned.child_id,
+        planned.usage,
+        planned.workload,
+        planned.prior_desired,
+        planned.granted,
+        planned.preference_name,
+        planned.preference_etag,
+        planned.target_strategy,
+        planned.target_derivation,
+        planned.direct_accelerator_rank,
+        planned.scope_breadth_rank,
+        planned.warnings,
+        planned.evidence,
+    ) == (
+        "single",
+        QuotaQuantity(3, UNIT),
+        QuotaQuantity(4, UNIT),
+        QuotaQuantity(6, UNIT),
+        QuotaQuantity(5, UNIT),
+        child.preference_name,
+        "etag-single",
+        TargetStrategy.MANUAL,
+        StableSymbol("manual-absolute"),
+        1,
+        3,
+        (StableSymbol("manual-review-required"),),
+        (evidence,),
+    )
+    assert review.data.review is not None
+    assert review.data.review.plan == preview.data.plan
 
 
 @pytest.mark.parametrize(
