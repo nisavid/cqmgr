@@ -1032,9 +1032,7 @@ def test_export_review_fails_closed_when_local_authority_is_unavailable(
     repository = MemoryPlanRepository()
     operations = _operations(repository, MemoryAuditJournal())
     plan_out = tmp_path / "portable.plan"
-    preview = operations.preview(
-        _preview_request(_preview_child(), plan_out=plan_out)
-    )
+    preview = operations.preview(_preview_request(_preview_child(), plan_out=plan_out))
     repository.load_outcome = local_outcome
 
     result = operations.review(
