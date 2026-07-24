@@ -1,9 +1,12 @@
 """Authenticated durable Watch observation checkpoints."""
 
 import json
+import os
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from cqmgr.adapters.persistence.watch import LocalWatchCheckpointRepository
 from cqmgr.application.ports.secrets import SecretValue
@@ -105,10 +108,10 @@ def test_checkpoint_round_trips_authentically_and_is_immutable(
     assert conflict.status is WatchCheckpointRepositoryStatus.CONFLICT
 
 
-def test_checkpoint_rejects_foreign_keys_tampering_modes_and_addresses(
+def test_checkpoint_rejects_foreign_keys_tampering_and_addresses(
     tmp_path: Path,
 ) -> None:
-    """Only canonical, private, locally authenticated checkpoints are resumable."""
+    """Only canonical, locally authenticated checkpoints are resumable."""
     repository = LocalWatchCheckpointRepository(tmp_path)
     checkpoint = _checkpoint()
     assert repository.save(checkpoint, KEY).status is (
@@ -132,12 +135,6 @@ def test_checkpoint_rejects_foreign_keys_tampering_modes_and_addresses(
         WatchCheckpointRepositoryStatus.FAILED
     )
 
-    path.chmod(0o644)
-    assert repository.load(checkpoint.checkpoint_id, KEY).status is (
-        WatchCheckpointRepositoryStatus.CONFLICT
-    )
-    path.chmod(0o600)
-
     envelope = json.loads(original)
     envelope["checkpoint"]["sequence"] = 99
     path.write_text(json.dumps(envelope))
@@ -150,4 +147,27 @@ def test_checkpoint_rejects_foreign_keys_tampering_modes_and_addresses(
     path.chmod(0o600)
     assert repository.load(checkpoint.checkpoint_id, KEY).status is (
         WatchCheckpointRepositoryStatus.FAILED
+    )
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="Windows privacy uses ACLs, not POSIX modes"
+)
+def test_checkpoint_rejects_posix_mode_drift(tmp_path: Path) -> None:
+    """A checkpoint with widened POSIX permissions is not resumable."""
+    repository = LocalWatchCheckpointRepository(tmp_path)
+    checkpoint = _checkpoint()
+    assert repository.save(checkpoint, KEY).status is (
+        WatchCheckpointRepositoryStatus.STORED
+    )
+    path = (
+        tmp_path
+        / "watch-checkpoints"
+        / f"{checkpoint.checkpoint_id.removeprefix('sha256:')}.json"
+    )
+
+    path.chmod(0o644)
+
+    assert repository.load(checkpoint.checkpoint_id, KEY).status is (
+        WatchCheckpointRepositoryStatus.CONFLICT
     )
