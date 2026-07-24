@@ -140,6 +140,7 @@ def test_exact_preview_copy_cli_retains_safe_inputs_and_contact_stdin() -> None:
         target="8",
         acknowledgements=("decrease-over-ten-percent",),
         quota_contact_stdin=True,
+        expert=True,
         plan_out=Path("request.plan"),
         presentation=CopyCliPresentation(output="json", no_color=True, quiet=True),
     )
@@ -156,7 +157,7 @@ def test_exact_preview_copy_cli_retains_safe_inputs_and_contact_stdin() -> None:
         "--no-color",
         "--quiet",
     ]
-    assert "--expert" not in arguments
+    assert arguments.count("--expert") == 1
 
 
 def test_plan_copy_cli_preserves_reference_and_incomplete_apply_acknowledgement() -> (
@@ -255,6 +256,7 @@ def test_workload_preview_copy_cli_retains_shape_strategy_and_manual_targets() -
         target_strategy=TargetStrategy.MANUAL,
         targets=(("accelerator", "16"), ("all-regions", "32")),
         quota_contact_stdin=True,
+        expert=True,
         presentation=CopyCliPresentation(output="json"),
     )
     arguments = shlex.split(command)
@@ -264,7 +266,7 @@ def test_workload_preview_copy_cli_retains_shape_strategy_and_manual_targets() -
     assert "accelerator=16" in arguments
     assert "all-regions=32" in arguments
     assert "--quota-contact-stdin" in arguments
-    assert "--expert" not in arguments
+    assert arguments.count("--expert") == 1
 
 
 def test_copy_cli_presentations_reject_cross_wired_controls() -> None:

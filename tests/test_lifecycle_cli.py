@@ -143,7 +143,7 @@ def test_lifecycle_groups_and_aliases_publish_only_canonical_paths() -> None:
     assert request_help.stdout.startswith("Usage: cqmgr request preview [OPTIONS]\n")
     assert plan_help.exit_code == 0
     assert plan_help.stdout.startswith("Usage: cqmgr plan apply [OPTIONS]\n")
-    assert "--expert" not in request_help.output
+    assert "--expert" in request_help.output
     assert "--expert" not in plan_help.output
 
 
@@ -214,6 +214,7 @@ def test_exact_preview_dispatches_through_shared_facade_without_contact_output(
             "region=us-central1",
             "--target",
             "8",
+            "--expert",
             "--quota-contact-stdin",
             "--plan-out",
             "request.plan",
@@ -228,6 +229,7 @@ def test_exact_preview_dispatches_through_shared_facade_without_contact_output(
     name, value = factory.calls[0]
     assert name == "preview"
     assert value.quota_contact is not None  # type: ignore[union-attr]
+    assert value.expert is True  # type: ignore[union-attr]
     assert value.quota_contact.reveal() == b"operator@example.com"  # type: ignore[union-attr]
     assert value.plan_out == Path("request.plan")  # type: ignore[union-attr]
     assert facade.calls[0][0] == "preview"
