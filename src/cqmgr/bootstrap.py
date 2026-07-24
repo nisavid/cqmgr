@@ -388,6 +388,9 @@ def build_trust_initialization_operations(
 
     path = runtime_paths(environment).trust
     native_lock = NativePlanInterprocessLock(path.parent / ".native-plan-keyring.lock")
+    workflow_lock = NativePlanInterprocessLock(
+        path.parent / ".installation-trust-init.lock"
+    )
     store = NativeSecretStore(
         cast("Any", keyring.get_keyring()),
         native_lock,
@@ -408,6 +411,7 @@ def build_trust_initialization_operations(
         TomlInstallationTrustRepository(path),
         store,
         material=material,
+        workflow_lock=workflow_lock,
     )
 
 

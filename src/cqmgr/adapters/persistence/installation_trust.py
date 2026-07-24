@@ -116,6 +116,46 @@ class TomlInstallationTrustRepository:
             msg = f"installation trust transition failed: {type(error).__name__}"
             raise InstallationTrustPersistenceError(msg) from error
 
+    def restart_incomplete(
+        self,
+        expected: InstallationTrust,
+        replacement: InstallationTrust,
+    ) -> None:
+        """Replace one exact incomplete candidate without touching active trust."""
+        if not isinstance(expected, InstallationTrust):
+            msg = "installation trust restart requires typed expected state"
+            raise TypeError(msg)
+        if not isinstance(replacement, InstallationTrust):
+            msg = "installation trust restart requires typed replacement state"
+            raise TypeError(msg)
+        if expected.phase is InstallationTrustPhase.ACTIVE:
+            msg = "active installation trust cannot be restarted"
+            raise InstallationTrustPersistenceError(msg)
+        if replacement.phase is not InstallationTrustPhase.PREPARED:
+            msg = "installation trust restart must prepare fresh authority"
+            raise InstallationTrustPersistenceError(msg)
+        if (
+            replacement.installation_id == expected.installation_id
+            or replacement.authentication_key_reference
+            == expected.authentication_key_reference
+            or replacement.authentication_key_commitment
+            == expected.authentication_key_commitment
+        ):
+            msg = "installation trust restart requires fresh authority"
+            raise InstallationTrustPersistenceError(msg)
+        try:
+            with self._lock:
+                current = self._load_unlocked()
+                if current != expected:
+                    msg = "installation trust changed before incomplete restart"
+                    raise InstallationTrustPersistenceError(msg)  # noqa: TRY301
+                self._write_unlocked(replacement)
+        except InstallationTrustPersistenceError:
+            raise
+        except OSError as error:
+            msg = f"installation trust restart failed: {type(error).__name__}"
+            raise InstallationTrustPersistenceError(msg) from error
+
     def _load_unlocked(self) -> InstallationTrust | None:
         if not self._path.exists():
             return None

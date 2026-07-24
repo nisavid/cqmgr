@@ -30,6 +30,11 @@ REFERENCE = SecretStoreReference.generate(
     INSTALLATION_ID,
     SecretPurpose.PLAN_AUTHENTICATION,
 )
+RECOVERY_INSTALLATION_ID = "installation-recovery"
+RECOVERY_REFERENCE = SecretStoreReference.generate(
+    RECOVERY_INSTALLATION_ID,
+    SecretPurpose.PLAN_AUTHENTICATION,
+)
 KEY_COMMITMENT = bytes.fromhex(
     "5e318f8cf9cbe249a30812b8ca132d691ded7a91991413558db5758575f5e01f"
 )
@@ -37,6 +42,15 @@ KEY_COMMITMENT = bytes.fromhex(
 
 def _trust(phase: InstallationTrustPhase) -> InstallationTrust:
     return InstallationTrust(INSTALLATION_ID, REFERENCE, KEY_COMMITMENT, phase)
+
+
+def _recovery_trust(phase: InstallationTrustPhase) -> InstallationTrust:
+    return InstallationTrust(
+        RECOVERY_INSTALLATION_ID,
+        RECOVERY_REFERENCE,
+        b"r" * 32,
+        phase,
+    )
 
 
 def test_trust_repository_creates_and_transitions_private_state(tmp_path: Path) -> None:
@@ -76,6 +90,42 @@ def test_trust_repository_rejects_recreation_and_wrong_phase(tmp_path: Path) -> 
         repository.transition(
             InstallationTrustPhase.ACTIVE,
             _trust(InstallationTrustPhase.ACTIVE),
+        )
+
+
+def test_trust_repository_restarts_only_the_exact_incomplete_candidate(
+    tmp_path: Path,
+) -> None:
+    """Explicit recovery cannot replace changed or active installation trust."""
+    path = tmp_path / "trust.toml"
+    repository = TomlInstallationTrustRepository(path)
+    prepared = _trust(InstallationTrustPhase.PREPARED)
+    recovery = _recovery_trust(InstallationTrustPhase.PREPARED)
+    repository.create(prepared)
+
+    repository.restart_incomplete(prepared, recovery)
+
+    assert repository.load() == recovery
+    with pytest.raises(InstallationTrustPersistenceError, match="changed"):
+        repository.restart_incomplete(
+            prepared,
+            _recovery_trust(InstallationTrustPhase.PREPARED),
+        )
+    with pytest.raises(InstallationTrustPersistenceError, match="fresh"):
+        repository.restart_incomplete(recovery, recovery)
+    with pytest.raises(InstallationTrustPersistenceError, match="prepare"):
+        repository.restart_incomplete(
+            recovery,
+            _trust(InstallationTrustPhase.CREATE_INTENT),
+        )
+    active_repository = TomlInstallationTrustRepository(tmp_path / "active.toml")
+    active_repository.create(_trust(InstallationTrustPhase.ACTIVE))
+    with pytest.raises(InstallationTrustPersistenceError, match="changed"):
+        active_repository.restart_incomplete(prepared, recovery)
+    with pytest.raises(InstallationTrustPersistenceError, match="active"):
+        repository.restart_incomplete(
+            _trust(InstallationTrustPhase.ACTIVE),
+            recovery,
         )
 
 
