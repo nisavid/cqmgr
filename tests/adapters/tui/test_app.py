@@ -80,12 +80,15 @@ from cqmgr.domain.obtainability import (
     CapacityAdvice,
     CapacityHistory,
     DistributionShape,
+    GpuAttachment,
     ObtainabilityBand,
     ObtainabilityCandidate,
     ObtainabilityComparison,
+    ObtainabilityProductCoverage,
     PriceInterval,
     RankedCandidate,
     SpotMachineConfiguration,
+    UnrankedReason,
 )
 from cqmgr.domain.quota_queries import ProviderSourceCoverage, QuotaQueryItem
 from cqmgr.domain.quotas import (
@@ -105,6 +108,7 @@ from cqmgr.domain.results import (
     OperationName,
     OperationResult,
     Outcome,
+    Provenance,
     StableSymbol,
 )
 from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
@@ -378,6 +382,144 @@ def _obtainability_result() -> OperationResult[ObtainabilityComparison]:
             verification=PrincipalVerification.VERIFIED,
             acting_principal=PrincipalIdentity(
                 "principal://accounts.google.com/operator@example.com"
+            ),
+        ),
+    )
+
+
+def _incomplete_obtainability_result() -> OperationResult[ObtainabilityComparison]:
+    """Retain ranked ties and unsupported N1 history with incomplete evidence."""
+    machine = SpotMachineConfiguration("a3-highgpu-8g")
+    candidates = (
+        ObtainabilityCandidate(
+            "us-central1",
+            ("us-central1-a", "us-central1-b"),
+            machine,
+            2,
+            DistributionShape.BALANCED,
+        ),
+        ObtainabilityCandidate(
+            "us-east1",
+            ("us-east1-b", "us-east1-c"),
+            machine,
+            2,
+            DistributionShape.BALANCED,
+        ),
+    )
+    advice = CapacityAdvice(Decimal("0.8"), "7d", (), NOW)
+    history = CapacityHistory(
+        machine.machine_type,
+        "us-central1",
+        (),
+        (),
+        NOW,
+    )
+    n1_machine = SpotMachineConfiguration(
+        "n1-standard-8",
+        GpuAttachment("nvidia-tesla-t4", 1),
+    )
+    n1_candidate = ObtainabilityCandidate(
+        "us-west1",
+        ("us-west1-a",),
+        n1_machine,
+        1,
+        DistributionShape.ANY_SINGLE_ZONE,
+    )
+    comparison = ObtainabilityComparison(
+        (
+            RankedCandidate(
+                candidates[0],
+                advice,
+                history,
+                ObtainabilityBand.HIGH,
+                Decimal("0.12"),
+                Decimal("6.50"),
+                1,
+                (),
+            ),
+            RankedCandidate(
+                candidates[1],
+                advice,
+                replace(history, location="us-east1"),
+                ObtainabilityBand.HIGH,
+                Decimal("0.12"),
+                Decimal("6.50"),
+                2,
+                (),
+            ),
+            RankedCandidate(
+                n1_candidate,
+                CapacityAdvice(Decimal("0.6"), "1d", (), NOW),
+                None,
+                ObtainabilityBand.MEDIUM,
+                None,
+                None,
+                None,
+                (UnrankedReason.HISTORY_UNSUPPORTED_N1_GPU,),
+            ),
+        ),
+        catalog_coverage=(
+            ObtainabilityProductCoverage(
+                "a3-highgpu-8g",
+                "compute.googleapis.com",
+                True,
+                True,
+                True,
+            ),
+            ObtainabilityProductCoverage(
+                "n1-attached-gpu",
+                "compute.googleapis.com",
+                True,
+                True,
+                False,
+                ("capacityHistory does not support N1 attached GPUs",),
+            ),
+        ),
+    )
+    gap = EvidenceGap(
+        StableSymbol("capacity-history"),
+        StableSymbol("candidate-history-incomplete"),
+    )
+    return OperationResult(
+        operation=OperationName("obtainability.compare"),
+        resource_scope=SCOPE,
+        boundary=OperationBoundary(
+            StableSymbol("spot-advice-assessed"),
+            reached=False,
+        ),
+        outcome=Outcome(
+            StableSymbol("provider-source-incomplete"),
+            ExitClass.INCOMPLETE_EVIDENCE,
+        ),
+        completeness=Completeness.incomplete(gap),
+        started_at=NOW,
+        finished_at=NOW,
+        data=comparison,
+        diagnostics=(
+            Diagnostic(
+                code=DiagnosticCode("capacity-history-incomplete"),
+                severity=Severity.WARNING,
+                phase=DiagnosticPhase("provider-read"),
+                source=DiagnosticSource("capacity-history"),
+                retry=RetryDisposition.AFTER_REFRESH,
+                message=RedactedText(
+                    "One candidate history source is incomplete; ranking is partial."
+                ),
+            ),
+        ),
+        provenance=(
+            Provenance(
+                StableSymbol("capacity-advice"),
+                NOW,
+                StableSymbol("complete"),
+                lifecycle_or_preview_status=RedactedText("Preview"),
+                request_identity=RedactedText("a3-highgpu-8g x2 balanced"),
+            ),
+            Provenance(
+                StableSymbol("capacity-history"),
+                NOW,
+                StableSymbol("incomplete"),
+                request_identity=RedactedText("candidate histories"),
             ),
         ),
     )
@@ -965,6 +1107,40 @@ class DelayedQuotaInspectOperations(ScriptedReadOnlyOperations):
         return result
 
 
+class DelayedObtainabilityOperations(ScriptedReadOnlyOperations):
+    """Delay one advice comparison until the user has left Obtainability."""
+
+    def __init__(self) -> None:
+        super().__init__(_browse_result())
+        self.compare_started = asyncio.Event()
+        self.release_compare = asyncio.Event()
+        self.compare_returned = asyncio.Event()
+
+    @override
+    async def compare_obtainability(
+        self,
+        candidates: tuple[ObtainabilityCandidate, ...],
+        *,
+        deadline: float,
+        support: AdviceSupport,
+        catalog_coverage: tuple[object, ...] = (),
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[ObtainabilityComparison]:
+        self.compare_started.set()
+        await self.release_compare.wait()
+        result = await super().compare_obtainability(
+            candidates,
+            deadline=deadline,
+            support=support,
+            catalog_coverage=catalog_coverage,
+            cancellation=cancellation,
+            scope_input=scope_input,
+        )
+        self.compare_returned.set()
+        return result
+
+
 def test_wide_shell_opens_federated_quota_inspector_with_semantic_evidence() -> None:
     """The default workspace preserves provider truth and independent predicates."""
 
@@ -1115,7 +1291,7 @@ def test_obtainability_standalone_explicit_candidates_share_typed_cli_semantics(
             _input(
                 app, "#obtainability-candidates"
             ).value = "us-central1=us-central1-a,us-central1-b"
-            await pilot.click("#obtainability-compare")
+            _button(app, "#obtainability-compare").press()
             await pilot.pause()
 
             assert len(operations.obtainability_calls) == 1
@@ -1277,6 +1453,69 @@ def test_all_compatible_obtainability_expansion_is_visible_and_explicit() -> Non
             assert "--candidate" not in app.last_copied_cli
 
     asyncio.run(scenario())
+
+
+def test_obtainability_snapshot_preserves_incomplete_evidence_ties_and_n1_limits() -> (
+    None
+):
+    """Semantic snapshots expose partial ranking without implying capacity."""
+
+    async def scenario(size: tuple[int, int], expected_layout: str) -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        operations.obtainability_result = _incomplete_obtainability_result()
+        app = CloudQuotaManagerApp(
+            operations,
+            ScriptedAuditOperations(),
+            no_color=True,
+        )
+
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            _input(app, "#obtainability-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#obtainability-vm-count").value = "2"
+            _input(app, "#obtainability-distribution").value = "balanced"
+            _input(
+                app, "#obtainability-candidates"
+            ).value = (
+                "us-central1=us-central1-a,us-central1-b us-east1=us-east1-b,us-east1-c"
+            )
+            _button(app, "#obtainability-compare").press()
+            await pilot.pause()
+
+            snapshot = app.interface_snapshot()
+            assert f"layout={expected_layout}" in snapshot
+            assert "workspace=obtainability" in snapshot
+            assert "obtainability-breadcrumb=Obtainability / Standalone" in snapshot
+            assert (
+                "obtainability-expansion=Candidate expansion: explicit candidates only."
+                in snapshot
+            )
+            assert "Evidence gap: capacity-history / candidate-history-incomplete" in (
+                snapshot
+            )
+            assert (
+                "WARNING capacity-history-incomplete: One candidate history source "
+                "is incomplete; ranking is partial."
+            ) in snapshot
+            assert (
+                "Exact rank-component tie: yes; canonical candidate identity "
+                "breaks the tie"
+            ) in snapshot
+            assert "Unranked reasons: history-unsupported-n1-attached-gpu" in snapshot
+            assert (
+                "Coverage reasons: capacityHistory does not support N1 attached GPUs"
+                in snapshot
+            )
+            assert "Capacity guarantee: no" in snapshot
+            assert "\x1b" not in snapshot
+
+    async def all_sizes() -> None:
+        await scenario((140, 42), "wide")
+        await scenario((100, 36), "medium")
+        await scenario((72, 28), "narrow")
+
+    asyncio.run(all_sizes())
 
 
 def test_deferred_workload_worker_cannot_reclaim_ownership_after_leaving_quotas(
@@ -1732,6 +1971,46 @@ def test_obtainability_workspace_owns_state_over_older_quota_inspection() -> Non
     asyncio.run(scenario())
 
 
+def test_quota_workspace_owns_state_over_older_obtainability_comparison() -> None:
+    """A stale advice response cannot repaint the UI after leaving Obtainability."""
+
+    async def scenario() -> None:
+        operations = DelayedObtainabilityOperations()
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+        async with app.run_test(size=(100, 36)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            _input(app, "#obtainability-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#obtainability-vm-count").value = "2"
+            _input(app, "#obtainability-distribution").value = "balanced"
+            _input(
+                app, "#obtainability-candidates"
+            ).value = "us-central1=us-central1-a,us-central1-b"
+            _button(app, "#obtainability-compare").press()
+            await operations.compare_started.wait()
+
+            await pilot.click("#workspace-quotas")
+            await pilot.pause()
+            quota_result = app.last_result
+            quota_status = str(_static(app, "#status-line").content)
+            quota_instrument = str(_static(app, "#instrument-bar").content)
+            quota_detail = str(_static(app, "#quota-detail").content)
+            quota_copy_cli = app.last_copied_cli
+
+            operations.release_compare.set()
+            await operations.compare_returned.wait()
+            await pilot.pause()
+
+            assert app.active_workspace == "quotas"
+            assert app.last_result is quota_result
+            assert str(_static(app, "#status-line").content) == quota_status
+            assert str(_static(app, "#instrument-bar").content) == quota_instrument
+            assert str(_static(app, "#quota-detail").content) == quota_detail
+            assert app.last_copied_cli == quota_copy_cli
+
+    asyncio.run(scenario())
+
+
 def test_quota_workspace_owns_state_over_older_audit_load() -> None:
     """An older Audit load cannot replace the active quota operation."""
 
@@ -1957,6 +2236,75 @@ def test_tui_and_cli_consume_the_same_typed_query_and_result(
     tui_query, tui_options = operations.browse_calls[0]
     cli_query, cli_options = operations.browse_calls[1]
     assert tui_query == cli_query == ReadOnlyQuotaQuery()
+    assert (
+        tui_options["scope_input"].explicit_resource_scope
+        == cli_options["scope_input"].explicit_resource_scope
+        == SCOPE
+    )
+
+
+def test_obtainability_tui_and_cli_consume_the_same_typed_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both interfaces preserve the same request and serialized result facts."""
+    operations = ScriptedReadOnlyOperations(_browse_result())
+
+    async def tui_scenario() -> None:
+        app = CloudQuotaManagerApp(
+            operations,
+            ScriptedAuditOperations(),
+            scope_input=ReadOnlyScopeInput(explicit_resource_scope=SCOPE),
+            no_color=True,
+        )
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            _input(app, "#obtainability-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#obtainability-vm-count").value = "2"
+            _input(app, "#obtainability-distribution").value = "balanced"
+            _input(
+                app, "#obtainability-candidates"
+            ).value = "us-central1=us-central1-a,us-central1-b"
+            _button(app, "#obtainability-compare").press()
+            await pilot.pause()
+            assert app.last_result is operations.obtainability_result
+
+    asyncio.run(tui_scenario())
+    monkeypatch.setattr(
+        cli_module,
+        "build_read_only_operations",
+        lambda: operations,
+    )
+
+    cli = CliRunner().invoke(
+        cli_module.main,
+        [
+            "obtainability",
+            "compare",
+            "--resource-scope",
+            SCOPE.canonical_name,
+            "--machine-type",
+            "a3-highgpu-8g",
+            "--vm-count",
+            "2",
+            "--distribution-shape",
+            "balanced",
+            "--candidate",
+            "us-central1=us-central1-a,us-central1-b",
+            "--output",
+            "json",
+            "--no-color",
+            "--quiet",
+        ],
+    )
+
+    assert cli.exit_code == 0, cli.output
+    assert json.loads(cli.stdout) == operation_result_mapping(
+        operations.obtainability_result
+    )
+    tui_candidates, tui_options = operations.obtainability_calls[0]
+    cli_candidates, cli_options = operations.obtainability_calls[1]
+    assert tui_candidates == cli_candidates
     assert (
         tui_options["scope_input"].explicit_resource_scope
         == cli_options["scope_input"].explicit_resource_scope

@@ -862,6 +862,58 @@ class CloudQuotaManagerApp(App[None]):
                     "audit=" + str(self.query_one("#audit-detail", Static).content),
                 )
             )
+            if self.active_workspace == "obtainability":
+                machine_type = self.query_one(
+                    "#obtainability-machine-type",
+                    Input,
+                ).value
+                gpu_type = self.query_one("#obtainability-gpu-type", Input).value
+                gpu_count = self.query_one("#obtainability-gpu-count", Input).value
+                lines.extend(
+                    (
+                        "obtainability-breadcrumb="
+                        + str(
+                            self.query_one(
+                                "#obtainability-breadcrumb",
+                                Static,
+                            ).content
+                        ),
+                        "obtainability-request="
+                        f"machine={machine_type} "
+                        f"gpu={gpu_type or 'none'} "
+                        f"gpu-count={gpu_count or 'none'} "
+                        "vm-count="
+                        + self.query_one("#obtainability-vm-count", Input).value
+                        + " distribution="
+                        + self.query_one(
+                            "#obtainability-distribution",
+                            Input,
+                        ).value,
+                        "obtainability-candidates="
+                        + self.query_one("#obtainability-candidates", Input).value,
+                        "obtainability-expansion="
+                        + str(
+                            self.query_one(
+                                "#obtainability-expansion",
+                                Static,
+                            ).content
+                        ),
+                        "obtainability-detail="
+                        + str(
+                            self.query_one(
+                                "#obtainability-detail",
+                                Static,
+                            ).content
+                        ),
+                        "obtainability-copy-cli="
+                        + str(
+                            self.query_one(
+                                "#obtainability-copy-cli",
+                                Static,
+                            ).content
+                        ),
+                    )
+                )
         return "\n".join(lines)
 
     def _instrument_snapshot(self, result: OperationResult[Any]) -> str:
@@ -1465,7 +1517,18 @@ class CloudQuotaManagerApp(App[None]):
             "Obtainability comparison",
             f"Outcome: {result.outcome.code.value}",
             "Complete: " + ("yes" if result.completeness.is_complete else "no"),
+            "Partial evidence retained: "
+            + ("yes" if result.completeness.has_partial_data else "no"),
         ]
+        lines.extend(
+            f"Evidence gap: {gap.source.value} / {gap.reason.value}"
+            for gap in result.completeness.gaps
+        )
+        lines.extend(
+            f"{diagnostic.severity.value.upper()} {diagnostic.code.value}: "
+            f"{diagnostic.message} (retry: {diagnostic.retry.value})"
+            for diagnostic in result.diagnostics
+        )
         if isinstance(data, ObtainabilityComparison):
             if data.resolver_provenance is not None:
                 compatible = tuple(
@@ -1490,6 +1553,7 @@ class CloudQuotaManagerApp(App[None]):
                 lines.extend(
                     (
                         f"Catalog product: {coverage.product_id}",
+                        f"Catalog service: {coverage.service}",
                         f"Cataloged: {str(coverage.cataloged).lower()}",
                         "Current advice supported: "
                         f"{str(coverage.current_advice_supported).lower()}",
@@ -1561,11 +1625,15 @@ class CloudQuotaManagerApp(App[None]):
                             f"Advice source: {advice.source}",
                         )
                     )
-                    lines.extend(
-                        f"Recommended shard: {shard.zone} · {shard.machine_type} · "
-                        f"{shard.vm_count} VM · {shard.provisioning_model}"
-                        for shard in advice.shards
-                    )
+                    if advice.shards:
+                        lines.extend(
+                            f"Recommended shard: {shard.zone} · "
+                            f"{shard.machine_type} · {shard.vm_count} VM · "
+                            f"{shard.provisioning_model}"
+                            for shard in advice.shards
+                        )
+                    else:
+                        lines.append("Recommended shards: none returned")
                 lines.extend(
                     (
                         "30-day p90 preemption: "
@@ -1597,18 +1665,46 @@ class CloudQuotaManagerApp(App[None]):
                     )
         elif isinstance(data, ReadOnlyFailureData):
             lines.append(f"Reason: {data.reason}")
-        lines.extend(
-            f"Evidence source: {item.source.value} · coverage {item.coverage.value} · "
-            "request "
-            + (
+        lines.extend(self._obtainability_provenance_lines(result))
+        self.query_one("#obtainability-detail", Static).update("\n".join(lines))
+        self._set_status(self._result_status(result))
+
+    @staticmethod
+    def _obtainability_provenance_lines(
+        result: OperationResult[Any],
+    ) -> tuple[str, ...]:
+        lines: list[str] = []
+        for item in result.provenance:
+            request = (
                 item.request_identity.value
                 if item.request_identity is not None
                 else "none"
             )
-            for item in result.provenance
-        )
-        self.query_one("#obtainability-detail", Static).update("\n".join(lines))
-        self._set_status(self._result_status(result))
+            interval_start = (
+                item.interval_started_at.isoformat()
+                if item.interval_started_at is not None
+                else "none"
+            )
+            interval_finish = (
+                item.interval_finished_at.isoformat()
+                if item.interval_finished_at is not None
+                else "none"
+            )
+            status = (
+                item.lifecycle_or_preview_status.value
+                if item.lifecycle_or_preview_status is not None
+                else "none"
+            )
+            lines.extend(
+                (
+                    f"Evidence source: {item.source.value} · "
+                    f"coverage {item.coverage.value} · "
+                    f"observed {item.observed_at.isoformat()} · request {request}",
+                    "Evidence interval: "
+                    f"{interval_start} through {interval_finish} · status {status}",
+                )
+            )
+        return tuple(lines)
 
     @staticmethod
     def _obtainability_tie_components(
