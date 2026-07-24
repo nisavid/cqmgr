@@ -7,13 +7,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, cast
+from decimal import Decimal
+from enum import Enum
+from typing import TYPE_CHECKING, Any, cast, override
 
 import pytest
 from click.testing import CliRunner
-from textual.widgets import Static
+from textual.widgets import Input, Static
 
 import cqmgr.cli as cli_module
 from cqmgr.adapters.cli.lifecycle import (
@@ -69,6 +72,12 @@ from cqmgr.application.ports.secrets import (
 from cqmgr.application.ports.watch import WatchObservation
 from cqmgr.domain.apply_records import ApplyChildDisposition
 from cqmgr.domain.audit import AuditFactName, AuditQuery
+from cqmgr.domain.diagnostics import (
+    DiagnosticCode,
+    DiagnosticPhase,
+    DiagnosticSource,
+)
+from cqmgr.domain.identity import PrincipalIdentity
 from cqmgr.domain.plans import (
     ContactBinding,
     PlanKind,
@@ -83,6 +92,7 @@ from cqmgr.domain.quotas import (
     QuotaScope,
     QuotaUnit,
 )
+from cqmgr.domain.redaction import RedactedText
 from cqmgr.domain.results import OperationResult, StableSymbol
 from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 from cqmgr.domain.status import (
@@ -109,6 +119,7 @@ if TYPE_CHECKING:
         WatchCheckpointRepository,
         WatchObservationRequest,
     )
+    from cqmgr.domain.audit import AuditRecordDraft
     from cqmgr.domain.watch import WatchStreamEvent
 
 NOW = datetime(2026, 7, 24, 12, tzinfo=UTC)
@@ -160,8 +171,13 @@ class _MemoryConsumptionStore:
         return SecretStoreOutcome(SecretStoreStatus.DELETED)
 
 
-class _CurrentPlanRevalidator:
-    """Return exact current facts from the hermetic Preview plan."""
+class _CurrentSourceRevalidator:
+    """Return independently known current facts from the Preview source."""
+
+    def __init__(self, kind: PlanKind) -> None:
+        self._children = {
+            child.child_id: child for child in _composition(kind).children
+        }
 
     async def refresh(self, plan: QuotaPlan, _now: datetime) -> ApplyRevalidation:
         return ApplyRevalidation(
@@ -174,11 +190,11 @@ class _CurrentPlanRevalidator:
                 RefreshedApplyChild(
                     child_id=child.child_id,
                     slice_identity=child.slice_identity,
-                    effective=child.effective,
-                    usage=child.usage,
-                    preference_name=child.preference_name,
-                    preference_etag=child.preference_etag,
-                    evidence=child.evidence,
+                    effective=self._children[child.child_id].effective,
+                    usage=self._children[child.child_id].usage,
+                    preference_name=self._children[child.child_id].preference_name,
+                    preference_etag=self._children[child.child_id].preference_etag,
+                    evidence=self._children[child.child_id].evidence,
                 )
                 for child in plan.children
             ),
@@ -293,18 +309,17 @@ class _UnusedAuditSurface:
 class _RequestFactory:
     """Resolve CLI adapter values to the same protected test context."""
 
-    def __init__(self, clock: _Clock) -> None:
+    def __init__(self, clock: _Clock, kind: PlanKind) -> None:
         self.clock = clock
+        self.kind = kind
 
     def compose(self, value: RequestCompositionInput) -> ComposeRequest:
-        del value
-        message = "cross-surface test composes through Textual"
-        raise AssertionError(message)
+        assert value.target_strategy is TargetStrategy.MANUAL
+        assert (value.selector is not None) == (self.kind is PlanKind.SINGLE)
+        return _composition(self.kind)
 
     def preview(self, value: RequestCompositionInput) -> PreviewRequest:
-        del value
-        message = "cross-surface test previews through Textual"
-        raise AssertionError(message)
+        return replace(_preview_request(self.kind), plan_out=value.plan_out)
 
     def review(self, value: PlanReferenceInput) -> PlanReviewRequest:
         return PlanReviewRequest(
@@ -425,7 +440,7 @@ def _preview_request(kind: PlanKind) -> PreviewRequest:
     )
 
 
-def _harness(root: Path) -> _Harness:
+def _harness(root: Path, kind: PlanKind) -> _Harness:
     repository = LocalPlanRepository(root / "plans", _MemoryConsumptionStore())
     apply_records = LocalApplyRecordRepository(root / "apply")
     audit = FilesystemAuditJournal(root / "audit")
@@ -441,7 +456,7 @@ def _harness(root: Path) -> _Harness:
         apply_records=cast("ApplyRecordRepository", apply_records),
         audit=cast("AuditJournal", audit),
         codec=cast("PlanCodecPort", PlanCodec()),
-        revalidator=cast("ApplyRevalidator", _CurrentPlanRevalidator()),
+        revalidator=cast("ApplyRevalidator", _CurrentSourceRevalidator(kind)),
         writer=cast("QuotaPreferenceWriter", writer),
         unknown_resolver=cast(
             "QuotaPreferenceUnknownResolver",
@@ -463,7 +478,7 @@ def _harness(root: Path) -> _Harness:
         poll_interval_seconds=1,
     )
     facade = LifecycleOperations(plans, apply, watch)
-    return _Harness(facade, _RequestFactory(clock), audit, writer, clock)
+    return _Harness(facade, _RequestFactory(clock, kind), audit, writer, clock)
 
 
 async def _textual_preview(
@@ -487,30 +502,6 @@ async def _textual_preview(
         return cast("OperationResult[Any]", result)
 
 
-async def _textual_watch(
-    facade: LifecycleOperations,
-    request: WatchRequest,
-) -> tuple[OperationResult[Any], str]:
-    app = CloudQuotaManagerApp(
-        _OfflineReads(),  # type: ignore[arg-type]
-        _UnusedAuditSurface(),  # type: ignore[arg-type]
-        lifecycle=facade,
-    )
-    async with app.run_test(size=(110, 38)) as pilot:
-        await pilot.pause()
-        app.prepare_watch(request, bound_scope=SCOPE)
-        app._submit_lifecycle_watch()
-        await pilot.pause()
-        await pilot.pause()
-        assert app.last_result is not None
-        resume = app._lifecycle_state.latest_resume
-        assert resume is not None
-        detail = str(app.query_one("#lifecycle-detail", Static).content)
-        assert "Terminal outcome: granted" in detail
-        assert "Resume token: available" in detail
-        return app.last_result, resume
-
-
 def _json_result(
     runner: CliRunner,
     arguments: list[str],
@@ -520,14 +511,102 @@ def _json_result(
     return cast("dict[str, object]", json.loads(result.stdout))
 
 
-@pytest.mark.parametrize("kind", [PlanKind.SINGLE, PlanKind.BUNDLE])
-def test_textual_plan_is_reviewed_applied_and_resumed_through_cli(  # noqa: PLR0915
-    tmp_path: Path,
+class _RecordingApp(CloudQuotaManagerApp):
+    """Retain every complete typed Watch event consumed by Textual."""
+
+    def __init__(self, facade: LifecycleOperations) -> None:
+        super().__init__(
+            _OfflineReads(),  # type: ignore[arg-type]
+            _UnusedAuditSurface(),  # type: ignore[arg-type]
+            lifecycle=facade,
+        )
+        self.watch_events: list[WatchStreamEvent] = []
+
+    @override
+    def _render_watch_event(self, event: WatchStreamEvent) -> None:
+        self.watch_events.append(event)
+        super()._render_watch_event(event)
+
+
+async def _textual_review_apply_watch(
+    harness: _Harness,
+    digest: str,
+) -> tuple[
+    OperationResult[Any],
+    OperationResult[Any],
+    tuple[WatchStreamEvent, ...],
+]:
+    """Drive Review, Apply, and initial Watch through one Textual session."""
+    app = _RecordingApp(harness.facade)
+    review_request = harness.factory.review(PlanReferenceInput(digest, None))
+    apply_request = harness.factory.apply(
+        PlanReferenceInput(digest, None),
+        SCOPE.canonical_name,
+    )
+    async with app.run_test(size=(110, 38)) as pilot:
+        await pilot.pause()
+        review = app.open_plan_review(review_request)
+        app.prepare_apply(apply_request)
+        app.query_one(
+            "#apply-scope-acknowledgement", Input
+        ).value = SCOPE.canonical_name
+        app._submit_lifecycle_apply()
+        await pilot.pause()
+        await pilot.pause()
+        applied = app.last_result
+        assert applied is not None
+        assert applied.operation.value == "plan.apply"
+        assert applied.data.intent_id is not None
+        app.prepare_watch(
+            WatchRequest(
+                intent_id=applied.data.intent_id,
+                condition=WatchCondition.GRANTED,
+                resume=None,
+                authentication_key=KEY,
+                installation_id=INSTALLATION_ID,
+                deadline=harness.clock.monotonic() + 10,
+                cancellation=CancellationToken(),
+            ),
+            bound_scope=SCOPE,
+        )
+        app._submit_lifecycle_watch()
+        await pilot.pause()
+        await pilot.pause()
+        assert app.watch_events
+        return review, applied, tuple(app.watch_events)
+
+
+async def _textual_resume_watch(
+    harness: _Harness,
+    resume: str,
+) -> tuple[WatchStreamEvent, ...]:
+    """Resume one Watch stream through Textual and retain every typed event."""
+    app = _RecordingApp(harness.facade)
+    async with app.run_test(size=(110, 38)) as pilot:
+        await pilot.pause()
+        app.prepare_watch(
+            WatchRequest(
+                intent_id=None,
+                condition=None,
+                resume=resume,
+                authentication_key=KEY,
+                installation_id=INSTALLATION_ID,
+                deadline=harness.clock.monotonic() + 10,
+                cancellation=CancellationToken(),
+            ),
+            bound_scope=SCOPE,
+        )
+        app._submit_lifecycle_watch()
+        await pilot.pause()
+        await pilot.pause()
+        assert app.watch_events
+        return tuple(app.watch_events)
+
+
+def _install_cli_runtime(
     monkeypatch: pytest.MonkeyPatch,
-    kind: PlanKind,
+    harness: _Harness,
 ) -> None:
-    """Both surfaces preserve the same typed lifecycle and durable evidence."""
-    harness = _harness(tmp_path / kind.value)
     monkeypatch.setattr(
         cli_module,
         "build_lifecycle_cli_runtime",
@@ -536,134 +615,328 @@ def test_textual_plan_is_reviewed_applied_and_resumed_through_cli(  # noqa: PLR0
             cast("LifecycleCliRequestFactory", harness.factory),
         ),
     )
-    captured_results: list[OperationResult[Any]] = []
-    original_emit_result = cli_module.emit_lifecycle_result
 
-    def capture_result(
-        result: OperationResult[Any],
-        presentation: object,
-    ) -> int:
-        captured_results.append(result)
-        return original_emit_result(result, presentation)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(cli_module, "emit_lifecycle_result", capture_result)
+def _cli_result(
+    monkeypatch: pytest.MonkeyPatch,
+    harness: _Harness,
+    arguments: list[str],
+) -> tuple[OperationResult[Any], dict[str, object]]:
+    """Return both the typed result and complete CLI JSON representation."""
+    captured: list[OperationResult[Any]] = []
+    original = cli_module.emit_lifecycle_result
 
+    def capture(result: OperationResult[Any], presentation: object) -> int:
+        captured.append(result)
+        return original(result, presentation)  # type: ignore[arg-type]
+
+    with monkeypatch.context() as context:
+        _install_cli_runtime(context, harness)
+        context.setattr(cli_module, "emit_lifecycle_result", capture)
+        mapping = _json_result(CliRunner(), arguments)
+    assert len(captured) == 1
+    assert mapping == operation_result_mapping(captured[0])
+    return captured[0], mapping
+
+
+def _cli_watch(
+    monkeypatch: pytest.MonkeyPatch,
+    harness: _Harness,
+    arguments: list[str],
+) -> tuple[tuple[WatchStreamEvent, ...], tuple[dict[str, object], ...]]:
+    """Return every typed event and its complete CLI JSONL representation."""
+    captured: list[WatchStreamEvent] = []
+    original = cli_module.emit_watch_event
+
+    def capture(event: WatchStreamEvent, presentation: object) -> None:
+        captured.append(event)
+        original(event, presentation)  # type: ignore[arg-type]
+
+    with monkeypatch.context() as context:
+        _install_cli_runtime(context, harness)
+        context.setattr(cli_module, "emit_watch_event", capture)
+        result = CliRunner().invoke(cli_module.main, arguments)
+    assert result.exit_code == 0, result.output
+    mappings = tuple(
+        cast("dict[str, object]", json.loads(line))
+        for line in result.stdout.splitlines()
+    )
+    assert len(mappings) == len(captured)
+    assert mappings == tuple(
+        cast("dict[str, object]", _watch_value(event)) for event in captured
+    )
+    return tuple(captured), mappings
+
+
+def _watch_value(value: object) -> object:  # noqa: C901, PLR0911
+    """Independently map every typed Watch fact to its public JSON value."""
+    if isinstance(value, OperationResult):
+        return operation_result_mapping(value)
+    if isinstance(value, ResourceScope):
+        return {"type": value.kind.value, "name": value.canonical_name}
+    if isinstance(value, QuotaQuantity):
+        return {"value": value.base10, "unit": value.unit.symbol}
+    if isinstance(
+        value,
+        (
+            StableSymbol,
+            DiagnosticCode,
+            DiagnosticPhase,
+            DiagnosticSource,
+            PrincipalIdentity,
+            RedactedText,
+        ),
+    ):
+        return value.value
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, datetime):
+        return value.isoformat().replace("+00:00", "Z")
+    if isinstance(value, Decimal):
+        return str(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _watch_value(getattr(value, field.name))
+            for field in fields(value)
+        }
+    if isinstance(value, Mapping):
+        return {str(key): _watch_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_watch_value(item) for item in value]
+    return value
+
+
+def _cli_preview_arguments(kind: PlanKind) -> list[str]:
+    common = [
+        "request",
+        "preview",
+        "--resource-scope",
+        SCOPE.canonical_name,
+        "--output",
+        "json",
+    ]
+    if kind is PlanKind.SINGLE:
+        return [
+            *common,
+            "--service",
+            "compute.googleapis.com",
+            "--quota-id",
+            "GPU-DIRECT",
+            "--location",
+            "us-central1",
+            "--target",
+            "8",
+        ]
+    return [
+        *common,
+        "--machine-type",
+        "a4-highgpu-8g",
+        "--instance-count",
+        "1",
+        "--provisioning-model",
+        "standard",
+        "--candidate",
+        "us-central1-a",
+        "--target-strategy",
+        "manual",
+        "--target",
+        "direct=8",
+        "--target",
+        "companion=9",
+    ]
+
+
+def _review_arguments(digest: str) -> list[str]:
+    return ["plan", "review", "--plan", digest, "--output", "json"]
+
+
+def _apply_arguments(digest: str) -> list[str]:
+    return [
+        "plan",
+        "apply",
+        "--plan",
+        digest,
+        "--acknowledge-resource-scope",
+        SCOPE.canonical_name,
+        "--output",
+        "json",
+    ]
+
+
+def _initial_watch_arguments(intent_id: str) -> list[str]:
+    return [
+        "request",
+        "watch",
+        "--intent-id",
+        intent_id,
+        "--condition",
+        "granted",
+        "--deadline",
+        "2026-07-25T00:00:00Z",
+        "--output",
+        "jsonl",
+    ]
+
+
+def _resume_watch_arguments(resume: str) -> list[str]:
+    return [
+        "request",
+        "watch",
+        "--resume",
+        resume,
+        "--deadline",
+        "2026-07-25T00:00:00Z",
+        "--output",
+        "jsonl",
+    ]
+
+
+@dataclass(frozen=True)
+class _WorkflowEvidence:
+    preview: OperationResult[Any]
+    review: OperationResult[Any]
+    applied: OperationResult[Any]
+    initial_watch: tuple[WatchStreamEvent, ...]
+    resumed_watch: tuple[WatchStreamEvent, ...]
+    audit_drafts: tuple[AuditRecordDraft, ...]
+    writes: tuple[QuotaPreferenceWrite, ...]
+
+
+def _audit_drafts(harness: _Harness) -> tuple[AuditRecordDraft, ...]:
+    return tuple(
+        record.draft for record in harness.audit.query(AuditQuery(limit=100)).records
+    )
+
+
+def _textual_created_workflow(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: PlanKind,
+) -> _WorkflowEvidence:
+    harness = _harness(root, kind)
     preview = asyncio.run(_textual_preview(harness.facade, _preview_request(kind)))
     digest = preview.data.plan_digest
     assert digest is not None
-    assert preview.data.plan is not None
-
-    runner = CliRunner()
-    review_json = _json_result(
-        runner,
-        ["plan", "review", "--plan", digest, "--output", "json"],
+    review, _review_json = _cli_result(
+        monkeypatch,
+        harness,
+        _review_arguments(digest),
     )
-    review = captured_results[-1]
-    assert review_json == operation_result_mapping(review)
-    assert review.diagnostics == preview.diagnostics
-    assert review.data.review is not None
-    assert review.data.review.plan == preview.data.plan
-    assert review.data.review.digest == digest
-
-    apply_json = _json_result(
-        runner,
-        [
-            "plan",
-            "apply",
-            "--plan",
-            digest,
-            "--acknowledge-resource-scope",
-            SCOPE.canonical_name,
-            "--output",
-            "json",
-        ],
+    applied, _apply_json = _cli_result(
+        monkeypatch,
+        harness,
+        _apply_arguments(digest),
     )
-    applied = captured_results[-1]
-    assert apply_json == operation_result_mapping(applied)
-    assert applied.diagnostics == review.diagnostics
-    assert tuple(child.disposition for child in applied.data.children) == (
-        ApplyChildDisposition.ACCEPTED,
-    ) * len(preview.data.plan.children)
-    assert tuple(write.child_id for write in harness.writer.requests) == tuple(
-        child.child_id for child in preview.data.plan.children
+    assert applied.data.intent_id is not None
+    initial_watch, _initial_jsonl = _cli_watch(
+        monkeypatch,
+        harness,
+        _initial_watch_arguments(applied.data.intent_id),
+    )
+    resume = initial_watch[-1].resume
+    resumed_watch = asyncio.run(_textual_resume_watch(harness, resume))
+    return _WorkflowEvidence(
+        preview,
+        review,
+        applied,
+        initial_watch,
+        resumed_watch,
+        _audit_drafts(harness),
+        tuple(harness.writer.requests),
     )
 
-    audit_records = harness.audit.query(AuditQuery(limit=100)).records
-    returned_audit_ids = {
-        preview.data.audit_record_id,
-        *applied.data.audit_record_ids,
-    }
-    assert returned_audit_ids <= {record.record_id for record in audit_records}
-    preview_record = next(
-        record
-        for record in audit_records
-        if record.record_id == preview.data.audit_record_id
+
+def _cli_created_workflow(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: PlanKind,
+) -> _WorkflowEvidence:
+    harness = _harness(root, kind)
+    preview, _preview_json = _cli_result(
+        monkeypatch,
+        harness,
+        _cli_preview_arguments(kind),
     )
-    preview_facts = {
-        (fact.name, fact.value.value) for fact in preview_record.draft.facts
-    }
-    assert (AuditFactName.PLAN_DIGEST, digest) in preview_facts
-    assert sum(
-        name is AuditFactName.PLAN_CHILD for name, _value in preview_facts
-    ) == len(preview.data.plan.children)
-    apply_disposition_facts = {
-        fact.value.value
-        for record in audit_records
-        for fact in record.draft.facts
-        if fact.name is AuditFactName.DISPOSITION
-    }
-    assert "accepted" in apply_disposition_facts
-
-    intent_id = applied.data.intent_id
-    assert intent_id is not None
-    typed_watch, resume = asyncio.run(
-        _textual_watch(
-            harness.facade,
-            WatchRequest(
-                intent_id=intent_id,
-                condition=WatchCondition.GRANTED,
-                resume=None,
-                authentication_key=KEY,
-                installation_id=INSTALLATION_ID,
-                deadline=harness.clock.monotonic() + 10,
-                cancellation=CancellationToken(),
-            ),
-        )
+    digest = preview.data.plan_digest
+    assert digest is not None
+    review, applied, initial_watch = asyncio.run(
+        _textual_review_apply_watch(harness, digest)
     )
-    assert typed_watch.data.resume == resume
-    assert typed_watch.diagnostics == ()
-
-    captured_events: list[WatchStreamEvent] = []
-    original_emit_event = cli_module.emit_watch_event
-
-    def capture_event(event: WatchStreamEvent, presentation: object) -> None:
-        captured_events.append(event)
-        original_emit_event(event, presentation)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(cli_module, "emit_watch_event", capture_event)
-    watched = runner.invoke(
-        cli_module.main,
-        [
-            "request",
-            "watch",
-            "--resume",
-            resume,
-            "--deadline",
-            "2026-07-25T00:00:00Z",
-            "--output",
-            "jsonl",
-        ],
+    resume = initial_watch[-1].resume
+    resumed_watch, _resumed_jsonl = _cli_watch(
+        monkeypatch,
+        harness,
+        _resume_watch_arguments(resume),
     )
-    assert watched.exit_code == 0, watched.output
-    jsonl_events = [json.loads(line) for line in watched.stdout.splitlines()]
-    assert len(jsonl_events) == len(captured_events)
-    for mapping, event in zip(jsonl_events, captured_events, strict=True):
-        assert mapping["resume"] == event.resume
-        assert mapping["diagnostics"] == []
-        assert mapping["aggregate"]["disposition"] == event.aggregate.disposition.value
-        assert [
-            child["child"]["disposition"] for child in mapping["aggregate"]["children"]
-        ] == [child.child.disposition.value for child in event.aggregate.children]
-        if event.result is not None:
-            assert mapping["result"] == operation_result_mapping(event.result)
-            assert event.result.data.resume == event.resume
+    return _WorkflowEvidence(
+        preview,
+        review,
+        applied,
+        initial_watch,
+        resumed_watch,
+        _audit_drafts(harness),
+        tuple(harness.writer.requests),
+    )
+
+
+@pytest.mark.parametrize("kind", [PlanKind.SINGLE, PlanKind.BUNDLE])
+def test_lifecycle_is_semantically_equal_in_both_cross_surface_directions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: PlanKind,
+) -> None:
+    """Either surface can create a Plan completed and resumed by the other."""
+    textual_created = _textual_created_workflow(
+        tmp_path / "textual" / kind.value,
+        monkeypatch,
+        kind,
+    )
+    cli_created = _cli_created_workflow(
+        tmp_path / "cli" / kind.value,
+        monkeypatch,
+        kind,
+    )
+
+    assert operation_result_mapping(textual_created.preview) == (
+        operation_result_mapping(cli_created.preview)
+    )
+    assert operation_result_mapping(textual_created.review) == (
+        operation_result_mapping(cli_created.review)
+    )
+    assert operation_result_mapping(textual_created.applied) == (
+        operation_result_mapping(cli_created.applied)
+    )
+    assert textual_created.preview.diagnostics == cli_created.preview.diagnostics
+    assert textual_created.review.diagnostics == cli_created.review.diagnostics
+    assert textual_created.applied.diagnostics == cli_created.applied.diagnostics
+    assert textual_created.initial_watch == cli_created.initial_watch
+    assert textual_created.resumed_watch == cli_created.resumed_watch
+    assert textual_created.initial_watch[-1].resume == (
+        cli_created.initial_watch[-1].resume
+    )
+    assert textual_created.resumed_watch[-1].resume == (
+        cli_created.resumed_watch[-1].resume
+    )
+    assert textual_created.audit_drafts == cli_created.audit_drafts
+    assert textual_created.writes == cli_created.writes
+    assert textual_created.preview.data.plan is not None
+    assert tuple(
+        child.disposition for child in textual_created.applied.data.children
+    ) == (ApplyChildDisposition.ACCEPTED,) * len(
+        textual_created.preview.data.plan.children
+    )
+    assert all(
+        child.usage is not None for child in textual_created.preview.data.plan.children
+    )
+    assert textual_created.initial_watch[-1].result is not None
+    assert textual_created.initial_watch[-1].result.diagnostics == ()
+    assert any(
+        fact.name is AuditFactName.PLAN_DIGEST
+        for draft in textual_created.audit_drafts
+        for fact in draft.facts
+    )
+    assert any(
+        fact.name is AuditFactName.DISPOSITION and fact.value.value == "accepted"
+        for draft in textual_created.audit_drafts
+        for fact in draft.facts
+    )
