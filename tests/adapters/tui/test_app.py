@@ -170,6 +170,7 @@ if TYPE_CHECKING:
 
 NOW = datetime(2026, 7, 23, 20, tzinfo=UTC)
 SCOPE = ResourceScope(ResourceScopeKind.PROJECT, "projects/123456789")
+OTHER_PROJECT_SCOPE = ResourceScope(ResourceScopeKind.PROJECT, "projects/987654321")
 ALT_SCOPE = ResourceScope(ResourceScopeKind.FOLDER, "folders/987654321")
 UNIT = QuotaUnit("1")
 DEFAULT_SCOPE_INPUT = ReadOnlyScopeInput()
@@ -1289,6 +1290,49 @@ class ScriptedLifecycleOperations:
             yield event
 
 
+class DelayedApplyLifecycleOperations(ScriptedLifecycleOperations):
+    """Hold Apply open so Pilot can exercise consequential navigation."""
+
+    def __init__(self, apply_result: OperationResult[ApplyData]) -> None:
+        super().__init__(apply_result)
+        self.apply_started = asyncio.Event()
+        self.release_apply = asyncio.Event()
+
+    @override
+    async def apply(self, request: ApplyRequest) -> OperationResult[ApplyData]:
+        self.apply_calls.append(request)
+        self.apply_started.set()
+        await self.release_apply.wait()
+        return self.apply_result
+
+
+class DelayedPostApplyReads(ScriptedReadOnlyOperations):
+    """Hold the first affected-slice refresh open after successful Apply."""
+
+    def __init__(self, result: OperationResult[QuotaBrowseData]) -> None:
+        super().__init__(result)
+        self.inspect_started = asyncio.Event()
+        self.release_inspect = asyncio.Event()
+
+    @override
+    async def inspect(
+        self,
+        selector: QuotaInspectSelector,
+        *,
+        deadline: float,
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[QuotaInspectData]:
+        self.inspect_started.set()
+        await self.release_inspect.wait()
+        return await super().inspect(
+            selector,
+            deadline=deadline,
+            cancellation=cancellation,
+            scope_input=scope_input,
+        )
+
+
 def _mutation_slice(quota_id: str) -> EffectiveQuotaSliceIdentity:
     return EffectiveQuotaSliceIdentity(
         SCOPE,
@@ -1392,7 +1436,46 @@ def _apply_result() -> OperationResult[ApplyData]:
     )
 
 
-def _plan_child(child_id: str, *, direct_rank: int) -> QuotaRequestPlanChild:
+def _successful_apply_result() -> OperationResult[ApplyData]:
+    child = ApplyChildData(
+        child_id="direct",
+        disposition=ApplyChildDisposition.ACCEPTED,
+        slice_identity=_mutation_slice("QUOTA-DIRECT"),
+        target=QuotaQuantity(8, UNIT),
+        preference_identity="preferences/direct",
+        etag="etag-direct",
+        trace_id="trace-direct",
+        provider_outcome=StableSymbol("accepted"),
+        audit_record_ids=("audit-direct",),
+    )
+    return OperationResult(
+        operation=OperationName("plan.apply"),
+        resource_scope=SCOPE,
+        boundary=OperationBoundary(
+            StableSymbol("all-children-accepted"),
+            reached=True,
+        ),
+        outcome=Outcome(StableSymbol("submitted"), ExitClass.SUCCESS),
+        completeness=Completeness.complete(),
+        started_at=NOW,
+        finished_at=NOW,
+        data=ApplyData(
+            plan_digest="sha256:" + ("a" * 64),
+            kind=PlanKind.SINGLE,
+            intent_id="intent-success",
+            children=(child,),
+            audit_record_ids=("audit-apply",),
+        ),
+    )
+
+
+def _plan_child(
+    child_id: str,
+    *,
+    direct_rank: int,
+    required_acknowledgements: tuple[StableSymbol, ...] = (),
+    acknowledgements: tuple[StableSymbol, ...] = (),
+) -> QuotaRequestPlanChild:
     return QuotaRequestPlanChild(
         child_id=child_id,
         slice_identity=_mutation_slice(f"QUOTA-{child_id.upper()}"),
@@ -1409,8 +1492,8 @@ def _plan_child(child_id: str, *, direct_rank: int) -> QuotaRequestPlanChild:
         direct_accelerator_rank=direct_rank,
         scope_breadth_rank=1 + direct_rank,
         warnings=(StableSymbol("remaining-bottleneck"),),
-        required_acknowledgements=(),
-        acknowledgements=(),
+        required_acknowledgements=required_acknowledgements,
+        acknowledgements=acknowledgements,
         evidence=(
             EvidenceBinding(
                 StableSymbol("effective-quota"),
@@ -1423,7 +1506,15 @@ def _plan_child(child_id: str, *, direct_rank: int) -> QuotaRequestPlanChild:
 
 def _review_result() -> OperationResult[PlanReviewData]:
     children = (
-        _plan_child("direct", direct_rank=0),
+        _plan_child(
+            "direct",
+            direct_rank=0,
+            required_acknowledgements=(
+                StableSymbol("decrease-below-usage"),
+                StableSymbol("decrease-over-ten-percent"),
+            ),
+            acknowledgements=(StableSymbol("decrease-below-usage"),),
+        ),
         _plan_child("companion", direct_rank=1),
     )
     plan = QuotaRequestBundlePlan(
@@ -1570,6 +1661,24 @@ def _watch_terminal_event(
         started_at=NOW,
         finished_at=NOW,
         data=data,
+        diagnostics=(
+            Diagnostic(
+                code=DiagnosticCode("watch-terminal-warning"),
+                severity=Severity.WARNING,
+                phase=DiagnosticPhase("watch"),
+                source=DiagnosticSource("local-watch"),
+                retry=RetryDisposition.AFTER_REFRESH,
+                message=RedactedText("Watch retained its terminal evidence."),
+            ),
+        ),
+        provenance=(
+            Provenance(
+                StableSymbol("local-watch"),
+                NOW,
+                StableSymbol("accepted-watch-set"),
+                lifecycle_or_preview_status=RedactedText("terminal"),
+            ),
+        ),
     )
     return WatchStreamEvent(
         "stream-42",
@@ -1580,6 +1689,16 @@ def _watch_terminal_event(
         subject,
         aggregate,
         result=result,
+        diagnostics=(
+            Diagnostic(
+                code=DiagnosticCode("watch-material-warning"),
+                severity=Severity.WARNING,
+                phase=DiagnosticPhase("watch"),
+                source=DiagnosticSource("local-watch"),
+                retry=RetryDisposition.AFTER_REFRESH,
+                message=RedactedText("Watch retained a material warning."),
+            ),
+        ),
     )
 
 
@@ -1617,7 +1736,7 @@ def test_wide_shell_opens_federated_quota_inspector_with_semantic_evidence() -> 
     asyncio.run(scenario())
 
 
-def test_single_no_op_preview_preserves_drift_expert_and_contact_placeholders(
+def test_single_no_op_preview_preserves_drift_expert_and_contact_placeholders(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Single Preview keeps expert evidence and protected contact input explicit."""
@@ -1636,6 +1755,8 @@ def test_single_no_op_preview_preserves_drift_expert_and_contact_placeholders(
             direct_accelerator_rank=0,
             scope_breadth_rank=1,
             observed_at=NOW,
+            preference_name="preferences/single",
+            preference_etag="etag-single",
             warnings=("drift-observed", "expert-override"),
         )
         compose_request = ComposeRequest(
@@ -1679,6 +1800,24 @@ def test_single_no_op_preview_preserves_drift_expert_and_contact_placeholders(
                 plan_digest=None,
                 audit_record_id="audit-42",
                 apply_capability=False,
+            ),
+            diagnostics=(
+                Diagnostic(
+                    code=DiagnosticCode("preview-evidence-retained"),
+                    severity=Severity.WARNING,
+                    phase=DiagnosticPhase("preview"),
+                    source=DiagnosticSource("local-plan"),
+                    retry=RetryDisposition.AFTER_REFRESH,
+                    message=RedactedText("Preview retained a material warning."),
+                ),
+            ),
+            provenance=(
+                Provenance(
+                    StableSymbol("local-plan"),
+                    NOW,
+                    StableSymbol("complete-preflight"),
+                    lifecycle_or_preview_status=RedactedText("verified-no-op"),
+                ),
             ),
         )
         lifecycle = ScriptedLifecycleOperations(
@@ -1729,6 +1868,17 @@ def test_single_no_op_preview_preserves_drift_expert_and_contact_placeholders(
             assert "Preview outcome: verified-no-op" in detail
             assert "Plan digest: none (verified no-op)" in detail
             assert "Apply capability: no" in detail
+            assert "Dimensions: region=us-central1" in detail
+            assert "Quota scope: regional" in detail
+            assert "Preference: preferences/single" in detail
+            assert "Preference ETag: etag-single" in detail
+            assert f"Observed at: {NOW.isoformat()}" in detail
+            assert "Outcome: verified-no-op" in detail
+            assert "Exit class: 0" in detail
+            assert "Diagnostic: warning preview-evidence-retained" in detail
+            assert "Provenance: local-plan" in detail
+            assert "Boundary: safe-complete-preview" in detail
+            assert f"Started: {NOW.isoformat()}" in detail
             assert str(_static(app, "#lifecycle-copy-cli").content) == command
 
     asyncio.run(scenario())
@@ -1759,7 +1909,7 @@ def test_bundle_compose_and_non_atomic_apply_keep_scope_and_children_explicit(  
             effective=QuotaQuantity(4, UNIT),
             usage=QuotaQuantity(3, UNIT),
             workload=QuotaQuantity(4, UNIT),
-            manual_target=QuotaQuantity(8, UNIT),
+            manual_target=QuotaQuantity(2, UNIT),
             direct_accelerator_rank=0,
             scope_breadth_rank=1,
             observed_at=NOW,
@@ -1771,6 +1921,11 @@ def test_bundle_compose_and_non_atomic_apply_keep_scope_and_children_explicit(  
             resource_scope=SCOPE,
             children=(no_op, mutation),
             selected_location="us-central1",
+            expert=True,
+            acknowledgements=(
+                "decrease-below-usage",
+                "decrease-over-ten-percent",
+            ),
         )
         result = _apply_result()
         lifecycle = ScriptedLifecycleOperations(result)
@@ -1798,6 +1953,14 @@ def test_bundle_compose_and_non_atomic_apply_keep_scope_and_children_explicit(  
             assert "Disposition: verified no-op" in detail
             assert "Disposition: mutation" in detail
             assert "remaining-companion-bottleneck" in detail
+            assert (
+                "Required acknowledgements: decrease-below-usage, "
+                "decrease-over-ten-percent"
+            ) in detail
+            assert (
+                "Supplied acknowledgements: decrease-below-usage, "
+                "decrease-over-ten-percent"
+            ) in detail
             assert "ordered and non-atomic" in detail
 
             apply_request = ApplyRequest(
@@ -1837,6 +2000,11 @@ def test_bundle_compose_and_non_atomic_apply_keep_scope_and_children_explicit(  
             assert "ETag: etag-0" in detail
             assert "Trace ID: trace-direct" in detail
             assert "Unknown resolution: accepted" in detail
+            unknown_block = detail.split("3. uncertain", maxsplit=1)[1].split(
+                "4. companion",
+                maxsplit=1,
+            )[0]
+            assert "Watchable now: yes" in unknown_block
             assert "Audit record IDs: audit-direct" in detail
             assert "Audit record IDs: audit-apply" in detail
             assert "Diagnostic: warning dispatch-partial" in detail
@@ -1864,7 +2032,88 @@ def test_bundle_compose_and_non_atomic_apply_keep_scope_and_children_explicit(  
             assert "REFRESHED — 4/4 affected slices" in str(
                 _static(app, "#status-line").content
             )
+            refreshed = str(_static(app, "#quota-detail").content)
+            assert "Apply child direct: accepted" in refreshed
+            assert "Apply child unchanged: failed" in refreshed
+            assert "Apply child uncertain: unknown" in refreshed
+            assert "Apply child companion: unattempted" in refreshed
             assert _table(app, "#quota-ledger").has_focus
+
+    asyncio.run(scenario())
+
+
+def test_successful_apply_returns_and_reconciles_under_its_bound_scope() -> None:
+    """Apply owns navigation through bound-scope affected-slice reconciliation."""
+
+    async def scenario() -> None:
+        operations = DelayedPostApplyReads(_browse_result())
+        lifecycle = DelayedApplyLifecycleOperations(_successful_apply_result())
+        app = CloudQuotaManagerApp(
+            operations,
+            ScriptedAuditOperations(),
+            lifecycle=lifecycle,  # type: ignore[arg-type]
+            scope_input=ReadOnlyScopeInput(
+                explicit_resource_scope=OTHER_PROJECT_SCOPE,
+            ),
+        )
+        request = ApplyRequest(
+            digest="sha256:" + ("a" * 64),
+            authentication_key=SecretValue(b"k" * 32),
+            local_installation_id="installation-42",
+            resource_scope_acknowledgement=SCOPE,
+            principal=PlanPrincipal("principal://accounts/42"),
+            contact_binding=ContactBinding(
+                StableSymbol("direct-user"),
+                "principal://accounts/42",
+                "hmac-sha256:" + ("c" * 64),
+            ),
+            contact_value="operator@example.com",
+            now=NOW,
+        )
+
+        async with app.run_test(size=(120, 42)) as pilot:
+            await pilot.pause()
+            app.prepare_apply(request)
+            _input(app, "#apply-scope-acknowledgement").value = SCOPE.canonical_name
+            await pilot.pause()
+            await pilot.click("#lifecycle-apply")
+            await asyncio.wait_for(lifecycle.apply_started.wait(), timeout=3)
+
+            await pilot.click("#workspace-audit")
+            assert app.active_workspace == "quotas"
+            assert not app.query_one("#lifecycle-route").has_class("hidden")
+
+            lifecycle.release_apply.set()
+            await asyncio.wait_for(operations.inspect_started.wait(), timeout=3)
+            assert app.query_one("#lifecycle-route").has_class("hidden")
+            assert not app.query_one("#quota-workbench").has_class("hidden")
+            assert app.scope_input.explicit_resource_scope == SCOPE
+
+            await pilot.click("#workspace-audit")
+            assert app.active_workspace == "quotas"
+
+            operations.release_inspect.set()
+            await pilot.pause()
+            await pilot.pause()
+
+            assert all(
+                options["scope_input"].explicit_resource_scope == SCOPE
+                for _selector, options in operations.inspect_calls
+            )
+            assert (
+                operations.browse_calls[-1][1]["scope_input"].explicit_resource_scope
+                == SCOPE
+            )
+            detail = str(_static(app, "#quota-detail").content)
+            assert "QUOTA-DIRECT" in detail
+            assert "Apply child direct: accepted" in detail
+            assert "Provider outcome: accepted" in detail
+            assert "Preference: preferences/direct" in detail
+            assert "ETag: etag-direct" in detail
+            assert "Trace ID: trace-direct" in detail
+            assert "REFRESHED — 1/1 affected slices" in str(
+                _static(app, "#status-line").content
+            )
 
     asyncio.run(scenario())
 
@@ -1915,6 +2164,12 @@ def test_plan_review_and_watch_preserve_incapability_and_mixed_grant_evidence(  
             assert "Granted: 5 1" in detail
             assert "Preference: preferences/direct" in detail
             assert "Preference ETag: etag-direct" in detail
+            assert (
+                "Required acknowledgements: decrease-below-usage, "
+                "decrease-over-ten-percent"
+            ) in detail
+            assert "Supplied acknowledgements: decrease-below-usage" in detail
+            assert "Unresolved acknowledgements: decrease-over-ten-percent" in detail
             assert "Evidence effective-quota" in detail
             assert "Age: 30.0 seconds" in detail
             assert "Diagnostic: warning plan-inapplicable" in detail
@@ -1953,12 +2208,27 @@ def test_plan_review_and_watch_preserve_incapability_and_mixed_grant_evidence(  
             assert lifecycle.watch_calls == [request]
             detail = str(_static(app, "#lifecycle-detail").content)
             assert "Aggregate: unmet" in detail
+            assert f"Observed at: {NOW.isoformat()}" in detail
+            assert "Stream ID: stream-42" in detail
+            assert "Slice: compute.googleapis.com / QUOTA-GRANTED" in detail
+            assert "Dimensions: region=us-central1" in detail
+            assert "Quota scope: regional" in detail
+            assert "Target: 8 1" in detail
+            assert "Preference: preferences/granted" in detail
+            assert "Lineage ETag: etag-granted" in detail
+            assert "Lineage trace ID: none" in detail
+            assert "Baseline: 4 1" in detail
+            assert f"Status observed: {NOW.isoformat()}" in detail
             assert "Apply disposition: accepted" in detail
             assert "Grant satisfaction: full" in detail
             assert "Grant satisfaction: partial" in detail
             assert "Apply disposition: unattempted" in detail
             assert "Lifecycle: not in accepted Watch set" in detail
             assert "Terminal outcome: requested-outcome-unmet" in detail
+            assert "Event diagnostic: warning watch-material-warning" in detail
+            assert "Diagnostic: warning watch-terminal-warning" in detail
+            assert "Provenance: local-watch" in detail
+            assert "Last material observation:" in detail
             assert "Resume token: available" in detail
             assert watch_event.aggregate.disposition is WatchDisposition.UNMET
             await pilot.click("#lifecycle-back")
