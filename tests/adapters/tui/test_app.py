@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, override
@@ -94,6 +95,7 @@ if TYPE_CHECKING:
 
 NOW = datetime(2026, 7, 23, 20, tzinfo=UTC)
 SCOPE = ResourceScope(ResourceScopeKind.PROJECT, "projects/123456789")
+ALT_SCOPE = ResourceScope(ResourceScopeKind.FOLDER, "folders/987654321")
 UNIT = QuotaUnit("1")
 DEFAULT_SCOPE_INPUT = ReadOnlyScopeInput()
 
@@ -658,8 +660,12 @@ class FailedReadOnlyOperations(ScriptedReadOnlyOperations):
 class BrowseInspectRaceOperations(ScriptedReadOnlyOperations):
     """Delay a refresh past a completed exact-slice inspection."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        refresh_result: OperationResult[QuotaBrowseData] | None = None,
+    ) -> None:
         super().__init__(_browse_result())
+        self.refresh_result = refresh_result or self.result
         self.refresh_started = asyncio.Event()
         self.release_refresh = asyncio.Event()
         self.refresh_returned = asyncio.Event()
@@ -700,7 +706,37 @@ class BrowseInspectRaceOperations(ScriptedReadOnlyOperations):
         self.refresh_started.set()
         await self.release_refresh.wait()
         self.refresh_returned.set()
-        return self.result
+        return self.refresh_result
+
+
+class DelayedQuotaInspectOperations(ScriptedReadOnlyOperations):
+    """Delay one quota inspection until the user has left Quotas."""
+
+    def __init__(self, inspect_result: OperationResult[QuotaInspectData]) -> None:
+        super().__init__(_browse_result(), inspect_result)
+        self.inspect_started = asyncio.Event()
+        self.release_inspect = asyncio.Event()
+        self.inspect_returned = asyncio.Event()
+
+    @override
+    async def inspect(
+        self,
+        selector: QuotaInspectSelector,
+        *,
+        deadline: float,
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[QuotaInspectData]:
+        self.inspect_started.set()
+        await self.release_inspect.wait()
+        result = await super().inspect(
+            selector,
+            deadline=deadline,
+            cancellation=cancellation,
+            scope_input=scope_input,
+        )
+        self.inspect_returned.set()
+        return result
 
 
 def test_wide_shell_opens_federated_quota_inspector_with_semantic_evidence() -> None:
@@ -1089,6 +1125,79 @@ def test_audit_workspace_owns_state_over_older_quota_refresh() -> None:
     asyncio.run(scenario())
 
 
+def test_obtainability_workspace_owns_state_over_older_quota_refresh() -> None:
+    """An older quota refresh cannot replace the active Obtainability state."""
+
+    async def scenario() -> None:
+        refresh_result = replace(
+            _browse_result(complete=False),
+            resource_scope=ALT_SCOPE,
+            identity_evidence=None,
+        )
+        operations = BrowseInspectRaceOperations(refresh_result)
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            app.action_refresh()
+            await operations.refresh_started.wait()
+
+            await pilot.click("#workspace-obtainability")
+            await pilot.pause()
+            quota_result = app.last_result
+            quota_status = str(_static(app, "#status-line").content)
+            quota_instrument = str(_static(app, "#instrument-bar").content)
+            quota_copy_cli = app.last_copied_cli
+
+            operations.release_refresh.set()
+            await operations.refresh_returned.wait()
+            await pilot.pause()
+
+            assert app.active_workspace == "obtainability"
+            assert app.last_result is quota_result
+            assert str(_static(app, "#status-line").content) == quota_status
+            assert str(_static(app, "#instrument-bar").content) == quota_instrument
+            assert app.last_copied_cli == quota_copy_cli
+
+    asyncio.run(scenario())
+
+
+def test_obtainability_workspace_owns_state_over_older_quota_inspection() -> None:
+    """An older quota inspection cannot replace the active Obtainability state."""
+
+    async def scenario() -> None:
+        inspect_result = replace(
+            _inspect_result(ITEMS[1]),
+            resource_scope=ALT_SCOPE,
+            identity_evidence=None,
+        )
+        operations = DelayedQuotaInspectOperations(inspect_result)
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            _table(app, "#quota-ledger").focus()
+            await pilot.press("enter")
+            await operations.inspect_started.wait()
+
+            await pilot.click("#workspace-obtainability")
+            await pilot.pause()
+            quota_result = app.last_result
+            quota_status = str(_static(app, "#status-line").content)
+            quota_instrument = str(_static(app, "#instrument-bar").content)
+            quota_copy_cli = app.last_copied_cli
+
+            operations.release_inspect.set()
+            await operations.inspect_returned.wait()
+            await pilot.pause()
+
+            assert app.active_workspace == "obtainability"
+            assert app.last_result is quota_result
+            assert str(_static(app, "#status-line").content) == quota_status
+            assert str(_static(app, "#instrument-bar").content) == quota_instrument
+            assert app.last_copied_cli == quota_copy_cli
+
+    asyncio.run(scenario())
+
+
 def test_quota_workspace_owns_state_over_older_audit_load() -> None:
     """An older Audit load cannot replace the active quota operation."""
 
@@ -1190,6 +1299,83 @@ def test_quota_workspace_owns_state_over_older_audit_verification() -> None:
             assert app.last_result is quota_result
             assert str(_static(app, "#status-line").content) == quota_status
             assert str(_static(app, "#audit-detail").content) == audit_detail
+
+    asyncio.run(scenario())
+
+
+def test_newer_audit_verification_owns_state_over_older_audit_load() -> None:
+    """A newer Audit verification cannot be replaced by an older page load."""
+
+    async def scenario() -> None:
+        audit = DelayedAuditOperations((AUDIT_RECORD,))
+        app = CloudQuotaManagerApp(
+            ScriptedReadOnlyOperations(_browse_result()),
+            audit,
+        )
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-audit")
+            await audit.list_started.wait()
+
+            _button(app, "#audit-verify").press()
+            await pilot.pause()
+            verify_result = app.last_result
+            assert verify_result is not None
+            assert verify_result.operation == OperationName("audit.verify")
+            verify_status = str(_static(app, "#status-line").content)
+            verify_detail = str(_static(app, "#audit-detail").content)
+            assert _table(app, "#audit-table").row_count == 0
+
+            audit.release_list.set()
+            await audit.list_returned.wait()
+            await pilot.pause()
+
+            assert app.active_workspace == "audit"
+            assert app.last_result is verify_result
+            assert str(_static(app, "#status-line").content) == verify_status
+            assert str(_static(app, "#audit-detail").content) == verify_detail
+            assert _table(app, "#audit-table").row_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_newer_audit_verification_owns_state_over_older_audit_inspection() -> None:
+    """A newer Audit verification cannot be replaced by an older inspection."""
+
+    async def scenario() -> None:
+        audit = DelayedAuditWorkerOperations((AUDIT_RECORD,))
+        app = CloudQuotaManagerApp(
+            ScriptedReadOnlyOperations(_browse_result()),
+            audit,
+        )
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-audit")
+            await pilot.pause()
+
+            _table(app, "#audit-table").focus()
+            await pilot.press("enter")
+            await audit.inspect_started.wait()
+
+            _button(app, "#audit-verify").press()
+            await audit.verify_started.wait()
+            audit.release_verify.set()
+            await audit.verify_returned.wait()
+            await pilot.pause()
+            verify_result = app.last_result
+            assert verify_result is not None
+            assert verify_result.operation == OperationName("audit.verify")
+            verify_status = str(_static(app, "#status-line").content)
+            verify_detail = str(_static(app, "#audit-detail").content)
+
+            audit.release_inspect.set()
+            await audit.inspect_returned.wait()
+            await pilot.pause()
+
+            assert app.active_workspace == "audit"
+            assert app.last_result is verify_result
+            assert str(_static(app, "#status-line").content) == verify_status
+            assert str(_static(app, "#audit-detail").content) == verify_detail
 
     asyncio.run(scenario())
 
