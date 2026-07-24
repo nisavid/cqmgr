@@ -1012,6 +1012,55 @@ def test_apply_reports_ordered_dispatching_and_accepted_child_progress() -> None
     ]
 
 
+@pytest.mark.parametrize(
+    ("event_args", "error", "message"),
+    [
+        (
+            (cast("int", "1"), 1, "direct", ApplyProgressState.ACCEPTED),
+            TypeError,
+            "order",
+        ),
+        (
+            (cast("int", bool(1)), 1, "direct", ApplyProgressState.ACCEPTED),
+            TypeError,
+            "order",
+        ),
+        (
+            (1, cast("int", "1"), "direct", ApplyProgressState.ACCEPTED),
+            TypeError,
+            "total",
+        ),
+        (
+            (1, cast("int", bool(1)), "direct", ApplyProgressState.ACCEPTED),
+            TypeError,
+            "total",
+        ),
+        ((1, 0, "direct", ApplyProgressState.ACCEPTED), ValueError, "child set"),
+        ((0, 1, "direct", ApplyProgressState.ACCEPTED), ValueError, "child set"),
+        ((2, 1, "direct", ApplyProgressState.ACCEPTED), ValueError, "child set"),
+        (
+            (1, 1, cast("str", 7), ApplyProgressState.ACCEPTED),
+            ValueError,
+            "child_id",
+        ),
+        ((1, 1, "", ApplyProgressState.ACCEPTED), ValueError, "child_id"),
+        (
+            (1, 1, "direct", cast("ApplyProgressState", "accepted")),
+            TypeError,
+            "state",
+        ),
+    ],
+)
+def test_apply_progress_event_rejects_invalid_boundary_facts(
+    event_args: tuple[int, int, str, ApplyProgressState],
+    error: type[Exception],
+    message: str,
+) -> None:
+    """Presentation progress never carries malformed ordered child evidence."""
+    with pytest.raises(error, match=message):
+        ApplyProgressEvent(*event_args)
+
+
 def test_apply_progress_observer_cannot_interrupt_dispatch() -> None:
     """Presentation failure cannot acquire authority over Apply execution."""
 
