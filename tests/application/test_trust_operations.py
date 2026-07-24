@@ -29,6 +29,9 @@ REFERENCE = SecretStoreReference.generate(
     SecretPurpose.PLAN_AUTHENTICATION,
 )
 KEY = SecretValue(b"k" * 32)
+KEY_COMMITMENT = bytes.fromhex(
+    "5e318f8cf9cbe249a30812b8ca132d691ded7a91991413558db5758575f5e01f"
+)
 
 
 class _Repository:
@@ -130,6 +133,7 @@ def test_active_trust_is_never_recreated_when_key_is_lost() -> None:
     repository.value = InstallationTrust(
         INSTALLATION_ID,
         REFERENCE,
+        KEY_COMMITMENT,
         InstallationTrustPhase.ACTIVE,
     )
     store = _Store()
@@ -151,6 +155,7 @@ def test_loader_rejects_missing_incomplete_and_short_trust() -> None:
     incomplete.value = InstallationTrust(
         INSTALLATION_ID,
         REFERENCE,
+        KEY_COMMITMENT,
         InstallationTrustPhase.PREPARED,
     )
     with pytest.raises(TrustLoadError, match="incomplete"):
@@ -160,6 +165,7 @@ def test_loader_rejects_missing_incomplete_and_short_trust() -> None:
     short.value = InstallationTrust(
         INSTALLATION_ID,
         REFERENCE,
+        KEY_COMMITMENT,
         InstallationTrustPhase.ACTIVE,
     )
     with pytest.raises(TrustLoadError, match="inconsistent"):
@@ -175,6 +181,7 @@ def test_preview_loader_accepts_only_active_consistent_native_trust() -> None:
     repository.value = InstallationTrust(
         INSTALLATION_ID,
         REFERENCE,
+        KEY_COMMITMENT,
         InstallationTrustPhase.ACTIVE,
     )
     store = _Store(SecretStoreOutcome.available(KEY))
@@ -193,6 +200,7 @@ def test_existing_create_intent_with_missing_key_fails_without_recreation() -> N
     repository.value = InstallationTrust(
         INSTALLATION_ID,
         REFERENCE,
+        KEY_COMMITMENT,
         InstallationTrustPhase.CREATE_INTENT,
     )
     store = _Store()
@@ -214,6 +222,7 @@ def test_existing_create_intent_with_available_key_finishes_activation() -> None
     repository.value = InstallationTrust(
         INSTALLATION_ID,
         REFERENCE,
+        KEY_COMMITMENT,
         InstallationTrustPhase.CREATE_INTENT,
     )
     store = _Store(SecretStoreOutcome.available(KEY))
@@ -230,12 +239,53 @@ def test_existing_create_intent_with_available_key_finishes_activation() -> None
     assert store.create_calls == 0
 
 
+def test_existing_create_intent_rejects_replaced_key() -> None:
+    """Interrupted initialization cannot bless a different key at the same ref."""
+    repository = _Repository()
+    repository.value = InstallationTrust(
+        INSTALLATION_ID,
+        REFERENCE,
+        KEY_COMMITMENT,
+        InstallationTrustPhase.CREATE_INTENT,
+    )
+    store = _Store(SecretStoreOutcome.available(SecretValue(b"x" * 32)))
+
+    result = TrustInitializationOperations(
+        repository,
+        store,
+        material=_material,
+    ).initialize()
+
+    assert not result.initialized
+    assert result.reason == "trust-create-interrupted"
+    assert repository.value.phase is InstallationTrustPhase.CREATE_INTENT
+    assert store.create_calls == 0
+
+
+def test_active_trust_rejects_replaced_key() -> None:
+    """A same-length replacement cannot become active installation authority."""
+    repository = _Repository()
+    repository.value = InstallationTrust(
+        INSTALLATION_ID,
+        REFERENCE,
+        KEY_COMMITMENT,
+        InstallationTrustPhase.ACTIVE,
+    )
+    store = _Store(SecretStoreOutcome.available(SecretValue(b"x" * 32)))
+
+    with pytest.raises(TrustLoadError, match="inconsistent"):
+        InstallationTrustLoader(repository, store).load()
+
+    assert store.create_calls == 0
+
+
 def test_active_trust_repeat_init_reports_existing_without_creation() -> None:
     """A healthy active installation remains create-once."""
     repository = _Repository()
     repository.value = InstallationTrust(
         INSTALLATION_ID,
         REFERENCE,
+        KEY_COMMITMENT,
         InstallationTrustPhase.ACTIVE,
     )
     store = _Store(SecretStoreOutcome.available(KEY))
@@ -279,6 +329,7 @@ def test_unsupported_backend_blocks_init_and_loading(
     repository.value = InstallationTrust(
         INSTALLATION_ID,
         REFERENCE,
+        KEY_COMMITMENT,
         InstallationTrustPhase.ACTIVE,
     )
     with pytest.raises(TrustLoadError, match="unsupported"):

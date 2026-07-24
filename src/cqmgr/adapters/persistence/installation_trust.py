@@ -19,9 +19,16 @@ from cqmgr.application.ports.secrets import (
     SecretStoreReference,
 )
 
-_SCHEMA = "cqmgr.installation-trust/v1"
+_SCHEMA = "cqmgr.installation-trust/v2"
 _FIELDS = frozenset(
-    ("schema", "installation_id", "key_service", "key_item_id", "phase")
+    (
+        "schema",
+        "installation_id",
+        "key_service",
+        "key_item_id",
+        "key_commitment",
+        "phase",
+    )
 )
 
 
@@ -97,6 +104,8 @@ class TomlInstallationTrustRepository:
                     current.installation_id != replacement.installation_id
                     or current.authentication_key_reference
                     != replacement.authentication_key_reference
+                    or current.authentication_key_commitment
+                    != replacement.authentication_key_commitment
                 ):
                     msg = "installation trust identity cannot change"
                     raise InstallationTrustPersistenceError(msg)  # noqa: TRY301
@@ -133,8 +142,25 @@ class TomlInstallationTrustRepository:
             if raw["key_service"] != reference.service:
                 msg = "installation trust key service must match its reference"
                 raise ValueError(msg)  # noqa: TRY301
+            key_commitment_value = raw["key_commitment"]
+            if not isinstance(key_commitment_value, str):
+                msg = "installation trust key commitment must be text"
+                raise TypeError(msg)  # noqa: TRY301
+            try:
+                key_commitment = bytes.fromhex(key_commitment_value)
+            except ValueError as error:
+                msg = "installation trust key commitment must be hexadecimal"
+                raise ValueError(msg) from error
+            if key_commitment.hex() != key_commitment_value:
+                msg = "installation trust key commitment must be canonical hex"
+                raise ValueError(msg)  # noqa: TRY301
             phase = InstallationTrustPhase(cast("str", raw["phase"]))
-            return InstallationTrust(installation_id, reference, phase)
+            return InstallationTrust(
+                installation_id,
+                reference,
+                key_commitment,
+                phase,
+            )
         except (KeyError, TypeError, ValueError) as error:
             msg = f"installation trust is inconsistent: {error}"
             raise InstallationTrustPersistenceError(msg) from error
@@ -151,6 +177,8 @@ class TomlInstallationTrustRepository:
                 + json.dumps(value.authentication_key_reference.service),
                 "key_item_id = "
                 + json.dumps(value.authentication_key_reference.item_id),
+                "key_commitment = "
+                + json.dumps(value.authentication_key_commitment.hex()),
                 f"phase = {json.dumps(value.phase.value)}",
                 "",
             )
