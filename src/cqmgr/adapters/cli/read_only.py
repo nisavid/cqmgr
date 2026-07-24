@@ -640,7 +640,7 @@ def _identity_evidence_lines(result: OperationResult[Any]) -> list[str]:
     return [
         f"Credential kind: {evidence.credential_kind.value}",
         f"Principal verification: {evidence.verification.value}",
-        f"Acting principal: {acting_principal}",
+        f"Authenticated principal: {acting_principal}",
         f"Impersonation chain: {chain or 'none'}",
     ]
 

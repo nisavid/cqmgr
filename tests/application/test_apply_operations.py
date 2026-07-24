@@ -17,6 +17,9 @@ from cqmgr.adapters.serialization.plans import PlanCodec
 from cqmgr.application.operations.apply import (
     ApplyData,
     ApplyPlanOperations,
+    ApplyProgressEvent,
+    ApplyProgressObserver,
+    ApplyProgressState,
     ApplyRequest,
     ComposedApplyRevalidator,
 )
@@ -860,6 +863,7 @@ def _apply(  # noqa: PLR0913
     unknown_resolver: _ScriptedResolver | None = None,
     codec: object | None = None,
     request: ApplyRequest | None = None,
+    on_progress: ApplyProgressObserver | None = None,
 ) -> tuple[
     OperationResult[ApplyData],
     _MemoryPlanRepository,
@@ -892,7 +896,8 @@ def _apply(  # noqa: PLR0913
                 contact_binding=CONTACT,
                 contact_value="operator@example.com",
                 now=NOW + timedelta(minutes=1),
-            )
+            ),
+            on_progress=on_progress,
         )
     )
     return result, repository, apply_records, audit
@@ -975,6 +980,65 @@ def test_apply_result_preserves_submitted_time_and_plan_safety_context() -> None
         StableSymbol("decrease-over-ten-percent"),
     )
     assert child.unresolved_acknowledgements == ()
+
+
+def test_apply_reports_ordered_dispatching_and_accepted_child_progress() -> None:
+    """Apply exposes each durable child transition before aggregate completion."""
+    progress: list[ApplyProgressEvent] = []
+
+    result, _, _, _ = _apply(
+        _plan(),
+        _ScriptedWriter(
+            QuotaPreferenceWriteResult(
+                accepted=True,
+                outcome=StableSymbol("submitted"),
+            ),
+            QuotaPreferenceWriteResult(
+                accepted=True,
+                outcome=StableSymbol("submitted"),
+            ),
+        ),
+        on_progress=progress.append,
+    )
+
+    assert result.succeeded
+    assert [
+        (event.order, event.total, event.child_id, event.state) for event in progress
+    ] == [
+        (1, 2, "direct", ApplyProgressState.DISPATCHING),
+        (1, 2, "direct", ApplyProgressState.ACCEPTED),
+        (2, 2, "companion", ApplyProgressState.DISPATCHING),
+        (2, 2, "companion", ApplyProgressState.ACCEPTED),
+    ]
+
+
+def test_apply_progress_observer_cannot_interrupt_dispatch() -> None:
+    """Presentation failure cannot acquire authority over Apply execution."""
+
+    def fail_to_render(_event: ApplyProgressEvent) -> None:
+        msg = "presentation unavailable"
+        raise RuntimeError(msg)
+
+    result, _, _, _ = _apply(
+        _plan(),
+        _ScriptedWriter(
+            QuotaPreferenceWriteResult(
+                accepted=True,
+                outcome=StableSymbol("submitted"),
+            ),
+            QuotaPreferenceWriteResult(
+                accepted=True,
+                outcome=StableSymbol("submitted"),
+            ),
+        ),
+        on_progress=fail_to_render,
+    )
+
+    assert result.succeeded
+    assert tuple(child.disposition for child in result.data.children) == (
+        ApplyChildDisposition.ACCEPTED,
+        ApplyChildDisposition.ACCEPTED,
+    )
 
 
 def test_partial_unknown_apply_preserves_every_child_plan_safety_fact() -> None:

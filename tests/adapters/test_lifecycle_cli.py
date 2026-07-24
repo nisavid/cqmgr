@@ -53,6 +53,12 @@ from cqmgr.domain.diagnostics import (
     RetryDisposition,
     Severity,
 )
+from cqmgr.domain.identity import (
+    CredentialKind,
+    PrincipalIdentity,
+    PrincipalVerification,
+    ProviderIdentityEvidence,
+)
 from cqmgr.domain.plans import PlanKind, TargetStrategy
 from cqmgr.domain.quotas import (
     EffectiveQuotaSliceIdentity,
@@ -669,6 +675,12 @@ def test_lifecycle_result_uses_canonical_json_and_required_human_facts(
             "sha256:" + ("a" * 64),
             ("accelerator", "companion"),
         ),
+        identity_evidence=ProviderIdentityEvidence(
+            credential_kind=CredentialKind.DIRECT_USER,
+            verification=PrincipalVerification.VERIFIED,
+            acting_principal=PrincipalIdentity("principal://accounts/operator"),
+            impersonation_chain=(PrincipalIdentity("principal://accounts/operator"),),
+        ),
     )
 
     json_exit = emit_lifecycle_result(
@@ -687,9 +699,14 @@ def test_lifecycle_result_uses_canonical_json_and_required_human_facts(
     assert structured.err == ""
     assert payload["operation"] == "plan.review"
     assert payload["data"]["ordered_children"] == ["accelerator", "companion"]
+    assert payload["identity_evidence"]["acting_principal"] == (
+        "principal://accounts/operator"
+    )
     assert "Operation: plan.review" in human.out
     assert "Resource scope: projects/123" in human.out
     assert "Ordered children: accelerator, companion" in human.out
+    assert "Authenticated principal: principal://accounts/operator" in human.out
+    assert "Acting principal:" not in human.out
 
 
 def test_rejected_structured_result_stays_valid_json_on_stdout(

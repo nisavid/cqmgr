@@ -32,12 +32,13 @@ slice evidence prevents Preview. A target equal to the existing settled desired
 value is a verified child no-op and has no provider write.
 
 Preview performs complete preflight for every child before issuing an
-integrity-protected plan. It validates one resource scope, acting principal,
-impersonation chain, quota-contact binding, plan lifetime, every exact slice,
-target, preference identity and etag, eligibility, usage, acknowledgements, and
-companion evidence. Any failed child preflight produces zero provider writes and
-no Apply-capable plan. Canonical plan bytes bind the ordered children, target
-strategy and inputs, evidence, warnings, acknowledgements, issuing installation,
+integrity-protected plan. It validates one resource scope, authenticated
+principal, impersonation chain, quota-contact binding, plan lifetime, every
+exact slice, target, preference identity and etag, eligibility, usage,
+acknowledgements, and companion evidence. Any failed child preflight produces
+zero provider writes and no Apply-capable plan. Canonical plan bytes bind the
+ordered children, target strategy and inputs, evidence, warnings,
+acknowledgements, issuing installation,
 and expiry. The unreleased `cqmgr.quota-request-plan/v1` payload has a required
 top-level `kind` beside `schema`: `single` requires exactly one child and
 `bundle` permits one or more ordered children. Unknown kinds fail closed.
@@ -75,7 +76,7 @@ durable disposition:
 - `unknown` when provider acceptance cannot be established safely; or
 - `unattempted` when an earlier child failed or became unknown.
 
-An accepted child is never described as rolled back when a later child fails.
+An accepted child remains accepted when a later child fails.
 The aggregate Apply succeeds only when every dispatchable child is accepted.
 The result preserves verified no-ops and every accepted, failed, unknown, and
 unattempted child with every available provider reconciliation identity.

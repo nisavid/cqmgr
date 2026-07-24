@@ -228,8 +228,8 @@ scenarios include:
 - recovery resumes only a child without a persisted dispatch intent when every
   prior outcome is durably accepted, while a dispatch intent without a terminal
   outcome becomes durable `unknown` and is never automatically re-dispatched;
-- a conclusively failed child stops dispatch, retains prior accepted children,
-  marks later children unattempted, and performs no rollback;
+- a conclusively failed child stops dispatch, preserves prior children as
+  accepted, and marks later children unattempted;
 - an ambiguous dispatch is `unknown`, consumes and quarantines the plan, stops
   later dispatch, and requires read-after-unknown reconciliation at the
   deterministic preference identity;

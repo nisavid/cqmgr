@@ -59,9 +59,10 @@ same explicit resource-scope acknowledgement as input.
 
 Showing, selecting, or clearing resource scope remains a local offline
 operation. It does not initialize ADC, contact Resource Manager, verify provider
-access, or claim an acting principal. Acting-principal and impersonation-chain
-evidence appears only after a provider-scoped operation observes it; until then
-the TUI says `acting principal deferred (offline)`.
+access, or claim an authenticated principal. Authenticated-principal and
+impersonation-chain evidence appears only after a provider-scoped operation
+observes it; until then the TUI says
+`authenticated principal deferred (offline)`.
 
 The inspector federates the versioned Compute and legacy Cloud TPU V1 inventory
 by default. With no service or catalog-group filters it queries both providers.
@@ -106,7 +107,7 @@ Selecting a slice opens a detail pane that keeps these facts together:
 - existing preference identity, desired value, granted value, etag, and
   reconciliation state;
 - related accelerator constraints and remaining bottlenecks;
-- acting principal and impersonation chain; and
+- authenticated principal and impersonation chain; and
 - valid next operations.
 
 A mutable exact slice offers a quota request composer in this pane. The operator
@@ -169,8 +170,8 @@ cannot be reviewed as trustworthy plans.
 
 Single-slice review makes clear that Apply changes only the selected slice.
 Bundle review makes clear that Apply is ordered and non-atomic: accepted earlier
-children are not rolled back if a later child fails or becomes transport
-unknown. No companion slice is changed merely because it was related; only
+children remain accepted if a later child fails or becomes transport unknown.
+No companion slice is changed merely because it was related; only
 reviewed children belong to the plan. Dangerous decreases, unlimited-value
 transitions, missing evidence, drift, ongoing rollouts, and expert
 acknowledgements follow the safety and quota request contract independently for
@@ -188,11 +189,12 @@ region, multi-region/all-regions/global, then broader provider scope; canonical
 exact-slice identity breaks remaining ties. A child that cannot map to one rank
 pair fails during Preview. Each child has one durable pre-intent and at most one
 provider dispatch. Apply stops at the first child whose acceptance cannot be
-proven, marks later children `unattempted`, and never attempts rollback. Each
-plan-child disposition is exactly `accepted`, `failed`, `unknown`, or
-`unattempted`. A transport-unknown dispatch is `unknown`, not `failed`; a failed
-child preserves its exact unchanged, conflicting, or other conclusive failure
-outcome. Verified Preview no-ops remain separate explicit facts. A stale or
+proven and marks later children `unattempted`. Every earlier accepted child
+remains accepted. Each plan-child disposition is exactly `accepted`, `failed`,
+`unknown`, or `unattempted`. A transport-unknown dispatch is `unknown`, not
+`failed`; a failed child preserves its exact unchanged, conflicting, or other
+conclusive failure outcome. Verified Preview no-ops remain separate explicit
+facts. A stale or
 drifted plan returns to reviewable evidence instead of silently rebuilding,
 reordering, or applying a different intent.
 

@@ -99,10 +99,10 @@ and credential objects never cross an adapter boundary.
   operations remain offline;
 - loads validated configuration and mutable selection state;
 - resolves explicit profiles and the locally selected project resource scope
-  without loading acting-principal evidence;
-- resolves and canonicalizes provider-scoped projects and acting-principal
-  evidence only when the selected operation crosses a provider-read or
-  provider-mutation seam;
+  without loading authenticated-principal evidence;
+- resolves and canonicalizes provider-scoped projects and
+  authenticated-principal evidence only when the selected operation crosses a
+  provider-read or provider-mutation seam;
 - consumes ADC, including externally configured impersonated ADC, and
   initializes provider clients, the shared budget coordinator, storage, locks,
   clocks, and serializers;
@@ -211,7 +211,7 @@ resulting credential object with provider adapters.
 
 The following concepts stay separate:
 
-- the **acting principal** whose credential signs provider calls;
+- the **authenticated principal** whose credential signs provider calls;
 - an explicit impersonation target and delegate chain;
 - the ADC quota project used for transport billing and API quota; and
 - the project resource scope named by the operation.
@@ -220,12 +220,13 @@ Neither the ADC-discovered project nor the ADC quota project becomes the
 resource scope.
 
 Local scope, profile, configuration, help, and audit operations do not load
-ADC or acting-principal evidence. Their results state that identity loading was
-deferred because the operation was offline; this is an explicit non-applicable
-fact, not missing or incomplete evidence. A provider-scoped operation
-canonicalizes the selected project and resolves acting-principal and
-impersonation-chain evidence before its first provider read. Preview and Apply
-continue to require the exact stable-principal evidence described below.
+ADC or authenticated-principal evidence. Their results state that identity
+loading was deferred because the operation was offline; this is an explicit
+non-applicable fact, not missing or incomplete evidence. A provider-scoped
+operation canonicalizes the selected project and resolves
+authenticated-principal and impersonation-chain evidence before its first
+provider read. Preview and Apply continue to require the exact stable-principal
+evidence described below.
 
 Before Preview, the identity adapter produces a verified auth context using the
 credential-type-specific authoritative surface:
@@ -251,7 +252,7 @@ exact external service-account impersonation or credential-configuration
 action. `cqmgr` does not switch, impersonate, broker a more privileged identity,
 or own OAuth consent or refresh-token storage.
 
-The quota contact remains distinct from the acting principal. Per-operation
+The quota contact remains distinct from the authenticated principal. Per-operation
 input may supply it. A profile may hold only an OS-keyring reference, never the
 email value. Resolution order is protected per-operation input, the reference
 in an explicitly named profile, the reference in the explicitly selected
@@ -360,7 +361,7 @@ revalidation durably records one bundle pre-intent, consumes the single-use
 plan, and then dispatches children in their bound order. Each child has at most
 one provider write. Its durable dispatch intent binds the deterministic
 provider-visible QuotaPreference identity that the adapter must use for create
-or amend and later reconciliation. An accepted child is never rolled back. The
+or amend and later reconciliation. An accepted child remains accepted. The
 first conclusively failed child or any unknown child stops dispatch. A conclusive
 provider rejection or failure is `failed`; a dispatched child whose acceptance
 cannot be proven is `unknown`; every earlier accepted child is `accepted`; and
@@ -372,8 +373,8 @@ it never rewrites the immutable `unknown` Apply disposition. Conflicting
 resolution evidence fails closed. Apply reaches its success boundary only when
 every non-no-op child is accepted during Apply. Its aggregate result preserves
 all child dispositions and exact provider identities instead of reporting
-transaction or rollback semantics. Verified preflight no-ops remain composition
-facts and are never rewritten as dispatch dispositions.
+transaction or reverse-mutation semantics. Verified preflight no-ops remain
+composition facts and are never rewritten as dispatch dispositions.
 
 Watch accepts one shared intent identity for both subject shapes. The
 application and CLI expose `intent_id` / `--intent-id`; the durable Apply
@@ -412,8 +413,8 @@ credential JSON, raw quota-contact values, Apply acknowledgements, or plan
 authorization.
 
 Selecting a profile may select the ADC quota project used by `cqmgr` transport,
-but it does not change the credential's acting principal, create impersonated
-credentials, mutate ADC, or alter `gcloud` configuration.
+but it does not change the credential's authenticated principal, create
+impersonated credentials, mutate ADC, or alter `gcloud` configuration.
 
 `cqmgr`-specific environment variables are bootstrap-only. They may override
 configuration and state paths and honor standard presentation conventions such

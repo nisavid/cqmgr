@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     from cqmgr.application.operations.apply import (
         ApplyChildData,
         ApplyData,
+        ApplyProgressEvent,
         ApplyRequest,
     )
     from cqmgr.application.operations.lifecycle import LifecycleOperations
@@ -274,6 +275,7 @@ class LifecycleRouteState:
     pending_preview: PreviewRequest | None = None
     pending_apply: ApplyRequest | None = None
     apply_in_progress: bool = False
+    apply_progress: tuple[ApplyProgressEvent, ...] = ()
     apply_result: OperationResult[ApplyData] | None = None
     pending_watch: WatchRequest | None = None
     latest_resume: str | None = None
@@ -1121,8 +1123,8 @@ class CloudQuotaManagerApp(App[None]):
             "Apply confirmation\n"
             f"Bound resource scope: {scope.canonical_name}\n"
             "Type the exact resource scope below. This value is never prefilled.\n"
-            "Apply is ordered and non-atomic. Accepted earlier children are not "
-            "rolled back if a later child fails or becomes unknown."
+            "Apply is ordered and non-atomic. Accepted earlier children remain "
+            "accepted if a later child fails or becomes unknown."
         )
         self._set_lifecycle_copy_cli(plan_apply_copy_cli(digest=request.digest))
         self._set_status("CONFIRMATION REQUIRED — no provider dispatch has started")
@@ -1469,8 +1471,8 @@ class CloudQuotaManagerApp(App[None]):
                 )
             )
         lines.append(
-            "Apply consequence: ordered and non-atomic; accepted earlier children "
-            "are never rolled back."
+            "Apply consequence: ordered and non-atomic. Accepted earlier children "
+            "remain accepted if a later child fails or becomes unknown."
         )
         self.query_one("#lifecycle-detail", Static).update("\n".join(lines))
 
@@ -1654,8 +1656,8 @@ class CloudQuotaManagerApp(App[None]):
                     )
                 )
             lines.append(
-                "Apply is ordered and non-atomic. Accepted earlier children are "
-                "not rolled back."
+                "Apply is ordered and non-atomic. Accepted earlier children remain "
+                "accepted if a later child fails or becomes unknown."
             )
         lines.extend(self._result_fact_lines(result))
         self.query_one("#lifecycle-detail", Static).update("\n".join(lines))
@@ -1686,7 +1688,10 @@ class CloudQuotaManagerApp(App[None]):
 
     async def _apply_lifecycle(self, request: ApplyRequest) -> None:
         lifecycle = self._require_lifecycle()
-        result = await lifecycle.apply(request)
+        result = await lifecycle.apply(
+            request,
+            on_progress=lambda event: self._record_apply_progress(request, event),
+        )
         if (
             self._lifecycle_state.route is not LifecycleRoute.APPLY
             or self._lifecycle_state.pending_apply is not request
@@ -1707,6 +1712,41 @@ class CloudQuotaManagerApp(App[None]):
         self._render_apply_result(result)
         self._set_status(self._result_status(result))
         self._leave_lifecycle_route()
+
+    def _record_apply_progress(
+        self,
+        request: ApplyRequest,
+        event: ApplyProgressEvent,
+    ) -> None:
+        """Render the latest durable state for every observed ordered child."""
+        if (
+            self._lifecycle_state.route is not LifecycleRoute.APPLY
+            or self._lifecycle_state.pending_apply is not request
+        ):
+            return
+        progress = tuple(
+            item
+            for item in self._lifecycle_state.apply_progress
+            if item.order != event.order
+        )
+        self._lifecycle_state.apply_progress = tuple(
+            sorted((*progress, event), key=lambda item: item.order)
+        )
+        scope = self._lifecycle_state.bound_scope
+        lines = [
+            "Apply dispatch progress",
+            "Bound resource scope: "
+            + (scope.canonical_name if scope is not None else "unavailable"),
+            *(
+                f"{item.order}/{item.total} {item.child_id}: {item.state.value}"
+                for item in self._lifecycle_state.apply_progress
+            ),
+        ]
+        self.query_one("#lifecycle-detail", Static).update("\n".join(lines))
+        self._set_status(
+            f"APPLYING — {event.order}/{event.total} "
+            f"{event.child_id}: {event.state.value}"
+        )
 
     def _render_apply_result(self, result: OperationResult[ApplyData]) -> None:
         self._render_instrument(result)

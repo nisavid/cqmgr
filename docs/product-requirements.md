@@ -291,10 +291,10 @@ These requirements are hard gates rather than interface guidance:
    rollout, policy, material usage, or companion evidence drift for any child
    invalidates the plan. Apply never silently rebuilds or refreshes a different
    plan.
-6. **Identity separation.** Acting principal, impersonation chain, ADC quota
-   project, resource scope, and quota contact remain distinct. The product
-   never elevates, switches, or brokers identity. Preview and Apply require an
-   exact stable-principal match.
+6. **Identity separation.** Authenticated principal, impersonation chain, ADC
+   quota project, resource scope, and quota contact remain distinct. The
+   product never elevates, switches, or brokers identity. Preview and Apply
+   require an exact stable-principal match.
 7. **Contact privacy.** The contact is accepted per operation, by native-keyring
    reference from the selected profile, or from a verified direct-user
    identity. Its value never enters plans, audit records, diagnostics, exports,
