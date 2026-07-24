@@ -1315,6 +1315,7 @@ class ScriptedLifecyclePreparation:
     def __init__(self, item: QuotaQueryItem) -> None:
         self.item = item
         self.intents: list[LifecycleCompositionIntent] = []
+        self.require_preview_calls: list[bool] = []
 
     async def prepare(
         self,
@@ -1324,6 +1325,7 @@ class ScriptedLifecyclePreparation:
         require_preview: bool,
     ) -> Any:
         assert deadline > 0
+        self.require_preview_calls.append(require_preview)
         assert require_preview
         self.intents.append(intent)
         effective = self.item.effective_value
@@ -1365,8 +1367,7 @@ class ScriptedLifecyclePreparation:
             expert=intent.expert,
             acknowledgements=intent.acknowledgements,
         )
-        contact = intent.quota_contact
-        assert contact is not None
+        contact = intent.quota_contact or SecretValue(b"profile@example.com")
         key = SecretValue(b"k" * 32)
         preview = PreviewRequest(
             composition,
@@ -2876,6 +2877,126 @@ def test_selected_quota_composes_through_async_preparation() -> None:
             assert "--acknowledge decrease-over-ten-percent" in copied
             assert "--quota-contact-stdin" in copied
             assert "operator@example.com" not in copied
+
+    asyncio.run(scenario())
+
+
+def test_blank_contact_uses_profile_or_direct_user_preview_resolution() -> None:
+    """Blank protected input still asks preparation for canonical fallbacks."""
+
+    async def scenario() -> None:
+        browse = _browse_result()
+        assert isinstance(browse.data, QuotaBrowseData)
+        item = browse.data.items[0]
+        preparation = ScriptedLifecyclePreparation(item)
+        app = CloudQuotaManagerApp(
+            ScriptedReadOnlyOperations(browse),
+            ScriptedAuditOperations(),
+            lifecycle=ScriptedLifecycleOperations(_apply_result()),  # type: ignore[arg-type]
+            lifecycle_preparation=preparation,  # type: ignore[arg-type]
+        )
+
+        async with app.run_test(size=(110, 70)) as pilot:
+            await pilot.pause()
+            app._select_quota(item)  # noqa: SLF001 - selected inspected evidence
+            await pilot.pause()
+            await pilot.click("#quota-compose-request")
+            _input(app, "#lifecycle-target").value = "8"
+            assert _input(app, "#lifecycle-contact").value == ""
+            await pilot.click("#lifecycle-compose")
+            await pilot.pause()
+
+            assert preparation.require_preview_calls == [True]
+            assert preparation.intents[0].quota_contact is None
+            assert not _button(app, "#lifecycle-preview").disabled
+
+    asyncio.run(scenario())
+
+
+def test_standalone_review_and_watch_are_reachable_only_through_controls() -> None:
+    """Portable Plans and CLI-created intents have visible cross-surface ingress."""
+
+    async def scenario() -> None:
+        preview = _preview_plan_result()
+        plan = preview.data.plan
+        assert plan is not None
+        reviewed = review_plan(
+            plan,
+            digest=preview.data.plan_digest or "",
+            authenticated=False,
+            local_installation_id="installation-other",
+            state=PlanLedgerState.CONSUMED,
+            now=NOW,
+        )
+        review_result = replace(
+            _review_result(),
+            data=PlanReviewData(reviewed),
+            diagnostics=(),
+        )
+        apply_request = ApplyRequest(
+            digest=reviewed.digest,
+            authentication_key=KEY,
+            local_installation_id=plan.installation_id,
+            resource_scope_acknowledgement=SCOPE,
+            principal=plan.principal,
+            contact_binding=plan.contact_binding,
+            contact_value="operator@example.com",
+            now=NOW,
+        )
+        watch_request = WatchRequest(
+            intent_id="intent-from-cli",
+            condition=WatchCondition.FULFILLED,
+            resume=None,
+            authentication_key=KEY,
+            installation_id=plan.installation_id,
+            deadline=12345.0,
+            cancellation=CancellationToken(),
+        )
+        requests = ScriptedLifecycleRequestFactory(
+            PlanReviewRequest(
+                None,
+                Path("portable.plan"),
+                None,
+                "installation-authority-unavailable",
+                NOW,
+            ),
+            apply_request,
+            watch_request,
+        )
+        app = CloudQuotaManagerApp(
+            ScriptedReadOnlyOperations(_browse_result()),
+            ScriptedAuditOperations(),
+            lifecycle=ScriptedLifecycleOperations(  # type: ignore[arg-type]
+                _apply_result(),
+                review_result=review_result,
+            ),
+            lifecycle_requests=requests,  # type: ignore[arg-type]
+        )
+
+        async with app.run_test(size=(120, 80)) as pilot:
+            await pilot.pause()
+            await pilot.click("#open-plan-review")
+            assert not app.query_one("#lifecycle-plan-input").has_class("hidden")
+            _input(app, "#lifecycle-plan-path").value = "portable.plan"
+            await pilot.click("#lifecycle-review")
+            await pilot.pause()
+            assert requests.review_inputs == [
+                PlanReferenceInput(None, Path("portable.plan"))
+            ]
+            assert _button(app, "#lifecycle-prepare-apply").disabled
+
+            await pilot.click("#lifecycle-back")
+            await pilot.click("#open-watch")
+            assert not app.query_one("#lifecycle-watch-input").has_class("hidden")
+            _input(app, "#lifecycle-intent-id").value = "intent-from-cli"
+            _input(app, "#lifecycle-watch-condition").value = "fulfilled"
+            _input(app, "#lifecycle-watch-deadline").value = "2026-07-25T00:00:00Z"
+            await pilot.click("#lifecycle-prepare-watch")
+            await pilot.pause()
+
+            assert requests.watch_inputs[0].intent_id == "intent-from-cli"
+            assert requests.watch_inputs[0].condition is WatchCondition.FULFILLED
+            assert not _button(app, "#lifecycle-watch").disabled
 
     asyncio.run(scenario())
 
