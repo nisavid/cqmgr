@@ -23,6 +23,7 @@ class AuditJournal(Protocol):
         *,
         sensitive_values: tuple[str, ...] = (),
         machine_paths: tuple[str, ...] = (),
+        deduplicate: bool = False,
     ) -> AuditRecord:
         """Durably append one explicitly scrubbed record."""
         ...

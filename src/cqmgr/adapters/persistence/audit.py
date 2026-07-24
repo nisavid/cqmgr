@@ -88,9 +88,10 @@ class UnavailableAuditJournal:
         *,
         sensitive_values: tuple[str, ...] = (),
         machine_paths: tuple[str, ...] = (),
+        deduplicate: bool = False,
     ) -> Never:
         """Report unavailable storage through the application result boundary."""
-        del draft, sensitive_values, machine_paths
+        del draft, sensitive_values, machine_paths, deduplicate
         raise _AuditJournalUnavailableError
 
     def query(self, query: AuditQuery) -> Never:
@@ -123,9 +124,10 @@ class EmptyAuditJournal:
         *,
         sensitive_values: tuple[str, ...] = (),
         machine_paths: tuple[str, ...] = (),
+        deduplicate: bool = False,
     ) -> Never:
         """Reject writes through the deliberately read-only empty view."""
-        del draft, sensitive_values, machine_paths
+        del draft, sensitive_values, machine_paths, deduplicate
         raise _AuditJournalUnavailableError
 
     def query(self, query: AuditQuery) -> AuditQueryPage:
@@ -197,11 +199,19 @@ class FilesystemAuditJournal:
         *,
         sensitive_values: tuple[str, ...] = (),
         machine_paths: tuple[str, ...] = (),
+        deduplicate: bool = False,
     ) -> AuditRecord:
         """Append and fsync one canonical record before returning it."""
         with self._new_lock():
             records = self._recover_and_read()
             safe_draft = self._scrub(draft, sensitive_values, machine_paths)
+            if deduplicate:
+                existing = next(
+                    (record for record in records if record.draft == safe_draft),
+                    None,
+                )
+                if existing is not None:
+                    return existing
             segment = records[-1].segment if records else 1
             segment_count = sum(record.segment == segment for record in records)
             if records and segment_count >= self._max_records_per_segment:

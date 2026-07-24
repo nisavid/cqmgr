@@ -516,15 +516,22 @@ class ApplyPlanOperations:
             request.authentication_key,
             request.now,
         )
+        quarantined_unknown = (
+            resumed.status is PlanRepositoryStatus.QUARANTINED
+            and record.state is ApplyRecordState.UNKNOWN
+        )
         if (
-            resumed.status
-            not in {
-                PlanRepositoryStatus.LEASED,
-                PlanRepositoryStatus.DISPATCHED,
-            }
+            (
+                resumed.status
+                not in {
+                    PlanRepositoryStatus.LEASED,
+                    PlanRepositoryStatus.DISPATCHED,
+                }
+                and not quarantined_unknown
+            )
             or resumed.plan_bytes is None
-            or resumed.lease is None
             or resumed.authenticated is not True
+            or (resumed.lease is None and not quarantined_unknown)
         ):
             return _result_for_record(
                 request,
@@ -539,7 +546,10 @@ class ApplyPlanOperations:
             ApplyRecordState.ACCEPTED,
             ApplyRecordState.FAILED,
         }:
-            if resumed.status is not PlanRepositoryStatus.DISPATCHED:
+            if (
+                resumed.status is not PlanRepositoryStatus.DISPATCHED
+                or resumed.lease is None
+            ):
                 return self._critical_unknown(
                     record.resource_scope,
                     resumed.lease,
@@ -625,7 +635,21 @@ class ApplyPlanOperations:
             None,
         )
         if stopping is not None or unresolved is not None:
-            if resumed.status is not PlanRepositoryStatus.DISPATCHED:
+            if (
+                resumed.status
+                not in {
+                    PlanRepositoryStatus.DISPATCHED,
+                    PlanRepositoryStatus.QUARANTINED,
+                }
+                or (
+                    resumed.status is PlanRepositoryStatus.QUARANTINED
+                    and stopping is None
+                )
+                or (
+                    resumed.lease is None
+                    and resumed.status is not PlanRepositoryStatus.QUARANTINED
+                )
+            ):
                 return self._critical_unknown(
                     record.resource_scope,
                     resumed.lease,
@@ -647,7 +671,7 @@ class ApplyPlanOperations:
                     provider_outcome = cast("StableSymbol", stopping.provider_outcome)
                     return self._finish(
                         record.resource_scope,
-                        resumed.lease,
+                        cast("PlanLease", resumed.lease),
                         request,
                         record,
                         [],
@@ -679,7 +703,7 @@ class ApplyPlanOperations:
             if unresolved is not None:
                 return await self._unknown_dispatch(
                     record.resource_scope,
-                    resumed.lease,
+                    cast("PlanLease", resumed.lease),
                     request,
                     record,
                     write,
@@ -692,6 +716,7 @@ class ApplyPlanOperations:
                 record,
                 write,
                 [],
+                already_quarantined=quarantined_unknown,
             )
         try:
             refreshed = await self._revalidator.refresh(plan, request.now)
@@ -708,7 +733,7 @@ class ApplyPlanOperations:
                     )
                 return self._invalidate(
                     plan,
-                    resumed.lease,
+                    cast("PlanLease", resumed.lease),
                     request,
                     reason=StableSymbol("revalidation-incomplete"),
                 )
@@ -719,7 +744,17 @@ class ApplyPlanOperations:
                 record,
                 [],
             )
-        if _revalidation_drift(plan, request, refreshed):
+        accepted_child_ids = frozenset(
+            child.child_id
+            for child in record.children
+            if child.disposition is ApplyChildDisposition.ACCEPTED
+        )
+        if _revalidation_drift(
+            plan,
+            request,
+            refreshed,
+            accepted_child_ids=accepted_child_ids,
+        ):
             if resumed.status is PlanRepositoryStatus.LEASED:
                 stopped = record.stop_unattempted(request.now)
                 if not self._save(stopped, request):
@@ -730,7 +765,11 @@ class ApplyPlanOperations:
                         record,
                         [],
                     )
-                return self._invalidate(plan, resumed.lease, request)
+                return self._invalidate(
+                    plan,
+                    cast("PlanLease", resumed.lease),
+                    request,
+                )
             return self._critical_unknown(
                 record.resource_scope,
                 resumed.lease,
@@ -740,7 +779,7 @@ class ApplyPlanOperations:
             )
         if resumed.status is PlanRepositoryStatus.LEASED:
             consumed = self._repository.mark_dispatched(
-                resumed.lease,
+                cast("PlanLease", resumed.lease),
                 request.authentication_key,
                 request.now,
             )
@@ -756,7 +795,7 @@ class ApplyPlanOperations:
                 )
         return await self._dispatch_children(
             plan,
-            resumed.lease,
+            cast("PlanLease", resumed.lease),
             request,
             record,
             [],
@@ -840,31 +879,6 @@ class ApplyPlanOperations:
                 record,
                 audit_record_ids,
             )
-        try:
-            audit_record_ids.append(
-                self._append_audit(
-                    request,
-                    resource_scope,
-                    AuditRecordKind.CRITICAL_UNKNOWN,
-                    "unknown",
-                    record.intent_id,
-                    facts=_child_facts(
-                        next(
-                            child
-                            for child in record.children
-                            if child.child_id == write.child_id
-                        )
-                    ),
-                )
-            )
-        except BaseException:  # noqa: BLE001
-            return self._critical_unknown(
-                resource_scope,
-                lease,
-                request,
-                record,
-                audit_record_ids,
-            )
         return await self._finish_unknown(
             resource_scope,
             lease,
@@ -874,47 +888,21 @@ class ApplyPlanOperations:
             audit_record_ids,
         )
 
-    async def _finish_unknown(  # noqa: PLR0913
+    async def _finish_unknown(  # noqa: C901, PLR0911, PLR0913
         self,
         resource_scope: ResourceScope,
-        lease: PlanLease,
+        lease: PlanLease | None,
         request: ApplyRequest,
         record: ApplyRecord,
         write: QuotaPreferenceWrite,
         audit_record_ids: list[str],
+        *,
+        already_quarantined: bool = False,
     ) -> OperationResult[ApplyData]:
         """Finalize, contain, and reconcile one durable unknown write."""
-        record = record.finalize(request.now)
-        if not self._save(record, request):
-            return self._critical_unknown(
-                resource_scope,
-                lease,
-                request,
-                record,
-                audit_record_ids,
-            )
-        if not self._quarantine(lease, request, "unknown-dispatch"):
-            return self._critical_unknown(
-                resource_scope,
-                lease,
-                request,
-                record,
-                audit_record_ids,
-            )
-        try:
-            resolution = await self._unknown_resolver.resolve_unknown(write)
-        except BaseException:  # noqa: BLE001
-            resolution = UnknownWriteResolution.UNRESOLVED
-        if resolution is not UnknownWriteResolution.UNRESOLVED:
-            resolution_value = UnknownDispatchResolution(resolution.value)
-            appended = self._apply_records.append_unknown_resolution(
-                record.intent_id,
-                write.child_id,
-                resolution_value,
-                request.now,
-                request.authentication_key,
-            )
-            if appended.status is not ApplyRecordRepositoryStatus.STORED:
+        if record.state is ApplyRecordState.IN_PROGRESS:
+            record = record.finalize(request.now)
+            if not self._save(record, request):
                 return self._critical_unknown(
                     resource_scope,
                     lease,
@@ -922,10 +910,105 @@ class ApplyPlanOperations:
                     record,
                     audit_record_ids,
                 )
+        unknown_child = next(
+            child for child in record.children if child.child_id == write.child_id
+        )
+        try:
+            audit_record_ids.append(
+                self._append_child_outcome_audit(
+                    request,
+                    resource_scope,
+                    record,
+                    unknown_child,
+                )
+            )
+            audit_record_ids.append(
+                self._append_audit(
+                    request,
+                    resource_scope,
+                    AuditRecordKind.APPLY_RESULT,
+                    "unknown-dispatch",
+                    record.intent_id,
+                    facts=_aggregate_facts(record),
+                    occurred_at=cast("datetime", record.finished_at),
+                    deduplicate=True,
+                )
+            )
+        except BaseException:  # noqa: BLE001
+            return self._critical_unknown(
+                resource_scope,
+                lease,
+                request,
+                record,
+                audit_record_ids,
+            )
+        if not already_quarantined and (
+            lease is None
+            or not self._quarantine(
+                lease,
+                request,
+                "unknown-dispatch",
+            )
+        ):
+            return self._critical_unknown(
+                resource_scope,
+                lease,
+                request,
+                record,
+                audit_record_ids,
+            )
+        loaded_resolutions = self._apply_records.load_unknown_resolutions(
+            record.intent_id,
+            request.authentication_key,
+        )
+        if loaded_resolutions.status is not ApplyRecordRepositoryStatus.AVAILABLE:
+            return self._critical_unknown(
+                resource_scope,
+                lease,
+                request,
+                record,
+                audit_record_ids,
+            )
+        retained = next(
+            (
+                evidence
+                for evidence in loaded_resolutions.resolutions
+                if evidence.child_id == write.child_id
+            ),
+            None,
+        )
+        resolution_recorded_at = request.now
+        if retained is not None:
+            resolution_value = retained.resolution
+            resolution_recorded_at = retained.recorded_at
+            resolution = UnknownWriteResolution(resolution_value.value)
+        else:
+            try:
+                resolution = await self._unknown_resolver.resolve_unknown(write)
+            except Exception:  # noqa: BLE001
+                resolution = UnknownWriteResolution.UNRESOLVED
+        if resolution is not UnknownWriteResolution.UNRESOLVED:
+            resolution_value = UnknownDispatchResolution(resolution.value)
+            if retained is None:
+                appended = self._apply_records.append_unknown_resolution(
+                    record.intent_id,
+                    write.child_id,
+                    resolution_value,
+                    resolution_recorded_at,
+                    request.authentication_key,
+                )
+                if appended.status is not ApplyRecordRepositoryStatus.STORED:
+                    return self._critical_unknown(
+                        resource_scope,
+                        lease,
+                        request,
+                        record,
+                        audit_record_ids,
+                    )
             record = record.resolve_unknown(
                 write.child_id,
                 resolution_value,
-                request.now,
+                resolution_recorded_at,
             )
             try:
                 audit_record_ids.append(
@@ -942,6 +1025,8 @@ class ApplyPlanOperations:
                                 if child.child_id == write.child_id
                             )
                         ),
+                        occurred_at=resolution_recorded_at,
+                        deduplicate=True,
                     )
                 )
             except BaseException:  # noqa: BLE001
@@ -1008,7 +1093,7 @@ class ApplyPlanOperations:
     def _critical_unknown(  # noqa: PLR0913
         self,
         resource_scope: ResourceScope,
-        lease: PlanLease,
+        lease: PlanLease | None,
         request: ApplyRequest,
         record: ApplyRecord,
         audit_record_ids: list[str],
@@ -1023,7 +1108,11 @@ class ApplyPlanOperations:
             ),
             record.intent_id,
         )
-        quarantined = self._quarantine(lease, request, "critical-unknown")
+        quarantined = lease is None or self._quarantine(
+            lease,
+            request,
+            "critical-unknown",
+        )
         critical_record = self._record_critical_evidence(
             resource_scope,
             request,
@@ -1134,16 +1223,34 @@ class ApplyPlanOperations:
         exit_class: ExitClass,
     ) -> OperationResult[ApplyData]:
         try:
-            audit_record_ids.append(
-                self._append_audit(
+            failed = next(
+                (
+                    child
+                    for child in record.children
+                    if child.disposition is ApplyChildDisposition.FAILED
+                ),
+                None,
+            )
+            if failed is not None:
+                child_audit_id = self._append_child_outcome_audit(
                     request,
                     resource_scope,
-                    AuditRecordKind.APPLY_RESULT,
-                    outcome,
-                    record.intent_id,
-                    facts=_aggregate_facts(record),
+                    record,
+                    failed,
                 )
+                if child_audit_id not in audit_record_ids:
+                    audit_record_ids.append(child_audit_id)
+            aggregate_audit_id = self._append_audit(
+                request,
+                resource_scope,
+                AuditRecordKind.APPLY_RESULT,
+                outcome,
+                record.intent_id,
+                facts=_aggregate_facts(record),
+                occurred_at=cast("datetime", record.finished_at),
+                deduplicate=True,
             )
+            audit_record_ids.append(aggregate_audit_id)
         except BaseException:  # noqa: BLE001
             return self._critical_unknown(
                 resource_scope,
@@ -1181,6 +1288,31 @@ class ApplyPlanOperations:
             is ApplyRecordRepositoryStatus.STORED
         )
 
+    def _append_child_outcome_audit(
+        self,
+        request: ApplyRequest,
+        resource_scope: ResourceScope,
+        record: ApplyRecord,
+        child: ApplyChildRecord,
+    ) -> str:
+        """Append one stable child outcome fact or return its retained identity."""
+        if child.disposition is ApplyChildDisposition.UNKNOWN:
+            kind = AuditRecordKind.CRITICAL_UNKNOWN
+            outcome = "unknown"
+        else:
+            kind = AuditRecordKind.APPLY_RESULT
+            outcome = cast("ApplyChildDisposition", child.disposition).value
+        return self._append_audit(
+            request,
+            resource_scope,
+            kind,
+            outcome,
+            record.intent_id,
+            facts=_child_facts(child),
+            occurred_at=cast("datetime", child.outcome_recorded_at),
+            deduplicate=True,
+        )
+
     def _append_audit(  # noqa: PLR0913
         self,
         request: ApplyRequest,
@@ -1190,18 +1322,21 @@ class ApplyPlanOperations:
         correlation_id: str,
         *,
         facts: tuple[AuditFact, ...],
+        occurred_at: datetime | None = None,
+        deduplicate: bool = False,
     ) -> str:
         retained = self._audit.append(
             AuditRecordDraft(
                 kind=kind,
                 operation=OperationName("plan.apply"),
                 resource_scope=resource_scope,
-                occurred_at=request.now,
+                occurred_at=occurred_at or request.now,
                 outcome=StableSymbol(outcome),
                 correlation_id=RedactedText(correlation_id),
                 facts=facts,
             ),
             sensitive_values=(request.contact_value,),
+            deduplicate=deduplicate,
         )
         return retained.record_id
 
@@ -1220,6 +1355,8 @@ def _revalidation_drift(
     plan: QuotaPlan,
     request: ApplyRequest,
     refreshed: ApplyRevalidation,
+    *,
+    accepted_child_ids: frozenset[str] = frozenset(),
 ) -> bool:
     if (
         refreshed.resource_scope != plan.resource_scope
@@ -1236,7 +1373,12 @@ def _revalidation_drift(
         if (
             current.child_id != expected.child_id
             or current.slice_identity != expected.slice_identity
-            or current.effective != expected.effective
+        ):
+            return True
+        if expected.child_id in accepted_child_ids:
+            continue
+        if (
+            current.effective != expected.effective
             or current.usage != expected.usage
             or current.preference_name != expected.preference_name
             or current.preference_etag != expected.preference_etag
