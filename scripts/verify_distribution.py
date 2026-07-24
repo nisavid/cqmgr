@@ -65,6 +65,7 @@ EXPECTED_PACKAGE_FILES = {
     PurePosixPath("application/operations/quotas.py"),
     PurePosixPath("application/operations/read_only.py"),
     PurePosixPath("application/ports/__init__.py"),
+    PurePosixPath("application/ports/apply.py"),
     PurePosixPath("application/ports/apply_records.py"),
     PurePosixPath("application/ports/audit.py"),
     PurePosixPath("application/ports/catalog_reads.py"),

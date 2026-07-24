@@ -11,7 +11,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from stat import S_IMODE
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest.mock import patch
 
 import pytest
@@ -51,6 +51,9 @@ from cqmgr.domain.quotas import (
 )
 from cqmgr.domain.results import StableSymbol
 from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 NOW = datetime(2026, 7, 21, 12, tzinfo=UTC)
 KEY = b"k" * 32
@@ -93,6 +96,44 @@ class _MemoryConsumptionStore:
         if self.values.pop(reference, None) is None:
             return SecretStoreOutcome(SecretStoreStatus.MISSING)
         return SecretStoreOutcome(SecretStoreStatus.DELETED)
+
+
+class _ScriptedConsumptionStore(_MemoryConsumptionStore):
+    """Return injected marker outcomes through the public repository seam."""
+
+    def __init__(
+        self,
+        *,
+        get_status: SecretStoreStatus | None = None,
+        create_status: SecretStoreStatus | None = None,
+    ) -> None:
+        super().__init__()
+        self.get_status = get_status
+        self.create_status = create_status
+        self.available_secret: SecretValue | None = None
+
+    @override
+    def get_consumption_marker(
+        self, reference: SecretStoreReference
+    ) -> SecretStoreOutcome:
+        if self.get_status is SecretStoreStatus.AVAILABLE:
+            return SecretStoreOutcome(
+                SecretStoreStatus.AVAILABLE,
+                self.available_secret,
+            )
+        if self.get_status is not None:
+            return SecretStoreOutcome(self.get_status)
+        return super().get_consumption_marker(reference)
+
+    @override
+    def create_consumption_marker(
+        self,
+        reference: SecretStoreReference,
+        secret: SecretValue,
+    ) -> SecretStoreOutcome:
+        if self.create_status is not None:
+            return SecretStoreOutcome(self.create_status)
+        return super().create_consumption_marker(reference, secret)
 
 
 class _MemoryNativeKeyring:
@@ -1293,6 +1334,644 @@ def test_ledger_record_rejects_ambiguous_state_shapes(  # noqa: PLR0913
     """Every persisted state has one fail-closed domain representation."""
     with pytest.raises(error, match=message):
         PlanLedgerRecord(state, token, expires_at, reason)
+
+
+def test_export_store_and_load_fail_closed_at_every_persistence_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Portable and local plan persistence never accepts ambiguous bytes or state."""
+    encoded = _encoded()
+    repository = _repository(tmp_path / "export")
+    destination = tmp_path / "request.plan"
+    other_digest = "sha256:" + ("d" * 64)
+
+    assert (
+        repository.export(
+            EncodedPlan(b"{", encoded.digest),
+            destination,
+        ).status
+        is PlanRepositoryStatus.FAILED
+    )
+    assert (
+        repository.export(
+            EncodedPlan(encoded.bytes, other_digest),
+            destination,
+        ).status
+        is PlanRepositoryStatus.CONFLICT
+    )
+
+    root = tmp_path / "store"
+    repository = _repository(root)
+    assert repository.store(encoded, PLAN_KEY).status is PlanRepositoryStatus.STORED
+    plan_path = _plan_path(root, encoded.digest)
+    state_path = _state_path(root, encoded.digest)
+    plan_path.write_bytes(b"different")
+    assert repository.store(encoded, PLAN_KEY).status is PlanRepositoryStatus.CONFLICT
+    plan_path.write_bytes(encoded.bytes)
+    state_path.unlink()
+    missing_ledger = repository.store(encoded, PLAN_KEY)
+    assert missing_ledger.status is PlanRepositoryStatus.QUARANTINED
+    assert missing_ledger.reason == StableSymbol("missing-consumption-ledger")
+
+    failing_store = _ScriptedConsumptionStore(get_status=SecretStoreStatus.FAILED)
+    failing_root = tmp_path / "marker-failure"
+    failing_repository = plan_persistence.LocalPlanRepository(
+        failing_root,
+        failing_store,
+    )
+    assert (
+        failing_repository.store(encoded, PLAN_KEY).status
+        is PlanRepositoryStatus.FAILED
+    )
+
+    stable_root = tmp_path / "storage-failure"
+    stable_repository = _repository(stable_root)
+    stable_repository.store(encoded, PLAN_KEY)
+
+    def fail_read_record(*_args: object) -> PlanLedgerRecord:
+        raise OSError
+
+    monkeypatch.setattr(stable_repository, "_read_record", fail_read_record)
+    assert (
+        stable_repository.store(encoded, PLAN_KEY).status is PlanRepositoryStatus.FAILED
+    )
+
+
+def test_store_and_load_preserve_marker_and_terminal_fail_closed_state(
+    tmp_path: Path,
+) -> None:
+    """Marker replay and terminal invalidation cannot restore Apply authority."""
+    encoded = _encoded()
+    root = tmp_path / "marker-replay"
+    repository = _repository(root)
+    repository.store(encoded, PLAN_KEY)
+    state_path = _state_path(root, encoded.digest)
+    available_state = state_path.read_bytes()
+    leased = repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
+    assert leased.lease is not None
+    repository.mark_dispatched(leased.lease, PLAN_KEY, NOW)
+    state_path.write_bytes(available_state)
+
+    assert repository.store(encoded, PLAN_KEY).status is (
+        PlanRepositoryStatus.QUARANTINED
+    )
+    loaded = repository.load(encoded.digest, PLAN_KEY, NOW)
+    assert loaded.status is PlanRepositoryStatus.QUARANTINED
+    assert loaded.reason == StableSymbol("consumption-marker-exists")
+
+    invalidated_root = tmp_path / "invalidated"
+    invalidated_repository = _repository(invalidated_root)
+    invalidated_repository.store(encoded, PLAN_KEY)
+    invalidated_lease = invalidated_repository.acquire_lease(
+        encoded.digest,
+        PLAN_KEY,
+        NOW,
+    )
+    assert invalidated_lease.lease is not None
+    invalidated_repository.invalidate(
+        invalidated_lease.lease,
+        StableSymbol("child-evidence-drift"),
+        PLAN_KEY,
+        NOW,
+    )
+    repeated = invalidated_repository.store(encoded, PLAN_KEY)
+    assert repeated.status is PlanRepositoryStatus.INVALIDATED
+
+
+def test_load_and_acquire_classify_missing_marker_and_publication_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Load and lease report every local or marker failure without authority."""
+    encoded = _encoded()
+    root = tmp_path / "missing-plan"
+    repository = _repository(root)
+    repository.store(encoded, PLAN_KEY)
+    _plan_path(root, encoded.digest).unlink()
+    assert repository.load(encoded.digest, PLAN_KEY, NOW).status is (
+        PlanRepositoryStatus.MISSING
+    )
+    assert repository.acquire_lease(encoded.digest, PLAN_KEY, NOW).status is (
+        PlanRepositoryStatus.MISSING
+    )
+
+    marker_store = _MemoryConsumptionStore()
+    marker_root = tmp_path / "marker"
+    marker_repository = plan_persistence.LocalPlanRepository(marker_root, marker_store)
+    marker_repository.store(encoded, PLAN_KEY)
+    scripted = _ScriptedConsumptionStore(get_status=SecretStoreStatus.FAILED)
+    marker_repository._consumption_store = scripted  # noqa: SLF001
+    assert marker_repository.load(encoded.digest, PLAN_KEY, NOW).status is (
+        PlanRepositoryStatus.FAILED
+    )
+    assert marker_repository.acquire_lease(encoded.digest, PLAN_KEY, NOW).status is (
+        PlanRepositoryStatus.FAILED
+    )
+
+    write_root = tmp_path / "lease-write"
+    write_repository = _repository(write_root)
+    write_repository.store(encoded, PLAN_KEY)
+
+    def fail_write(*_args: object) -> None:
+        raise OSError
+
+    monkeypatch.setattr(write_repository, "_write_record", fail_write)
+    assert write_repository.acquire_lease(encoded.digest, PLAN_KEY, NOW).status is (
+        PlanRepositoryStatus.FAILED
+    )
+
+
+def test_resume_and_lease_transitions_classify_every_authority_failure(
+    tmp_path: Path,
+) -> None:
+    """Resume, dispatch, completion, quarantine, and invalidation fail closed."""
+    encoded = _encoded()
+    root = tmp_path / "transitions"
+    repository = _repository(root)
+    repository.store(encoded, PLAN_KEY)
+    leased = repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
+    assert leased.lease is not None
+
+    assert (
+        repository.resume_dispatched(
+            cast("str", 7),
+            PLAN_KEY,
+            NOW,
+        ).status
+        is PlanRepositoryStatus.FAILED
+    )
+    assert (
+        repository.resume_dispatched(
+            encoded.digest,
+            cast("SecretValue", b"not-secret"),
+            NOW,
+        ).status
+        is PlanRepositoryStatus.FAILED
+    )
+    bad_key = cast("SecretValue", b"not-secret")
+    for outcome in (
+        repository.mark_dispatched(leased.lease, bad_key, NOW),
+        repository.complete(leased.lease, bad_key, NOW),
+        repository.quarantine(
+            leased.lease,
+            StableSymbol("unknown-dispatch"),
+            bad_key,
+            NOW,
+        ),
+        repository.invalidate(
+            leased.lease,
+            StableSymbol("child-evidence-drift"),
+            bad_key,
+            NOW,
+        ),
+    ):
+        assert outcome.status is PlanRepositoryStatus.FAILED
+
+
+@pytest.mark.parametrize(
+    ("create_status", "expected"),
+    [
+        (SecretStoreStatus.CONFLICT, PlanRepositoryStatus.CONFLICT),
+        (SecretStoreStatus.FAILED, PlanRepositoryStatus.FAILED),
+    ],
+)
+def test_dispatch_requires_one_new_immutable_consumption_marker(
+    tmp_path: Path,
+    create_status: SecretStoreStatus,
+    expected: PlanRepositoryStatus,
+) -> None:
+    """Dispatch authority is withheld when marker creation is not conclusive."""
+    encoded = _encoded()
+    store = _ScriptedConsumptionStore(create_status=create_status)
+    repository = plan_persistence.LocalPlanRepository(tmp_path, store)
+    repository.store(encoded, PLAN_KEY)
+    leased = repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
+    assert leased.lease is not None
+
+    dispatched = repository.mark_dispatched(leased.lease, PLAN_KEY, NOW)
+
+    assert dispatched.status is expected
+
+
+def test_completion_resume_and_repeated_quarantine_require_durable_marker_state(
+    tmp_path: Path,
+) -> None:
+    """Missing markers quarantine recovery and block terminal completion."""
+    encoded = _encoded()
+    root = tmp_path / "completion"
+    repository = _repository(root)
+    store = _CONSUMPTION_STORES[root.resolve()]
+    repository.store(encoded, PLAN_KEY)
+    leased = repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
+    assert leased.lease is not None
+    repository.mark_dispatched(leased.lease, PLAN_KEY, NOW)
+    store.values.clear()
+
+    assert repository.complete(leased.lease, PLAN_KEY, NOW).status is (
+        PlanRepositoryStatus.FAILED
+    )
+    resumed = repository.resume_dispatched(encoded.digest, PLAN_KEY, NOW)
+    assert resumed.status is PlanRepositoryStatus.QUARANTINED
+    assert resumed.reason == StableSymbol("consumption-marker-missing")
+
+    quarantine_root = tmp_path / "quarantine"
+    quarantine_repository = _repository(quarantine_root)
+    quarantine_repository.store(encoded, PLAN_KEY)
+    quarantine_lease = quarantine_repository.acquire_lease(
+        encoded.digest,
+        PLAN_KEY,
+        NOW,
+    )
+    assert quarantine_lease.lease is not None
+    first = quarantine_repository.quarantine(
+        quarantine_lease.lease,
+        StableSymbol("unknown-dispatch"),
+        PLAN_KEY,
+        NOW,
+    )
+    repeated = quarantine_repository.quarantine(
+        quarantine_lease.lease,
+        StableSymbol("critical-unknown"),
+        PLAN_KEY,
+        NOW,
+    )
+    assert first.status is PlanRepositoryStatus.QUARANTINED
+    assert repeated.status is PlanRepositoryStatus.QUARANTINED
+    assert repeated.reason == first.reason
+
+
+@pytest.mark.parametrize("operation", ["resume", "quarantine", "invalidate"])
+def test_recovery_operations_classify_authenticated_ledger_read_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    """A ledger read failure never yields recovered authority."""
+    encoded = _encoded()
+    repository = _repository(tmp_path / operation)
+    repository.store(encoded, PLAN_KEY)
+    leased = repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
+    assert leased.lease is not None
+
+    def fail_read(*_args: object) -> PlanLedgerRecord:
+        raise OSError
+
+    monkeypatch.setattr(repository, "_read_record", fail_read)
+    if operation == "resume":
+        outcome = repository.resume_dispatched(encoded.digest, PLAN_KEY, NOW)
+    elif operation == "quarantine":
+        outcome = repository.quarantine(
+            leased.lease,
+            StableSymbol("unknown-dispatch"),
+            PLAN_KEY,
+            NOW,
+        )
+    else:
+        outcome = repository.invalidate(
+            leased.lease,
+            StableSymbol("child-evidence-drift"),
+            PLAN_KEY,
+            NOW,
+        )
+    assert outcome.status is PlanRepositoryStatus.FAILED
+
+
+@pytest.mark.parametrize("operation", ["quarantine", "invalidate"])
+def test_terminal_block_publication_failures_remain_typed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    """A failed terminal ledger fsync cannot report containment."""
+    encoded = _encoded()
+    repository = _repository(tmp_path / operation)
+    repository.store(encoded, PLAN_KEY)
+    leased = repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
+    assert leased.lease is not None
+
+    def fail_write(*_args: object) -> None:
+        raise OSError
+
+    monkeypatch.setattr(repository, "_write_record", fail_write)
+    if operation == "quarantine":
+        outcome = repository.quarantine(
+            leased.lease,
+            StableSymbol("unknown-dispatch"),
+            PLAN_KEY,
+            NOW,
+        )
+    else:
+        outcome = repository.invalidate(
+            leased.lease,
+            StableSymbol("child-evidence-drift"),
+            PLAN_KEY,
+            NOW,
+        )
+    assert outcome.status is PlanRepositoryStatus.FAILED
+
+
+def test_resume_and_terminal_transitions_reject_plan_authentication_or_marker_failure(
+    tmp_path: Path,
+) -> None:
+    """Recovery and both lease transitions re-authenticate exact plan bytes."""
+    encoded = _encoded()
+
+    def tamper_authentication(root: Path) -> None:
+        path = _plan_path(root, encoded.digest)
+        envelope = json.loads(path.read_text())
+        envelope["authentication"] = "hmac-sha256:" + ("0" * 64)
+        path.write_text(
+            json.dumps(envelope, separators=(",", ":"), sort_keys=True) + "\n"
+        )
+        path.chmod(PRIVATE_FILE_MODE)
+
+    resume_root = tmp_path / "resume-auth"
+    resume_repository = _repository(resume_root)
+    resume_repository.store(encoded, PLAN_KEY)
+    resume_repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
+    tamper_authentication(resume_root)
+    assert (
+        resume_repository.resume_dispatched(
+            encoded.digest,
+            PLAN_KEY,
+            NOW,
+        ).status
+        is PlanRepositoryStatus.CONFLICT
+    )
+
+    dispatch_root = tmp_path / "dispatch-auth"
+    dispatch_repository = _repository(dispatch_root)
+    dispatch_repository.store(encoded, PLAN_KEY)
+    dispatch_lease = dispatch_repository.acquire_lease(
+        encoded.digest,
+        PLAN_KEY,
+        NOW,
+    )
+    assert dispatch_lease.lease is not None
+    tamper_authentication(dispatch_root)
+    assert (
+        dispatch_repository.mark_dispatched(
+            dispatch_lease.lease,
+            PLAN_KEY,
+            NOW,
+        ).status
+        is PlanRepositoryStatus.CONFLICT
+    )
+
+    complete_root = tmp_path / "complete-auth"
+    complete_repository = _repository(complete_root)
+    complete_repository.store(encoded, PLAN_KEY)
+    complete_lease = complete_repository.acquire_lease(
+        encoded.digest,
+        PLAN_KEY,
+        NOW,
+    )
+    assert complete_lease.lease is not None
+    complete_repository.mark_dispatched(complete_lease.lease, PLAN_KEY, NOW)
+    tamper_authentication(complete_root)
+    assert complete_repository.load(encoded.digest, PLAN_KEY, NOW).status is (
+        PlanRepositoryStatus.CONFLICT
+    )
+    assert (
+        complete_repository.complete(
+            complete_lease.lease,
+            PLAN_KEY,
+            NOW,
+        ).status
+        is PlanRepositoryStatus.CONFLICT
+    )
+
+    marker_store = _ScriptedConsumptionStore()
+    marker_repository = plan_persistence.LocalPlanRepository(
+        tmp_path / "resume-marker",
+        marker_store,
+    )
+    marker_repository.store(encoded, PLAN_KEY)
+    marker_repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
+    marker_store.get_status = SecretStoreStatus.FAILED
+    assert (
+        marker_repository.resume_dispatched(
+            encoded.digest,
+            PLAN_KEY,
+            NOW,
+        ).status
+        is PlanRepositoryStatus.FAILED
+    )
+
+
+def test_dispatch_reports_plan_read_failure_without_consuming_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plan read failure after leasing cannot cross the dispatch barrier."""
+    encoded = _encoded()
+    repository = _repository(tmp_path)
+    repository.store(encoded, PLAN_KEY)
+    leased = repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
+    assert leased.lease is not None
+
+    def fail_plan_read(*_args: object) -> tuple[bytes, object]:
+        raise OSError
+
+    monkeypatch.setattr(repository, "_read_local_plan", fail_plan_read)
+
+    assert repository.mark_dispatched(leased.lease, PLAN_KEY, NOW).status is (
+        PlanRepositoryStatus.FAILED
+    )
+
+
+@pytest.mark.parametrize(
+    ("scenario", "failure_number"),
+    [
+        ("marker-first", 1),
+        ("expired-dispatch", 1),
+        ("expired-plan", 2),
+        ("renew-lease", 2),
+        ("missing-marker", 1),
+    ],
+)
+def test_resume_reports_each_recovery_publication_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    failure_number: int,
+) -> None:
+    """Every recovery fsync failure remains a typed failure without new authority."""
+    encoded = _encoded()
+    root = tmp_path / scenario
+    repository = _repository(root)
+    store = _CONSUMPTION_STORES[root.resolve()]
+    repository.store(encoded, PLAN_KEY)
+    leased = repository.acquire_lease(
+        encoded.digest,
+        PLAN_KEY,
+        NOW,
+        lease_duration=timedelta(seconds=1),
+    )
+    assert leased.lease is not None
+    now = NOW
+    if scenario in {"marker-first", "expired-dispatch", "missing-marker"}:
+        if scenario == "marker-first":
+            original_write = repository._write_record  # noqa: SLF001
+
+            def fail_barrier(
+                digest_hex: str,
+                record: PlanLedgerRecord,
+                key: bytes,
+            ) -> None:
+                if record.state is PlanLedgerState.DISPATCHED:
+                    raise OSError
+                original_write(digest_hex, record, key)
+
+            monkeypatch.setattr(repository, "_write_record", fail_barrier)
+            repository.mark_dispatched(leased.lease, PLAN_KEY, NOW)
+            monkeypatch.setattr(repository, "_write_record", original_write)
+        else:
+            repository.mark_dispatched(leased.lease, PLAN_KEY, NOW)
+        if scenario == "expired-dispatch":
+            now = NOW + timedelta(seconds=1)
+        if scenario == "missing-marker":
+            store.values.clear()
+    elif scenario == "expired-plan":
+        now = NOW + PLAN_LIFETIME
+    else:
+        now = NOW + timedelta(seconds=2)
+
+    original_write = repository._write_record  # noqa: SLF001
+    writes = 0
+
+    def fail_selected(
+        digest_hex: str,
+        record: PlanLedgerRecord,
+        key: bytes,
+    ) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == failure_number:
+            raise OSError
+        original_write(digest_hex, record, key)
+
+    monkeypatch.setattr(repository, "_write_record", fail_selected)
+    assert repository.resume_dispatched(encoded.digest, PLAN_KEY, now).status is (
+        PlanRepositoryStatus.FAILED
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda state: state.update(authentication="hmac-sha256:" + ("0" * 64)),
+        lambda state: state.update(lease_token=7),
+        lambda state: state.update(lease_expires_at="2026-07-21T12:01:00+00:00"),
+    ],
+)
+def test_authenticated_ledger_corruption_remains_unavailable(
+    tmp_path: Path,
+    mutation: Callable[[dict[str, object]], None],
+) -> None:
+    """Malformed authenticated ledger fields cannot become plan authority."""
+    encoded = _encoded()
+    repository = _repository(tmp_path)
+    repository.store(encoded, PLAN_KEY)
+    leased = repository.acquire_lease(encoded.digest, PLAN_KEY, NOW)
+    assert leased.lease is not None
+    path = _state_path(tmp_path, encoded.digest)
+    state = json.loads(path.read_text())
+    mutation(state)
+    if state["authentication"] != "hmac-sha256:" + ("0" * 64):
+        digest_hex = encoded.digest.removeprefix("sha256:")
+        mapping = {
+            key: value for key, value in state.items() if key != "authentication"
+        }
+        state["authentication"] = plan_persistence._record_authentication(  # noqa: SLF001
+            digest_hex,
+            mapping,
+            KEY,
+        )
+    path.write_text(json.dumps(state))
+
+    assert repository.load(encoded.digest, PLAN_KEY, NOW).status is (
+        PlanRepositoryStatus.FAILED
+    )
+
+
+def test_marker_plan_and_atomic_filesystem_corruption_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Marker identity, addressed plan bytes, and atomic cleanup are verified."""
+    encoded = _encoded()
+    marker_store = _ScriptedConsumptionStore(get_status=SecretStoreStatus.AVAILABLE)
+    marker_store.available_secret = SecretValue(b"x" * 32)
+    marker_repository = plan_persistence.LocalPlanRepository(
+        tmp_path / "marker",
+        _MemoryConsumptionStore(),
+    )
+    marker_repository.store(encoded, PLAN_KEY)
+    marker_repository._consumption_store = marker_store  # noqa: SLF001
+    assert marker_repository.load(encoded.digest, PLAN_KEY, NOW).status is (
+        PlanRepositoryStatus.FAILED
+    )
+
+    plan_root = tmp_path / "plan"
+    plan_repository = _repository(plan_root)
+    plan_repository.store(encoded, PLAN_KEY)
+    decoded = PlanCodec.decode(encoded.bytes)
+    assert isinstance(decoded.plan, QuotaRequestPlan)
+    other = PlanCodec.encode(
+        replace(decoded.plan, target=QuotaQuantity(9, QuotaUnit("1"))),
+        KEY,
+    )
+    _plan_path(plan_root, encoded.digest).write_bytes(other.bytes)
+    assert plan_repository.load(encoded.digest, PLAN_KEY, NOW).status is (
+        PlanRepositoryStatus.FAILED
+    )
+
+    atomic_root = tmp_path / "atomic"
+    atomic_repository = _repository(atomic_root)
+
+    def fail_fsync(_descriptor: int) -> None:
+        raise OSError
+
+    monkeypatch.setattr(plan_persistence.os, "fsync", fail_fsync)
+    assert atomic_repository.store(encoded, PLAN_KEY).status is (
+        PlanRepositoryStatus.FAILED
+    )
+    assert list((atomic_root / "state").glob(".*.tmp")) == []
+
+
+def test_existing_export_hardening_reports_mode_and_filesystem_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Idempotent export succeeds only after the existing file is private."""
+    encoded = _encoded()
+    repository = _repository(tmp_path / "repository")
+    destination = tmp_path / "request.plan"
+    destination.write_bytes(encoded.bytes)
+    destination.chmod(0o644)
+    original_chmod = Path.chmod
+
+    def ignore_destination_chmod(path: Path, mode: int) -> None:
+        if path != destination:
+            original_chmod(path, mode)
+
+    monkeypatch.setattr(Path, "chmod", ignore_destination_chmod)
+    assert repository.export(encoded, destination).status is (
+        PlanRepositoryStatus.FAILED
+    )
+    monkeypatch.setattr(Path, "chmod", original_chmod)
+
+    def fail_destination_chmod(path: Path, mode: int) -> None:
+        if path == destination:
+            raise OSError
+        original_chmod(path, mode)
+
+    monkeypatch.setattr(Path, "chmod", fail_destination_chmod)
+    assert repository.export(encoded, destination).status is (
+        PlanRepositoryStatus.FAILED
+    )
 
 
 class PlanRepositoryStateMachine(RuleBasedStateMachine):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, cast, override
 
 import pytest
 
@@ -13,13 +13,15 @@ from cqmgr.adapters.persistence import apply_records as apply_record_persistence
 from cqmgr.adapters.persistence.apply_records import LocalApplyRecordRepository
 from cqmgr.adapters.serialization.plans import PlanCodec
 from cqmgr.application.operations.apply import (
-    ApplyContactRefresh,
     ApplyData,
-    ApplyEvidenceRefresh,
     ApplyPlanOperations,
     ApplyRequest,
-    ApplyRevalidation,
     ComposedApplyRevalidator,
+)
+from cqmgr.application.ports.apply import (
+    ApplyContactRefresh,
+    ApplyEvidenceRefresh,
+    ApplyRevalidation,
     RefreshedApplyChild,
 )
 from cqmgr.application.ports.apply_records import (
@@ -72,7 +74,7 @@ from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from cqmgr.application.operations.apply import ApplyRevalidator
+    from cqmgr.application.ports.apply import ApplyRevalidator
     from cqmgr.application.ports.apply_records import ApplyRecordRepository
     from cqmgr.application.ports.audit import AuditJournal
     from cqmgr.application.ports.plans import (
@@ -81,7 +83,10 @@ if TYPE_CHECKING:
     from cqmgr.application.ports.plans import (
         PlanRepository,
     )
-    from cqmgr.application.ports.provider_writes import QuotaPreferenceWriter
+    from cqmgr.application.ports.provider_writes import (
+        QuotaPreferenceUnknownResolver,
+        QuotaPreferenceWriter,
+    )
     from cqmgr.domain.audit import AuditRecordDraft
     from cqmgr.domain.plans import QuotaPlan
 
@@ -168,12 +173,18 @@ class _MemoryPlanRepository:
         self.fail_mark_dispatched = False
         self.fail_complete = False
         self.fail_quarantine = False
+        self.fail_acquire = False
+        self.fail_invalidate = False
         self.lease: PlanLease | None = None
+        self.load_outcome: PlanRepositoryOutcome | None = None
+        self.resume_outcome: PlanRepositoryOutcome | None = None
 
     def load(
         self, digest: str, _key: SecretValue, _now: datetime
     ) -> PlanRepositoryOutcome:
         assert digest == self.encoded.digest
+        if self.load_outcome is not None:
+            return self.load_outcome
         return PlanRepositoryOutcome(
             PlanRepositoryStatus.AVAILABLE,
             plan_bytes=self.encoded.bytes,
@@ -184,6 +195,8 @@ class _MemoryPlanRepository:
     def acquire_lease(
         self, digest: str, _key: SecretValue, now: datetime
     ) -> PlanRepositoryOutcome:
+        if self.fail_acquire:
+            return PlanRepositoryOutcome(PlanRepositoryStatus.CONFLICT)
         self.state = PlanLedgerState.LEASED
         self.lease = PlanLease(digest, "lease-1", now + timedelta(minutes=1))
         return PlanRepositoryOutcome(
@@ -196,6 +209,8 @@ class _MemoryPlanRepository:
     def resume_dispatched(
         self, _digest: str, _key: SecretValue, _now: datetime
     ) -> PlanRepositoryOutcome:
+        if self.resume_outcome is not None:
+            return self.resume_outcome
         if (
             self.state
             not in {
@@ -224,6 +239,8 @@ class _MemoryPlanRepository:
         _key: SecretValue,
         _now: datetime,
     ) -> PlanRepositoryOutcome:
+        if self.fail_invalidate:
+            return PlanRepositoryOutcome(PlanRepositoryStatus.FAILED)
         self.state = PlanLedgerState.INVALIDATED
         self.invalidated_reason = reason
         return PlanRepositoryOutcome(
@@ -281,6 +298,7 @@ class _MemoryApplyRecords:
         self.record: ApplyRecord | None = None
         self.fail_on_revision: int | None = None
         self.fail_create = False
+        self.fail_append_resolution = False
         self.resolutions: list[UnknownResolutionEvidence] = []
 
     def create(
@@ -316,6 +334,8 @@ class _MemoryApplyRecords:
         recorded_at: datetime,
         _authentication_key: SecretValue,
     ) -> ApplyRecordRepositoryOutcome:
+        if self.fail_append_resolution:
+            return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.FAILED)
         evidence = UnknownResolutionEvidence(
             intent_id,
             child_id,
@@ -400,6 +420,24 @@ class _RaisingRevalidator:
         raise OSError
 
 
+class _CancellingRevalidator:
+    async def refresh(self, _plan: QuotaPlan, _now: datetime) -> ApplyRevalidation:
+        raise asyncio.CancelledError
+
+
+class _FailingCodec:
+    @staticmethod
+    def decode(_data: bytes) -> object:
+        raise ValueError
+
+
+class _RaisingResolver:
+    async def resolve_unknown(
+        self, _request: QuotaPreferenceWrite
+    ) -> UnknownWriteResolution:
+        raise OSError
+
+
 class _FailFastWriter:
     def __init__(self) -> None:
         self.calls = 0
@@ -420,12 +458,9 @@ class _ScriptedWriter:
     def __init__(
         self,
         *results: QuotaPreferenceWriteResult | BaseException,
-        resolution: UnknownWriteResolution = UnknownWriteResolution.UNRESOLVED,
     ) -> None:
         self.results = list(results)
-        self.resolution = resolution
         self.requests: list[QuotaPreferenceWrite] = []
-        self.resolve_requests: list[QuotaPreferenceWrite] = []
 
     async def dispatch(
         self, request: QuotaPreferenceWrite
@@ -436,10 +471,19 @@ class _ScriptedWriter:
             raise result
         return result
 
+
+class _ScriptedResolver:
+    def __init__(
+        self,
+        resolution: UnknownWriteResolution = UnknownWriteResolution.UNRESOLVED,
+    ) -> None:
+        self.resolution = resolution
+        self.requests: list[QuotaPreferenceWrite] = []
+
     async def resolve_unknown(
         self, request: QuotaPreferenceWrite
     ) -> UnknownWriteResolution:
-        self.resolve_requests.append(request)
+        self.requests.append(request)
         return self.resolution
 
 
@@ -489,6 +533,10 @@ def test_all_child_revalidation_drift_invalidates_without_provider_writes() -> N
             codec=cast("PlanCodecPort", PlanCodec()),
             revalidator=cast("ApplyRevalidator", _ScriptedRevalidator(revalidation)),
             writer=cast("QuotaPreferenceWriter", writer),
+            unknown_resolver=cast(
+                "QuotaPreferenceUnknownResolver",
+                _ScriptedResolver(),
+            ),
         ).apply(
             ApplyRequest(
                 digest=repository.encoded.digest,
@@ -720,6 +768,9 @@ def _apply(  # noqa: PLR0913
     repository: _MemoryPlanRepository | None = None,
     audit: _MemoryAuditJournal | None = None,
     revalidator: object | None = None,
+    unknown_resolver: _ScriptedResolver | None = None,
+    codec: object | None = None,
+    request: ApplyRequest | None = None,
 ) -> tuple[
     OperationResult[ApplyData],
     _MemoryPlanRepository,
@@ -734,14 +785,16 @@ def _apply(  # noqa: PLR0913
             repository=cast("PlanRepository", repository),
             apply_records=cast("ApplyRecordRepository", apply_records),
             audit=cast("AuditJournal", audit),
-            codec=cast("PlanCodecPort", PlanCodec()),
+            codec=cast("PlanCodecPort", codec or PlanCodec()),
             revalidator=cast(
                 "ApplyRevalidator",
                 revalidator or _ScriptedRevalidator(_valid_revalidation(plan)),
             ),
             writer=writer,
+            unknown_resolver=unknown_resolver or _ScriptedResolver(),
         ).apply(
-            ApplyRequest(
+            request
+            or ApplyRequest(
                 digest=repository.encoded.digest,
                 authentication_key=KEY,
                 local_installation_id="installation-123",
@@ -792,15 +845,374 @@ def test_apply_dispatches_bound_order_once_and_durably_accepts_every_child() -> 
     ]
 
 
+def test_apply_revalidates_then_persists_preintent_before_consumption_barrier() -> None:
+    """The complete bundle is fresh and durable before acquiring dispatch authority."""
+    plan = _plan()
+    events: list[str] = []
+
+    class OrderedRevalidator(_ScriptedRevalidator):
+        @override
+        async def refresh(self, _plan: QuotaPlan, _now: datetime) -> ApplyRevalidation:
+            events.append("revalidated")
+            return await super().refresh(_plan, _now)
+
+    class OrderedAudit(_MemoryAuditJournal):
+        @override
+        def append(self, draft: AuditRecordDraft, **kwargs: object) -> _AuditRecord:
+            if draft.outcome == StableSymbol("pre-apply-intent"):
+                events.append("preintent")
+            return super().append(draft, **kwargs)
+
+    class OrderedRepository(_MemoryPlanRepository):
+        @override
+        def acquire_lease(
+            self, digest: str, _key: SecretValue, now: datetime
+        ) -> PlanRepositoryOutcome:
+            events.append("lease")
+            return super().acquire_lease(digest, _key, now)
+
+        @override
+        def mark_dispatched(
+            self, _lease: PlanLease, _key: SecretValue, _now: datetime
+        ) -> PlanRepositoryOutcome:
+            events.append("dispatched")
+            return super().mark_dispatched(_lease, _key, _now)
+
+    class OrderedWriter(_ScriptedWriter):
+        @override
+        async def dispatch(
+            self, request: QuotaPreferenceWrite
+        ) -> QuotaPreferenceWriteResult:
+            events.append("provider")
+            return await super().dispatch(request)
+
+    repository = OrderedRepository(plan)
+    writer = OrderedWriter(
+        QuotaPreferenceWriteResult(
+            accepted=True,
+            outcome=StableSymbol("submitted"),
+        ),
+        QuotaPreferenceWriteResult(
+            accepted=True,
+            outcome=StableSymbol("submitted"),
+        ),
+    )
+    _apply(
+        plan,
+        writer,
+        repository=repository,
+        audit=OrderedAudit(),
+        revalidator=OrderedRevalidator(_valid_revalidation(plan)),
+    )
+
+    assert events[:5] == [
+        "revalidated",
+        "preintent",
+        "lease",
+        "dispatched",
+        "provider",
+    ]
+
+
+def test_preintent_audit_failure_leaves_plan_available_without_dispatch() -> None:
+    """Failure before the barrier returns typed evidence without leasing the plan."""
+    plan = _plan()
+    repository = _MemoryPlanRepository(plan)
+    audit = _MemoryAuditJournal()
+    audit.fail_on_append = 1
+    writer = _ScriptedWriter()
+
+    result, repository, records, _audit = _apply(
+        plan,
+        writer,
+        repository=repository,
+        audit=audit,
+    )
+
+    assert result.outcome.code == StableSymbol("apply-intent-audit-failed")
+    assert repository.state is PlanLedgerState.AVAILABLE
+    assert records.record is None
+    assert writer.requests == []
+
+
+def test_cancellation_during_preflight_propagates_without_leasing_or_dispatch() -> None:
+    """Caller cancellation before durable intent remains an ordinary interruption."""
+    plan = _plan()
+    repository = _MemoryPlanRepository(plan)
+    writer = _ScriptedWriter()
+
+    with pytest.raises(asyncio.CancelledError):
+        _apply(
+            plan,
+            writer,
+            repository=repository,
+            revalidator=_CancellingRevalidator(),
+        )
+
+    assert repository.state is PlanLedgerState.AVAILABLE
+    assert writer.requests == []
+
+
+def test_lease_conflict_after_preintent_never_crosses_provider_boundary() -> None:
+    """An optimistic loser retains durable intent but cannot dispatch."""
+    plan = _plan()
+
+    class ConflictingRepository(_MemoryPlanRepository):
+        @override
+        def acquire_lease(
+            self, digest: str, _key: SecretValue, now: datetime
+        ) -> PlanRepositoryOutcome:
+            del digest, _key, now
+            return PlanRepositoryOutcome(
+                PlanRepositoryStatus.CONFLICT,
+                state=PlanLedgerState.AVAILABLE,
+                authenticated=True,
+            )
+
+    repository = ConflictingRepository(plan)
+    writer = _ScriptedWriter()
+
+    result, repository, records, audit = _apply(
+        plan,
+        writer,
+        repository=repository,
+    )
+
+    assert result.outcome.code == StableSymbol("plan-lease-failed")
+    assert repository.state is PlanLedgerState.AVAILABLE
+    assert records.record is not None
+    assert [draft.outcome for draft in audit.drafts] == [
+        StableSymbol("pre-apply-intent")
+    ]
+    assert writer.requests == []
+
+
+def test_apply_rejects_unavailable_undecodable_and_request_drift_before_preintent() -> (
+    None
+):
+    """Every preflight identity failure remains a terminal zero-write result."""
+    plan = _plan()
+
+    unavailable = _MemoryPlanRepository(plan)
+    unavailable.load_outcome = PlanRepositoryOutcome(PlanRepositoryStatus.MISSING)
+    missing, *_ = _apply(plan, _ScriptedWriter(), repository=unavailable)
+    undecodable, *_ = _apply(plan, _ScriptedWriter(), codec=_FailingCodec())
+
+    drift_repository = _MemoryPlanRepository(plan)
+    drift_request = ApplyRequest(
+        digest=drift_repository.encoded.digest,
+        authentication_key=KEY,
+        local_installation_id="foreign-installation",
+        resource_scope_acknowledgement=SCOPE,
+        principal=PRINCIPAL,
+        contact_binding=CONTACT,
+        contact_value="operator@example.com",
+        now=NOW + timedelta(minutes=1),
+    )
+    drifted, *_ = _apply(
+        plan,
+        _ScriptedWriter(),
+        repository=drift_repository,
+        request=drift_request,
+    )
+
+    assert missing.outcome.code == StableSymbol("plan-unavailable")
+    assert undecodable.outcome.code == StableSymbol("plan-unauthenticated")
+    assert drifted.outcome.code == StableSymbol("plan-precondition-failed")
+
+
+def test_failed_revalidation_classifies_lease_invalidation_and_audit_failures() -> None:
+    """No-write invalidation reports each failed local durability boundary."""
+    plan = _plan()
+
+    lease_failure = _MemoryPlanRepository(plan)
+    lease_failure.fail_acquire = True
+    no_lease, *_ = _apply(
+        plan,
+        _ScriptedWriter(),
+        repository=lease_failure,
+        revalidator=_RaisingRevalidator(),
+    )
+
+    invalidation_failure = _MemoryPlanRepository(plan)
+    invalidation_failure.fail_invalidate = True
+    not_invalidated, *_ = _apply(
+        plan,
+        _ScriptedWriter(),
+        repository=invalidation_failure,
+        revalidator=_RaisingRevalidator(),
+    )
+
+    audit_failure = _MemoryAuditJournal()
+    audit_failure.fail_on_append = 1
+    no_audit, *_ = _apply(
+        plan,
+        _ScriptedWriter(),
+        audit=audit_failure,
+        revalidator=_RaisingRevalidator(),
+    )
+
+    assert no_lease.outcome.code == StableSymbol("plan-lease-failed")
+    assert not_invalidated.outcome.code == StableSymbol("plan-invalidation-failed")
+    assert no_audit.outcome.code == StableSymbol("plan-invalidation-audit-failed")
+
+
+@pytest.mark.parametrize(
+    ("writer_result", "failed_revision", "failed_append", "expected"),
+    [
+        (
+            QuotaPreferenceWriteResult(
+                accepted=False,
+                outcome=StableSymbol("provider-rejected"),
+            ),
+            None,
+            3,
+            "critical-unknown",
+        ),
+        (
+            QuotaPreferenceWriteResult(
+                accepted=False,
+                outcome=StableSymbol("provider-rejected"),
+            ),
+            3,
+            None,
+            "critical-unknown",
+        ),
+        (
+            QuotaPreferenceWriteResult(
+                accepted=True,
+                outcome=StableSymbol("submitted"),
+            ),
+            3,
+            None,
+            "critical-unknown",
+        ),
+    ],
+)
+def test_terminal_child_evidence_failure_is_always_quarantined(
+    writer_result: QuotaPreferenceWriteResult,
+    failed_revision: int | None,
+    failed_append: int | None,
+    expected: str,
+) -> None:
+    """No accepted or failed dispatch escapes without durable terminal evidence."""
+    plan = _single_plan()
+    records = _MemoryApplyRecords()
+    records.fail_on_revision = failed_revision
+    audit = _MemoryAuditJournal()
+    audit.fail_on_append = failed_append
+
+    result, repository, _records, _audit = _apply(
+        plan,
+        _ScriptedWriter(writer_result),
+        records=records,
+        audit=audit,
+    )
+
+    assert result.outcome.code == StableSymbol(expected)
+    assert repository.state is PlanLedgerState.QUARANTINED
+
+
+@pytest.mark.parametrize(
+    ("failed_revision", "failed_append"),
+    [
+        (2, None),
+        (None, 3),
+        (3, None),
+    ],
+)
+def test_unknown_dispatch_persistence_failures_are_critical(
+    failed_revision: int | None,
+    failed_append: int | None,
+) -> None:
+    """Every unknown checkpoint is durable or escalates to critical unknown."""
+    plan = _single_plan()
+    records = _MemoryApplyRecords()
+    records.fail_on_revision = failed_revision
+    audit = _MemoryAuditJournal()
+    audit.fail_on_append = failed_append
+
+    result, repository, _records, _audit = _apply(
+        plan,
+        _ScriptedWriter(TimeoutError("transport lost")),
+        records=records,
+        audit=audit,
+    )
+
+    assert result.outcome.code == StableSymbol("critical-unknown")
+    assert repository.state is PlanLedgerState.QUARANTINED
+
+
+def test_unknown_reconciliation_read_and_append_failures_remain_quarantined() -> None:
+    """Read loss stays unresolved and rejected append evidence becomes critical."""
+    plan = _single_plan()
+    unresolved, repository, *_ = _apply(
+        plan,
+        _ScriptedWriter(TimeoutError("transport lost")),
+        unknown_resolver=cast("_ScriptedResolver", _RaisingResolver()),
+    )
+
+    records = _MemoryApplyRecords()
+    records.fail_append_resolution = True
+    rejected, rejected_repository, *_ = _apply(
+        plan,
+        _ScriptedWriter(TimeoutError("transport lost")),
+        records=records,
+        unknown_resolver=_ScriptedResolver(UnknownWriteResolution.ACCEPTED),
+    )
+
+    assert unresolved.outcome.code == StableSymbol("unknown-dispatch")
+    assert repository.state is PlanLedgerState.QUARANTINED
+    assert rejected.outcome.code == StableSymbol("critical-unknown")
+    assert rejected_repository.state is PlanLedgerState.QUARANTINED
+
+
+def test_child_preintent_quarantine_failure_is_critical_unknown() -> None:
+    """A failed child preintent plus failed containment becomes critical unknown."""
+    plan = _single_plan()
+    repository = _MemoryPlanRepository(plan)
+    repository.fail_quarantine = True
+    audit = _MemoryAuditJournal()
+    audit.fail_on_append = 2
+
+    result, *_ = _apply(
+        plan,
+        _ScriptedWriter(),
+        repository=repository,
+        audit=audit,
+    )
+
+    assert result.outcome.code == StableSymbol("critical-unknown-uncontained")
+
+
+def test_nonconflict_provider_failure_uses_operational_exit_class() -> None:
+    """A provider rejection is distinct from an etag or identity conflict."""
+    result, *_ = _apply(
+        _single_plan(),
+        _ScriptedWriter(
+            QuotaPreferenceWriteResult(
+                accepted=False,
+                outcome=StableSymbol("provider-rejected"),
+            )
+        ),
+    )
+
+    assert result.outcome.exit_class is ExitClass.OPERATIONAL_FAILURE
+
+
 def test_unknown_first_child_is_never_retried_and_later_child_is_unattempted() -> None:
     """Transport ambiguity stops the bundle and reconciles the exact identity."""
     plan = _plan()
-    writer = _ScriptedWriter(
-        TimeoutError("scripted transport loss"),
+    writer = _ScriptedWriter(TimeoutError("scripted transport loss"))
+    resolver = _ScriptedResolver(
         resolution=UnknownWriteResolution.ACCEPTED,
     )
 
-    result, repository, records, _audit = _apply(plan, writer)
+    result, repository, records, _audit = _apply(
+        plan,
+        writer,
+        unknown_resolver=resolver,
+    )
 
     assert not result.boundary.reached
     assert result.outcome.exit_class is ExitClass.OPERATIONAL_FAILURE
@@ -812,7 +1224,7 @@ def test_unknown_first_child_is_never_retried_and_later_child_is_unattempted() -
         ApplyChildDisposition.UNATTEMPTED,
     )
     assert result.data.quarantine_identity == writer.requests[0].preference_identity
-    assert writer.resolve_requests == writer.requests
+    assert resolver.requests == writer.requests
     assert records.record.children[0].unknown_resolution is None
     assert records.resolutions[0].resolution is UnknownDispatchResolution.ACCEPTED
 
@@ -822,8 +1234,8 @@ def test_unknown_resolution_audit_failure_returns_contained_critical_unknown() -
     plan = _plan()
     audit = _MemoryAuditJournal()
     audit.fail_on_append = 4
-    writer = _ScriptedWriter(
-        TimeoutError("scripted transport loss"),
+    writer = _ScriptedWriter(TimeoutError("scripted transport loss"))
+    resolver = _ScriptedResolver(
         resolution=UnknownWriteResolution.ACCEPTED,
     )
 
@@ -831,6 +1243,7 @@ def test_unknown_resolution_audit_failure_returns_contained_critical_unknown() -
         plan,
         writer,
         audit=audit,
+        unknown_resolver=resolver,
     )
 
     assert result.outcome.code == StableSymbol("critical-unknown")
@@ -920,6 +1333,223 @@ def _recovery_record(plan: QuotaPlan) -> ApplyRecord:
     )
 
 
+def test_recovery_rejects_missing_authority_and_invalid_authenticated_plan() -> None:
+    """Prepared intent cannot resume without exact ledger and plan authority."""
+    plan = _plan()
+    unavailable_repository = _MemoryPlanRepository(plan)
+    unavailable_records = _MemoryApplyRecords()
+    unavailable_records.record = _recovery_record(plan)
+
+    unavailable, *_ = _apply(
+        plan,
+        _ScriptedWriter(),
+        records=unavailable_records,
+        repository=unavailable_repository,
+    )
+
+    invalid_repository = _MemoryPlanRepository(plan)
+    invalid_repository.acquire_lease(
+        invalid_repository.encoded.digest,
+        KEY,
+        NOW + timedelta(minutes=1),
+    )
+    invalid_repository.state = PlanLedgerState.DISPATCHED
+    invalid_records = _MemoryApplyRecords()
+    invalid_records.record = _recovery_record(plan)
+    invalid, invalid_repository, *_ = _apply(
+        plan,
+        _ScriptedWriter(),
+        records=invalid_records,
+        repository=invalid_repository,
+        codec=_FailingCodec(),
+    )
+
+    assert unavailable.outcome.code == StableSymbol("apply-recovery-unavailable")
+    assert invalid.outcome.code == StableSymbol("critical-unknown")
+    assert invalid_repository.state is PlanLedgerState.QUARANTINED
+
+
+@pytest.mark.parametrize(
+    ("ledger_state", "fail_save", "expected"),
+    [
+        (PlanLedgerState.LEASED, True, "critical-unknown"),
+        (PlanLedgerState.DISPATCHED, False, "critical-unknown"),
+    ],
+)
+def test_recovery_refresh_failure_never_reopens_dispatch(
+    ledger_state: PlanLedgerState,
+    fail_save: bool,  # noqa: FBT001
+    expected: str,
+) -> None:
+    """Incomplete resumed preflight is invalidated or quarantined, never dispatched."""
+    plan = _plan()
+    repository = _MemoryPlanRepository(plan)
+    repository.acquire_lease(
+        repository.encoded.digest,
+        KEY,
+        NOW + timedelta(minutes=1),
+    )
+    repository.state = ledger_state
+    records = _MemoryApplyRecords()
+    records.record = _recovery_record(plan)
+    records.fail_on_revision = 1 if fail_save else None
+
+    result, repository, *_ = _apply(
+        plan,
+        _ScriptedWriter(),
+        records=records,
+        repository=repository,
+        revalidator=_RaisingRevalidator(),
+    )
+
+    assert result.outcome.code == StableSymbol(expected)
+    assert repository.state is PlanLedgerState.QUARANTINED
+
+
+@pytest.mark.parametrize("fail_save", [False, True])
+def test_prebarrier_recovery_drift_invalidates_or_escalates(
+    fail_save: bool,  # noqa: FBT001
+) -> None:
+    """A drifted prepared intent cannot cross the consumption barrier."""
+    plan = _plan()
+    repository = _MemoryPlanRepository(plan)
+    repository.acquire_lease(
+        repository.encoded.digest,
+        KEY,
+        NOW + timedelta(minutes=1),
+    )
+    records = _MemoryApplyRecords()
+    records.record = _recovery_record(plan)
+    records.fail_on_revision = 1 if fail_save else None
+    drifted = _valid_revalidation(plan)
+    drifted = replace(
+        drifted,
+        children=(
+            replace(drifted.children[0], effective=QuotaQuantity(5, UNIT)),
+            drifted.children[1],
+        ),
+    )
+
+    result, repository, *_ = _apply(
+        plan,
+        _ScriptedWriter(),
+        records=records,
+        repository=repository,
+        revalidator=_ScriptedRevalidator(drifted),
+    )
+
+    assert result.outcome.code == StableSymbol(
+        "critical-unknown" if fail_save else "plan-invalidated"
+    )
+    assert repository.state is (
+        PlanLedgerState.QUARANTINED if fail_save else PlanLedgerState.INVALIDATED
+    )
+
+
+def test_prebarrier_recovery_consumption_conflict_stops_before_provider() -> None:
+    """A failed recovered barrier cannot dispatch any prepared child."""
+    plan = _plan()
+    repository = _MemoryPlanRepository(plan)
+    repository.acquire_lease(
+        repository.encoded.digest,
+        KEY,
+        NOW + timedelta(minutes=1),
+    )
+    repository.fail_mark_dispatched = True
+    records = _MemoryApplyRecords()
+    records.record = _recovery_record(plan)
+    writer = _ScriptedWriter()
+
+    result, *_ = _apply(
+        plan,
+        writer,
+        records=records,
+        repository=repository,
+    )
+
+    assert result.outcome.code == StableSymbol("plan-consumption-failed")
+    assert writer.requests == []
+
+
+def test_recovery_returns_existing_terminal_child_without_redispatch() -> None:
+    """A durable stopping disposition remains terminal on every recovery."""
+    plan = _plan()
+    repository = _MemoryPlanRepository(plan)
+    repository.acquire_lease(
+        repository.encoded.digest,
+        KEY,
+        NOW + timedelta(minutes=1),
+    )
+    repository.state = PlanLedgerState.DISPATCHED
+    records = _MemoryApplyRecords()
+    records.record = (
+        _recovery_record(plan)
+        .record_dispatch_intent("direct", NOW + timedelta(minutes=1))
+        .record_outcome(
+            "direct",
+            ApplyChildDisposition.FAILED,
+            StableSymbol("provider-rejected"),
+            NOW + timedelta(minutes=1),
+        )
+        .finalize(NOW + timedelta(minutes=1))
+    )
+    writer = _ScriptedWriter()
+
+    result, *_ = _apply(
+        plan,
+        writer,
+        records=records,
+        repository=repository,
+    )
+
+    assert result.outcome.code == StableSymbol("failed")
+    assert writer.requests == []
+
+
+def test_top_level_and_evidence_identity_drift_are_whole_bundle_failures() -> None:
+    """Scope and evidence identity changes invalidate before durable preintent."""
+    plan = _plan()
+    other_scope = ResourceScope(ResourceScopeKind.PROJECT, "projects/987654321")
+    top_level = replace(_valid_revalidation(plan), resource_scope=other_scope)
+    top_result, *_ = _apply(
+        plan,
+        _ScriptedWriter(),
+        revalidator=_ScriptedRevalidator(top_level),
+    )
+
+    evidence = EvidenceBinding(
+        StableSymbol("effective-quota"),
+        "sha256:" + ("a" * 64),
+        NOW,
+    )
+    evidence_plan = replace(
+        plan,
+        children=(
+            replace(plan.children[0], evidence=(evidence,)),
+            plan.children[1],
+        ),
+    )
+    refreshed = _valid_revalidation(evidence_plan)
+    refreshed = replace(
+        refreshed,
+        children=(
+            replace(
+                refreshed.children[0],
+                evidence=(replace(evidence, value_digest="sha256:" + ("b" * 64)),),
+            ),
+            refreshed.children[1],
+        ),
+    )
+    evidence_result, *_ = _apply(
+        evidence_plan,
+        _ScriptedWriter(),
+        revalidator=_ScriptedRevalidator(refreshed),
+    )
+
+    assert top_result.outcome.code == StableSymbol("plan-invalidated")
+    assert evidence_result.outcome.code == StableSymbol("plan-invalidated")
+
+
 def test_recovery_marks_intent_without_outcome_unknown_without_redispatch() -> None:
     """A crashed child intent is reconciled and never sent a second time."""
     plan = _plan()
@@ -934,18 +1564,20 @@ def test_recovery_marks_intent_without_outcome_unknown_without_redispatch() -> N
     records.record = _recovery_record(plan).record_dispatch_intent(
         "direct", NOW + timedelta(minutes=1)
     )
-    writer = _ScriptedWriter(resolution=UnknownWriteResolution.ACCEPTED)
+    writer = _ScriptedWriter()
+    resolver = _ScriptedResolver(UnknownWriteResolution.ACCEPTED)
 
     result, repository, records, _audit = _apply(
         plan,
         writer,
         records=records,
         repository=repository,
+        unknown_resolver=resolver,
     )
 
     assert result.outcome.code == StableSymbol("unknown-dispatch")
     assert writer.requests == []
-    assert len(writer.resolve_requests) == 1
+    assert len(resolver.requests) == 1
     assert repository.state is PlanLedgerState.QUARANTINED
     assert records.record is not None
     assert tuple(child.disposition for child in records.record.children) == (
@@ -1278,6 +1910,7 @@ def test_real_repository_recovers_exact_revision_after_terminal_save_failure(
                 _ScriptedRevalidator(_valid_revalidation(plan)),
             ),
             writer=writer,
+            unknown_resolver=_ScriptedResolver(),
         ).apply(
             ApplyRequest(
                 digest=plan_repository.encoded.digest,

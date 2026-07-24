@@ -104,7 +104,7 @@ jobs:
       - name: Enforce critical domain coverage
         run: >-
           uv run --locked --no-sync --python "$PYTHON_VERSION" coverage report
-          --include="src/cqmgr/domain/status.py,src/cqmgr/domain/results.py,src/cqmgr/domain/redaction.py,src/cqmgr/domain/plans.py,src/cqmgr/domain/plan_consumption.py,src/cqmgr/adapters/serialization/plans.py,src/cqmgr/domain/audit.py,src/cqmgr/adapters/persistence/audit.py,src/cqmgr/application/operations/audited_write.py"
+          --include="src/cqmgr/domain/status.py,src/cqmgr/domain/results.py,src/cqmgr/domain/redaction.py,src/cqmgr/domain/plans.py,src/cqmgr/domain/plan_consumption.py,src/cqmgr/domain/apply_records.py,src/cqmgr/adapters/serialization/plans.py,src/cqmgr/domain/audit.py,src/cqmgr/adapters/persistence/audit.py,src/cqmgr/adapters/persistence/plans.py,src/cqmgr/adapters/persistence/apply_records.py,src/cqmgr/adapters/google/quota_preference_writes.py,src/cqmgr/application/operations/audited_write.py,src/cqmgr/application/operations/apply.py,src/cqmgr/application/ports/plans.py,src/cqmgr/application/ports/apply.py,src/cqmgr/application/ports/apply_records.py,src/cqmgr/application/ports/provider_writes.py"
           --fail-under=100
 
   package-smoke:
