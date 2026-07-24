@@ -488,7 +488,13 @@ class _EvidenceRefresher:
         return ApplyEvidenceRefresh(
             SCOPE,
             self._plan.constraints,
-            tuple(_refreshed(child) for child in self._plan.children),
+            tuple(
+                _refreshed(child)
+                for child in (
+                    *self._plan.children,
+                    *getattr(self._plan, "no_op_children", ()),
+                )
+            ),
         )
 
 
@@ -815,7 +821,10 @@ def _valid_revalidation(plan: QuotaPlan) -> ApplyRevalidation:
         contact_binding=plan.contact_binding,
         contact_value="resolved@example.com",
         constraints=plan.constraints,
-        children=tuple(_refreshed(child) for child in plan.children),
+        children=tuple(
+            _refreshed(child)
+            for child in (*plan.children, *getattr(plan, "no_op_children", ()))
+        ),
     )
 
 
@@ -1244,6 +1253,47 @@ def test_apply_result_retains_subject_no_ops_and_provider_lineage() -> None:
         "direct-trace",
         "companion-trace",
     ]
+
+
+def test_verified_no_op_drift_invalidates_mixed_bundle_before_writes() -> None:
+    """A prior no-op remains part of the fresh all-or-nothing preflight."""
+    no_op = _child(
+        "already-sufficient",
+        "GPU-SPOT",
+        direct_rank=1,
+        scope_rank=1,
+        target=4,
+    )
+    original = _plan()
+    plan = replace(
+        original,
+        constraints=(
+            *original.constraints,
+            ConstraintReference(no_op.slice_identity),
+        ),
+        no_op_children=(no_op,),
+    )
+    current = _valid_revalidation(plan)
+    current = replace(
+        current,
+        children=(
+            *current.children[:-1],
+            replace(
+                current.children[-1],
+                effective=QuotaQuantity(no_op.effective.value + 1, UNIT),
+            ),
+        ),
+    )
+    writer = _FailFastWriter()
+
+    result, _, _, _ = _apply(
+        plan,
+        cast("_ScriptedWriter", writer),
+        revalidator=_ScriptedRevalidator(current),
+    )
+
+    assert result.outcome.code == StableSymbol("plan-invalidated")
+    assert writer.calls == 0
 
 
 def test_apply_revalidates_then_persists_preintent_before_consumption_barrier() -> None:

@@ -15,7 +15,10 @@ from cqmgr.application.operations.lifecycle_apply import (
     EphemeralApplyContactRefresher,
     ReadOnlyApplyEvidenceRefresher,
 )
-from cqmgr.application.operations.lifecycle_requests import bind_protected_contact
+from cqmgr.application.operations.lifecycle_requests import (
+    LifecyclePreparationError,
+    bind_protected_contact,
+)
 from cqmgr.application.operations.quotas import QuotaInspectData
 from cqmgr.application.ports.secrets import SecretValue
 from cqmgr.domain.catalog import CatalogPredicates
@@ -28,6 +31,7 @@ from cqmgr.domain.identity import (
 from cqmgr.domain.plans import PlanPrincipal
 from cqmgr.domain.quota_queries import QuotaQueryItem
 from cqmgr.domain.quotas import (
+    ConstraintReference,
     EffectiveQuotaEvidence,
     EffectiveQuotaSliceIdentity,
     NormalizedDimensions,
@@ -71,6 +75,15 @@ class _ReadOnly:
     async def inspect(self, selector: object, **kwargs: object) -> object:
         self.calls.append((selector, kwargs))
         return self.result
+
+
+class _ReadOnlyByQuota:
+    def __init__(self, results: dict[str, object]) -> None:
+        self.results = results
+
+    async def inspect(self, selector: object, **kwargs: object) -> object:
+        del kwargs
+        return self.results[selector.quota_id]  # type: ignore[attr-defined]
 
 
 def _identity() -> EffectiveQuotaSliceIdentity:
@@ -135,6 +148,26 @@ def test_current_principal_requires_verified_stable_adc() -> None:
     )
 
 
+def test_current_principal_rejects_invalid_timeout_and_unverified_identity() -> None:
+    """Apply never treats an invalid budget or unstable ADC identity as authority."""
+    with pytest.raises(ValueError, match="positive"):
+        CurrentApplyPrincipalRefresher(cast("Any", _Identity()), timeout_seconds=0)
+
+    class _UnverifiedIdentity:
+        async def resolve(self, **kwargs: object) -> ADCIdentityEvidence:
+            assert kwargs == {"timeout_seconds": 10.0}
+            return ADCIdentityEvidence(
+                CredentialKind.UNKNOWN,
+                None,
+                None,
+                verification=PrincipalVerification.UNVERIFIED,
+            )
+
+    refresher = CurrentApplyPrincipalRefresher(cast("Any", _UnverifiedIdentity()))
+    with pytest.raises(ApplyRefreshError, match="stably verified"):
+        asyncio.run(refresher.refresh_principal(cast("Any", object()), NOW))
+
+
 def test_ephemeral_contact_requires_exact_plan_binding() -> None:
     """A re-entered contact is retained only after its keyed digest matches."""
     refresher = EphemeralApplyContactRefresher()
@@ -156,12 +189,27 @@ def test_ephemeral_contact_requires_exact_plan_binding() -> None:
     assert "operator@example.com" not in repr(refresher)
 
 
+def test_ephemeral_contact_rejects_missing_and_non_utf8_values() -> None:
+    """A protected contact must be re-entered exactly and decode as UTF-8."""
+    refresher = EphemeralApplyContactRefresher()
+    contact = SecretValue(b"\xff")
+    binding = bind_protected_contact(contact, KEY)
+
+    with pytest.raises(ApplyRefreshError, match="unavailable"):
+        asyncio.run(refresher.refresh_contact(binding, NOW))
+
+    refresher.register(binding, contact, KEY)
+    with pytest.raises(ApplyRefreshError, match="UTF-8"):
+        asyncio.run(refresher.refresh_contact(binding, NOW))
+
+
 def test_evidence_refresher_inspects_every_exact_planned_child() -> None:
     """Apply refreshes exact identity, values, mutability, and rollout read-only."""
     identity = _identity()
     read_only = _ReadOnly(_inspect_result(identity))
     plan = SimpleNamespace(
         resource_scope=SCOPE,
+        constraints=(ConstraintReference(identity),),
         children=(
             SimpleNamespace(
                 child_id="single",
@@ -184,3 +232,117 @@ def test_evidence_refresher_inspects_every_exact_planned_child() -> None:
     assert selector.quota_id == identity.quota_id
     assert selector.location == "us-central1"
     assert kwargs["deadline"] == DEADLINE
+
+
+def test_evidence_refresher_rejects_failed_and_scope_mismatched_reads() -> None:
+    """Apply requires successful exact reads covering the reviewed Plan scope."""
+    identity = _identity()
+    child = SimpleNamespace(child_id="single", slice_identity=identity)
+    failed = SimpleNamespace(
+        succeeded=False,
+        data=None,
+        outcome=SimpleNamespace(code=StableSymbol("provider-unavailable")),
+    )
+    refresher = ReadOnlyApplyEvidenceRefresher(
+        cast("Any", _ReadOnly(failed)),
+        deadline=lambda: DEADLINE,
+    )
+    with pytest.raises(ApplyRefreshError, match="provider-unavailable"):
+        asyncio.run(
+            refresher.refresh_evidence(
+                cast(
+                    "Any",
+                    SimpleNamespace(
+                        resource_scope=SCOPE,
+                        constraints=(ConstraintReference(identity),),
+                        children=(child,),
+                    ),
+                ),
+                NOW,
+            )
+        )
+
+    other_scope = ResourceScope(ResourceScopeKind.PROJECT, "projects/456")
+    refresher = ReadOnlyApplyEvidenceRefresher(
+        cast("Any", _ReadOnly(_inspect_result(identity))),
+        deadline=lambda: DEADLINE,
+    )
+    with pytest.raises(ApplyRefreshError, match="exact Plan scope"):
+        asyncio.run(
+            refresher.refresh_evidence(
+                cast(
+                    "Any",
+                    SimpleNamespace(
+                        resource_scope=other_scope,
+                        constraints=(ConstraintReference(identity),),
+                        children=(child,),
+                    ),
+                ),
+                NOW,
+            )
+        )
+
+
+def test_evidence_refresher_rejects_slice_without_exact_location() -> None:
+    """Apply never infers a regional location absent from the reviewed identity."""
+    identity = EffectiveQuotaSliceIdentity(
+        SCOPE,
+        "compute.googleapis.com",
+        "GPU-DIRECT",
+        NormalizedDimensions(),
+        QuotaScope.REGIONAL,
+    )
+    plan = SimpleNamespace(
+        resource_scope=SCOPE,
+        constraints=(ConstraintReference(identity),),
+        children=(SimpleNamespace(child_id="single", slice_identity=identity),),
+    )
+    refresher = ReadOnlyApplyEvidenceRefresher(
+        cast("Any", _ReadOnly(_inspect_result(identity))),
+        deadline=lambda: DEADLINE,
+    )
+
+    with pytest.raises(LifecyclePreparationError, match="exact location"):
+        asyncio.run(refresher.refresh_evidence(cast("Any", plan), NOW))
+
+
+def test_evidence_refresher_includes_dispatch_and_verified_no_op_children() -> None:
+    """Mixed bundles refresh every bound constraint, including prior no-ops."""
+    direct = _identity()
+    no_op = EffectiveQuotaSliceIdentity(
+        SCOPE,
+        "compute.googleapis.com",
+        "GPU-COMPANION",
+        direct.dimensions,
+        QuotaScope.REGIONAL,
+    )
+    plan = SimpleNamespace(
+        resource_scope=SCOPE,
+        constraints=(ConstraintReference(direct), ConstraintReference(no_op)),
+        children=(SimpleNamespace(child_id="direct", slice_identity=direct),),
+        no_op_children=(SimpleNamespace(child_id="companion", slice_identity=no_op),),
+    )
+    refresher = ReadOnlyApplyEvidenceRefresher(
+        cast(
+            "Any",
+            _ReadOnlyByQuota(
+                {
+                    direct.quota_id: _inspect_result(direct),
+                    no_op.quota_id: _inspect_result(no_op),
+                }
+            ),
+        ),
+        deadline=lambda: DEADLINE,
+    )
+
+    refreshed = asyncio.run(refresher.refresh_evidence(cast("Any", plan), NOW))
+
+    assert refreshed.constraints == plan.constraints
+    assert tuple(child.child_id for child in refreshed.children) == (
+        "direct",
+        "companion",
+    )
+    assert all(
+        child.evidence[0].name == StableSymbol("quota-state")
+        for child in refreshed.children
+    )

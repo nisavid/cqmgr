@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from cqmgr.application.operations.lifecycle_requests import (
     LifecyclePreparationError,
     bind_protected_contact,
+    quota_state_evidence_binding,
 )
 from cqmgr.application.ports.apply import (
     ApplyContactRefresh,
@@ -14,7 +15,6 @@ from cqmgr.application.ports.apply import (
     RefreshedApplyChild,
 )
 from cqmgr.domain.plans import PlanPrincipal
-from cqmgr.domain.quotas import ConstraintReference
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -137,7 +137,11 @@ class ReadOnlyApplyEvidenceRefresher:
             explicit_resource_scope=plan.resource_scope,
         )
         deadline = self._deadline()
-        for child in plan.children:
+        planned_children = (
+            *plan.children,
+            *getattr(plan, "no_op_children", ()),
+        )
+        for child in planned_children:
             identity = child.slice_identity
             location = _identity_location(
                 identity.dimensions.items, identity.quota_scope
@@ -176,7 +180,7 @@ class ReadOnlyApplyEvidenceRefresher:
                         None if preference is None else preference.provider_name
                     ),
                     preference_etag=None if preference is None else preference.etag,
-                    evidence=(),
+                    evidence=(quota_state_evidence_binding(data),),
                     fresh=True,
                     complete=True,
                     ambiguous=False,
@@ -184,9 +188,7 @@ class ReadOnlyApplyEvidenceRefresher:
                     ongoing_rollout=data.evidence.ongoing_rollout,
                 )
             )
-        constraints = tuple(
-            ConstraintReference(child.slice_identity) for child in plan.children
-        )
+        constraints = plan.constraints
         if not children or any(
             child.slice_identity.resource_scope != plan.resource_scope
             for child in children
