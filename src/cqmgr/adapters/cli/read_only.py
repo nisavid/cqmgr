@@ -335,6 +335,12 @@ def _resolution_lines(data: ResolvedWorkloadRequirement) -> list[str]:
         ),
     ]
     for location in data.locations:
+        attachment_proof = (
+            location.proves_requested_compute_attachment(requirement)
+            if isinstance(requirement, ComputeInstanceRequirement)
+            and requirement.attached_accelerator_type is not None
+            else None
+        )
         lines.extend(
             (
                 f"Location: {location.location}",
@@ -358,13 +364,19 @@ def _resolution_lines(data: ResolvedWorkloadRequirement) -> list[str]:
                     if location.deployable_accelerator_quantity is not None
                     else "unavailable"
                 ),
-                "Proven attached accelerator type: "
+                "Resolved attached accelerator type: "
                 f"{location.attached_accelerator_type or 'unavailable'}",
-                "Proven attached accelerator count: "
+                "Resolved attached accelerator count: "
                 + (
                     str(location.attached_accelerator_count)
                     if location.attached_accelerator_count is not None
                     else "unavailable"
+                ),
+                "Requested attachment proven: "
+                + (
+                    "unavailable"
+                    if attachment_proof is None
+                    else str(attachment_proof).lower()
                 ),
                 "Permits: "
                 + (

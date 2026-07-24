@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from cqmgr.adapters.cli.read_only import Presentation, emit_read_only_result
+from cqmgr.adapters.serialization.results import operation_result_mapping
 from cqmgr.application.operations.quotas import QuotaBrowseData, QuotaInspectData
 from cqmgr.application.operations.read_only import (
     IncompleteQuotaInspectData,
@@ -92,6 +94,7 @@ from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 NOW = datetime(2026, 7, 23, tzinfo=UTC)
 SCOPE = ResourceScope(ResourceScopeKind.PROJECT, "projects/123")
 UNIT = QuotaUnit("1")
+ATTACHED_ACCELERATOR_COUNT = 2
 IDENTITY = EffectiveQuotaSliceIdentity(
     SCOPE,
     "compute.googleapis.com",
@@ -534,7 +537,7 @@ def test_human_inspection_preserves_provider_evidence_and_relationships(
 def test_human_resolution_preserves_each_location_and_constraint(
     capsys: object,
 ) -> None:
-    """Resolution does not collapse the location, native-unit, or permit facts."""
+    """Mismatched retained attachment facts are displayed but never called proven."""
     companion_identity = EffectiveQuotaSliceIdentity(
         SCOPE,
         "compute.googleapis.com",
@@ -626,8 +629,10 @@ def test_human_resolution_preserves_each_location_and_constraint(
     assert "Provisioning model: spot" in captured.out
     assert "Attached accelerator type: nvidia-tesla-t4" in captured.out
     assert "Attached accelerator count: 2" in captured.out
-    assert "Proven attached accelerator type: nvidia-tesla-t4" in captured.out
-    assert "Proven attached accelerator count: 2" in captured.out
+    assert "Resolved attached accelerator type: nvidia-tesla-t4" in captured.out
+    assert "Resolved attached accelerator count: 2" in captured.out
+    assert "Requested attachment proven: false" in captured.out
+    assert "Proven attached accelerator" not in captured.out
     assert "Location mode: candidates" in captured.out
     assert "Location: us-central1-a" in captured.out
     assert "Disposition: compatible" in captured.out
@@ -647,6 +652,118 @@ def test_human_resolution_preserves_each_location_and_constraint(
         "Slice quota ID: INSTANCES-PER-PROJECT-REGION"
     ) < second_assessment.index("Constraint effective: 20 1")
     assert "\x1b" not in captured.out
+    structured = operation_result_mapping(result)["data"]
+    assert isinstance(structured, dict)
+    locations = structured["locations"]
+    assert isinstance(locations, list)
+    assert locations[0]["attached_accelerator_type"] == "nvidia-tesla-t4"
+    assert locations[0]["attached_accelerator_count"] == ATTACHED_ACCELERATOR_COUNT
+
+
+def test_human_resolution_labels_exact_attachment_proof_without_color(
+    capsys: object,
+) -> None:
+    """Exact type, count, quantity, and constraint evidence render proven."""
+    requirement = ComputeInstanceRequirement(
+        machine_type="n1-standard-16",
+        instance_count=1,
+        provisioning_model=ProvisioningModel.SPOT,
+        locations=CandidateLocations(("us-central1-a",)),
+        attached_accelerator_type="nvidia-tesla-t4",
+        attached_accelerator_count=2,
+    )
+    accelerator_id = AcceleratorId("nvidia-t4")
+    t4_identity = EffectiveQuotaSliceIdentity(
+        SCOPE,
+        "compute.googleapis.com",
+        "PREEMPTIBLE_NVIDIA_T4_GPUS",
+        NormalizedDimensions((("region", "us-central1"),)),
+        QuotaScope.REGIONAL,
+    )
+    constraint_set = AcceleratorConstraintSet(
+        accelerator_id,
+        (ConstraintReference(t4_identity),),
+    )
+    location = ResolvedWorkloadLocation(
+        location="us-central1-a",
+        disposition=WorkloadLocationDisposition.COMPATIBLE,
+        accelerator_id=accelerator_id,
+        owning_service="compute.googleapis.com",
+        management_plane=ManagementPlane.COMPUTE,
+        supported_consumers=(WorkloadConsumer.COMPUTE_ENGINE,),
+        quota_pool="preemptible",
+        deployable_accelerator_quantity=2,
+        constraint_set=constraint_set,
+        constraint_requirements=(
+            QuotaConstraintRequirement(
+                t4_identity,
+                2,
+                QuotaQuantity(2, UNIT),
+                UnitConversionEvidence("accelerator", UNIT, 1, "catalog/v1"),
+            ),
+        ),
+        coverage=(),
+        attached_accelerator_type="nvidia-tesla-t4",
+        attached_accelerator_count=2,
+    )
+    result = OperationResult(
+        operation=OperationName("quota.resolve"),
+        resource_scope=SCOPE,
+        boundary=OperationBoundary(
+            StableSymbol("workload-requirement-resolved"), reached=True
+        ),
+        outcome=Outcome(StableSymbol("requirement-resolved"), ExitClass.SUCCESS),
+        completeness=Completeness.complete(),
+        started_at=NOW,
+        finished_at=NOW,
+        data=ResolvedWorkloadRequirement(requirement, (location,), None),
+    )
+
+    exit_class = emit_read_only_result(
+        result,
+        Presentation(output="human", no_color=True, quiet=True),
+    )
+
+    captured = capsys.readouterr()  # type: ignore[union-attr]
+    assert exit_class == ExitClass.SUCCESS
+    assert captured.err == ""
+    assert "Resolved attached accelerator type: nvidia-tesla-t4" in captured.out
+    assert "Resolved attached accelerator count: 2" in captured.out
+    assert "Requested attachment proven: true" in captured.out
+    assert "Proven attached accelerator" not in captured.out
+    assert "\x1b" not in captured.out
+
+    without_attachment = replace(
+        result,
+        data=ResolvedWorkloadRequirement(
+            replace(
+                requirement,
+                attached_accelerator_type=None,
+                attached_accelerator_count=None,
+            ),
+            (
+                replace(
+                    location,
+                    attached_accelerator_type=None,
+                    attached_accelerator_count=None,
+                ),
+            ),
+            None,
+        ),
+    )
+
+    emit_read_only_result(
+        without_attachment,
+        Presentation(output="human", no_color=True, quiet=True),
+    )
+
+    absent = capsys.readouterr()  # type: ignore[union-attr]
+    assert absent.err == ""
+    assert "Resolved attached accelerator type: unavailable" in absent.out
+    assert "Resolved attached accelerator count: unavailable" in absent.out
+    assert "Requested attachment proven: unavailable" in absent.out
+    assert "Proven attached accelerator" not in absent.out
+    assert "\x1b" not in absent.out
 
 
 def test_human_setup_failure_preserves_the_stable_reason(capsys: object) -> None:
