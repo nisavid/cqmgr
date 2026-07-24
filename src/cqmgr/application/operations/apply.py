@@ -33,7 +33,12 @@ from cqmgr.domain.audit import (
     AuditRecordDraft,
     AuditRecordKind,
 )
-from cqmgr.domain.plans import PlanLedgerState
+from cqmgr.domain.plans import (
+    PlanKind,
+    PlanLedgerState,
+    QuotaRequestBundlePlan,
+    QuotaRequestPlanChild,
+)
 from cqmgr.domain.redaction import RedactedText
 from cqmgr.domain.results import (
     Completeness,
@@ -136,6 +141,7 @@ class ApplyChildData:
     target: QuotaQuantity
     preference_identity: str
     etag: str | None
+    trace_id: str | None = None
     provider_outcome: StableSymbol | None = None
     unknown_resolution: UnknownDispatchResolution | None = None
     audit_record_ids: tuple[str, ...] = ()
@@ -146,8 +152,10 @@ class ApplyData:
     """Durable Apply evidence returned through the shared result boundary."""
 
     plan_digest: str
+    kind: PlanKind | None
     intent_id: str | None = None
     children: tuple[ApplyChildData, ...] = ()
+    verified_no_ops: tuple[QuotaRequestPlanChild, ...] = ()
     audit_record_ids: tuple[str, ...] = ()
     quarantine_identity: str | None = None
 
@@ -226,6 +234,7 @@ class ApplyPlanOperations:
                 outcome="plan-precondition-failed",
                 exit_class=ExitClass.REJECTED_PRECONDITION,
                 resource_scope=plan.resource_scope,
+                plan=plan,
             )
         try:
             refreshed = await self._revalidator.refresh(plan, request.now)
@@ -253,6 +262,7 @@ class ApplyPlanOperations:
                 outcome="plan-lease-failed",
                 exit_class=ExitClass.STALE_OR_CONFLICTING,
                 resource_scope=plan.resource_scope,
+                plan=plan,
             )
         lease = lease_outcome.lease
         record = _apply_record(plan, request)
@@ -275,6 +285,7 @@ class ApplyPlanOperations:
                 outcome="apply-intent-audit-failed",
                 exit_class=ExitClass.OPERATIONAL_FAILURE,
                 resource_scope=plan.resource_scope,
+                plan=plan,
             )
         created = self._apply_records.create(record, request.authentication_key)
         if (
@@ -287,6 +298,7 @@ class ApplyPlanOperations:
                 outcome="apply-record-intent-failed",
                 exit_class=ExitClass.OPERATIONAL_FAILURE,
                 resource_scope=plan.resource_scope,
+                plan=plan,
                 audit_record_ids=tuple(audit_record_ids),
             )
         record = created.record
@@ -302,6 +314,7 @@ class ApplyPlanOperations:
                 outcome="plan-consumption-failed",
                 exit_class=ExitClass.OPERATIONAL_FAILURE,
                 resource_scope=plan.resource_scope,
+                plan=plan,
                 intent_id=record.intent_id,
                 audit_record_ids=tuple(audit_record_ids),
             )
@@ -338,6 +351,7 @@ class ApplyPlanOperations:
                 outcome="plan-lease-failed",
                 exit_class=ExitClass.STALE_OR_CONFLICTING,
                 resource_scope=plan.resource_scope,
+                plan=plan,
             )
         return self._invalidate(
             plan,
@@ -494,6 +508,7 @@ class ApplyPlanOperations:
                     request,
                     record,
                     audit_record_ids,
+                    plan=plan,
                     outcome=provider_result.outcome.value,
                     exit_class=_failure_exit(provider_result.outcome),
                 )
@@ -513,6 +528,7 @@ class ApplyPlanOperations:
             request,
             record,
             audit_record_ids,
+            plan=plan,
             outcome="applied",
             exit_class=ExitClass.SUCCESS,
         )
@@ -528,8 +544,10 @@ class ApplyPlanOperations:
             request.authentication_key,
             request.now,
         )
+        plan = self._authenticated_resumed_plan(resumed, request)
         consumed_terminal = (
-            self._consumed_authority_matches(resumed, request)
+            resumed.status is PlanRepositoryStatus.CONSUMED
+            and plan is not None
             and record.state
             in {
                 ApplyRecordState.ACCEPTED,
@@ -540,7 +558,7 @@ class ApplyPlanOperations:
             and record.resource_scope == request.resource_scope_acknowledgement
         )
         if consumed_terminal:
-            return self._project_consumed_terminal(record, request)
+            return self._project_consumed_terminal(record, request, plan)
         quarantined_unknown = (
             resumed.status is PlanRepositoryStatus.QUARANTINED
             and record.state is ApplyRecordState.UNKNOWN
@@ -577,6 +595,14 @@ class ApplyPlanOperations:
                 exit_class=ExitClass.STALE_OR_CONFLICTING,
                 audit_record_ids=(),
             )
+        if plan is None:
+            return self._critical_unknown(
+                record.resource_scope,
+                resumed.lease,
+                request,
+                record,
+                [],
+            )
         if (
             record.state
             in {
@@ -603,6 +629,7 @@ class ApplyPlanOperations:
                     request,
                     record,
                     [],
+                    plan=plan,
                     outcome="applied",
                     exit_class=ExitClass.SUCCESS,
                 )
@@ -621,6 +648,7 @@ class ApplyPlanOperations:
                     request,
                     record,
                     [],
+                    plan=plan,
                     outcome="dispatch-intent-persistence-failed",
                     exit_class=ExitClass.OPERATIONAL_FAILURE,
                 )
@@ -631,27 +659,9 @@ class ApplyPlanOperations:
                 request,
                 record,
                 [],
+                plan=plan,
                 outcome=provider_outcome.value,
                 exit_class=_failure_exit(provider_outcome),
-            )
-        plan: QuotaPlan | None = None
-        try:
-            decoded = self._codec.decode(resumed.plan_bytes)
-            plan = decoded.plan
-            invalid = (
-                decoded.digest != request.digest
-                or not decoded.authenticate(request.authentication_key.reveal())
-                or _request_drift(plan, request)
-            )
-        except (TypeError, ValueError):
-            invalid = True
-        if invalid or plan is None:
-            return self._critical_unknown(
-                record.resource_scope,
-                resumed.lease,
-                request,
-                record,
-                [],
             )
         audit_record_ids: list[str] = []
         if quarantined_prewrite_failure:
@@ -683,6 +693,7 @@ class ApplyPlanOperations:
                 reached=False,
                 outcome="dispatch-intent-persistence-failed",
                 exit_class=ExitClass.OPERATIONAL_FAILURE,
+                plan=plan,
                 audit_record_ids=tuple(audit_record_ids),
             )
         try:
@@ -765,6 +776,7 @@ class ApplyPlanOperations:
                         request,
                         record,
                         audit_record_ids,
+                        plan=plan,
                         outcome=provider_outcome.value,
                         exit_class=_failure_exit(provider_outcome),
                     )
@@ -881,6 +893,7 @@ class ApplyPlanOperations:
                     reached=False,
                     outcome="plan-consumption-failed",
                     exit_class=ExitClass.OPERATIONAL_FAILURE,
+                    plan=plan,
                     audit_record_ids=tuple(audit_record_ids),
                 )
         return await self._dispatch_children(
@@ -892,33 +905,32 @@ class ApplyPlanOperations:
             refreshed.contact_value,
         )
 
-    def _consumed_authority_matches(
+    def _authenticated_resumed_plan(
         self,
         resumed: PlanRepositoryOutcome,
         request: ApplyRequest,
-    ) -> bool:
+    ) -> QuotaPlan | None:
         """Authenticate the immutable reviewed authority for terminal replay."""
-        if (
-            resumed.status is not PlanRepositoryStatus.CONSUMED
-            or resumed.authenticated is not True
-            or resumed.plan_bytes is None
-        ):
-            return False
+        if resumed.authenticated is not True or resumed.plan_bytes is None:
+            return None
         try:
             decoded = self._codec.decode(resumed.plan_bytes)
             authenticated = decoded.authenticate(request.authentication_key.reveal())
         except (TypeError, ValueError):
-            return False
-        return (
+            return None
+        if not (
             authenticated
             and decoded.digest == request.digest
             and not _request_drift(decoded.plan, request)
-        )
+        ):
+            return None
+        return decoded.plan
 
     def _project_consumed_terminal(
         self,
         record: ApplyRecord,
         request: ApplyRequest,
+        plan: QuotaPlan,
     ) -> OperationResult[ApplyData]:
         """Return one authenticated terminal Apply after ledger completion."""
         audit_record_ids: list[str] = []
@@ -982,6 +994,7 @@ class ApplyPlanOperations:
             reached=record.state is ApplyRecordState.ACCEPTED,
             outcome=outcome,
             exit_class=exit_class,
+            plan=plan,
             audit_record_ids=tuple(audit_record_ids),
         )
 
@@ -1007,6 +1020,7 @@ class ApplyPlanOperations:
                 outcome="plan-invalidation-failed",
                 exit_class=ExitClass.OPERATIONAL_FAILURE,
                 resource_scope=plan.resource_scope,
+                plan=plan,
             )
         try:
             audit_id = self._append_audit(
@@ -1029,6 +1043,7 @@ class ApplyPlanOperations:
                 outcome="plan-invalidation-audit-failed",
                 exit_class=ExitClass.OPERATIONAL_FAILURE,
                 resource_scope=plan.resource_scope,
+                plan=plan,
             )
         return _result(
             request,
@@ -1036,6 +1051,7 @@ class ApplyPlanOperations:
             outcome="plan-invalidated",
             exit_class=ExitClass.STALE_OR_CONFLICTING,
             resource_scope=plan.resource_scope,
+            plan=plan,
             audit_record_ids=(audit_id,),
         )
 
@@ -1437,6 +1453,7 @@ class ApplyPlanOperations:
         record: ApplyRecord,
         audit_record_ids: list[str],
         *,
+        plan: QuotaPlan | None = None,
         outcome: str,
         exit_class: ExitClass,
     ) -> OperationResult[ApplyData]:
@@ -1494,6 +1511,7 @@ class ApplyPlanOperations:
             request,
             resource_scope,
             record,
+            plan=plan,
             reached=record.state is ApplyRecordState.ACCEPTED,
             outcome=outcome,
             exit_class=exit_class,
@@ -1744,6 +1762,7 @@ def _result_for_record(  # noqa: PLR0913
     resource_scope: ResourceScope,
     record: ApplyRecord,
     *,
+    plan: QuotaPlan | None = None,
     reached: bool,
     outcome: str,
     exit_class: ExitClass,
@@ -1752,15 +1771,16 @@ def _result_for_record(  # noqa: PLR0913
 ) -> OperationResult[ApplyData]:
     children = tuple(
         ApplyChildData(
-            child.child_id,
-            child.disposition,
-            child.slice_identity,
-            child.target,
-            child.preference_identity,
-            child.etag,
-            child.provider_outcome,
-            child.unknown_resolution,
-            audit_record_ids,
+            child_id=child.child_id,
+            disposition=child.disposition,
+            slice_identity=child.slice_identity,
+            target=child.target,
+            preference_identity=child.preference_identity,
+            etag=child.accepted_etag or child.etag,
+            trace_id=child.accepted_trace_id,
+            provider_outcome=child.provider_outcome,
+            unknown_resolution=child.unknown_resolution,
+            audit_record_ids=audit_record_ids,
         )
         for child in record.children
         if child.disposition is not None
@@ -1771,8 +1791,13 @@ def _result_for_record(  # noqa: PLR0913
         outcome=outcome,
         exit_class=exit_class,
         resource_scope=resource_scope,
+        plan=plan,
+        kind=record.kind,
         intent_id=record.intent_id,
         children=children,
+        verified_no_ops=(
+            plan.no_op_children if isinstance(plan, QuotaRequestBundlePlan) else ()
+        ),
         audit_record_ids=audit_record_ids,
         quarantine_identity=quarantine_identity,
     )
@@ -1785,11 +1810,18 @@ def _result(  # noqa: PLR0913
     outcome: str,
     exit_class: ExitClass,
     resource_scope: ResourceScope | None = None,
+    plan: QuotaPlan | None = None,
+    kind: PlanKind | None = None,
     intent_id: str | None = None,
     children: tuple[ApplyChildData, ...] = (),
+    verified_no_ops: tuple[QuotaRequestPlanChild, ...] = (),
     audit_record_ids: tuple[str, ...] = (),
     quarantine_identity: str | None = None,
 ) -> OperationResult[ApplyData]:
+    if plan is not None:
+        kind = plan.kind
+        if isinstance(plan, QuotaRequestBundlePlan):
+            verified_no_ops = plan.no_op_children
     return OperationResult(
         operation=OperationName("plan.apply"),
         resource_scope=resource_scope,
@@ -1799,10 +1831,12 @@ def _result(  # noqa: PLR0913
         started_at=request.now,
         finished_at=request.now,
         data=ApplyData(
-            request.digest,
-            intent_id,
-            children,
-            audit_record_ids,
-            quarantine_identity,
+            plan_digest=request.digest,
+            kind=kind,
+            intent_id=intent_id,
+            children=children,
+            verified_no_ops=verified_no_ops,
+            audit_record_ids=audit_record_ids,
+            quarantine_identity=quarantine_identity,
         ),
     )

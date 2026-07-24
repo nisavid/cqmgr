@@ -267,6 +267,7 @@ class QuotaRequestBundlePlan:
     installation_id: str
     issued_at: datetime
     expires_at: datetime
+    no_op_children: tuple[QuotaRequestPlanChild, ...] = ()
     schema: str = field(default=PLAN_SCHEMA, init=False)
 
     def __post_init__(self) -> None:  # noqa: C901, PLR0912
@@ -313,8 +314,18 @@ class QuotaRequestBundlePlan:
         ):
             msg = "bundle child resource scope must match the plan"
             raise ValueError(msg)
+        _require_bundle_no_op_children(self)
         _require_tuple_of(self.constraints, ConstraintReference, "constraints")
         _require_plan_constraints(self.resource_scope, self.constraints)
+        constraint_identities = {
+            constraint.slice_identity for constraint in self.constraints
+        }
+        if any(
+            child.slice_identity not in constraint_identities
+            for child in (*self.children, *self.no_op_children)
+        ):
+            msg = "bundle composition children must belong to the constraint set"
+            raise ValueError(msg)
         if not isinstance(self.principal, PlanPrincipal):
             msg = "principal must be a PlanPrincipal"
             raise TypeError(msg)
@@ -343,6 +354,34 @@ class QuotaRequestBundlePlan:
             for child in self.children
             for acknowledgement in child.unresolved_acknowledgements
         )
+
+
+def _require_bundle_no_op_children(plan: QuotaRequestBundlePlan) -> None:
+    """Require verified no-op facts to be exact and composition-bound."""
+    _require_tuple_of(
+        plan.no_op_children,
+        QuotaRequestPlanChild,
+        "no_op_children",
+    )
+    composition = (*plan.children, *plan.no_op_children)
+    if len({child.child_id for child in composition}) != len(composition):
+        msg = "bundle plan child IDs must be unique across composition"
+        raise ValueError(msg)
+    if (
+        tuple(sorted(plan.no_op_children, key=lambda child: child.order_key))
+        != plan.no_op_children
+    ):
+        msg = "bundle no-op children must use deterministic accelerator-first order"
+        raise ValueError(msg)
+    if any(
+        child.slice_identity.resource_scope != plan.resource_scope
+        for child in plan.no_op_children
+    ):
+        msg = "bundle no-op child resource scope must match the plan"
+        raise ValueError(msg)
+    if any(child.required_acknowledgements for child in plan.no_op_children):
+        msg = "bundle no-op children cannot require acknowledgements"
+        raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True)
