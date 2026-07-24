@@ -1126,7 +1126,14 @@ class CloudQuotaManagerApp(App[None]):
             "Apply is ordered and non-atomic. Accepted earlier children remain "
             "accepted if a later child fails or becomes unknown."
         )
-        self._set_lifecycle_copy_cli(plan_apply_copy_cli(digest=request.digest))
+        self._set_lifecycle_copy_cli(
+            plan_apply_copy_cli(
+                digest=request.digest,
+                quota_contact_stdin=(
+                    request.contact_binding.source.value == "per-operation-input"
+                ),
+            )
+        )
         self._set_status("CONFIRMATION REQUIRED — no provider dispatch has started")
 
     def prepare_watch(

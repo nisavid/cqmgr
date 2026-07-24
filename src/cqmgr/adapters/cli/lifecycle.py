@@ -317,8 +317,10 @@ class LifecycleCliRequestFactory(Protocol):
         self,
         value: PlanReferenceInput,
         acknowledgement: str,
+        *,
+        quota_contact: SecretValue | None = None,
     ) -> ApplyRequest:
-        """Resolve one Plan reference and exact operator acknowledgement."""
+        """Resolve one Plan reference, exact scope, and protected contact input."""
         ...
 
     def watch(self, value: WatchCliInput) -> WatchRequest:

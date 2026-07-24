@@ -1460,6 +1460,7 @@ def plan_review(
 
 @plan.command(name="apply")
 @_presentation_options
+@click.option("--quota-contact-stdin", is_flag=True)
 @click.option("--acknowledge-resource-scope", required=True)
 @click.option("--plan-file", type=click.Path(path_type=Path))
 @click.option("--plan", "digest")
@@ -1469,13 +1470,18 @@ def plan_apply(  # noqa: PLR0913
     digest: str | None,
     plan_file: Path | None,
     acknowledge_resource_scope: str,
+    quota_contact_stdin: bool,
     no_color: bool,
     quiet: bool,
 ) -> None:
     """Apply one reviewed Plan in its bound non-atomic child order."""
     value = _plan_reference(digest, plan_file)
     runtime = build_lifecycle_cli_runtime()
-    request_value = runtime.requests.apply(value, acknowledge_resource_scope)
+    request_value = runtime.requests.apply(
+        value,
+        acknowledge_resource_scope,
+        quota_contact=_quota_contact_from_stdin(enabled=quota_contact_stdin),
+    )
     asyncio.run(
         _apply_lifecycle_async(
             runtime,

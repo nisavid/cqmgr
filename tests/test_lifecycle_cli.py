@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
+from unittest.mock import ANY
 
 import pytest
 from click.testing import CliRunner
@@ -108,8 +109,14 @@ class _Factory:
         self.calls.append(("review", value))
         return ("review-request", value)
 
-    def apply(self, value: PlanReferenceInput, acknowledgement: str) -> object:
-        self.calls.append(("apply", (value, acknowledgement)))
+    def apply(
+        self,
+        value: PlanReferenceInput,
+        acknowledgement: str,
+        *,
+        quota_contact: object | None = None,
+    ) -> object:
+        self.calls.append(("apply", (value, acknowledgement, quota_contact)))
         return ("apply-request", value, acknowledgement)
 
     def watch(self, value: object) -> object:
@@ -368,9 +375,11 @@ def test_plan_review_and_apply_dispatch_exact_reference_and_acknowledgement(
             "request.plan",
             "--acknowledge-resource-scope",
             "projects/123",
+            "--quota-contact-stdin",
             "--output",
             "json",
         ],
+        input="operator@example.com\n",
     )
 
     assert review.exit_code == apply.exit_code == 0
@@ -383,6 +392,7 @@ def test_plan_review_and_apply_dispatch_exact_reference_and_acknowledgement(
         (
             PlanReferenceInput(digest=None, path=Path("request.plan")),
             "projects/123",
+            ANY,
         ),
     )
     assert [name for name, _ in facade.calls] == ["review", "apply"]
