@@ -14,6 +14,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, DataTable, Footer, Input, Static
 
 from cqmgr.adapters.cli.copy_cli import (
+    obtainability_compare_copy_cli,
     quota_inspect_copy_cli,
     quota_list_copy_cli,
     quota_resolve_copy_cli,
@@ -21,12 +22,14 @@ from cqmgr.adapters.cli.copy_cli import (
 from cqmgr.adapters.cli.read_only_requests import (
     parse_cloud_tpu_slice_requirement,
     parse_compute_instance_requirement,
+    parse_obtainability_candidates,
 )
 from cqmgr.application.operations.audit import (
     AuditInspectData,
     AuditListData,
     AuditVerifyData,
 )
+from cqmgr.application.operations.obtainability import AdviceSupport
 from cqmgr.application.operations.quotas import QuotaBrowseData, QuotaInspectData
 from cqmgr.application.operations.read_only import (
     IncompleteQuotaInspectData,
@@ -42,6 +45,10 @@ from cqmgr.domain.accelerator_overlay import (
     ResolvedWorkloadRequirement,
 )
 from cqmgr.domain.audit import AuditQuery
+from cqmgr.domain.obtainability import (
+    ObtainabilityCandidate,
+    ObtainabilityComparison,
+)
 from cqmgr.domain.quota_queries import QuotaQueryFilters, QuotaQueryItem
 
 if TYPE_CHECKING:
@@ -92,6 +99,18 @@ class ReadOnlyOperationsLike(Protocol):
         scope_input: ReadOnlyScopeInput = _DEFAULT_SCOPE_INPUT,
     ) -> OperationResult[Any]:
         """Resolve one workload-first requirement."""
+
+    async def compare_obtainability(  # noqa: PLR0913
+        self,
+        candidates: tuple[ObtainabilityCandidate, ...],
+        *,
+        deadline: float,
+        support: AdviceSupport,
+        catalog_coverage: tuple[Any, ...] = (),
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = _DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[Any]:
+        """Compare one explicit fixed-shape candidate set."""
 
     async def aclose(self) -> None:
         """Close invocation-scoped provider clients."""
@@ -225,8 +244,45 @@ class CloudQuotaManagerApp(App[None]):
         border-top: solid #67727b;
     }
 
-    #obtainability-workspace {
-        padding: 2;
+    #obtainability-form {
+        width: 36;
+        min-width: 30;
+        padding: 1;
+        background: #1d2328;
+        border-right: solid #67727b;
+    }
+
+    #obtainability-result-pane {
+        width: 1fr;
+        padding: 1;
+    }
+
+    #obtainability-detail {
+        height: 1fr;
+    }
+
+    #obtainability-copy-cli {
+        height: auto;
+        max-height: 6;
+        color: #d9e7f2;
+        background: #232b31;
+        padding: 0 1;
+    }
+
+    .medium #obtainability-form {
+        width: 32;
+    }
+
+    .narrow #obtainability-workspace {
+        layout: vertical;
+    }
+
+    .narrow #obtainability-form {
+        width: 1fr;
+        height: auto;
+        max-height: 18;
+        border-right: none;
+        border-bottom: solid #67727b;
     }
 
     .medium #scope-filter-rail, .narrow #scope-filter-rail {
@@ -312,7 +368,7 @@ class CloudQuotaManagerApp(App[None]):
         self._audit_operation_generation = 0
 
     @override
-    def compose(self) -> ComposeResult:
+    def compose(self) -> ComposeResult:  # noqa: PLR0915
         """Compose one integrated instrument rather than floating cards."""
         yield Static(
             self._offline_instrument_text(),
@@ -401,12 +457,64 @@ class CloudQuotaManagerApp(App[None]):
                     id="copy-cli-preview",
                     markup=False,
                 )
-        with Vertical(id="obtainability-workspace", classes="hidden"):
-            yield Static(
-                "Obtainability\nExact Spot VM comparison arrives in the next "
-                "implementation slice. Quota evidence remains distinct from capacity.",
-                markup=False,
-            )
+        with Horizontal(id="obtainability-workspace", classes="hidden"):
+            with VerticalScroll(id="obtainability-form"):
+                yield Static(
+                    "Obtainability / Standalone\n"
+                    "Fix one exact Spot VM request. Candidate locations never expand "
+                    "silently.",
+                    id="obtainability-breadcrumb",
+                    markup=False,
+                )
+                yield Input(
+                    placeholder="Machine type",
+                    id="obtainability-machine-type",
+                )
+                yield Input(
+                    placeholder="Optional attached GPU type",
+                    id="obtainability-gpu-type",
+                )
+                yield Input(
+                    placeholder="Optional attached GPU count",
+                    id="obtainability-gpu-count",
+                )
+                yield Input(
+                    placeholder="VM count",
+                    id="obtainability-vm-count",
+                )
+                yield Input(
+                    placeholder="Distribution: any, any-single-zone, or balanced",
+                    id="obtainability-distribution",
+                )
+                yield Input(
+                    placeholder=(
+                        "Explicit candidates separated by spaces: "
+                        "REGION[=ZONE[,ZONE...]]"
+                    ),
+                    id="obtainability-candidates",
+                )
+                yield Button(
+                    "Compare explicit candidates",
+                    id="obtainability-compare",
+                )
+                yield Button(
+                    "Compare all compatible locations",
+                    id="obtainability-compare-all",
+                )
+            with VerticalScroll(id="obtainability-result-pane"):
+                yield Static(
+                    "Complete the fixed request and choose an explicit "
+                    "candidate mode.\n"
+                    "Obtainability is Preview evidence, not capacity.",
+                    id="obtainability-detail",
+                    markup=False,
+                )
+                yield Button("Copy CLI", id="obtainability-copy")
+                yield Static(
+                    "Copy CLI unavailable until a comparison is fully specified.",
+                    id="obtainability-copy-cli",
+                    markup=False,
+                )
         with Vertical(id="audit-workspace", classes="hidden"):
             yield Static(
                 "Audit\nAppend-only local evidence. No provider access.",
@@ -487,6 +595,11 @@ class CloudQuotaManagerApp(App[None]):
 
     def _owns_quota_view(self, generation: int) -> bool:
         return self.active_workspace == "quotas" and self._owns_provider_view(
+            generation
+        )
+
+    def _owns_obtainability_view(self, generation: int) -> bool:
+        return self.active_workspace == "obtainability" and self._owns_provider_view(
             generation
         )
 
@@ -827,7 +940,7 @@ class CloudQuotaManagerApp(App[None]):
             title="Keyboard help",
         )
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
+    def on_button_pressed(self, event: Button.Pressed) -> None:  # noqa: C901
         """Route explicit shell and filter controls."""
         button_id = event.button.id
         if button_id and button_id.startswith("workspace-"):
@@ -842,6 +955,19 @@ class CloudQuotaManagerApp(App[None]):
             self._open_workload_route("cloud-tpu-slice")
         elif button_id == "workload-submit" and self.active_workspace == "quotas":
             self._submit_workload()
+        elif (
+            button_id == "obtainability-compare"
+            and self.active_workspace == "obtainability"
+        ):
+            self._submit_obtainability()
+        elif (
+            button_id == "obtainability-compare-all"
+            and self.active_workspace == "obtainability"
+        ):
+            self._set_status(
+                "CONFIRM EXPANSION — all-compatible comparison requires "
+                "explicit confirmation"
+            )
         elif button_id == "audit-verify" and self.active_workspace == "audit":
             operation_generation = self._claim_audit_operation()
             self.run_worker(
@@ -853,7 +979,9 @@ class CloudQuotaManagerApp(App[None]):
                 exclusive=True,
                 exit_on_error=False,
             )
-        elif button_id == "copy-cli" and self.last_copied_cli is not None:
+        elif (button_id == "copy-cli" and self.last_copied_cli is not None) or (
+            button_id == "obtainability-copy" and self.last_copied_cli is not None
+        ):
             self.copy_to_clipboard(self.last_copied_cli)
 
     def _apply_filters(self) -> None:
@@ -967,6 +1095,255 @@ class CloudQuotaManagerApp(App[None]):
             group="workload-resolve",
             exclusive=True,
             exit_on_error=False,
+        )
+
+    def _submit_obtainability(self) -> None:
+        """Decode an explicit fixed request through the same parser as Click."""
+        machine_type = self.query_one(
+            "#obtainability-machine-type",
+            Input,
+        ).value.strip()
+        gpu_type = self.query_one("#obtainability-gpu-type", Input).value.strip()
+        gpu_count = self.query_one("#obtainability-gpu-count", Input).value.strip()
+        candidate_text = self.query_one(
+            "#obtainability-candidates",
+            Input,
+        ).value.strip()
+        try:
+            candidates = parse_obtainability_candidates(
+                machine_type=machine_type,
+                gpu_type=gpu_type or None,
+                gpu_count=gpu_count or None,
+                vm_count=self.query_one(
+                    "#obtainability-vm-count",
+                    Input,
+                ).value.strip(),
+                distribution_shape=self.query_one(
+                    "#obtainability-distribution",
+                    Input,
+                ).value.strip(),
+                candidates=tuple(candidate_text.split()),
+            )
+        except (TypeError, ValueError) as error:
+            self._set_status(f"INVALID OBTAINABILITY REQUEST — {error}")
+            return
+        generation = self._claim_provider_view()
+        cancellation = CancellationToken()
+        self._cancellation = cancellation
+        self.run_worker(
+            self._compare_obtainability(candidates, cancellation, generation),
+            group="obtainability-compare",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _compare_obtainability(
+        self,
+        candidates: tuple[ObtainabilityCandidate, ...],
+        cancellation: CancellationToken,
+        generation: int,
+    ) -> None:
+        if cancellation.cancelled or not self._owns_obtainability_view(generation):
+            return
+        self._set_status("READING — comparing exact Spot VM candidates")
+        first = candidates[0]
+        machine_type = first.machine.machine_type
+        support = AdviceSupport(
+            current_advice_supported=not machine_type.startswith(
+                ("custom-", "ct", "tpu-")
+            )
+            and "-custom-" not in machine_type,
+            history_supported=not machine_type.startswith(("custom-", "ct", "tpu-"))
+            and "-custom-" not in machine_type,
+        )
+        try:
+            result = await self.read_only.compare_obtainability(
+                candidates,
+                deadline=self._deadline(),
+                support=support,
+                cancellation=cancellation,
+                scope_input=self.scope_input,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - no typed result exists for worker failure
+            if self._owns_obtainability_view(generation):
+                self._set_status(
+                    "ERROR — obtainability comparison unavailable; retry the "
+                    "read-only operation"
+                )
+            return
+        if cancellation.cancelled or not self._owns_obtainability_view(generation):
+            return
+        self.last_result = result
+        self._render_instrument(result)
+        self._render_obtainability_result(result)
+        if result.resource_scope is not None:
+            command = obtainability_compare_copy_cli(
+                result.resource_scope,
+                candidates,
+            )
+            self._show_copy_cli(command)
+            self.query_one("#obtainability-copy-cli", Static).update(command)
+
+    def _render_obtainability_result(self, result: OperationResult[Any]) -> None:
+        data = result.data
+        lines = [
+            "Obtainability comparison",
+            f"Outcome: {result.outcome.code.value}",
+            "Complete: " + ("yes" if result.completeness.is_complete else "no"),
+        ]
+        if isinstance(data, ObtainabilityComparison):
+            lines.extend(
+                (
+                    f"Provider status: {data.preview_status}",
+                    "Capacity guarantee: "
+                    + ("no" if data.no_capacity_guarantee else "yes"),
+                )
+            )
+            for coverage in data.catalog_coverage:
+                lines.extend(
+                    (
+                        f"Catalog product: {coverage.product_id}",
+                        f"Cataloged: {str(coverage.cataloged).lower()}",
+                        "Current advice supported: "
+                        f"{str(coverage.current_advice_supported).lower()}",
+                        f"History supported: {str(coverage.history_supported).lower()}",
+                        "Coverage reasons: " + (", ".join(coverage.reasons) or "none"),
+                    )
+                )
+            tie_components = self._obtainability_tie_components(data)
+            for assessment in data.candidates:
+                candidate = assessment.candidate
+                machine = candidate.machine
+                lines.extend(
+                    (
+                        f"Candidate identity: {candidate.candidate_id}",
+                        f"Endpoint region: {candidate.endpoint_region}",
+                        "Candidate zones: " + (", ".join(candidate.zones) or "none"),
+                        f"Machine type: {machine.machine_type}",
+                        "GPU: "
+                        + (
+                            f"{machine.gpu.accelerator_type} x{machine.gpu.count}"
+                            if machine.gpu is not None
+                            else "none"
+                        ),
+                        f"Local SSD count: {machine.local_ssd_count}",
+                        f"VM quantity: {candidate.vm_count}",
+                        f"Distribution shape: {candidate.distribution_shape.value}",
+                        "Rank: "
+                        + (
+                            str(assessment.rank)
+                            if assessment.rank is not None
+                            else "unranked"
+                        ),
+                        "Unranked reasons: "
+                        + (
+                            ", ".join(
+                                reason.value for reason in assessment.unranked_reasons
+                            )
+                            or "none"
+                        ),
+                        "Exact rank-component tie: "
+                        + (
+                            "yes; canonical candidate identity breaks the tie"
+                            if candidate.candidate_id in tie_components
+                            else "no"
+                        ),
+                    )
+                )
+                advice = assessment.advice
+                if advice is None:
+                    lines.extend(
+                        (
+                            "Provider candidate score: unavailable",
+                            "Estimated uptime: unavailable",
+                            "Provider shards: unavailable",
+                        )
+                    )
+                else:
+                    band = (
+                        assessment.band.value
+                        if assessment.band is not None
+                        else "unknown"
+                    )
+                    lines.extend(
+                        (
+                            "Provider candidate score: "
+                            f"{advice.obtainability} ({band})",
+                            f"Estimated uptime: {advice.estimated_uptime}",
+                            f"Advice observed: {advice.retrieved_at.isoformat()}",
+                            f"Advice source: {advice.source}",
+                        )
+                    )
+                    lines.extend(
+                        f"Recommended shard: {shard.zone} · {shard.machine_type} · "
+                        f"{shard.vm_count} VM · {shard.provisioning_model}"
+                        for shard in advice.shards
+                    )
+                lines.extend(
+                    (
+                        "30-day p90 preemption: "
+                        + (
+                            str(assessment.preemption_p90)
+                            if assessment.preemption_p90 is not None
+                            else "unavailable"
+                        ),
+                        "Total-request hourly price: "
+                        + (
+                            f"USD {assessment.total_request_hourly_price_usd}"
+                            if assessment.total_request_hourly_price_usd is not None
+                            else "unavailable"
+                        ),
+                    )
+                )
+                if assessment.history is not None:
+                    lines.extend(
+                        (
+                            f"History location: {assessment.history.location}",
+                            "History observed: "
+                            f"{assessment.history.retrieved_at.isoformat()}",
+                            f"History source: {assessment.history.source}",
+                            "History preemption buckets: "
+                            f"{len(assessment.history.preemption)}",
+                            "History price intervals: "
+                            f"{len(assessment.history.prices)}",
+                        )
+                    )
+        elif isinstance(data, ReadOnlyFailureData):
+            lines.append(f"Reason: {data.reason}")
+        lines.extend(
+            f"Evidence source: {item.source.value} · coverage {item.coverage.value} · "
+            "request "
+            + (
+                item.request_identity.value
+                if item.request_identity is not None
+                else "none"
+            )
+            for item in result.provenance
+        )
+        self.query_one("#obtainability-detail", Static).update("\n".join(lines))
+        self._set_status(self._result_status(result))
+
+    @staticmethod
+    def _obtainability_tie_components(
+        data: ObtainabilityComparison,
+    ) -> frozenset[str]:
+        groups: dict[tuple[object, object, object], list[str]] = {}
+        for assessment in data.candidates:
+            if assessment.unranked_reasons:
+                continue
+            key = (
+                assessment.band,
+                assessment.preemption_p90,
+                assessment.total_request_hourly_price_usd,
+            )
+            groups.setdefault(key, []).append(assessment.candidate.candidate_id)
+        return frozenset(
+            candidate_id
+            for identities in groups.values()
+            if len(identities) > 1
+            for candidate_id in identities
         )
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
