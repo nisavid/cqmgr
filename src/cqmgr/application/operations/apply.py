@@ -15,6 +15,7 @@ from cqmgr.application.ports.apply import (
 from cqmgr.application.ports.apply_records import ApplyRecordRepositoryStatus
 from cqmgr.application.ports.plans import PlanRepositoryStatus
 from cqmgr.application.ports.provider_writes import (
+    QuotaPreferenceUnknownResolutionResult,
     QuotaPreferenceWrite,
     QuotaPreferenceWriteAction,
     UnknownWriteResolution,
@@ -276,7 +277,10 @@ class ApplyPlanOperations:
                 resource_scope=plan.resource_scope,
             )
         created = self._apply_records.create(record, request.authentication_key)
-        if created.status is not ApplyRecordRepositoryStatus.STORED:
+        if (
+            created.status is not ApplyRecordRepositoryStatus.STORED
+            or created.record is None
+        ):
             return _result(
                 request,
                 reached=False,
@@ -285,6 +289,7 @@ class ApplyPlanOperations:
                 resource_scope=plan.resource_scope,
                 audit_record_ids=tuple(audit_record_ids),
             )
+        record = created.record
         consumed = self._repository.mark_dispatched(
             lease,
             request.authentication_key,
@@ -437,6 +442,8 @@ class ApplyPlanOperations:
                 disposition,
                 provider_result.outcome,
                 request.now,
+                accepted_etag=provider_result.etag,
+                accepted_trace_id=provider_result.trace_id,
             )
             if not self._save(record, request):
                 return self._critical_unknown(
@@ -1158,11 +1165,18 @@ class ApplyPlanOperations:
             resolution_value = retained.resolution
             resolution_recorded_at = retained.recorded_at
             resolution = UnknownWriteResolution(resolution_value.value)
+            resolution_etag = retained.lineage_etag
+            resolution_trace_id = retained.lineage_trace_id
         else:
             try:
-                resolution = await self._unknown_resolver.resolve_unknown(write)
+                resolution_result = await self._unknown_resolver.resolve_unknown(write)
             except Exception:  # noqa: BLE001
-                resolution = UnknownWriteResolution.UNRESOLVED
+                resolution_result = QuotaPreferenceUnknownResolutionResult(
+                    UnknownWriteResolution.UNRESOLVED
+                )
+            resolution = resolution_result.resolution
+            resolution_etag = resolution_result.etag
+            resolution_trace_id = resolution_result.trace_id
         if resolution is not UnknownWriteResolution.UNRESOLVED:
             resolution_value = UnknownDispatchResolution(resolution.value)
             if retained is None:
@@ -1172,6 +1186,8 @@ class ApplyPlanOperations:
                     resolution_value,
                     resolution_recorded_at,
                     request.authentication_key,
+                    lineage_etag=resolution_etag,
+                    lineage_trace_id=resolution_trace_id,
                 )
                 if appended.status is not ApplyRecordRepositoryStatus.STORED:
                     return self._critical_unknown(
@@ -1185,6 +1201,8 @@ class ApplyPlanOperations:
                 write.child_id,
                 resolution_value,
                 resolution_recorded_at,
+                accepted_etag=resolution_etag,
+                accepted_trace_id=resolution_trace_id,
             )
             try:
                 audit_record_ids.append(
@@ -1630,6 +1648,7 @@ def _apply_record(plan: QuotaPlan, request: ApplyRequest) -> ApplyRecord:
                 ),
                 etag=child.preference_etag,
                 preference_existed=child.preference_name is not None,
+                baseline=child.effective,
             )
             for child in plan.children
         ),

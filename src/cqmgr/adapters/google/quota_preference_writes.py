@@ -9,6 +9,7 @@ from google.cloud import cloudquotas_v1
 from google.protobuf import field_mask_pb2
 
 from cqmgr.application.ports.provider_writes import (
+    QuotaPreferenceUnknownResolutionResult,
     QuotaPreferenceWrite,
     QuotaPreferenceWriteAction,
     QuotaPreferenceWriteResult,
@@ -140,6 +141,8 @@ class OfficialQuotaPreferenceWriter:
         return QuotaPreferenceWriteResult(
             accepted=True,
             outcome=StableSymbol("submitted"),
+            etag=response.etag or None,
+            trace_id=response.quota_config.trace_id or None,
         )
 
 
@@ -162,7 +165,7 @@ class OfficialQuotaPreferenceUnknownResolver:
     async def resolve_unknown(
         self,
         request: QuotaPreferenceWrite,
-    ) -> UnknownWriteResolution:
+    ) -> QuotaPreferenceUnknownResolutionResult:
         """Read the exact identity once; never turn uncertainty into a write."""
         try:
             response = await self._client.get_quota_preference(
@@ -173,12 +176,16 @@ class OfficialQuotaPreferenceUnknownResolver:
                 timeout=self._timeout_seconds,
             )
         except google_exceptions.NotFound:
-            return UnknownWriteResolution.UNRESOLVED
-        return (
-            UnknownWriteResolution.ACCEPTED
-            if _matches(response, request)
-            else UnknownWriteResolution.UNRESOLVED
-        )
+            return QuotaPreferenceUnknownResolutionResult(
+                UnknownWriteResolution.UNRESOLVED
+            )
+        if _matches(response, request):
+            return QuotaPreferenceUnknownResolutionResult(
+                UnknownWriteResolution.ACCEPTED,
+                etag=response.etag or None,
+                trace_id=response.quota_config.trace_id or None,
+            )
+        return QuotaPreferenceUnknownResolutionResult(UnknownWriteResolution.UNRESOLVED)
 
 
 def _preference(

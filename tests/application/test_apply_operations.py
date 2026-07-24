@@ -36,6 +36,7 @@ from cqmgr.application.ports.plans import (
     PlanRepositoryStatus,
 )
 from cqmgr.application.ports.provider_writes import (
+    QuotaPreferenceUnknownResolutionResult,
     QuotaPreferenceWrite,
     QuotaPreferenceWriteAction,
     QuotaPreferenceWriteResult,
@@ -390,13 +391,16 @@ class _MemoryApplyRecords:
         self.record = record
         return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.STORED, record)
 
-    def append_unknown_resolution(
+    def append_unknown_resolution(  # noqa: PLR0913
         self,
         intent_id: str,
         child_id: str,
         resolution: UnknownDispatchResolution,
         recorded_at: datetime,
         _authentication_key: SecretValue,
+        *,
+        lineage_etag: str | None = None,
+        lineage_trace_id: str | None = None,
     ) -> ApplyRecordRepositoryOutcome:
         if self.fail_append_resolution:
             return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.FAILED)
@@ -405,6 +409,8 @@ class _MemoryApplyRecords:
             child_id,
             resolution,
             recorded_at,
+            lineage_etag=lineage_etag,
+            lineage_trace_id=lineage_trace_id,
         )
         if self.resolutions and self.resolutions != [evidence]:
             return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.CONFLICT)
@@ -508,7 +514,7 @@ class _FailingCodec:
 class _RaisingResolver:
     async def resolve_unknown(
         self, _request: QuotaPreferenceWrite
-    ) -> UnknownWriteResolution:
+    ) -> QuotaPreferenceUnknownResolutionResult:
         raise OSError
 
 
@@ -523,7 +529,7 @@ class _FailFastWriter:
 
     async def resolve_unknown(
         self, _request: QuotaPreferenceWrite
-    ) -> UnknownWriteResolution:
+    ) -> QuotaPreferenceUnknownResolutionResult:
         msg = "revalidation failure reached unknown resolution"
         raise AssertionError(msg)
 
@@ -556,9 +562,9 @@ class _ScriptedResolver:
 
     async def resolve_unknown(
         self, request: QuotaPreferenceWrite
-    ) -> UnknownWriteResolution:
+    ) -> QuotaPreferenceUnknownResolutionResult:
         self.requests.append(request)
-        return self.resolution
+        return QuotaPreferenceUnknownResolutionResult(self.resolution)
 
 
 def _refreshed(child: QuotaRequestPlanChild) -> RefreshedApplyChild:
