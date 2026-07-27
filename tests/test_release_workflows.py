@@ -300,3 +300,14 @@ def test_release_performance_job_enforces_budgets_and_retains_failure_evidence()
 
     assert "--budgets docs/release/performance-budgets.json" in measure
     assert "if: always()" in upload
+
+
+def test_dependency_review_accepts_the_reviewed_python_license_expression() -> None:
+    """Compound dependency metadata may use SPDX Python-2.0."""
+    workflow = (WORKFLOWS / "dependency-review.yml").read_text()
+    review = _job_step(
+        _workflow_job(workflow, "dependency-review"),
+        "Review dependency changes",
+    )
+
+    assert "Python-2.0" in review
