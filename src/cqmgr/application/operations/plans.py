@@ -67,6 +67,14 @@ _ACKNOWLEDGEMENT_CODES = frozenset(
         "unlimited-transition",
     }
 )
+_PLAN_LEDGER_STATUS = {
+    PlanLedgerState.AVAILABLE: PlanRepositoryStatus.AVAILABLE,
+    PlanLedgerState.LEASED: PlanRepositoryStatus.LEASED,
+    PlanLedgerState.DISPATCHED: PlanRepositoryStatus.DISPATCHED,
+    PlanLedgerState.CONSUMED: PlanRepositoryStatus.CONSUMED,
+    PlanLedgerState.QUARANTINED: PlanRepositoryStatus.QUARANTINED,
+    PlanLedgerState.INVALIDATED: PlanRepositoryStatus.INVALIDATED,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -509,10 +517,14 @@ def _review_state(
             request.now,
         )
     )
+    expected_status = (
+        None if local.state is None else _PLAN_LEDGER_STATUS.get(local.state)
+    )
     if (
         local.authenticated is not True
         or local.state is None
-        or local.status.value != local.state.value
+        or expected_status is None
+        or local.status is not expected_status
     ):
         return fallback, False
     return local.state, True

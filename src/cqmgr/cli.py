@@ -505,8 +505,11 @@ async def _apply_lifecycle_async(
         )
     except (OSError, TypeError, ValueError, RuntimeError) as error:
         raise click.ClickException(str(error)) from error
-    result = await runtime.operations.apply(request)  # type: ignore[arg-type]
-    _emit_lifecycle(result, presentation)
+    try:
+        result = await runtime.operations.apply(request)  # type: ignore[arg-type]
+        _emit_lifecycle(result, presentation)
+    finally:
+        runtime.requests.discard_apply(request)  # type: ignore[arg-type]
 
 
 async def _watch_lifecycle_async(
@@ -589,8 +592,11 @@ def trust() -> None:
 )
 def trust_init(output: str) -> None:
     """Initialize installation signing trust once in the native keyring."""
-    operations = build_trust_initialization_operations()
-    result = operations.initialize()
+    try:
+        operations = build_trust_initialization_operations()
+        result = operations.initialize()
+    except (OSError, RuntimeError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
     if output == "json":
         click.echo(
             json.dumps(
@@ -1481,20 +1487,20 @@ def request_watch(  # noqa: PLR0913
             resume=resume,
             deadline=parse_absolute_rfc3339(deadline),
         )
-
-        async def run(runtime: LifecycleCliRuntime) -> None:
-            request_value = _protected_lifecycle_request(
-                lambda: runtime.requests.watch(value)
-            )
-            await _watch_lifecycle_async(
-                runtime,
-                request_value,
-                WatchPresentation(selected_output, no_color, quiet),
-            )
-
-        asyncio.run(_run_lifecycle_cli(run))
     except (TypeError, ValueError) as error:
         raise click.UsageError(str(error)) from error
+
+    async def run(runtime: LifecycleCliRuntime) -> None:
+        request_value = _protected_lifecycle_request(
+            lambda: runtime.requests.watch(value)
+        )
+        await _watch_lifecycle_async(
+            runtime,
+            request_value,
+            WatchPresentation(selected_output, no_color, quiet),
+        )
+
+    asyncio.run(_run_lifecycle_cli(run))
 
 
 @main.group(cls=CanonicalAliasGroup)

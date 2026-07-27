@@ -132,8 +132,16 @@ class MemoryPlanRepository:
             not self.load_any_digest and self.stored.digest != digest
         ):
             return PlanRepositoryOutcome(PlanRepositoryStatus.MISSING)
+        statuses = {
+            PlanLedgerState.AVAILABLE: PlanRepositoryStatus.AVAILABLE,
+            PlanLedgerState.LEASED: PlanRepositoryStatus.LEASED,
+            PlanLedgerState.DISPATCHED: PlanRepositoryStatus.DISPATCHED,
+            PlanLedgerState.CONSUMED: PlanRepositoryStatus.CONSUMED,
+            PlanLedgerState.QUARANTINED: PlanRepositoryStatus.QUARANTINED,
+            PlanLedgerState.INVALIDATED: PlanRepositoryStatus.INVALIDATED,
+        }
         return PlanRepositoryOutcome(
-            PlanRepositoryStatus(self.state.value),
+            statuses[self.state],
             plan_bytes=self.stored.bytes,
             state=self.state,
             authenticated=True,
@@ -1021,6 +1029,14 @@ def test_plan_review_preserves_foreign_expired_and_consumed_evidence(
                 authenticated=True,
             ),
             id="no-state",
+        ),
+        pytest.param(
+            PlanRepositoryOutcome(
+                PlanRepositoryStatus.CONSUMED,
+                state=PlanLedgerState.AVAILABLE,
+                authenticated=True,
+            ),
+            id="status-state-mismatch",
         ),
     ],
 )

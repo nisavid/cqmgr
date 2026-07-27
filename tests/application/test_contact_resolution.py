@@ -125,8 +125,8 @@ def _resolver(
 
 def test_preview_contact_precedence_is_explicit_named_selected_then_direct() -> None:
     """Each earlier selected source wins without consulting later sources."""
-    named_ref = QuotaContactKeyringReference("named")
-    selected_ref = QuotaContactKeyringReference("selected")
+    named_ref = QuotaContactKeyringReference("named", "installation-test")
+    selected_ref = QuotaContactKeyringReference("selected", "installation-test")
     config = ConfigSnapshot(
         profiles=(
             Profile("named", quota_contact_keyring_reference=named_ref),
@@ -203,7 +203,7 @@ def test_preview_contact_precedence_is_explicit_named_selected_then_direct() -> 
 
 def test_selected_profile_failure_never_falls_through_to_direct_user() -> None:
     """An unavailable selected source is a terminal contact resolution failure."""
-    reference = QuotaContactKeyringReference("selected")
+    reference = QuotaContactKeyringReference("selected", "installation-test")
     resolver, _, _, contacts, identity = _resolver(
         config=ConfigSnapshot(
             profiles=(Profile("selected", quota_contact_keyring_reference=reference),)
@@ -227,7 +227,7 @@ def test_selected_profile_failure_never_falls_through_to_direct_user() -> None:
 
 def test_apply_re_resolves_only_the_exact_plan_bound_source() -> None:
     """Apply cannot substitute an available later source for its Plan binding."""
-    reference = QuotaContactKeyringReference("selected")
+    reference = QuotaContactKeyringReference("selected", "installation-test")
     resolver, _, _, contacts, identity = _resolver(
         config=ConfigSnapshot(
             profiles=(Profile("selected", quota_contact_keyring_reference=reference),)
@@ -321,7 +321,7 @@ def test_apply_requires_prepared_context_and_bound_explicit_value() -> None:
 
 def test_selected_profile_must_remain_selected_at_apply() -> None:
     """A Plan bound to selected-profile cannot silently follow selection drift."""
-    reference = QuotaContactKeyringReference("selected")
+    reference = QuotaContactKeyringReference("selected", "installation-test")
     resolver, _, selection, _, _ = _resolver(
         config=ConfigSnapshot(
             profiles=(Profile("selected", quota_contact_keyring_reference=reference),)
@@ -381,7 +381,7 @@ def test_named_profile_errors_are_terminal() -> None:
 
 def test_profile_value_and_direct_principal_must_match_plan_binding() -> None:
     """Apply rejects changed profile values and a different direct-user principal."""
-    reference = QuotaContactKeyringReference("named")
+    reference = QuotaContactKeyringReference("named", "installation-test")
     resolver, _, _, contacts, _ = _resolver(
         config=ConfigSnapshot(
             profiles=(Profile("named", quota_contact_keyring_reference=reference),)

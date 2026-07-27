@@ -81,6 +81,9 @@ class _Clock:
 
 
 class _Contacts:
+    def __init__(self) -> None:
+        self.discarded: list[tuple[object, str]] = []
+
     async def prepare_apply(
         self,
         binding: object,
@@ -100,7 +103,11 @@ class _Contacts:
         if resolved != binding:
             message = "Apply quota contact does not match the reviewed Plan"
             raise ApplyRefreshError(message)
-        return ResolvedContact(resolved, explicit_value)
+        return ResolvedContact(resolved, explicit_value, "apply-context-1")
+
+    def discard_apply(self, binding: object, context_id: str) -> bool:
+        self.discarded.append((binding, context_id))
+        return True
 
 
 class _Decoded:
@@ -178,7 +185,10 @@ class _MissingConsumptionMarkers:
         return SecretStoreOutcome(SecretStoreStatus.CREATED)
 
 
-def _factory() -> tuple[ProtectedLifecycleCliRequestFactory, _Repository]:
+def _factory(
+    *,
+    contacts: _Contacts | None = None,
+) -> tuple[ProtectedLifecycleCliRequestFactory, _Repository]:
     binding = bind_protected_contact(CONTACT, KEY)
     plan = SimpleNamespace(
         installation_id="installation-test",
@@ -190,7 +200,7 @@ def _factory() -> tuple[ProtectedLifecycleCliRequestFactory, _Repository]:
         trust=_Trust(),
         repository=cast(Any, repository),
         codec=cast(Any, _Codec(plan)),
-        contacts=cast(Any, _Contacts()),
+        contacts=cast(Any, contacts or _Contacts()),
         clock=_Clock(),
     )
     return factory, repository
@@ -246,6 +256,7 @@ def test_apply_imports_authenticated_plan_and_rebinds_contact() -> None:
         "projects/123",
     )
     assert request.contact_value == "operator@example.com"
+    assert request.contact_context_id == "apply-context-1"
     assert repository.stored == [EncodedPlan(b"portable-plan", DIGEST)]
 
 
@@ -373,23 +384,39 @@ def test_export_review_survives_missing_authority_but_digest_review_does_not() -
 
 
 @pytest.mark.parametrize(
-    ("reference", "status"),
+    ("reference", "load_status", "export_status"),
     [
-        (PlanReferenceInput(DIGEST, None), PlanRepositoryStatus.MISSING),
+        (
+            PlanReferenceInput(DIGEST, None),
+            PlanRepositoryStatus.MISSING,
+            PlanRepositoryStatus.EXPORTED,
+        ),
         (
             PlanReferenceInput(None, Path("request.plan")),
+            PlanRepositoryStatus.AVAILABLE,
             PlanRepositoryStatus.MISSING,
+        ),
+        (
+            PlanReferenceInput(DIGEST, None),
+            PlanRepositoryStatus.EXPORTED,
+            PlanRepositoryStatus.EXPORTED,
+        ),
+        (
+            PlanReferenceInput(None, Path("request.plan")),
+            PlanRepositoryStatus.AVAILABLE,
+            PlanRepositoryStatus.AVAILABLE,
         ),
     ],
 )
 def test_apply_rejects_unavailable_local_and_exported_plans(
     reference: PlanReferenceInput,
-    status: PlanRepositoryStatus,
+    load_status: PlanRepositoryStatus,
+    export_status: PlanRepositoryStatus,
 ) -> None:
     """Apply requires the exact repository status for each Plan reference kind."""
     factory, repository = _factory()
-    repository.load_status = status
-    repository.export_status = status
+    repository.load_status = load_status
+    repository.export_status = export_status
 
     with pytest.raises(RuntimeError, match="Plan is unavailable"):
         asyncio.run(
@@ -403,7 +430,8 @@ def test_apply_rejects_unavailable_local_and_exported_plans(
 
 def test_apply_rejects_failed_portable_import() -> None:
     """An authenticated export must become a valid local record before Apply."""
-    factory, repository = _factory()
+    contacts = _Contacts()
+    factory, repository = _factory(contacts=contacts)
     repository.store_status = PlanRepositoryStatus.FAILED
 
     with pytest.raises(RuntimeError, match="could not be imported"):
@@ -414,3 +442,24 @@ def test_apply_rejects_failed_portable_import() -> None:
                 quota_contact=CONTACT,
             )
         )
+    assert contacts.discarded == [
+        (bind_protected_contact(CONTACT, KEY), "apply-context-1")
+    ]
+
+
+def test_discard_apply_releases_the_exact_prepared_contact_context() -> None:
+    """The route owner can release one unconsumed prepared context exactly."""
+    contacts = _Contacts()
+    factory, _repository = _factory(contacts=contacts)
+    request = asyncio.run(
+        factory.apply(
+            PlanReferenceInput(DIGEST, None),
+            "projects/123",
+            quota_contact=CONTACT,
+        )
+    )
+
+    assert factory.discard_apply(request)
+    assert contacts.discarded == [
+        (request.contact_binding, "apply-context-1"),
+    ]

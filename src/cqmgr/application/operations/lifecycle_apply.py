@@ -5,16 +5,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from cqmgr.application.operations.contacts import bind_protected_contact
-from cqmgr.application.operations.lifecycle_requests import (
-    LifecyclePreparationError,
-    quota_state_evidence_binding,
-)
+from cqmgr.application.operations.lifecycle_requests import quota_state_evidence_binding
 from cqmgr.application.ports.apply import (
     ApplyContactRefresh,
     ApplyEvidenceRefresh,
     RefreshedApplyChild,
 )
-from cqmgr.domain.plans import PlanPrincipal
+from cqmgr.domain.plans import PlanPrincipal, QuotaRequestBundlePlan
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -139,7 +136,7 @@ class ReadOnlyApplyEvidenceRefresher:
         deadline = self._deadline()
         planned_children = (
             *plan.children,
-            *getattr(plan, "no_op_children", ()),
+            *(plan.no_op_children if isinstance(plan, QuotaRequestBundlePlan) else ()),
         )
         for child in planned_children:
             identity = child.slice_identity
@@ -219,4 +216,4 @@ def _identity_location(
     if quota_scope is QuotaScope.GLOBAL:
         return "global"
     message = "Apply cannot derive an exact location from the planned slice"
-    raise LifecyclePreparationError(message)
+    raise ApplyRefreshError(message)

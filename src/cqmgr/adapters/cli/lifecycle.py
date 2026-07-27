@@ -336,6 +336,10 @@ class LifecycleCliRequestFactory(Protocol):
         """Resolve one Plan reference, exact scope, and protected contact input."""
         raise NotImplementedError
 
+    def discard_apply(self, request: ApplyRequest) -> bool:
+        """Release an unconsumed prepared contact context after route ownership ends."""
+        raise NotImplementedError
+
     def watch(self, value: WatchCliInput) -> WatchRequest:
         """Resolve public Watch controls into protected runtime inputs."""
         raise NotImplementedError
@@ -460,18 +464,34 @@ class ProtectedLifecycleCliRequestFactory:
             principal=plan.principal,
             trust=trust,
         )
-        if portable is not None:
-            self._import_apply_plan(portable, trust)
-        return ApplyRequest(
-            digest=decoded.digest,
-            authentication_key=trust.authentication_key,
-            local_installation_id=trust.installation_id,
-            resource_scope_acknowledgement=acknowledgement_scope,
-            principal=plan.principal,
-            contact_binding=plan.contact_binding,
-            contact_value=contact.value.reveal().decode("utf-8"),
-            now=self._clock.now(),
-        )
+        context_id = contact.apply_context_id
+        if context_id is None:
+            message = "Apply quota contact context is unavailable"
+            raise RuntimeError(message)
+        try:
+            if portable is not None:
+                self._import_apply_plan(portable, trust)
+            return ApplyRequest(
+                digest=decoded.digest,
+                authentication_key=trust.authentication_key,
+                local_installation_id=trust.installation_id,
+                resource_scope_acknowledgement=acknowledgement_scope,
+                principal=plan.principal,
+                contact_binding=plan.contact_binding,
+                contact_value=contact.value.reveal().decode("utf-8"),
+                now=self._clock.now(),
+                contact_context_id=context_id,
+            )
+        except BaseException:
+            self._contacts.discard_apply(plan.contact_binding, context_id)
+            raise
+
+    def discard_apply(self, request: ApplyRequest) -> bool:
+        """Release the exact prepared contact if Apply did not consume it."""
+        context_id = request.contact_context_id
+        if context_id is None:
+            return False
+        return self._contacts.discard_apply(request.contact_binding, context_id)
 
     def watch(self, value: WatchCliInput) -> WatchRequest:
         """Bind active trust and convert an absolute deadline to monotonic time."""

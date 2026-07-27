@@ -21,10 +21,6 @@ _QUOTA_CONTACT_KEYRING_PREFIX = "cqmgr:quota-contact:v1:"
 _QUOTA_CONTACT_KEYRING_COMPONENTS = 3
 
 
-def _generated_installation_id() -> str:
-    return f"installation-{secrets.token_urlsafe(18)}"
-
-
 def _generated_item_id() -> str:
     return f"item-{secrets.token_urlsafe(24)}"
 
@@ -126,7 +122,7 @@ class QuotaContactKeyringReference:
     """Closed native-keyring item identity for one profile's quota contact."""
 
     profile_name: str
-    installation_id: str = field(default_factory=_generated_installation_id)
+    installation_id: str
     item_id: str = field(default_factory=_generated_item_id)
 
     def __post_init__(self) -> None:

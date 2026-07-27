@@ -209,6 +209,8 @@ class TomlInstallationTrustRepository:
         self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if os.name != "nt":
             self._path.parent.chmod(0o700)
+        # json.dumps uses only escapes that TOML accepts in a basic string;
+        # ensure_ascii also keeps the retained file's encoding deterministic.
         contents = "\n".join(
             (
                 f"schema = {json.dumps(_SCHEMA)}",

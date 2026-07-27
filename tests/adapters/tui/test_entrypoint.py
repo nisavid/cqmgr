@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+
+import pytest
 
 import cqmgr.tui as tui_module
 from cqmgr import bootstrap
 from cqmgr.adapters.tui.app import CloudQuotaManagerApp
-
-if TYPE_CHECKING:
-    import pytest
 
 
 class _RecordingRuntime:
@@ -79,21 +77,42 @@ def test_build_app_injects_precomposed_production_lifecycle(
     assert runtime.close_calls == 1
 
 
-def test_build_app_accepts_one_precomposed_lifecycle_facade(
+def test_build_app_accepts_one_precomposed_lifecycle_facade_and_preparation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A future explicit trust bootstrap can inject the shared facade unchanged."""
+    """Explicit injection supplies the complete shared lifecycle graph."""
     read_only = object()
     audit = object()
     lifecycle = object()
+    preparation = object()
     monkeypatch.setattr(bootstrap, "build_read_only_operations", lambda: read_only)
     monkeypatch.setattr(bootstrap, "build_audit_operations", lambda: audit)
 
-    app = tui_module.build_app(lifecycle=lifecycle)  # type: ignore[arg-type]
+    app = tui_module.build_app(
+        lifecycle=lifecycle,  # type: ignore[arg-type]
+        lifecycle_preparation=preparation,  # type: ignore[arg-type]
+    )
 
     assert app.read_only is read_only
     assert app.audit is audit
     assert app.lifecycle is lifecycle
+    assert app.lifecycle_preparation is preparation
+
+
+def test_build_app_rejects_partial_lifecycle_injection() -> None:
+    """Callers cannot silently combine one injected half with production state."""
+    lifecycle = object()
+    preparation = object()
+
+    for partial in (
+        {"lifecycle": lifecycle},
+        {"lifecycle_preparation": preparation},
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="lifecycle and lifecycle_preparation must be provided together",
+        ):
+            tui_module.build_app(**partial)  # type: ignore[arg-type]
 
 
 def test_run_owns_the_full_screen_app_lifecycle(

@@ -339,19 +339,11 @@ class ReadOnlyLifecycleCompositionReader:
         if not selected.constraint_requirements or not selected.assessments:
             message = "workload lifecycle evidence lacks complete constraint assessment"
             raise LifecyclePreparationError(message)
-        target_values = dict(intent.targets)
         child_ids = tuple(
             _workload_child_id(index, len(selected.constraint_requirements))
             for index in range(len(selected.constraint_requirements))
         )
-        if intent.target_strategy is TargetStrategy.MANUAL and set(
-            target_values
-        ) != set(child_ids):
-            message = "manual workload targets must name every selected child"
-            raise LifecyclePreparationError(message)
-        if intent.target_strategy is not TargetStrategy.MANUAL and target_values:
-            message = "derived workload strategy cannot contain manual targets"
-            raise LifecyclePreparationError(message)
+        target_values = _workload_target_values(intent, child_ids)
 
         children: list[ComposeChild] = []
         principals: list[PlanPrincipal] = []
@@ -389,7 +381,7 @@ class ReadOnlyLifecycleCompositionReader:
             selected_location=selected.location,
             principal=principals[0],
             identity_verified=True,
-            normalized_workload=(f"{type(workload).__name__}:{selected.location}"),
+            normalized_workload=f"{workload.kind.value}:{selected.location}",
         )
 
 
@@ -505,6 +497,27 @@ def _workload_child_id(index: int, count: int) -> str:
     if count == _DIRECT_AND_COMPANION_COUNT:
         return "companion"
     return f"companion-{index}"
+
+
+def _workload_target_values(
+    intent: LifecycleCompositionIntent,
+    child_ids: tuple[str, ...],
+) -> dict[str | None, str]:
+    """Validate one-to-one manual workload targets before keyed conversion."""
+    target_child_ids = tuple(child_id for child_id, _target in intent.targets)
+    if len(set(target_child_ids)) != len(target_child_ids):
+        message = "workload targets cannot contain duplicate child IDs"
+        raise LifecyclePreparationError(message)
+    target_values = dict(intent.targets)
+    if intent.target_strategy is TargetStrategy.MANUAL and set(target_values) != set(
+        child_ids
+    ):
+        message = "manual workload targets must name every selected child"
+        raise LifecyclePreparationError(message)
+    if intent.target_strategy is not TargetStrategy.MANUAL and target_values:
+        message = "derived workload strategy cannot contain manual targets"
+        raise LifecyclePreparationError(message)
+    return target_values
 
 
 def _selector_for_identity(

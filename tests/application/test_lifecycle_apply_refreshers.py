@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -18,10 +18,7 @@ from cqmgr.application.operations.lifecycle_apply import (
     EphemeralApplyContactRefresher,
     ReadOnlyApplyEvidenceRefresher,
 )
-from cqmgr.application.operations.lifecycle_requests import (
-    LifecyclePreparationError,
-    bind_protected_contact,
-)
+from cqmgr.application.operations.lifecycle_requests import bind_protected_contact
 from cqmgr.application.operations.quotas import QuotaInspectData
 from cqmgr.application.ports.secrets import SecretValue
 from cqmgr.domain.catalog import CatalogPredicates
@@ -31,7 +28,14 @@ from cqmgr.domain.identity import (
     PrincipalIdentity,
     PrincipalVerification,
 )
-from cqmgr.domain.plans import PlanPrincipal
+from cqmgr.domain.plans import (
+    ContactBinding,
+    PlanKind,
+    PlanPrincipal,
+    QuotaRequestBundlePlan,
+    QuotaRequestPlanChild,
+    TargetStrategy,
+)
 from cqmgr.domain.quota_queries import QuotaQueryItem
 from cqmgr.domain.quotas import (
     ConstraintReference,
@@ -305,7 +309,7 @@ def test_evidence_refresher_rejects_slice_without_exact_location() -> None:
         deadline=lambda: DEADLINE,
     )
 
-    with pytest.raises(LifecyclePreparationError, match="exact location"):
+    with pytest.raises(ApplyRefreshError, match="exact location"):
         asyncio.run(refresher.refresh_evidence(cast(Any, plan), NOW))
 
 
@@ -319,11 +323,64 @@ def test_evidence_refresher_includes_dispatch_and_verified_no_op_children() -> N
         direct.dimensions,
         QuotaScope.REGIONAL,
     )
-    plan = SimpleNamespace(
+    direct_child = QuotaRequestPlanChild(
+        "direct",
+        direct,
+        QuotaQuantity(8, UNIT),
+        QuotaQuantity(4, UNIT),
+        QuotaQuantity(2, UNIT),
+        QuotaQuantity(4, UNIT),
+        None,
+        None,
+        None,
+        None,
+        TargetStrategy.MANUAL,
+        StableSymbol("manual-absolute"),
+        0,
+        1,
+        (),
+        (),
+        (),
+        (),
+    )
+    no_op_child = QuotaRequestPlanChild(
+        "companion",
+        no_op,
+        QuotaQuantity(4, UNIT),
+        QuotaQuantity(4, UNIT),
+        QuotaQuantity(2, UNIT),
+        QuotaQuantity(2, UNIT),
+        None,
+        None,
+        None,
+        None,
+        TargetStrategy.MINIMUM,
+        StableSymbol("usage-plus-workload"),
+        1,
+        1,
+        (),
+        (),
+        (),
+        (),
+    )
+    plan = QuotaRequestBundlePlan(
         resource_scope=SCOPE,
+        kind=PlanKind.BUNDLE,
+        selected_location="us-central1",
+        target_strategy=TargetStrategy.MANUAL,
+        normalized_workload="compute-instance:us-central1",
         constraints=(ConstraintReference(direct), ConstraintReference(no_op)),
-        children=(SimpleNamespace(child_id="direct", slice_identity=direct),),
-        no_op_children=(SimpleNamespace(child_id="companion", slice_identity=no_op),),
+        children=(direct_child,),
+        no_op_children=(no_op_child,),
+        principal=PlanPrincipal("principal://accounts/123"),
+        contact_binding=ContactBinding(
+            StableSymbol("direct-user"),
+            "principal://accounts/123",
+            "hmac-sha256:" + ("a" * 64),
+        ),
+        installation_id="installation-a",
+        issued_at=NOW,
+        expires_at=NOW + timedelta(minutes=15),
     )
     refresher = ReadOnlyApplyEvidenceRefresher(
         cast(
