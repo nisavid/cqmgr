@@ -182,13 +182,7 @@ def validate_measurement_report(value: object) -> dict[str, object]:  # noqa: C9
         msg = "performance baseline environment values must be non-empty strings"
         raise TypeError(msg)
     measurements = value["measurements"]
-    expected_measurements = {
-        "cold_start_seconds",
-        "first_tui_render_seconds",
-        "peak_python_memory_bytes",
-        "resident_memory_bytes",
-        "steady_refresh_seconds",
-    }
+    expected_measurements = set(BUDGET_FIELDS)
     if not isinstance(measurements, dict) or set(measurements) != expected_measurements:
         msg = "performance baseline measurements must be exact"
         raise TypeError(msg)
