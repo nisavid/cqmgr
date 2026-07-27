@@ -163,3 +163,14 @@ def test_artifact_smoke_qualifies_supported_terminal_behaviors() -> None:
         "low-color-output",
         "interactive-tui-dispatch",
     )
+    redirected = cast(
+        "tuple[str, ...]",
+        _smoke_contract()["REDIRECTED_TERMINAL_QUALIFICATION_CASES"],
+    )
+    interactive = cast(
+        "str",
+        _smoke_contract()["INTERACTIVE_TERMINAL_QUALIFICATION_CASE"],
+    )
+
+    assert set(cases) == {*redirected, interactive}
+    assert len(cases) == len(redirected) + 1

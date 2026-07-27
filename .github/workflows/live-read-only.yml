@@ -4,6 +4,7 @@ on:
   schedule:
     - cron: "41 8 * * 1"
   workflow_dispatch:
+  workflow_call:
 
 concurrency:
   group: live-read-only
@@ -20,6 +21,7 @@ jobs:
     environment: live-read-only
     permissions:
       contents: read
+      # Required by google-github-actions/auth for OIDC-based GCP authentication.
       id-token: write
     steps:
       - name: Checkout repository
@@ -38,7 +40,7 @@ jobs:
         with:
           version: 0.11.30
           python-version: "3.14"
-          enable-cache: true
+          enable-cache: false
 
       - name: Synchronize locked runtime
         run: uv sync --locked --no-dev --python 3.14

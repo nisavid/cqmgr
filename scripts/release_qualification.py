@@ -102,7 +102,7 @@ def _requirements_components(requirements: str) -> list[dict[str, str]]:
         match = PIN_PATTERN.match(line)
         if match is None:
             continue
-        name = match.group("name").lower().replace("_", "-")
+        name = re.sub(r"[-_.]+", "-", match.group("name")).lower()
         version = match.group("version")
         previous = components.setdefault(name, version)
         if previous != version:
@@ -280,11 +280,14 @@ def verify_release_bundle(  # noqa: C901 - one fail-closed bundle audit
     if not isinstance(distributions, list):
         msg = "release manifest distributions must be a list"
         raise TypeError(msg)
-    recorded = {
-        item.get("name"): item.get("sha256")
-        for item in distributions
-        if isinstance(item, dict)
-    }
+    if not all(isinstance(item, dict) for item in distributions):
+        msg = "release manifest distribution entries must be objects"
+        raise TypeError(msg)
+    names = [item.get("name") for item in distributions]
+    if len(set(names)) != len(names):
+        msg = "release manifest distribution names must be unique"
+        raise ValueError(msg)
+    recorded = {item.get("name"): item.get("sha256") for item in distributions}
     expected_distribution_hashes = {
         name: checksums[name] for name in _distribution_names(version)
     }

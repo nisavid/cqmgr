@@ -173,3 +173,45 @@ def test_page_limit_blocks_an_unexhausted_source() -> None:
             max_pages=1,
             timeout=1.0,
         )
+
+
+def test_compute_aggregated_pages_count_nested_records_not_scope_wrappers() -> None:
+    """Warnings and scope wrappers never inflate specialized-hardware evidence."""
+    read_pages = cast("Any", _module()["read_pages"])
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return
+
+        def json(self) -> dict[str, object]:
+            return {
+                "items": {
+                    "zones/us-central1-a": {
+                        "acceleratorTypes": [{"name": "nvidia-b200"}],
+                    },
+                    "zones/us-east1-d": {
+                        "warning": {"code": "NO_RESULTS_ON_PAGE"},
+                    },
+                }
+            }
+
+    class Session:
+        def request(self, method: str, url: str, **kwargs: object) -> Response:
+            del method, url, kwargs
+            return Response()
+
+    evidence, records = read_pages(
+        Session(),
+        method="GET",
+        path_template="/compute/v1/projects/{project}/aggregated/acceleratorTypes",
+        url="https://compute.googleapis.com/compute/v1/projects/example/"
+        "aggregated/acceleratorTypes",
+        item_key="items",
+        params={},
+        max_pages=1,
+        timeout=1.0,
+        nested_key="acceleratorTypes",
+    )
+
+    assert records == ({"name": "nvidia-b200"},)
+    assert evidence["records"] == 1

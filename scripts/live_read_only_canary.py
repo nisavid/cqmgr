@@ -101,12 +101,26 @@ def _response_mapping(response: ResponseLike) -> dict[str, object]:
     return cast("dict[str, object]", payload)
 
 
-def _records(value: object, item_key: str) -> tuple[object, ...]:
+def _records(
+    value: object,
+    item_key: str,
+    *,
+    nested_key: str | None = None,
+) -> tuple[object, ...]:
     if value is None:
         return ()
     if isinstance(value, list):
         return tuple(value)
     if isinstance(value, dict):
+        if nested_key is not None:
+            records: list[object] = []
+            for wrapper in value.values():
+                if not isinstance(wrapper, dict):
+                    continue
+                nested = wrapper.get(nested_key)
+                if isinstance(nested, list):
+                    records.extend(nested)
+            return tuple(records)
         return tuple(value.values())
     msg = f"provider field {item_key!r} is neither a list nor an object"
     raise RuntimeError(msg)
@@ -122,6 +136,7 @@ def read_pages(  # noqa: PLR0913 - one explicit bounded request contract
     params: Mapping[str, str],
     max_pages: int,
     timeout: float,
+    nested_key: str | None = None,
 ) -> tuple[dict[str, object], tuple[object, ...]]:
     """Return sanitized evidence and in-memory records for one bounded source."""
     require_allowlisted(method, path_template)
@@ -140,7 +155,13 @@ def read_pages(  # noqa: PLR0913 - one explicit bounded request contract
             timeout=timeout,
         )
         payload = _response_mapping(response)
-        records.extend(_records(payload.get(item_key), item_key))
+        records.extend(
+            _records(
+                payload.get(item_key),
+                item_key,
+                nested_key=nested_key,
+            )
+        )
         digests.append(hashlib.sha256(_canonical_json(payload)).hexdigest())
         token = payload.get("nextPageToken")
         if token in (None, ""):
@@ -300,6 +321,7 @@ def run_canary(
             params={"maxResults": "500"},
             max_pages=max_pages,
             timeout=timeout,
+            nested_key=resource,
         )
         sources.append(evidence)
     location_path = "/v2/projects/{project}/locations"

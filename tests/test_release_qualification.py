@@ -169,3 +169,66 @@ def test_release_bundle_detects_changed_distribution_bytes(tmp_path: Path) -> No
 
     with pytest.raises(ValueError, match="checksum"):
         verify_release_bundle(output, identity)
+
+
+def test_sbom_normalizes_pep_503_equivalent_dependency_names() -> None:
+    """Equivalent requirement spellings identify one SBOM component."""
+    requirements_components = cast("Any", _module()["_requirements_components"])
+
+    components = requirements_components(
+        "oslo.concurrency==7.2.0\noslo_concurrency==7.2.0"
+    )
+
+    assert components == [
+        {
+            "bom-ref": "pkg:pypi/oslo-concurrency@7.2.0",
+            "name": "oslo-concurrency",
+            "purl": "pkg:pypi/oslo-concurrency@7.2.0",
+            "type": "library",
+            "version": "7.2.0",
+        }
+    ]
+
+
+def test_release_bundle_rejects_duplicate_distribution_entries(tmp_path: Path) -> None:
+    """A manifest cannot hide duplicated distribution names behind a mapping."""
+    module = _module()
+    prepare_release_bundle = cast("Any", module["prepare_release_bundle"])
+    verify_release_bundle = cast("Any", module["verify_release_bundle"])
+    dist = tmp_path / "dist"
+    output = tmp_path / "release"
+    dist.mkdir()
+    (dist / "cqmgr-0.1.0-py3-none-any.whl").write_bytes(b"wheel")
+    (dist / "cqmgr-0.1.0.tar.gz").write_bytes(b"sdist")
+    identity = {
+        "commit": COMMIT,
+        "mode": "dry-run",
+        "repository": "nisavid/cqmgr",
+        "tag": "v0.1.0",
+        "version": "0.1.0",
+    }
+    prepare_release_bundle(dist, output, identity, "click==8.3.1")
+    manifest_path = output / "release-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["distributions"] = [
+        manifest["distributions"][0],
+        manifest["distributions"][0],
+    ]
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    )
+    checksums_path = output / "SHA256SUMS"
+    lines = [
+        (
+            f"{hashlib.sha256(manifest_path.read_bytes()).hexdigest()}"
+            "  release-manifest.json"
+            if line.endswith("  release-manifest.json")
+            else line
+        )
+        for line in checksums_path.read_text().splitlines()
+    ]
+    checksums_path.write_text("\n".join(lines) + "\n")
+
+    with pytest.raises(ValueError, match="names must be unique"):
+        verify_release_bundle(output, identity)
