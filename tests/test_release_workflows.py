@@ -292,12 +292,22 @@ def test_release_publication_requires_the_exact_commit_live_canary() -> None:
 def test_release_performance_job_enforces_budgets_and_retains_failure_evidence() -> (
     None
 ):
-    """Every platform compares executable evidence with the approved ceilings."""
-    workflow = (WORKFLOWS / "release.yml").read_text()
+    """PR and release callers share one approved performance qualification."""
+    release = (WORKFLOWS / "release.yml").read_text()
+    python = (WORKFLOWS / "python.yml").read_text()
+    workflow = (WORKFLOWS / "performance.yml").read_text()
     performance = _workflow_job(workflow, "performance")
     measure = _job_step(performance, "Measure and enforce performance budgets")
     upload = _job_step(performance, "Upload performance evidence")
 
+    assert "uses: ./.github/workflows/performance.yml" in _workflow_job(
+        release,
+        "performance",
+    )
+    assert "uses: ./.github/workflows/performance.yml" in _workflow_job(
+        python,
+        "performance",
+    )
     assert "--budgets docs/release/performance-budgets.json" in measure
     assert "if: always()" in upload
 

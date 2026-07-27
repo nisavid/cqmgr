@@ -17,6 +17,11 @@ permissions:
   contents: read
 
 jobs:
+  performance:
+    uses: ./.github/workflows/performance.yml
+    permissions:
+      contents: read
+
   quality:
     name: Python quality and package
     runs-on: ubuntu-latest

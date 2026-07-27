@@ -324,46 +324,9 @@ jobs:
           if-no-files-found: error
 
   performance:
-    name: ${{ matrix.runner }} performance baseline
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        runner:
-          - macos-14
-          - ubuntu-22.04
-          - windows-2022
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install uv and Python
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
-        with:
-          version: 0.11.30
-          python-version: "3.14"
-          enable-cache: false
-
-      - name: Synchronize locked environment
-        run: uv sync --locked --python 3.14
-
-      - name: Measure and enforce performance budgets
-        run: >-
-          uv run --locked --no-sync
-          python scripts/measure_performance.py
-          --output performance-${{ matrix.runner }}.json
-          --budgets docs/release/performance-budgets.json
-
-      - name: Upload performance evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: performance-${{ matrix.runner }}
-          path: performance-${{ matrix.runner }}.json
-          if-no-files-found: error
+    uses: ./.github/workflows/performance.yml
+    permissions:
+      contents: read
 
   live-read-only:
     needs: build
