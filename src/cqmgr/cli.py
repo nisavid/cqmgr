@@ -508,7 +508,11 @@ async def _apply_lifecycle_async(
     try:
         result = await runtime.operations.apply(request)  # type: ignore[arg-type]
         _emit_lifecycle(result, presentation)
-    finally:
+    except BaseException:
+        with suppress(BaseException):
+            runtime.requests.discard_apply(request)  # type: ignore[arg-type]
+        raise
+    else:
         runtime.requests.discard_apply(request)  # type: ignore[arg-type]
 
 

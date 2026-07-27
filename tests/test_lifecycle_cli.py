@@ -113,6 +113,7 @@ class _Factory:
     def __init__(self) -> None:
         self.calls: list[tuple[str, object]] = []
         self.discarded: list[object] = []
+        self.discard_error: BaseException | None = None
 
     def compose(self, value: RequestCompositionInput) -> object:
         self.calls.append(("compose", value))
@@ -138,6 +139,8 @@ class _Factory:
 
     def discard_apply(self, request: object) -> bool:
         self.discarded.append(request)
+        if self.discard_error is not None:
+            raise self.discard_error
         return True
 
     def watch(self, value: object) -> object:
@@ -538,6 +541,7 @@ def test_apply_route_discards_prepared_contact_when_operation_aborts(
 ) -> None:
     """Cancellation or dispatch failure cannot retain prepared contact authority."""
     facade, factory = _runtime(monkeypatch)
+    factory.discard_error = RuntimeError("cleanup failed")
 
     async def abort(_request: object) -> OperationResult[object]:
         raise error
@@ -555,9 +559,38 @@ def test_apply_route_discards_prepared_contact_when_operation_aborts(
             LifecyclePresentation("json", no_color=True, quiet=False),
         )
 
-    with pytest.raises(type(error), match=str(error)):
+    with pytest.raises(type(error), match=str(error)) as caught:
         asyncio.run(exercise())
 
+    assert caught.value is error
+    assert factory.discarded == [
+        ("apply-request", reference, "projects/123"),
+    ]
+
+
+def test_apply_route_propagates_discard_failure_after_success(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Cleanup remains observable when no earlier Apply outcome is active."""
+    _facade, factory = _runtime(monkeypatch)
+    cleanup_failure = RuntimeError("cleanup failed")
+    factory.discard_error = cleanup_failure
+    reference = PlanReferenceInput(digest="sha256:" + ("a" * 64), path=None)
+
+    async def exercise() -> None:
+        runtime = cli_module.build_lifecycle_cli_runtime()
+        await cli_module._apply_lifecycle_async(  # noqa: SLF001
+            runtime,
+            reference,
+            "projects/123",
+            None,
+            LifecyclePresentation("json", no_color=True, quiet=False),
+        )
+
+    with pytest.raises(RuntimeError, match="cleanup failed") as caught:
+        asyncio.run(exercise())
+
+    assert caught.value is cleanup_failure
     assert factory.discarded == [
         ("apply-request", reference, "projects/123"),
     ]
@@ -568,6 +601,7 @@ def test_apply_route_discards_prepared_contact_after_validation_result(
 ) -> None:
     """A non-success Apply result releases its prepared contact on route exit."""
     facade, factory = _runtime(monkeypatch)
+    factory.discard_error = RuntimeError("cleanup failed")
 
     async def reject(_request: object) -> OperationResult[object]:
         return OperationResult(
