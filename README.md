@@ -84,8 +84,10 @@ uv run ruff format --check .
 uv run ruff check .
 uv run pyrefly check
 uv run lint-imports --no-cache
-# CI enforces the reviewed dependency-license policy.
-uv run pip-licenses --from mixed
+uv run --locked --no-sync pip-licenses \
+  --from mixed \
+  --allow-only \
+  "3-Clause BSD License;Apache-2.0;Apache-2.0 OR BSD-2-Clause;Apache-2.0 OR BSD-3-Clause;Apache Software License;BSD-2-Clause;BSD-3-Clause;BSD License;MIT;MIT-0;MIT License;MPL-2.0;Mozilla Public License 2.0 (MPL 2.0);PSF-2.0;Python Software Foundation License"
 uv export --locked --no-dev --no-emit-project --format requirements-txt --output-file release-requirements.txt
 uv run pip-audit --requirement release-requirements.txt --disable-pip
 uv run pytest

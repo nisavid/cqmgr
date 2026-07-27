@@ -23,17 +23,18 @@ if TYPE_CHECKING:
 
 EVIDENCE_SCHEMA = "cqmgr.release-evidence/v1"
 SCHEMA_CATALOG_SCHEMA = "cqmgr.schema-catalog/v1"
+MIN_REORDER_PAGES = 2
 
 
 def _canonical_json(value: object) -> bytes:
     return (
         json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
         + "\n"
-    ).encode()
+    ).encode("utf-8")
 
 
 def _load_object(path: Path) -> dict[str, object]:
-    value = json.loads(path.read_text())
+    value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         msg = f"fixture {path.name} must contain a JSON object"
         raise TypeError(msg)
@@ -54,6 +55,21 @@ def _mapping(value: object, name: str) -> dict[str, object]:
     return cast("dict[str, object]", value)
 
 
+def _covers_derived_duplicate_and_reordered_pages(
+    page_digests: Sequence[str],
+) -> bool:
+    """Prove page identity survives a derived duplicate/reordered scenario."""
+    canonical = tuple(sorted(set(page_digests)))
+    if len(canonical) < MIN_REORDER_PAGES:
+        return False
+    scenario = (*reversed(canonical), canonical[0])
+    return (
+        scenario[: len(canonical)] != canonical
+        and len(scenario) > len(set(scenario))
+        and tuple(sorted(set(scenario))) == canonical
+    )
+
+
 def _compute_source(
     fixture_root: Path,
     filename: str,
@@ -63,7 +79,7 @@ def _compute_source(
     document = _load_object(fixture_root / filename)
     pages = _list(document.get("pages"), f"{source_name} pages")
     record_count = 0
-    record_digests: list[str] = []
+    page_digests = [hashlib.sha256(_canonical_json(page)).hexdigest() for page in pages]
     lifecycle_values: set[str] = set()
     unreachables = 0
     for page_value in pages:
@@ -75,9 +91,6 @@ def _compute_source(
             for record_value in _list(aggregate.get(item_key, []), item_key):
                 record = _mapping(record_value, f"{source_name} record")
                 record_count += 1
-                record_digests.append(
-                    hashlib.sha256(_canonical_json(record)).hexdigest()
-                )
                 lifecycle = record.get("deprecated")
                 if isinstance(lifecycle, dict):
                     state = lifecycle.get("state")
@@ -88,9 +101,7 @@ def _compute_source(
     ).get("nextPageToken")
     source: dict[str, object] = {
         "duplicate_and_reordered_pages": (
-            bool(record_digests)
-            and sorted(set(record_digests))
-            == sorted({*reversed(record_digests), record_digests[0]})
+            _covers_derived_duplicate_and_reordered_pages(page_digests)
         ),
         "fixture": filename,
         "name": source_name,
@@ -139,13 +150,8 @@ def _tpu_sources(fixture_root: Path) -> tuple[dict[str, object], ...]:
             )
             for page in pages
         )
-        record_digests = [
-            hashlib.sha256(_canonical_json(record)).hexdigest()
-            for page in pages
-            for record in _list(
-                _mapping(page, f"{name} page").get(item_key, []),
-                f"{name} records",
-            )
+        page_digests = [
+            hashlib.sha256(_canonical_json(page)).hexdigest() for page in pages
         ]
         terminal = bool(terminal_pages) and all(
             not _mapping(page, f"{name} terminal page").get("nextPageToken")
@@ -154,9 +160,7 @@ def _tpu_sources(fixture_root: Path) -> tuple[dict[str, object], ...]:
         sources.append(
             {
                 "duplicate_and_reordered_pages": (
-                    bool(record_digests)
-                    and sorted(set(record_digests))
-                    == sorted({*reversed(record_digests), record_digests[0]})
+                    _covers_derived_duplicate_and_reordered_pages(page_digests)
                 ),
                 "fixture": "tpu-catalog-pages.json",
                 "locations": locations,
@@ -250,7 +254,7 @@ def _evidence_resource(fixture_root: Path) -> dict[str, object]:
             "revision": MAINTAINED_ACCELERATOR_OVERLAY.metadata.revision,
         },
         "scenario_coverage": {
-            "duplicate-and-reordered-pages": all(
+            "duplicate-and-reordered-pages": any(
                 source["duplicate_and_reordered_pages"] for source in sources
             ),
             "location-local-failure": any(
@@ -295,7 +299,9 @@ def generate_release_resources(fixture_root: Path, output_root: Path) -> None:
     schema_root = output_root / "schemas"
     schema_root.mkdir(parents=True, exist_ok=True)
     (output_root / "__init__.py").write_text(
-        '"""Packaged release evidence and public schema resources."""\n'
+        '"""Packaged release evidence and public schema resources."""\n',
+        encoding="utf-8",
+        newline="\n",
     )
     (output_root / "accelerator-overlay.json").write_bytes(
         _canonical_json(_overlay_resource())

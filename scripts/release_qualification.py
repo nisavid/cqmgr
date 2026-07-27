@@ -21,12 +21,20 @@ PIN_PATTERN = re.compile(
 )
 RELEASE_MANIFEST_SCHEMA = "cqmgr.release-manifest/v1"
 SBOM_FILENAME_TEMPLATE = "cqmgr-{version}.cdx.json"
+RELEASE_IDENTITY_FIELDS = {
+    "commit",
+    "mode",
+    "repository",
+    "tag",
+    "version",
+}
 
 
 def _project_version(project_path: Path) -> str:
-    project = tomllib.loads(project_path.read_text())["project"]
-    version = project["version"]
-    if not isinstance(version, str) or not version:
+    document = tomllib.loads(project_path.read_text(encoding="utf-8"))
+    project = document.get("project")
+    version = project.get("version") if isinstance(project, dict) else None
+    if not isinstance(version, str) or not version.strip():
         msg = "project version must be one static non-empty string"
         raise ValueError(msg)
     return version
@@ -36,7 +44,7 @@ def _canonical_json(value: object) -> bytes:
     return (
         json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
         + "\n"
-    ).encode()
+    ).encode("utf-8")
 
 
 def _sha256(path: Path) -> str:
@@ -101,7 +109,8 @@ def _requirements_components(requirements: str) -> list[dict[str, str]]:
             continue
         match = PIN_PATTERN.match(line)
         if match is None:
-            continue
+            msg = f"requirements contain an unsupported unpinned line: {line}"
+            raise ValueError(msg)
         name = re.sub(r"[-_.]+", "-", match.group("name")).lower()
         version = match.group("version")
         previous = components.setdefault(name, version)
@@ -215,19 +224,30 @@ def prepare_release_bundle(
     checksum_lines = [
         f"{_sha256(output_dir / name)}  {name}" for name in checksum_names
     ]
-    (output_dir / "SHA256SUMS").write_text("\n".join(checksum_lines) + "\n")
+    (output_dir / "SHA256SUMS").write_text(
+        "\n".join(checksum_lines) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
     return manifest
 
 
 def _checksum_mapping(checksums_path: Path) -> dict[str, str]:
+    text = checksums_path.read_text(encoding="utf-8")
+    if not text.endswith("\n") or "\r" in text:
+        msg = "checksum manifest must use canonical UTF-8 lines"
+        raise ValueError(msg)
     checksums: dict[str, str] = {}
-    for line in checksums_path.read_text().splitlines():
+    for line in text.splitlines():
         try:
             digest, name = line.split("  ", 1)
         except ValueError as error:
             msg = "checksum manifest has an invalid line"
             raise ValueError(msg) from error
-        if not re.fullmatch(r"[0-9a-f]{64}", digest) or not name:
+        if not re.fullmatch(r"[0-9a-f]{64}", digest) or not name or name in checksums:
+            if name in checksums:
+                msg = f"checksum manifest has a duplicate entry for {name}"
+                raise ValueError(msg)
             msg = "checksum manifest has an invalid digest or name"
             raise ValueError(msg)
         checksums[name] = digest
@@ -259,7 +279,9 @@ def verify_release_bundle(  # noqa: C901 - one fail-closed bundle audit
         if _sha256(release_dir / name) != digest:
             msg = f"release checksum mismatch for {name}"
             raise ValueError(msg)
-    manifest_value = json.loads((release_dir / "release-manifest.json").read_text())
+    manifest_value = json.loads(
+        (release_dir / "release-manifest.json").read_text(encoding="utf-8")
+    )
     if not isinstance(manifest_value, dict):
         msg = "release manifest must be an object"
         raise TypeError(msg)
@@ -308,7 +330,7 @@ def verify_release_bundle(  # noqa: C901 - one fail-closed bundle audit
 def _write_json(path: Path | None, value: object) -> None:
     encoded = _canonical_json(value)
     if path is None:
-        print(encoded.decode(), end="")  # noqa: T201
+        print(encoded.decode("utf-8"), end="")  # noqa: T201
     else:
         path.write_bytes(encoded)
 
@@ -327,12 +349,13 @@ def _identity_command(arguments: argparse.Namespace) -> None:
 
 
 def _load_identity(path: Path) -> dict[str, str]:
-    value = json.loads(path.read_text())
-    if not isinstance(value, dict) or any(
-        not isinstance(key, str) or not isinstance(item, str)
-        for key, item in value.items()
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(value, dict)
+        or set(value) != RELEASE_IDENTITY_FIELDS
+        or any(not isinstance(item, str) or not item for item in value.values())
     ):
-        msg = "release identity must be a string mapping"
+        msg = "release identity must contain the exact required fields as strings"
         raise ValueError(msg)
     return value
 
@@ -343,7 +366,7 @@ def _prepare_command(arguments: argparse.Namespace) -> None:
         arguments.dist,
         arguments.output,
         identity,
-        arguments.requirements.read_text(),
+        arguments.requirements.read_text(encoding="utf-8"),
     )
 
 

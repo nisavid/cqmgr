@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import runpy
+import sys
 from pathlib import Path
 from typing import Any, cast
 
@@ -106,7 +107,8 @@ def test_measure_uses_dedicated_tui_boundaries_not_pytest_process_time() -> None
     report = measure(runs)
 
     assert len(commands) == runs
-    assert all("pytest" not in command for command in commands)
+    assert commands == [(sys.executable, "-m", "cqmgr", "--help")] * runs
+    assert all("pytest" not in argument for command in commands for argument in command)
     assert report["measurements"]["first_tui_render_seconds"] == first_render
     assert report["measurements"]["steady_refresh_seconds"] == steady_refresh
 
@@ -115,6 +117,6 @@ def test_committed_performance_baseline_is_loaded_and_validated() -> None:
     """The retained local artifact satisfies the executable baseline schema."""
     module = runpy.run_path(str(SCRIPT))
     validate = cast("Any", module["validate_measurement_report"])
-    baseline = json.loads(BASELINE.read_text())
+    baseline = json.loads(BASELINE.read_text(encoding="utf-8"))
 
     assert validate(baseline) == baseline

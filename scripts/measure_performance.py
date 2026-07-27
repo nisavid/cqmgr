@@ -320,7 +320,9 @@ def main(arguments: Sequence[str] | None = None) -> None:
             separators=(",", ":"),
             sort_keys=True,
         )
-        + "\n"
+        + "\n",
+        encoding="utf-8",
+        newline="\n",
     )
 
 

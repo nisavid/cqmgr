@@ -150,9 +150,10 @@ def test_artifact_smoke_executes_every_canonical_and_alias_leaf() -> None:
 
 def test_artifact_smoke_qualifies_supported_terminal_behaviors() -> None:
     """Installed executables cover interactive, redirected, and color fallbacks."""
+    contract = _smoke_contract()
     cases = cast(
         "tuple[str, ...]",
-        _smoke_contract()["TERMINAL_QUALIFICATION_CASES"],
+        contract["TERMINAL_QUALIFICATION_CASES"],
     )
 
     assert cases == (
@@ -165,11 +166,11 @@ def test_artifact_smoke_qualifies_supported_terminal_behaviors() -> None:
     )
     redirected = cast(
         "tuple[str, ...]",
-        _smoke_contract()["REDIRECTED_TERMINAL_QUALIFICATION_CASES"],
+        contract["REDIRECTED_TERMINAL_QUALIFICATION_CASES"],
     )
     interactive = cast(
         "str",
-        _smoke_contract()["INTERACTIVE_TERMINAL_QUALIFICATION_CASE"],
+        contract["INTERACTIVE_TERMINAL_QUALIFICATION_CASE"],
     )
 
     assert set(cases) == {*redirected, interactive}
