@@ -10,6 +10,7 @@ import json
 import sys
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from contextvars import ContextVar
 from io import BytesIO
 from pathlib import Path
@@ -274,7 +275,11 @@ async def _run_lifecycle_cli(
     runtime = build_lifecycle_cli_runtime()
     try:
         await callback(runtime)
-    finally:
+    except BaseException:
+        with suppress(BaseException):
+            await runtime.aclose()
+        raise
+    else:
         await runtime.aclose()
 
 
