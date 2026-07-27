@@ -287,3 +287,16 @@ def test_release_publication_requires_the_exact_commit_live_canary() -> None:
     assert "uses: ./.github/workflows/live-read-only.yml" in live_read_only
     assert "id-token: write" in live_read_only
     assert "live-read-only" in _yaml_list_values(publish_needs, indent=6)
+
+
+def test_release_performance_job_enforces_budgets_and_retains_failure_evidence() -> (
+    None
+):
+    """Every platform compares executable evidence with the approved ceilings."""
+    workflow = (WORKFLOWS / "release.yml").read_text()
+    performance = _workflow_job(workflow, "performance")
+    measure = _job_step(performance, "Measure and enforce performance budgets")
+    upload = _job_step(performance, "Upload performance evidence")
+
+    assert "--budgets docs/release/performance-budgets.json" in measure
+    assert "if: always()" in upload
