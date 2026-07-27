@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import runpy
+from email.message import Message
 from pathlib import Path
 from typing import Any, cast
+from urllib.error import HTTPError
 
 import pytest
 
@@ -42,14 +44,18 @@ def _candidate(tmp_path: Path) -> Path:
     }
     assets["release-manifest.json"] = (
         json.dumps(manifest, separators=(",", ":"), sort_keys=True) + "\n"
-    ).encode()
+    ).encode("utf-8")
     for name, content in assets.items():
         (candidate / name).write_bytes(content)
     checksums = "".join(
         f"{hashlib.sha256(content).hexdigest()}  {name}\n"
         for name, content in assets.items()
     )
-    (candidate / "SHA256SUMS").write_text(checksums)
+    (candidate / "SHA256SUMS").write_text(
+        checksums,
+        encoding="utf-8",
+        newline="\n",
+    )
     return candidate
 
 
@@ -58,6 +64,45 @@ def test_absent_pypi_version_requires_upload(tmp_path: Path) -> None:
     check_pypi = cast("Any", _module()["check_pypi"])
 
     assert check_pypi(_candidate(tmp_path), VERSION, None) == "publish"
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["asset-bytes", "duplicate-entry", "missing-entry", "missing-newline"],
+)
+def test_candidate_sha256sums_mismatch_fails_before_publication(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    """Every candidate asset must agree with one exact SHA256SUMS entry."""
+    check_pypi = cast("Any", _module()["check_pypi"])
+    candidate = _candidate(tmp_path)
+    checksums_path = candidate / "SHA256SUMS"
+    lines = checksums_path.read_text(encoding="utf-8").splitlines()
+    if mismatch == "asset-bytes":
+        (candidate / f"cqmgr-{VERSION}.cdx.json").write_bytes(b"replacement")
+    elif mismatch == "duplicate-entry":
+        lines.append(lines[0])
+        checksums_path.write_text(
+            "\n".join(lines) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+    elif mismatch == "missing-entry":
+        checksums_path.write_text(
+            "\n".join(lines[:-1]) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+    else:
+        checksums_path.write_text(
+            "\n".join(lines),
+            encoding="utf-8",
+            newline="\n",
+        )
+
+    with pytest.raises(ValueError, match="SHA256SUMS"):
+        check_pypi(candidate, VERSION, None)
 
 
 def test_exact_pypi_version_skips_upload(tmp_path: Path) -> None:
@@ -159,7 +204,7 @@ def test_exact_github_release_skips_creation_after_comparing_every_asset(
     assert downloaded == [asset["url"] for asset in assets]
 
 
-@pytest.mark.parametrize("mismatch", ["asset-set", "bytes", "draft", "tag"])
+@pytest.mark.parametrize("mismatch", ["asset-set", "bytes", "draft", "size", "tag"])
 def test_github_release_mismatch_fails_closed(
     tmp_path: Path,
     mismatch: str,
@@ -189,6 +234,8 @@ def test_github_release_mismatch_fails_closed(
         remote[assets[0]["url"]] = b"replacement"
     elif mismatch == "draft":
         metadata["draft"] = True
+    elif mismatch == "size":
+        assets[0]["size"] += 1
     else:
         metadata["tag_name"] = "v9.9.9"
 
@@ -199,3 +246,23 @@ def test_github_release_mismatch_fails_closed(
             metadata,
             remote.__getitem__,
         )
+
+
+def test_remote_error_is_not_treated_as_absent_publication_state() -> None:
+    """Only a remote 404 permits publication; server failures stop the workflow."""
+    module = _module()
+    fetch_json = cast("Any", module["_fetch_json"])
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise HTTPError(
+            url="https://pypi.org/pypi/cqmgr/0.1.0/json",
+            code=500,
+            msg="server error",
+            hdrs=Message(),
+            fp=None,
+        )
+
+    fetch_json.__globals__["urlopen"] = fail
+
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        fetch_json("https://pypi.org/pypi/cqmgr/0.1.0/json", headers={})

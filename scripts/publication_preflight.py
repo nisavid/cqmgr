@@ -39,12 +39,33 @@ def _object(value: object, *, context: str) -> Mapping[str, Any]:
     return value
 
 
-def _candidate_details(
+def _checksum_mapping(checksums_path: Path) -> dict[str, str]:
+    text = checksums_path.read_text(encoding="utf-8")
+    if not text.endswith("\n") or "\r" in text:
+        msg = "SHA256SUMS must use canonical UTF-8 lines"
+        raise ValueError(msg)
+    checksums: dict[str, str] = {}
+    for line in text.splitlines():
+        try:
+            digest, name = line.split("  ", 1)
+        except ValueError as error:
+            msg = "SHA256SUMS contains an invalid line"
+            raise ValueError(msg) from error
+        if SHA256_PATTERN.fullmatch(digest) is None or not name or name in checksums:
+            msg = "SHA256SUMS contains an invalid or duplicate asset"
+            raise ValueError(msg)
+        checksums[name] = digest
+    return checksums
+
+
+def _candidate_details(  # noqa: C901 - one fail-closed candidate audit
     candidate_dir: Path,
     version: str,
 ) -> tuple[dict[str, Path], dict[str, str]]:
     manifest = _object(
-        json.loads((candidate_dir / "release-manifest.json").read_text()),
+        json.loads(
+            (candidate_dir / "release-manifest.json").read_text(encoding="utf-8")
+        ),
         context="release manifest",
     )
     if manifest.get("version") != version:
@@ -90,10 +111,18 @@ def _candidate_details(
     if set(assets) != expected_asset_names:
         msg = "release candidate contains missing or unexpected assets"
         raise ValueError(msg)
-    for name, digest in distributions.items():
+    checksums = _checksum_mapping(assets["SHA256SUMS"])
+    expected_checksum_names = expected_asset_names - {"SHA256SUMS"}
+    if set(checksums) != expected_checksum_names:
+        msg = "SHA256SUMS does not cover the exact candidate assets"
+        raise ValueError(msg)
+    for name, digest in checksums.items():
         if _sha256(assets[name]) != digest:
-            msg = f"release candidate distribution checksum mismatch for {name}"
+            msg = f"SHA256SUMS does not match candidate asset bytes: {name}"
             raise ValueError(msg)
+    if any(checksums[name] != digest for name, digest in distributions.items()):
+        msg = "SHA256SUMS does not match the release manifest distributions"
+        raise ValueError(msg)
     return assets, distributions
 
 
@@ -258,7 +287,7 @@ def _write_action(output: Path, action: str) -> None:
     if action not in {"publish", "skip"}:
         msg = "publication preflight returned an unsupported action"
         raise ValueError(msg)
-    with output.open("a") as stream:
+    with output.open("a", encoding="utf-8", newline="\n") as stream:
         stream.write(f"publish={'true' if action == 'publish' else 'false'}\n")
 
 

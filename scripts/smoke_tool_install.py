@@ -570,6 +570,7 @@ def _read_pty_process(
         chunks: list[bytes] = []
         deadline = time.monotonic() + 15
         empty_fds: list[int] = []
+        completed = False
         while time.monotonic() < deadline:
             readable, _, _ = select.select([master], empty_fds, empty_fds, 0.1)
             if readable:
@@ -578,12 +579,19 @@ def _read_pty_process(
                 except OSError as error:
                     if error.errno != errno.EIO:
                         raise
+                    completed = True
                     break
                 if not chunk:
+                    completed = True
                     break
                 chunks.append(chunk)
             elif process.poll() is not None:
+                completed = True
                 break
+        if not completed and process.poll() is None:
+            output = b"".join(chunks).decode("utf-8", errors="replace")
+            msg = f"PTY command exceeded 15 seconds: {command!r}\n{output}"
+            raise TimeoutError(msg)
         process.wait(timeout=max(0.1, deadline - time.monotonic()))
     finally:
         os.close(master)

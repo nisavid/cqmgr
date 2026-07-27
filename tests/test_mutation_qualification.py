@@ -14,7 +14,6 @@ if TYPE_CHECKING:
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "verify_mutation_results.py"
 BASELINE = Path(__file__).parents[1] / "docs" / "release" / "mutation-baseline.json"
-EXPECTED_BASELINE_FLOOR = 64.0
 
 
 class MutationVerifier(Protocol):
@@ -38,7 +37,7 @@ def _verify() -> MutationVerifier:
 
 def test_reviewed_mutation_baseline_passes() -> None:
     """The committed critical-core evidence establishes an explicit floor."""
-    baseline = json.loads(BASELINE.read_text())
+    baseline = json.loads(BASELINE.read_text(encoding="utf-8"))
     assert baseline == {
         "killed": 78,
         "minimum_score": 60.0,
@@ -64,7 +63,7 @@ def test_reviewed_mutation_baseline_passes() -> None:
     }
 
     score = _verify()(stats, baseline["minimum_score"])
-    assert score > EXPECTED_BASELINE_FLOOR
+    assert score > baseline["minimum_score"]
     assert round(score, 2) == baseline["score"]
 
 
@@ -79,6 +78,7 @@ def test_reviewed_mutation_baseline_passes() -> None:
             {"total": 0, "killed": 0, "survived": 0},
             "produced no mutants",
         ),
+        ({"total": 122}, "only killed and survived"),
     ],
 )
 def test_mutation_gate_rejects_regression_or_incomplete_execution(
@@ -119,3 +119,23 @@ def test_mutation_gate_rejects_boolean_statistics(name: str) -> None:
 
     with pytest.raises(TypeError, match="non-negative integer"):
         _verify()(stats, 60.0)
+
+
+@pytest.mark.parametrize("minimum_score", [-0.1, 100.1])
+def test_mutation_gate_rejects_out_of_range_minimum(
+    minimum_score: float,
+) -> None:
+    """The reviewed mutation floor is always an inclusive percentage."""
+    stats = {
+        "check_was_interrupted_by_user": 0,
+        "killed": 78,
+        "no_tests": 0,
+        "segfault": 0,
+        "survived": 43,
+        "suspicious": 0,
+        "timeout": 0,
+        "total": 121,
+    }
+
+    with pytest.raises(ValueError, match="between 0 and 100"):
+        _verify()(stats, minimum_score)

@@ -38,7 +38,9 @@ def test_checked_in_release_resources_match_the_deterministic_generator(
 
 def test_release_evidence_records_exact_sources_and_honest_limitations() -> None:
     """Hermetic evidence is release-relative and never claims physical capacity."""
-    evidence = json.loads((RESOURCES / "release-evidence.json").read_text())
+    evidence = json.loads(
+        (RESOURCES / "release-evidence.json").read_text(encoding="utf-8")
+    )
 
     assert evidence["schema"] == "cqmgr.release-evidence/v1"
     assert evidence["overlay"]["content_digest"] == (
@@ -58,6 +60,17 @@ def test_release_evidence_records_exact_sources_and_honest_limitations() -> None
         "provider-unknown-lifecycle": True,
         "terminal-pagination": True,
     }
+    duplicate_reorder_by_source = {
+        source["name"]: source["duplicate_and_reordered_pages"]
+        for source in evidence["sources"]
+    }
+    assert duplicate_reorder_by_source == {
+        "compute-accelerator-types": True,
+        "compute-machine-types": True,
+        "tpu-accelerator-types": False,
+        "tpu-locations": True,
+        "tpu-runtime-versions": False,
+    }
     assert evidence["claims"]["physical_capacity"] is False
     assert evidence["claims"]["universal_availability"] is False
     encoded = json.dumps(evidence, sort_keys=True)
@@ -65,9 +78,24 @@ def test_release_evidence_records_exact_sources_and_honest_limitations() -> None
     assert "@" not in encoded
 
 
+def test_duplicate_and_reordered_coverage_is_a_derived_executable_scenario() -> None:
+    """Coverage requires two identities and proves reorder plus dedup normalization."""
+    module = runpy.run_path(str(SCRIPT))
+    covers = cast(
+        "Any",
+        module["_covers_derived_duplicate_and_reordered_pages"],
+    )
+
+    assert covers(("page-a", "page-b")) is True
+    assert covers(("page-a",)) is False
+    assert covers(()) is False
+
+
 def test_packaged_schema_catalog_closes_single_and_bundle_discriminators() -> None:
     """Published schema identities retain exact lifecycle subject kinds."""
-    catalog = json.loads((RESOURCES / "schemas" / "catalog.json").read_text())
+    catalog = json.loads(
+        (RESOURCES / "schemas" / "catalog.json").read_text(encoding="utf-8")
+    )
 
     assert catalog["schema"] == "cqmgr.schema-catalog/v1"
     assert catalog["public_record_schemas"] == [
@@ -82,7 +110,9 @@ def test_packaged_schema_catalog_closes_single_and_bundle_discriminators() -> No
 
 def test_packaged_overlay_uses_clean_quota_unit_symbols() -> None:
     """Release resources never serialize dataclass representations as unit values."""
-    overlay = json.loads((RESOURCES / "accelerator-overlay.json").read_text())
+    overlay = json.loads(
+        (RESOURCES / "accelerator-overlay.json").read_text(encoding="utf-8")
+    )
 
     units = {mapping["selector"]["unit"] for mapping in overlay["mappings"]}
     assert units == {"1", "core"}

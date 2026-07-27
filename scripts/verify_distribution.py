@@ -14,9 +14,19 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 PACKAGE_PREFIX = PurePosixPath("cqmgr")
-PROJECT_VERSION = tomllib.loads(Path("pyproject.toml").read_text())["project"][
-    "version"
-]
+
+
+def _project_version(project_path: Path) -> str:
+    document = tomllib.loads(project_path.read_text(encoding="utf-8"))
+    project = document.get("project")
+    version = project.get("version") if isinstance(project, dict) else None
+    if not isinstance(version, str) or not version.strip():
+        msg = "project version must be one static non-empty string"
+        raise ValueError(msg)
+    return version
+
+
+PROJECT_VERSION = _project_version(Path("pyproject.toml"))
 SDIST_ROOT = PurePosixPath(f"cqmgr-{PROJECT_VERSION}")
 WHEEL_DIST_INFO = PurePosixPath(f"cqmgr-{PROJECT_VERSION}.dist-info")
 EXPECTED_PACKAGE_FILES = {
@@ -146,27 +156,31 @@ def _regular_files(names: list[str]) -> set[PurePosixPath]:
 def _assert_release_resources(read: Callable[[str], bytes]) -> None:
     for relative_path in RELEASE_RESOURCE_FILES:
         raw = read(str(PACKAGE_PREFIX / relative_path))
-        text = raw.decode()
+        text = raw.decode("utf-8")
         assert all(
             forbidden not in text for forbidden in FORBIDDEN_RELEASE_RESOURCE_TEXT
         )
         document = json.loads(text)
         assert isinstance(document, dict)
     overlay = json.loads(
-        read(str(PACKAGE_PREFIX / "resources/accelerator-overlay.json"))
+        read(str(PACKAGE_PREFIX / "resources/accelerator-overlay.json")).decode("utf-8")
     )
     assert overlay["schema"] == "cqmgr.accelerator-catalog/v1"
     assert isinstance(overlay["revision"], str)
     assert overlay["revision"]
     assert isinstance(overlay["mappings"], list)
     assert overlay["mappings"]
-    evidence = json.loads(read(str(PACKAGE_PREFIX / "resources/release-evidence.json")))
+    evidence = json.loads(
+        read(str(PACKAGE_PREFIX / "resources/release-evidence.json")).decode("utf-8")
+    )
     assert evidence["schema"] == "cqmgr.release-evidence/v1"
     assert evidence["claims"] == {
         "physical_capacity": False,
         "universal_availability": False,
     }
-    catalog = json.loads(read(str(PACKAGE_PREFIX / "resources/schemas/catalog.json")))
+    catalog = json.loads(
+        read(str(PACKAGE_PREFIX / "resources/schemas/catalog.json")).decode("utf-8")
+    )
     assert catalog["schema"] == "cqmgr.schema-catalog/v1"
     assert catalog["quota_request_plan"]["kinds"] == ["bundle", "single"]
 
@@ -195,7 +209,7 @@ def _assert_wheel_contents(wheel: Path) -> set[PurePosixPath]:
         wheel_metadata = archive.read(str(WHEEL_DIST_INFO / "WHEEL"))
         assert b"Root-Is-Purelib: true" in wheel_metadata
         assert b"Tag: py3-none-any" in wheel_metadata
-        checkout = str(Path.cwd().resolve()).encode()
+        checkout = str(Path.cwd().resolve()).encode("utf-8")
         assert all(checkout not in archive.read(str(path)) for path in files)
         _assert_release_resources(archive.read)
     package_files = {
@@ -224,7 +238,7 @@ def _assert_sdist_contents(sdist: Path) -> set[PurePosixPath]:
         package_root = SDIST_ROOT / "src" / PACKAGE_PREFIX
         assert all(path in allowed or package_root in path.parents for path in files)
         assert package_root / "py.typed" in files
-        checkout = str(Path.cwd().resolve()).encode()
+        checkout = str(Path.cwd().resolve()).encode("utf-8")
         for path in files:
             extracted = archive.extractfile(str(path))
             assert extracted is not None

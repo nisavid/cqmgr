@@ -58,13 +58,29 @@ def main(arguments: Sequence[str] | None = None) -> None:
     """Verify one mutmut CI statistics file."""
     parser = argparse.ArgumentParser()
     parser.add_argument("stats", type=Path)
-    parser.add_argument("--minimum-score", type=float, required=True)
+    minimum = parser.add_mutually_exclusive_group(required=True)
+    minimum.add_argument("--minimum-score", type=float)
+    minimum.add_argument("--baseline", type=Path)
     parsed = parser.parse_args(arguments)
-    value = json.loads(parsed.stats.read_text())
+    value = json.loads(parsed.stats.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         msg = "mutation statistics must be an object"
         raise TypeError(msg)
-    verify_mutation_results(value, parsed.minimum_score)
+    minimum_score = parsed.minimum_score
+    if parsed.baseline is not None:
+        baseline = json.loads(parsed.baseline.read_text(encoding="utf-8"))
+        if not isinstance(baseline, dict):
+            msg = "mutation baseline must be an object"
+            raise TypeError(msg)
+        minimum_score = baseline.get("minimum_score")
+        if isinstance(minimum_score, bool) or not isinstance(
+            minimum_score,
+            int | float,
+        ):
+            msg = "mutation baseline minimum_score must be numeric"
+            raise TypeError(msg)
+    assert minimum_score is not None
+    verify_mutation_results(value, float(minimum_score))
 
 
 if __name__ == "__main__":
