@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import ANY
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -69,10 +70,13 @@ class _Facade:
         self.build_loop_ids: list[int] = []
         self.operation_loop_ids: list[int] = []
         self.close_loop_ids: list[int] = []
+        self.close_error: BaseException | None = None
 
     async def aclose(self) -> None:
         self.close_calls += 1
         self.close_loop_ids.append(id(asyncio.get_running_loop()))
+        if self.close_error is not None:
+            raise self.close_error
 
     def compose(self, request: object) -> object:
         self.calls.append(("compose", request))
@@ -202,6 +206,42 @@ def _async_runtime(
 
     monkeypatch.setattr(cli_module, "build_lifecycle_cli_runtime", build)
     return facade, factory, preparation
+
+
+def test_lifecycle_runtime_preserves_command_failure_when_shutdown_also_fails(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A cleanup failure never replaces the command's stable Click outcome."""
+    facade, _ = _runtime(monkeypatch)
+    command_failure = click.exceptions.Exit(USAGE_EXIT)
+    facade.close_error = RuntimeError("cleanup failed")
+
+    async def fail_command(_runtime: LifecycleCliRuntime) -> None:
+        raise command_failure
+
+    with pytest.raises(click.exceptions.Exit) as caught:
+        asyncio.run(cli_module._run_lifecycle_cli(fail_command))  # noqa: SLF001
+
+    assert caught.value is command_failure
+    assert facade.close_calls == 1
+
+
+def test_lifecycle_runtime_propagates_shutdown_failure_after_command_success(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Cleanup failures remain observable when no command outcome precedes them."""
+    facade, _ = _runtime(monkeypatch)
+    cleanup_failure = RuntimeError("cleanup failed")
+    facade.close_error = cleanup_failure
+
+    async def succeed(_runtime: LifecycleCliRuntime) -> None:
+        return
+
+    with pytest.raises(RuntimeError, match="cleanup failed") as caught:
+        asyncio.run(cli_module._run_lifecycle_cli(succeed))  # noqa: SLF001
+
+    assert caught.value is cleanup_failure
+    assert facade.close_calls == 1
 
 
 def test_lifecycle_groups_and_aliases_publish_only_canonical_paths() -> None:
