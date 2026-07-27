@@ -73,6 +73,7 @@ TARGET_STRATEGY_CHOICES = tuple(item.value for item in TargetStrategy)
 DEFAULT_TARGET_STRATEGY = TargetStrategy.MINIMUM.value
 MANUAL_TARGET_STRATEGY = TargetStrategy.MANUAL.value
 WATCH_CONDITION_CHOICES = tuple(item.value for item in WatchCondition)
+_MAXIMUM_BMP_CODEPOINT = 0xFFFF
 
 
 def parse_target_strategy(value: str) -> TargetStrategy:
@@ -592,9 +593,9 @@ def emit_lifecycle_result(
         )
     else:
         for line in _result_lines(mapping):
-            click.echo(line, err=destination_error)
+            click.echo(_terminal_safe_line(line), err=destination_error)
         for line in _diagnostic_lines(mapping["diagnostics"]):
-            click.echo(line, err=True)
+            click.echo(_terminal_safe_line(line), err=True)
     return int(result.outcome.exit_class)
 
 
@@ -625,7 +626,7 @@ def emit_composition(
         )
     else:
         for line in _human_lines("composition", mapping):
-            click.echo(line, err=exit_class != 0)
+            click.echo(_terminal_safe_line(line), err=exit_class != 0)
     return exit_class
 
 
@@ -654,9 +655,37 @@ def emit_watch_event(
         )
         return
     for line in _watch_lines(mapping):
-        click.echo(line)
+        click.echo(_terminal_safe_line(line))
     for line in _diagnostic_lines(mapping["diagnostics"]):
-        click.echo(line, err=True)
+        click.echo(_terminal_safe_line(line), err=True)
+
+
+def _terminal_safe_line(value: str) -> str:
+    """Render embedded terminal controls as visible ASCII escape sequences."""
+    if not isinstance(value, str):
+        msg = "terminal-safe lifecycle output requires text"
+        raise TypeError(msg)
+    named = {
+        "\b": "\\b",
+        "\t": "\\t",
+        "\n": "\\n",
+        "\f": "\\f",
+        "\r": "\\r",
+    }
+    rendered: list[str] = []
+    for character in value:
+        if character in named:
+            rendered.append(named[character])
+        elif character.isprintable():
+            rendered.append(character)
+        else:
+            codepoint = ord(character)
+            rendered.append(
+                f"\\u{codepoint:04x}"
+                if codepoint <= _MAXIMUM_BMP_CODEPOINT
+                else f"\\U{codepoint:08x}"
+            )
+    return "".join(rendered)
 
 
 def _result_lines(mapping: Mapping[str, Any]) -> tuple[str, ...]:

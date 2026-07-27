@@ -346,11 +346,15 @@ def build_lifecycle_runtime(  # noqa: PLR0915
     )
 
     async def shutdown() -> None:
-        await asyncio.gather(
+        results = await asyncio.gather(
             read_only.aclose(),
             generated.aclose(),
             return_exceptions=True,
         )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            message = "lifecycle runtime shutdown failed"
+            raise BaseExceptionGroup(message, failures)
 
     return LifecycleCliRuntime(
         operations,

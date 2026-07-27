@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -65,9 +66,13 @@ class _Facade:
     def __init__(self) -> None:
         self.calls: list[tuple[str, object]] = []
         self.close_calls = 0
+        self.build_loop_ids: list[int] = []
+        self.operation_loop_ids: list[int] = []
+        self.close_loop_ids: list[int] = []
 
     async def aclose(self) -> None:
         self.close_calls += 1
+        self.close_loop_ids.append(id(asyncio.get_running_loop()))
 
     def compose(self, request: object) -> object:
         self.calls.append(("compose", request))
@@ -75,6 +80,7 @@ class _Facade:
 
     def preview(self, request: object) -> OperationResult[object]:
         self.calls.append(("preview", request))
+        self.operation_loop_ids.append(id(asyncio.get_running_loop()))
         return _result(
             "request.preview",
             "plan-previewed",
@@ -137,15 +143,16 @@ def _runtime(monkeypatch: MonkeyPatch) -> tuple[_Facade, _Factory]:
         facade,  # type: ignore[arg-type]
         facade,  # type: ignore[arg-type]
     )
-    monkeypatch.setattr(
-        cli_module,
-        "build_lifecycle_cli_runtime",
-        lambda: LifecycleCliRuntime(
+
+    def build() -> LifecycleCliRuntime:
+        facade.build_loop_ids.append(id(asyncio.get_running_loop()))
+        return LifecycleCliRuntime(
             shared,
             factory,  # type: ignore[arg-type]
             shutdown=facade.aclose,
-        ),
-    )
+        )
+
+    monkeypatch.setattr(cli_module, "build_lifecycle_cli_runtime", build)
     return facade, factory
 
 
@@ -153,6 +160,7 @@ class _Preparation:
     def __init__(self, *, preview: object | None) -> None:
         self.preview = preview
         self.intents: list[tuple[object, float]] = []
+        self.loop_ids: list[int] = []
 
     async def prepare(
         self,
@@ -162,6 +170,7 @@ class _Preparation:
         require_preview: bool,
     ) -> object:
         assert require_preview
+        self.loop_ids.append(id(asyncio.get_running_loop()))
         self.intents.append((intent, deadline))
         return SimpleNamespace(
             composition=("async-compose-request", intent),
@@ -181,16 +190,17 @@ def _async_runtime(
         facade,  # type: ignore[arg-type]
         facade,  # type: ignore[arg-type]
     )
-    monkeypatch.setattr(
-        cli_module,
-        "build_lifecycle_cli_runtime",
-        lambda: LifecycleCliRuntime(
+
+    def build() -> LifecycleCliRuntime:
+        facade.build_loop_ids.append(id(asyncio.get_running_loop()))
+        return LifecycleCliRuntime(
             shared,
             factory,  # type: ignore[arg-type]
             preparation,  # type: ignore[arg-type]
             shutdown=facade.aclose,
-        ),
-    )
+        )
+
+    monkeypatch.setattr(cli_module, "build_lifecycle_cli_runtime", build)
     return facade, factory, preparation
 
 
@@ -371,6 +381,17 @@ def test_preview_uses_async_preparation_without_sync_factory(
     assert intent.expert is False  # type: ignore[union-attr]
     assert deadline > 0
     assert facade.close_calls == 1
+    assert (
+        len(
+            {
+                *facade.build_loop_ids,
+                *preparation.loop_ids,
+                *facade.operation_loop_ids,
+                *facade.close_loop_ids,
+            }
+        )
+        == 1
+    )
 
 
 def test_preview_async_preparation_fails_closed_without_contact(
