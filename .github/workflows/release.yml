@@ -1,0 +1,500 @@
+name: Release qualification
+
+on:
+  push:
+    tags:
+      - "v*"
+  schedule:
+    - cron: "23 7 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build immutable release candidate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.11.30
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Synchronize locked environment
+        run: uv sync --locked --python 3.14
+
+      - name: Bind release identity
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(uv run --locked --no-sync python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          MAIN_COMMIT="$(git ls-remote origin refs/heads/main | cut -f1)"
+          echo "value=${VERSION}" >> "${GITHUB_OUTPUT}"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            test "$(git cat-file -t "${GITHUB_REF}")" = "tag"
+            uv run --locked --no-sync python scripts/release_qualification.py identity \
+              --repository "${GITHUB_REPOSITORY}" \
+              --ref-type "${GITHUB_REF_TYPE}" \
+              --ref-name "${GITHUB_REF_NAME}" \
+              --commit "${GITHUB_SHA}" \
+              --main-commit "${MAIN_COMMIT}" \
+              --output release-identity.json
+          else
+            uv run --locked --no-sync python scripts/release_qualification.py identity \
+              --repository "${GITHUB_REPOSITORY}" \
+              --ref-type branch \
+              --ref-name main \
+              --commit "${GITHUB_SHA}" \
+              --main-commit "${MAIN_COMMIT}" \
+              --dry-run \
+              --output release-identity.json
+          fi
+
+      - name: Regenerate release resources
+        run: |
+          uv run --locked --no-sync python scripts/generate_release_resources.py
+          git diff --exit-code -- src/cqmgr/resources
+
+      - name: Build sdist once
+        run: uv build --no-sources --sdist --out-dir dist
+
+      - name: Build sole wheel from the sdist
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: >-
+          uv build --no-sources --wheel --out-dir dist
+          "dist/cqmgr-${VERSION}.tar.gz"
+
+      - name: Verify exact distributions
+        run: uv run --locked --no-sync python scripts/verify_distribution.py dist
+
+      - name: Export locked runtime resolution
+        run: >-
+          uv export --locked --no-dev --no-emit-project
+          --format requirements-txt --output-file release-requirements.txt
+
+      - name: Audit runtime vulnerabilities
+        run: >-
+          uv run --locked --no-sync pip-audit
+          --requirement release-requirements.txt
+          --disable-pip
+
+      - name: Check dependency licenses
+        run: >-
+          uv run --locked --no-sync pip-licenses
+          --from mixed
+          --allow-only
+          "3-Clause BSD License;Apache-2.0;Apache-2.0 OR BSD-2-Clause;Apache-2.0 OR BSD-3-Clause;Apache Software License;BSD-2-Clause;BSD-3-Clause;BSD License;MIT;MIT-0;MIT License;MPL-2.0;Mozilla Public License 2.0 (MPL 2.0);PSF-2.0;Python Software Foundation License"
+
+      - name: Prepare checksums, SBOM, and immutable manifest
+        run: >-
+          uv run --locked --no-sync python scripts/release_qualification.py prepare
+          --dist dist
+          --identity release-identity.json
+          --requirements release-requirements.txt
+          --output release
+
+      - name: Reverify immutable release candidate and SHA256SUMS
+        run: >-
+          uv run --locked --no-sync python scripts/release_qualification.py verify
+          --release release
+          --identity release-identity.json
+
+      - name: Upload immutable release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-candidate
+          path: |
+            release/*
+            release-identity.json
+          if-no-files-found: error
+          retention-days: 14
+
+  dependency-resolutions:
+    name: Dependency resolution ${{ matrix.resolution }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        resolution:
+          - locked
+          - lowest-direct
+          - fresh
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.11.30
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Resolve committed lock
+        if: matrix.resolution == 'locked'
+        run: uv sync --locked --python 3.12
+
+      - name: Resolve lowest direct dependencies
+        if: matrix.resolution == 'lowest-direct'
+        run: |
+          uv lock --resolution lowest-direct
+          uv sync --locked --python 3.12
+
+      - name: Resolve fresh compatible dependencies
+        if: matrix.resolution == 'fresh'
+        run: |
+          uv lock --upgrade
+          uv sync --locked --python 3.12
+
+      - name: Run contract suite
+        run: uv run --no-sync --python 3.12 pytest
+
+  installed-artifacts:
+    name: ${{ matrix.runner }} Python ${{ matrix.python }} artifacts
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python:
+          - "3.12"
+          - "3.13"
+          - "3.14"
+        runner:
+          - macos-14
+          - macos-15-intel
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - windows-2022
+          - windows-2025
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.11.30
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+
+      - name: Download immutable release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-candidate
+          path: candidate
+
+      - name: Verify candidate bytes and identity
+        run: >-
+          uv run --locked --python ${{ matrix.python }}
+          python scripts/release_qualification.py verify
+          --release candidate/release
+          --identity candidate/release-identity.json
+
+      - name: Provision ephemeral Linux Secret Service
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install --no-install-recommends --yes
+          dbus-x11 gnome-keyring
+
+      - name: Smoke macOS artifacts from zsh
+        if: runner.os == 'macOS'
+        shell: zsh {0}
+        run: >-
+          uv run --locked --python ${{ matrix.python }}
+          python scripts/smoke_tool_install.py
+          candidate/release
+          --python ${{ matrix.python }}
+          --native-keyring-round-trip
+
+      - name: Smoke Windows artifacts from PowerShell
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          uv run --locked --python ${{ matrix.python }}
+          python scripts/smoke_tool_install.py
+          candidate/release
+          --python ${{ matrix.python }}
+          --native-keyring-round-trip
+
+      - name: Smoke Linux artifacts from bash with Secret Service
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          dbus-run-session -- bash -euo pipefail -c '
+            export XDG_RUNTIME_DIR="${RUNNER_TEMP}/cqmgr-keyring-runtime"
+            mkdir -p "${XDG_RUNTIME_DIR}"
+            chmod 700 "${XDG_RUNTIME_DIR}"
+            eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
+            uv run --locked --python "${{ matrix.python }}" \
+              python scripts/smoke_tool_install.py candidate/release \
+              --python "${{ matrix.python }}" --native-keyring-round-trip
+          '
+
+  compatibility-canaries:
+    name: Compatibility canaries
+    needs: build
+    continue-on-error: true
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.11.30
+          python-version: "3.14"
+
+      - name: Download immutable release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-candidate
+          path: candidate
+
+      - name: Exercise wheel-only installation
+        run: >-
+          uv tool install --no-build --python 3.14
+          candidate/release/cqmgr-${{ needs.build.outputs.version }}-py3-none-any.whl
+
+  deep-tests:
+    name: Deep mutation and concurrency contracts
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.11.30
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Synchronize locked environment
+        run: uv sync --locked --python 3.14
+
+      - name: Run targeted mutation tests
+        run: |
+          uv run --locked --no-sync mutmut run
+          uv run --locked --no-sync mutmut export-cicd-stats
+          uv run --locked --no-sync python scripts/verify_mutation_results.py \
+            mutants/mutmut-cicd-stats.json --minimum-score 60
+
+      - name: Retain mutation evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-evidence
+          path: mutants/mutmut-cicd-stats.json
+          if-no-files-found: error
+
+  performance:
+    name: ${{ matrix.runner }} performance baseline
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - macos-14
+          - ubuntu-22.04
+          - windows-2022
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.11.30
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Synchronize locked environment
+        run: uv sync --locked --python 3.14
+
+      - name: Record executable performance evidence
+        run: >-
+          uv run --locked --no-sync
+          python scripts/measure_performance.py
+          --output performance-${{ matrix.runner }}.json
+
+      - name: Upload performance evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: performance-${{ matrix.runner }}
+          path: performance-${{ matrix.runner }}.json
+          if-no-files-found: error
+
+  live-read-only:
+    name: Exact-commit bounded provider reads
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: live-read-only
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout exact release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Authenticate with workload identity federation
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.11.30
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Synchronize locked runtime
+        run: uv sync --locked --no-dev --python 3.14
+
+      - name: Run bounded allowlisted canary
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        run: >-
+          uv run --locked --no-dev --no-sync
+          python scripts/live_read_only_canary.py
+          --project-env GCP_PROJECT_ID
+          --max-pages 20
+          --timeout 10
+          --output live-read-only-evidence.json
+
+      - name: Upload exact-commit sanitized evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-live-read-only-evidence
+          path: live-read-only-evidence.json
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish exact qualified bytes
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build
+      - deep-tests
+      - dependency-resolutions
+      - installed-artifacts
+      - live-read-only
+      - performance
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    environment: pypi
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Download immutable release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-candidate
+          path: candidate
+
+      - name: Generate GitHub artifact attestations
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.0.0
+        with:
+          subject-path: candidate/release/*
+
+      - name: Select exact PyPI distributions
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          mkdir publish-dists
+          cp "candidate/release/cqmgr-${VERSION}.tar.gz" publish-dists/
+          cp "candidate/release/cqmgr-${VERSION}-py3-none-any.whl" publish-dists/
+
+      - name: Publish to PyPI with Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247
+        with:
+          packages-dir: publish-dists
+          attestations: true
+
+      - name: Publish immutable GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}"
+          candidate/release/*
+          --repo "${GITHUB_REPOSITORY}"
+          --verify-tag
+          --generate-notes
+          --latest
+
+  post-publication:
+    name: Post-publication ${{ matrix.runner }} Python ${{ matrix.python }}
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build
+      - publish
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python:
+          - "3.12"
+          - "3.13"
+          - "3.14"
+        runner:
+          - macos-14
+          - ubuntu-22.04
+          - windows-2022
+    steps:
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.11.30
+          python-version: ${{ matrix.python }}
+
+      - name: Install exact published version
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          uv tool install --no-build --python "${{ matrix.python }}" "cqmgr==${VERSION}"
+          test "$(cqmgr --version)" = "cqmgr, version ${VERSION}"

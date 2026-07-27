@@ -54,7 +54,7 @@ jobs:
           uv run --locked --no-sync pip-licenses
           --from mixed
           --allow-only
-          "3-Clause BSD License;Apache-2.0;Apache-2.0 OR BSD-2-Clause;Apache-2.0 OR BSD-3-Clause;Apache Software License;BSD-2-Clause;BSD-3-Clause;BSD License;MIT;MIT-0;MIT License;MPL-2.0;Mozilla Public License 2.0 (MPL 2.0);PSF-2.0"
+          "3-Clause BSD License;Apache-2.0;Apache-2.0 OR BSD-2-Clause;Apache-2.0 OR BSD-3-Clause;Apache Software License;BSD-2-Clause;BSD-3-Clause;BSD License;MIT;MIT-0;MIT License;MPL-2.0;Mozilla Public License 2.0 (MPL 2.0);PSF-2.0;Python Software Foundation License"
 
       - name: Build distributions
         run: uv build --clear --no-sources
@@ -104,7 +104,7 @@ jobs:
       - name: Enforce critical domain coverage
         run: >-
           uv run --locked --no-sync --python "$PYTHON_VERSION" coverage report
-          --include="src/cqmgr/domain/status.py,src/cqmgr/domain/results.py,src/cqmgr/domain/redaction.py,src/cqmgr/domain/plans.py,src/cqmgr/domain/plan_consumption.py,src/cqmgr/domain/apply_records.py,src/cqmgr/adapters/serialization/plans.py,src/cqmgr/domain/audit.py,src/cqmgr/adapters/persistence/audit.py,src/cqmgr/adapters/persistence/plans.py,src/cqmgr/adapters/persistence/apply_records.py,src/cqmgr/adapters/google/quota_preference_writes.py,src/cqmgr/application/operations/audited_write.py,src/cqmgr/application/operations/apply.py,src/cqmgr/application/ports/plans.py,src/cqmgr/application/ports/apply.py,src/cqmgr/application/ports/apply_records.py,src/cqmgr/application/ports/provider_writes.py"
+          --include="src/cqmgr/domain/status.py,src/cqmgr/domain/results.py,src/cqmgr/domain/redaction.py,src/cqmgr/domain/plans.py,src/cqmgr/domain/plan_consumption.py,src/cqmgr/domain/apply_records.py,src/cqmgr/adapters/serialization/plans.py,src/cqmgr/domain/audit.py,src/cqmgr/adapters/persistence/audit.py,src/cqmgr/adapters/persistence/plans.py,src/cqmgr/adapters/persistence/apply_records.py,src/cqmgr/adapters/google/quota_preference_writes.py,src/cqmgr/application/operations/audited_write.py,src/cqmgr/application/operations/apply.py,src/cqmgr/application/ports/plans.py,src/cqmgr/application/ports/apply.py,src/cqmgr/application/ports/apply_records.py,src/cqmgr/application/ports/provider_writes.py,src/cqmgr/domain/watch.py,src/cqmgr/adapters/serialization/watch.py"
           --fail-under=100
 
   package-smoke:

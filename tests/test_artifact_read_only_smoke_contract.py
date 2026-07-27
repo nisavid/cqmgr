@@ -17,6 +17,8 @@ def test_artifact_smoke_covers_every_canonical_and_alias_command() -> None:
     """Every command identity is exercised from each built executable."""
     expected = {
         ("tui", "--help"),
+        ("trust", "--help"),
+        ("trust", "init", "--help"),
         ("scope", "--help"),
         ("sc", "--help"),
         ("scope", "show", "--help"),
@@ -51,6 +53,24 @@ def test_artifact_smoke_covers_every_canonical_and_alias_command() -> None:
         ("q", "r", "ci", "--help"),
         ("quota", "resolve", "cloud-tpu-slice", "--help"),
         ("q", "r", "ct", "--help"),
+        ("obtainability", "--help"),
+        ("ob", "--help"),
+        ("obtainability", "compare", "--help"),
+        ("ob", "c", "--help"),
+        ("request", "--help"),
+        ("req", "--help"),
+        ("request", "compose", "--help"),
+        ("req", "c", "--help"),
+        ("request", "preview", "--help"),
+        ("req", "p", "--help"),
+        ("request", "watch", "--help"),
+        ("req", "w", "--help"),
+        ("plan", "--help"),
+        ("pl", "--help"),
+        ("plan", "review", "--help"),
+        ("pl", "r", "--help"),
+        ("plan", "apply", "--help"),
+        ("pl", "a", "--help"),
         ("audit", "--help"),
         ("aud", "--help"),
         ("audit", "list", "--help"),
@@ -126,3 +146,20 @@ def test_artifact_smoke_executes_every_canonical_and_alias_leaf() -> None:
     }
 
     assert actual == expected
+
+
+def test_artifact_smoke_qualifies_supported_terminal_behaviors() -> None:
+    """Installed executables cover interactive, redirected, and color fallbacks."""
+    cases = cast(
+        "tuple[str, ...]",
+        _smoke_contract()["TERMINAL_QUALIFICATION_CASES"],
+    )
+
+    assert cases == (
+        "redirected-bare-cli-fallback",
+        "redirected-explicit-tui-rejection",
+        "structured-screen-reader-output",
+        "no-color-output",
+        "low-color-output",
+        "interactive-tui-dispatch",
+    )

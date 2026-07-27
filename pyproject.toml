@@ -49,6 +49,8 @@ dev = [
   "coverage>=7.15,<8",
   "hypothesis>=6.158,<7",
   "import-linter>=2.9,<3",
+  "mutmut>=3.4,<4",
+  "pip-audit>=2.9,<3",
   "pip-licenses>=5,<6",
   "pyrefly>=1.1,<1.2",
   "pytest>=9,<10",
@@ -103,6 +105,21 @@ addopts = [
   "--strict-markers",
 ]
 testpaths = ["tests"]
+
+[tool.mutmut]
+source_paths = ["src/cqmgr"]
+only_mutate = [
+  "src/cqmgr/domain/plan_consumption.py",
+  "src/cqmgr/domain/redaction.py",
+  "src/cqmgr/domain/status.py",
+]
+pytest_add_cli_args = ["--no-cov", "-q"]
+pytest_add_cli_args_test_selection = [
+  "tests/plans/test_plan_consumption.py",
+  "tests/domain/test_redaction_contract.py",
+  "tests/domain/test_status_invariants.py",
+  "tests/domain/test_status_results.py",
+]
 
 [tool.coverage.run]
 branch = true

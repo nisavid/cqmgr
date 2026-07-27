@@ -1,0 +1,1 @@
+{"public_record_schemas":["cqmgr.accelerator-catalog/v1","cqmgr.audit-record/v1","cqmgr.operation-result/v1","cqmgr.quota-request-plan/v1","cqmgr.watch-event/v1"],"quota_request_plan":{"kinds":["bundle","single"],"schema":"cqmgr.quota-request-plan/v1"},"schema":"cqmgr.schema-catalog/v1"}

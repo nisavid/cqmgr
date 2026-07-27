@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import subprocess
 import tempfile
+import time
 import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -15,13 +17,25 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 EXPECTED_ARTIFACT_COUNT = 2
+REJECTED_PRECONDITION_EXIT = 3
 CHECKOUT_ROOT = Path(__file__).resolve().parent.parent
 PROJECT_VERSION = tomllib.loads(Path("pyproject.toml").read_text())["project"][
     "version"
 ]
 RUNTIME_GUARD_MARKER = "CQMGR-RUNTIME-GUARD-ACTIVE"
+TUI_DISPATCH_MARKER = "CQMGR-INSTALLED-TUI-DISPATCHED"
+TERMINAL_QUALIFICATION_CASES = (
+    "redirected-bare-cli-fallback",
+    "redirected-explicit-tui-rejection",
+    "structured-screen-reader-output",
+    "no-color-output",
+    "low-color-output",
+    "interactive-tui-dispatch",
+)
 READ_ONLY_HELP_INVOCATIONS = (
     ("tui", "--help"),
+    ("trust", "--help"),
+    ("trust", "init", "--help"),
     ("scope", "--help"),
     ("sc", "--help"),
     ("scope", "show", "--help"),
@@ -56,6 +70,24 @@ READ_ONLY_HELP_INVOCATIONS = (
     ("q", "r", "ci", "--help"),
     ("quota", "resolve", "cloud-tpu-slice", "--help"),
     ("q", "r", "ct", "--help"),
+    ("obtainability", "--help"),
+    ("ob", "--help"),
+    ("obtainability", "compare", "--help"),
+    ("ob", "c", "--help"),
+    ("request", "--help"),
+    ("req", "--help"),
+    ("request", "compose", "--help"),
+    ("req", "c", "--help"),
+    ("request", "preview", "--help"),
+    ("req", "p", "--help"),
+    ("request", "watch", "--help"),
+    ("req", "w", "--help"),
+    ("plan", "--help"),
+    ("pl", "--help"),
+    ("plan", "review", "--help"),
+    ("pl", "r", "--help"),
+    ("plan", "apply", "--help"),
+    ("pl", "a", "--help"),
     ("audit", "--help"),
     ("aud", "--help"),
     ("audit", "list", "--help"),
@@ -85,6 +117,9 @@ CANONICAL_ALIASES_BY_PARENT: Mapping[
         "pf": "profile",
         "cfg": "config",
         "q": "quota",
+        "ob": "obtainability",
+        "req": "request",
+        "pl": "plan",
         "aud": "audit",
     },
     ("scope",): {"sh": "show", "se": "select", "cl": "clear"},
@@ -92,6 +127,9 @@ CANONICAL_ALIASES_BY_PARENT: Mapping[
     ("config",): {"g": "get", "s": "set"},
     ("quota",): {"l": "list", "i": "inspect", "r": "resolve"},
     ("quota", "resolve"): {"ci": "compute-instance", "ct": "cloud-tpu-slice"},
+    ("obtainability",): {"c": "compare"},
+    ("request",): {"c": "compose", "p": "preview", "w": "watch"},
+    ("plan",): {"r": "review", "a": "apply"},
     ("audit",): {"l": "list", "i": "inspect", "v": "verify"},
 }
 OFFLINE_FUNCTIONAL_CASES = (
@@ -313,6 +351,20 @@ def block_network(event, arguments):
 sys.meta_path.insert(0, BlockForbiddenImports())
 sys.addaudithook(block_network)
 print("CQMGR-RUNTIME-GUARD-ACTIVE", file=sys.stderr)
+
+if os.environ.get("CQMGR_SMOKE_TUI_STUB") == "1":
+    import json
+    import cqmgr.tui
+
+    def installed_tui_stub():
+        print("CQMGR-INSTALLED-TUI-DISPATCHED")
+        print(json.dumps({
+            "colorterm": os.environ.get("COLORTERM"),
+            "no_color": os.environ.get("NO_COLOR"),
+            "term": os.environ.get("TERM"),
+        }, sort_keys=True))
+
+    cqmgr.tui.run = installed_tui_stub
 """
 TTY_DISPATCH_SCRIPT = """
 import json
@@ -380,6 +432,197 @@ def _run(
     return completed.stdout, completed.stderr
 
 
+def _run_redirected(
+    command: list[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    expected_returncode: int = 0,
+) -> tuple[str, str]:
+    """Run with all three standard streams detached from a terminal."""
+    completed = subprocess.run(  # noqa: S603
+        command,
+        cwd=cwd,
+        env=environment,
+        check=False,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == expected_returncode, (
+        f"command: {command!r}\nstdout:\n{completed.stdout}\n"
+        f"stderr:\n{completed.stderr}"
+    )
+    return completed.stdout, completed.stderr
+
+
+def _assert_plain_terminal_text(*values: str) -> None:
+    """Require output whose meaning cannot be hidden in ANSI presentation."""
+    assert all("\x1b" not in value for value in values)
+
+
+def _exercise_redirected_terminal_behavior(
+    executable: Path,
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+) -> None:
+    """Qualify safe CLI fallback and accessible output without a terminal."""
+    bare_output, bare_errors = _run_redirected(
+        [str(executable)],
+        cwd=cwd,
+        environment=environment,
+        expected_returncode=2,
+    )
+    assert bare_output.startswith("Usage: cqmgr")
+    assert _without_runtime_guard(bare_errors) == ""
+    _assert_plain_terminal_text(bare_output, bare_errors)
+
+    tui_output, tui_errors = _run_redirected(
+        [str(executable), "tui"],
+        cwd=cwd,
+        environment=environment,
+        expected_returncode=2,
+    )
+    assert tui_output == ""
+    assert "tui requires interactive input and output" in tui_errors
+    assert "textual" not in tui_errors.lower()
+    _assert_plain_terminal_text(tui_output, tui_errors)
+
+    structured_environment = environment.copy()
+    structured_environment["NO_COLOR"] = "1"
+    structured_output, structured_errors = _run_redirected(
+        [
+            str(executable),
+            "scope",
+            "show",
+            "--output",
+            "json",
+            "--no-color",
+            "--quiet",
+        ],
+        cwd=cwd,
+        environment=structured_environment,
+        expected_returncode=REJECTED_PRECONDITION_EXIT,
+    )
+    payload = json.loads(structured_output)
+    assert payload["schema"] == "cqmgr.operation-result/v1"
+    assert payload["operation"] == "scope.show"
+    assert payload["outcome"]["exit_class"] == REJECTED_PRECONDITION_EXIT
+    assert _without_runtime_guard(structured_errors) == ""
+    _assert_plain_terminal_text(structured_output, structured_errors)
+
+    no_color_environment = environment.copy()
+    no_color_environment["NO_COLOR"] = "1"
+    no_color_output, no_color_errors = _run_redirected(
+        [str(executable), "--help"],
+        cwd=cwd,
+        environment=no_color_environment,
+    )
+    assert no_color_output.startswith("Usage: cqmgr")
+    _assert_plain_terminal_text(no_color_output, no_color_errors)
+
+    low_color_environment = environment.copy()
+    low_color_environment.pop("COLORTERM", None)
+    low_color_environment.pop("NO_COLOR", None)
+    low_color_environment["TERM"] = "dumb"
+    low_color_output, low_color_errors = _run_redirected(
+        [str(executable), "--help"],
+        cwd=cwd,
+        environment=low_color_environment,
+    )
+    assert low_color_output.startswith("Usage: cqmgr")
+    _assert_plain_terminal_text(low_color_output, low_color_errors)
+
+
+def _read_pty_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+) -> str:
+    """Run one command through a real POSIX pseudo-terminal."""
+    import pty  # noqa: PLC0415 - unavailable on Windows
+    import select  # noqa: PLC0415 - POSIX qualification only
+
+    master, slave = pty.openpty()
+    try:
+        process = subprocess.Popen(  # noqa: S603
+            command,
+            cwd=cwd,
+            env=environment,
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            close_fds=True,
+            start_new_session=True,
+        )
+    finally:
+        os.close(slave)
+
+    chunks: list[bytes] = []
+    deadline = time.monotonic() + 15
+    empty_fds: list[int] = []
+    try:
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([master], empty_fds, empty_fds, 0.1)
+            if readable:
+                try:
+                    chunks.append(os.read(master, 65536))
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                    break
+            elif process.poll() is not None:
+                break
+        process.wait(timeout=max(0.1, deadline - time.monotonic()))
+    finally:
+        os.close(master)
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+    output = b"".join(chunks).decode("utf-8", errors="replace")
+    assert process.returncode == 0, output
+    return output.replace("\r\n", "\n")
+
+
+def _exercise_posix_pty_dispatch(
+    executable: Path,
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+) -> None:
+    """Prove both interactive entry points dispatch from a real PTY."""
+    base_environment = environment.copy()
+    base_environment["CQMGR_SMOKE_TUI_STUB"] = "1"
+    base_environment["TERM"] = "xterm-256color"
+    base_environment.pop("NO_COLOR", None)
+    invocations: tuple[list[str], ...] = ([], ["tui"])
+    for arguments in invocations:
+        output = _read_pty_process(
+            [str(executable), *arguments],
+            cwd=cwd,
+            environment=base_environment,
+        )
+        assert TUI_DISPATCH_MARKER in output
+        assert '"term": "xterm-256color"' in output
+        assert '"no_color": null' in output
+
+    fallback_environment = base_environment.copy()
+    fallback_environment.pop("COLORTERM", None)
+    fallback_environment["NO_COLOR"] = "1"
+    fallback_environment["TERM"] = "dumb"
+    output = _read_pty_process(
+        [str(executable), "tui"],
+        cwd=cwd,
+        environment=fallback_environment,
+    )
+    assert TUI_DISPATCH_MARKER in output
+    assert '"term": "dumb"' in output
+    assert '"no_color": "1"' in output
+
+
 def _exercise_tty_dispatch(
     interpreter: Path,
     *,
@@ -441,7 +684,7 @@ def _exercise_offline_functional_cases(
             assert _without_runtime_guard(errors) == ""
 
 
-def smoke_artifact(  # noqa: PLR0915 - one installed-artifact acceptance flow
+def smoke_artifact(  # noqa: C901, PLR0915 - one installed-artifact acceptance flow
     artifact: Path,
     python: str,
     *,
@@ -539,6 +782,12 @@ def smoke_artifact(  # noqa: PLR0915 - one installed-artifact acceptance flow
             cwd=temporary,
             environment=runtime_environment,
         )
+        if os.name != "nt":
+            _exercise_posix_pty_dispatch(
+                executable,
+                cwd=temporary,
+                environment=runtime_environment,
+            )
         help_output, help_errors = _run(
             [str(executable), "--help"], cwd=temporary, environment=runtime_environment
         )
@@ -590,6 +839,11 @@ def smoke_artifact(  # noqa: PLR0915 - one installed-artifact acceptance flow
                 "CQMGR_QUOTA_SNAPSHOT_PATH": str(runtime_home / "quota-snapshots"),
                 "CQMGR_SELECTION_STATE_PATH": str(runtime_home / "selection.toml"),
             }
+        )
+        _exercise_redirected_terminal_behavior(
+            executable,
+            cwd=temporary,
+            environment=runtime_environment,
         )
         _exercise_offline_functional_cases(
             executable,

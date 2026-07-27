@@ -21,15 +21,16 @@ domain operations, evidence, warnings, and outcomes.
 
 ## Project status
 
-This repository contains the installable Python and quality baseline, product
-planning, provider-contract research, and an interaction prototype. The
-`cqmgr` executable currently exposes package help and version metadata; product
-workflows are not implemented, and this work does not authorize live quota
-mutations.
+This repository contains the installable V1 CLI and TUI, shared domain
+operations, provider adapters, durable local evidence, release qualification,
+product contracts, and provider research. Live provider reads require an
+explicit Google Cloud identity and project. Quota-request mutation remains
+separately guarded by Preview, Review, acknowledgement, and Apply; repository
+work never authorizes a live mutation by itself.
 
-The approved implementation baseline is CPython 3.12–3.14, `pyproject.toml`,
-uv, Ruff, Pyrefly, Click, and Textual. Once a package is published, the primary
-installation path will be `uv tool install cqmgr`. The runtime and provider
+The implementation baseline is CPython 3.12–3.14, `pyproject.toml`, uv, Ruff,
+Pyrefly, Click, and Textual. Once a package is published, the primary
+installation path is `uv tool install cqmgr`. The runtime and provider
 boundaries are defined in the [runtime and integration
 architecture](docs/runtime-integration-architecture.md). The supported platform,
 test, installation, and release gates are defined in the [verification and
@@ -69,6 +70,12 @@ uv tool install .
 cqmgr --help
 ```
 
+After publication, install the isolated command directly from PyPI:
+
+```console
+uv tool install cqmgr
+```
+
 Contributors use the committed lock and run the complete local baseline with:
 
 ```console
@@ -77,9 +84,10 @@ uv run ruff format --check .
 uv run ruff check .
 uv run pyrefly check
 uv run lint-imports --no-cache
-uv run pip-licenses --from mixed --allow-only "Apache-2.0;Apache-2.0 OR BSD-2-Clause;Apache Software License;BSD-2-Clause;BSD-3-Clause;BSD License;MIT;MIT License;MPL-2.0;PSF-2.0"
+uv run pip-licenses --from mixed --allow-only "3-Clause BSD License;Apache-2.0;Apache-2.0 OR BSD-2-Clause;Apache-2.0 OR BSD-3-Clause;Apache Software License;BSD-2-Clause;BSD-3-Clause;BSD License;MIT;MIT-0;MIT License;MPL-2.0;Mozilla Public License 2.0 (MPL 2.0);PSF-2.0;Python Software Foundation License"
+uv export --locked --no-dev --no-emit-project --format requirements-txt --output-file release-requirements.txt
+uv run pip-audit --requirement release-requirements.txt --disable-pip
 uv run pytest
-uv run coverage report --include="src/cqmgr/domain/status.py,src/cqmgr/domain/results.py,src/cqmgr/domain/redaction.py" --fail-under=100
 uv build --clear --no-sources
 uv run python scripts/verify_distribution.py dist
 uv run python scripts/smoke_tool_install.py dist --python 3.14

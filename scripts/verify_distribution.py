@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import tarfile
 import tomllib
 import zipfile
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 PACKAGE_PREFIX = PurePosixPath("cqmgr")
 PROJECT_VERSION = tomllib.loads(Path("pyproject.toml").read_text())["project"][
@@ -114,12 +119,48 @@ EXPECTED_PACKAGE_FILES = {
     PurePosixPath("domain/watch.py"),
     PurePosixPath("google_read_only.py"),
     PurePosixPath("py.typed"),
+    PurePosixPath("resources/__init__.py"),
+    PurePosixPath("resources/accelerator-overlay.json"),
+    PurePosixPath("resources/release-evidence.json"),
+    PurePosixPath("resources/schemas/catalog.json"),
     PurePosixPath("tui.py"),
 }
+RELEASE_RESOURCE_FILES = {
+    PurePosixPath("resources/accelerator-overlay.json"),
+    PurePosixPath("resources/release-evidence.json"),
+    PurePosixPath("resources/schemas/catalog.json"),
+}
+FORBIDDEN_RELEASE_RESOURCE_TEXT = (
+    "projects/",
+    "private.operator",
+    "private-access-token",
+    str(Path.home()),
+    str(Path.cwd().resolve()),
+)
 
 
 def _regular_files(names: list[str]) -> set[PurePosixPath]:
     return {PurePosixPath(name) for name in names if name and not name.endswith("/")}
+
+
+def _assert_release_resources(read: Callable[[str], bytes]) -> None:
+    for relative_path in RELEASE_RESOURCE_FILES:
+        raw = read(str(PACKAGE_PREFIX / relative_path))
+        text = raw.decode()
+        assert all(
+            forbidden not in text for forbidden in FORBIDDEN_RELEASE_RESOURCE_TEXT
+        )
+        document = json.loads(text)
+        assert isinstance(document, dict)
+    evidence = json.loads(read(str(PACKAGE_PREFIX / "resources/release-evidence.json")))
+    assert evidence["schema"] == "cqmgr.release-evidence/v1"
+    assert evidence["claims"] == {
+        "physical_capacity": False,
+        "universal_availability": False,
+    }
+    catalog = json.loads(read(str(PACKAGE_PREFIX / "resources/schemas/catalog.json")))
+    assert catalog["schema"] == "cqmgr.schema-catalog/v1"
+    assert catalog["quota_request_plan"]["kinds"] == ["bundle", "single"]
 
 
 def _assert_wheel_contents(wheel: Path) -> set[PurePosixPath]:
@@ -148,6 +189,7 @@ def _assert_wheel_contents(wheel: Path) -> set[PurePosixPath]:
         assert b"Tag: py3-none-any" in wheel_metadata
         checkout = str(Path.cwd().resolve()).encode()
         assert all(checkout not in archive.read(str(path)) for path in files)
+        _assert_release_resources(archive.read)
     package_files = {
         path.relative_to(PACKAGE_PREFIX)
         for path in files
@@ -179,6 +221,13 @@ def _assert_sdist_contents(sdist: Path) -> set[PurePosixPath]:
             extracted = archive.extractfile(str(path))
             assert extracted is not None
             assert checkout not in extracted.read()
+
+        def read_sdist_resource(name: str) -> bytes:
+            extracted = archive.extractfile(str(SDIST_ROOT / "src" / name))
+            assert extracted is not None
+            return extracted.read()
+
+        _assert_release_resources(read_sdist_resource)
     package_files = {
         path.relative_to(package_root) for path in files if package_root in path.parents
     }

@@ -1,0 +1,1 @@
+{"killed":78,"minimum_score":60.0,"score":64.46,"schema":"cqmgr.mutation-baseline/v1","source_paths":["src/cqmgr/domain/plan_consumption.py","src/cqmgr/domain/redaction.py","src/cqmgr/domain/status.py"],"survived":43,"total":121}
