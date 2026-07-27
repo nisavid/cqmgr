@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, override
 
 import pytest
 
@@ -179,5 +179,43 @@ def test_lifecycle_bootstrap_owns_read_and_mutation_clients_once(
     asyncio.run(runtime.aclose())
     asyncio.run(runtime.aclose())
 
+    assert read_only.close_calls == 1
+    assert _RecordingLazyClient.instances[0].close_calls == 1
+
+
+def test_lifecycle_bootstrap_reports_shutdown_failures_after_closing_all_clients(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Shutdown preserves close failures after attempting every owned client."""
+
+    class _FailingCloseReadOnly(_NoProviderAccess):
+        @override
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            message = "read-only close failed"
+            raise RuntimeError(message)
+
+    read_only = _FailingCloseReadOnly()
+    _RecordingLazyClient.instances = []
+    monkeypatch.setattr(
+        bootstrap,
+        "build_read_only_operations",
+        lambda _environment: read_only,
+    )
+    monkeypatch.setattr("keyring.get_keyring", _NoKeyringAccess)
+    monkeypatch.setattr(
+        "cqmgr.google_read_only.LazyClientProxy",
+        _RecordingLazyClient,
+    )
+    runtime = bootstrap.build_lifecycle_runtime(_environment(tmp_path))
+
+    with pytest.raises(BaseExceptionGroup, match="shutdown failed") as caught:
+        asyncio.run(runtime.aclose())
+
+    assert any(
+        isinstance(error, RuntimeError) and str(error) == "read-only close failed"
+        for error in caught.value.exceptions
+    )
     assert read_only.close_calls == 1
     assert _RecordingLazyClient.instances[0].close_calls == 1

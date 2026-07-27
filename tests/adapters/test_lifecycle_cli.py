@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from cqmgr.adapters.cli import lifecycle as lifecycle_module
 from cqmgr.adapters.cli.copy_cli import (
     CopyCliPresentation,
     WatchCopyCliPresentation,
@@ -583,7 +584,7 @@ def test_plan_reference_requires_exactly_one_typed_reference(
 ) -> None:
     """Plan Review and Apply never guess between local and portable plans."""
     with pytest.raises(error):
-        PlanReferenceInput(digest, path)  # type: ignore[arg-type]
+        PlanReferenceInput(digest, path)  # type: ignore[bad-argument-type]
 
 
 @pytest.mark.parametrize(
@@ -604,7 +605,7 @@ def test_watch_cli_input_rejects_cross_wired_selectors(
     with pytest.raises(ValueError, match=r"Watch CLI|initial|resumed"):
         WatchCliInput(
             intent_id,
-            condition,  # type: ignore[arg-type]
+            condition,  # type: ignore[bad-argument-type]
             resume,
             NOW,
         )
@@ -652,7 +653,7 @@ def test_presenter_rejects_secret_bearing_or_untyped_values(
             LifecyclePresentation(output="json", no_color=False, quiet=False),
         )
     with pytest.raises(TypeError, match="LifecyclePresentation"):
-        emit_lifecycle_result(  # type: ignore[arg-type]
+        emit_lifecycle_result(  # type: ignore[bad-argument-type]
             _result_with_data(SecretValue(b"secret")),
             object(),  # type: ignore[bad-argument-type]
         )
@@ -681,6 +682,41 @@ def _result_with_data(data: object) -> OperationResult[object]:
         finished_at=NOW,
         data=data,
     )
+
+
+def test_terminal_safe_line_escapes_controls_and_preserves_printable_unicode() -> None:
+    """Human output makes every terminal control visible without losing text."""
+    value = "safe\x1b[31mred\x1b]0;title\x07\r\n\t\b\f\u0085\u2028😀"
+
+    rendered = lifecycle_module._terminal_safe_line(value)  # noqa: SLF001
+
+    assert rendered == (
+        "safe\\u001b[31mred\\u001b]0;title\\u0007\\r\\n\\t\\b\\f\\u0085\\u2028😀"
+    )
+
+
+def test_human_lifecycle_output_encodes_controls_without_changing_json(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Structured data stays semantic while terminal output stays line-safe."""
+    data = {"label\x1b]0;owned\x07": "visible\rhidden\nnext"}
+    result = _result_with_data(data)
+
+    emit_lifecycle_result(
+        result,
+        LifecyclePresentation(output="json", no_color=True, quiet=True),
+    )
+    structured = capsys.readouterr()
+    emit_lifecycle_result(
+        result,
+        LifecyclePresentation(output="human", no_color=True, quiet=True),
+    )
+    human = capsys.readouterr()
+
+    assert json.loads(structured.out)["data"] == data
+    assert "\x1b" not in human.out
+    assert "\r" not in human.out
+    assert "Label\\u001b]0;owned\\u0007: visible\\rhidden\\nnext" in human.out
 
 
 def test_lifecycle_result_uses_canonical_json_and_required_human_facts(

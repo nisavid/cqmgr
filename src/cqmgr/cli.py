@@ -10,7 +10,6 @@ import json
 import sys
 import time
 from collections.abc import Callable
-from contextlib import contextmanager
 from contextvars import ContextVar
 from io import BytesIO
 from pathlib import Path
@@ -76,7 +75,7 @@ from cqmgr.bootstrap import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Iterator, Sequence
+    from collections.abc import Awaitable, Sequence
 
     from cqmgr.application.operations.lifecycle_requests import (
         PreparedLifecycleRequests,
@@ -268,18 +267,18 @@ def build_lifecycle_cli_runtime() -> LifecycleCliRuntime:
         raise click.ClickException(str(error)) from error
 
 
-@contextmanager
-def _lifecycle_runtime_scope(
-    runtime: LifecycleCliRuntime,
-) -> Iterator[LifecycleCliRuntime]:
-    """Close one lifecycle graph after every successful or failed CLI leaf."""
+async def _run_lifecycle_cli(
+    callback: Callable[[LifecycleCliRuntime], Awaitable[None]],
+) -> None:
+    """Create, use, and close one lifecycle graph on the same event loop."""
+    runtime = build_lifecycle_cli_runtime()
     try:
-        yield runtime
+        await callback(runtime)
     finally:
-        asyncio.run(runtime.aclose())
+        await runtime.aclose()
 
 
-def _prepare_lifecycle_requests(
+async def _prepare_lifecycle_requests(
     runtime: LifecycleCliRuntime,
     value: RequestCompositionInput,
     *,
@@ -289,12 +288,10 @@ def _prepare_lifecycle_requests(
     if runtime.preparation is None:
         return None
     try:
-        return asyncio.run(
-            runtime.preparation.prepare(
-                value.to_intent(),
-                deadline=_provider_deadline(),
-                require_preview=require_preview,
-            )
+        return await runtime.preparation.prepare(
+            value.to_intent(),
+            deadline=_provider_deadline(),
+            require_preview=require_preview,
         )
     except (TypeError, ValueError, RuntimeError) as error:
         raise click.ClickException(str(error)) from error
@@ -1344,9 +1341,13 @@ def request_compose(  # noqa: PLR0913
         all_compatible_locations=all_compatible_locations,
         plan_out=None,
     )
-    runtime = build_lifecycle_cli_runtime()
-    with _lifecycle_runtime_scope(runtime):
-        prepared = _prepare_lifecycle_requests(runtime, value, require_preview=False)
+
+    async def run(runtime: LifecycleCliRuntime) -> None:
+        prepared = await _prepare_lifecycle_requests(
+            runtime,
+            value,
+            require_preview=False,
+        )
         request_value = (
             _protected_lifecycle_request(lambda: runtime.requests.compose(value))
             if prepared is None
@@ -1359,6 +1360,8 @@ def request_compose(  # noqa: PLR0913
         )
         if exit_class:
             raise click.exceptions.Exit(exit_class)
+
+    asyncio.run(_run_lifecycle_cli(run))
 
 
 @request.command(name="preview")
@@ -1420,9 +1423,13 @@ def request_preview(  # noqa: PLR0913
         all_compatible_locations=all_compatible_locations,
         plan_out=plan_out,
     )
-    runtime = build_lifecycle_cli_runtime()
-    with _lifecycle_runtime_scope(runtime):
-        prepared = _prepare_lifecycle_requests(runtime, value, require_preview=True)
+
+    async def run(runtime: LifecycleCliRuntime) -> None:
+        prepared = await _prepare_lifecycle_requests(
+            runtime,
+            value,
+            require_preview=True,
+        )
         if prepared is None:
             request_value = _protected_lifecycle_request(
                 lambda: runtime.requests.preview(value)
@@ -1436,6 +1443,8 @@ def request_preview(  # noqa: PLR0913
             runtime.operations.preview(request_value),
             LifecyclePresentation(output, no_color, quiet),
         )
+
+    asyncio.run(_run_lifecycle_cli(run))
 
 
 @request.command(name="watch")
@@ -1467,18 +1476,18 @@ def request_watch(  # noqa: PLR0913
             resume=resume,
             deadline=parse_absolute_rfc3339(deadline),
         )
-        runtime = build_lifecycle_cli_runtime()
-        with _lifecycle_runtime_scope(runtime):
+
+        async def run(runtime: LifecycleCliRuntime) -> None:
             request_value = _protected_lifecycle_request(
                 lambda: runtime.requests.watch(value)
             )
-            asyncio.run(
-                _watch_lifecycle_async(
-                    runtime,
-                    request_value,
-                    WatchPresentation(selected_output, no_color, quiet),
-                )
+            await _watch_lifecycle_async(
+                runtime,
+                request_value,
+                WatchPresentation(selected_output, no_color, quiet),
             )
+
+        asyncio.run(_run_lifecycle_cli(run))
     except (TypeError, ValueError) as error:
         raise click.UsageError(str(error)) from error
 
@@ -1502,8 +1511,8 @@ def plan_review(
 ) -> None:
     """Review one Plan without provider mutation."""
     value = _plan_reference(digest, plan_file)
-    runtime = build_lifecycle_cli_runtime()
-    with _lifecycle_runtime_scope(runtime):
+
+    async def run(runtime: LifecycleCliRuntime) -> None:
         request_value = _protected_lifecycle_request(
             lambda: runtime.requests.review(value)
         )
@@ -1511,6 +1520,8 @@ def plan_review(
             runtime.operations.review(request_value),
             LifecyclePresentation(output, no_color, quiet),
         )
+
+    asyncio.run(_run_lifecycle_cli(run))
 
 
 @plan.command(name="apply")
@@ -1531,18 +1542,18 @@ def plan_apply(  # noqa: PLR0913
 ) -> None:
     """Apply one reviewed Plan in its bound non-atomic child order."""
     value = _plan_reference(digest, plan_file)
-    runtime = build_lifecycle_cli_runtime()
-    with _lifecycle_runtime_scope(runtime):
+
+    async def run(runtime: LifecycleCliRuntime) -> None:
         contact = _quota_contact_from_stdin(enabled=quota_contact_stdin)
-        asyncio.run(
-            _apply_lifecycle_async(
-                runtime,
-                value,
-                acknowledge_resource_scope,
-                contact,
-                LifecyclePresentation(output, no_color, quiet),
-            )
+        await _apply_lifecycle_async(
+            runtime,
+            value,
+            acknowledge_resource_scope,
+            contact,
+            LifecyclePresentation(output, no_color, quiet),
         )
+
+    asyncio.run(_run_lifecycle_cli(run))
 
 
 @main.group(cls=CanonicalAliasGroup)
