@@ -36,6 +36,8 @@ jobs:
           # Keep this SPDX list aligned with the Python metadata policy below.
           # HPND-Markus-Kuhn is the SPDX half of wcwidth's accepted dual license;
           # pip-licenses reports that package through its combined metadata label.
+          # Python-2.0 is the SPDX expression used by libcst and pyparsing;
+          # pip-licenses reports the same accepted terms through the PSF label.
           allow-licenses: >-
             Apache-2.0,
             BSD-2-Clause,
@@ -44,7 +46,8 @@ jobs:
             MIT,
             MIT-0,
             MPL-2.0,
-            PSF-2.0
+            PSF-2.0,
+            Python-2.0
           # The preceding exact-lock guard requires re-review on version changes.
           # Installed and upstream metadata declare MIT and 3-clause BSD.
           allow-dependencies-licenses: >-
