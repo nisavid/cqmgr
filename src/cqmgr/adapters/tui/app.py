@@ -295,6 +295,7 @@ class LifecycleRouteState:
     apply_result: OperationResult[ApplyData] | None = None
     pending_watch: WatchRequest | None = None
     latest_resume: str | None = None
+    copy_cli: str | None = None
     affected_selectors: tuple[QuotaInspectSelector, ...] = ()
     previous_scope_locked: bool = False
     previous_focus_id: str | None = None
@@ -922,6 +923,7 @@ class CloudQuotaManagerApp(App[None]):
         """Cancel active reads and release provider clients."""
         if self._cancellation is not None:
             self._cancellation.cancel()
+        self._discard_pending_apply()
         pending_watch = self._lifecycle_state.pending_watch
         if pending_watch is not None:
             pending_watch.cancellation.cancel()
@@ -1335,6 +1337,7 @@ class CloudQuotaManagerApp(App[None]):
         route: LifecycleRoute,
         scope: ResourceScope | None,
     ) -> None:
+        self._discard_pending_apply()
         pending_watch = self._lifecycle_state.pending_watch
         if pending_watch is not None:
             pending_watch.cancellation.cancel()
@@ -1391,6 +1394,7 @@ class CloudQuotaManagerApp(App[None]):
         self.query_one("#lifecycle-copy-instruction", Static).update("")
 
     def _clear_lifecycle_route(self) -> None:
+        self._discard_pending_apply()
         pending_watch = self._lifecycle_state.pending_watch
         if pending_watch is not None:
             pending_watch.cancellation.cancel()
@@ -2120,6 +2124,7 @@ class CloudQuotaManagerApp(App[None]):
         requests = self.lifecycle_requests
         if requests is None:  # pragma: no cover - guarded by button handler
             return
+        request: ApplyRequest | None = None
         try:
             request = await requests.apply(
                 reference,
@@ -2128,6 +2133,8 @@ class CloudQuotaManagerApp(App[None]):
             )
             self.prepare_apply(request, preserve_acknowledgement=True)
         except (OSError, TypeError, ValueError, RuntimeError) as error:
+            if request is not None:
+                requests.discard_apply(request)
             self.query_one("#lifecycle-detail", Static).update(
                 f"Apply unavailable\nReason: {error}\n"
                 "No provider mutation was attempted."
@@ -2179,10 +2186,47 @@ class CloudQuotaManagerApp(App[None]):
 
     async def _apply_lifecycle(self, request: ApplyRequest) -> None:
         lifecycle = self._require_lifecycle()
-        result = await lifecycle.apply(
-            request,
-            on_progress=lambda event: self._record_apply_progress(request, event),
-        )
+        try:
+            result = await lifecycle.apply(
+                request,
+                on_progress=lambda event: self._record_apply_progress(request, event),
+            )
+        except asyncio.CancelledError:
+            if (
+                self._lifecycle_state.route is LifecycleRoute.APPLY
+                and self._lifecycle_state.pending_apply is request
+            ):
+                self._lifecycle_state.apply_in_progress = False
+                self.query_one("#lifecycle-detail", Static).update(
+                    "Apply interrupted\n"
+                    "Provider dispatch did not return a complete operation result. "
+                    "Inspect retained audit evidence before retrying."
+                )
+                self._set_status(
+                    "APPLY INTERRUPTED — outcome unavailable; inspect audit evidence"
+                )
+                self._lifecycle_state.pending_apply = None
+            raise
+        except Exception:  # noqa: BLE001 - no typed result exists for worker failure
+            if (
+                self._lifecycle_state.route is LifecycleRoute.APPLY
+                and self._lifecycle_state.pending_apply is request
+            ):
+                self._lifecycle_state.apply_in_progress = False
+                self.query_one("#lifecycle-detail", Static).update(
+                    "Apply interrupted\n"
+                    "Provider dispatch did not return a complete operation result. "
+                    "Inspect retained audit evidence before retrying."
+                )
+                self._set_status(
+                    "APPLY INTERRUPTED — outcome unavailable; inspect audit evidence"
+                )
+                self._lifecycle_state.pending_apply = None
+            return
+        finally:
+            requests = self.lifecycle_requests
+            if requests is not None:
+                requests.discard_apply(request)
         if (
             self._lifecycle_state.route is not LifecycleRoute.APPLY
             or self._lifecycle_state.pending_apply is not request
@@ -2191,6 +2235,7 @@ class CloudQuotaManagerApp(App[None]):
         self.last_result = result
         self._lifecycle_state.apply_in_progress = False
         self._lifecycle_state.apply_result = result
+        self._lifecycle_state.pending_apply = None
         self._lifecycle_state.affected_selectors = self._merge_selectors(
             self._lifecycle_state.affected_selectors,
             self._selectors_for_identities(
@@ -2212,6 +2257,18 @@ class CloudQuotaManagerApp(App[None]):
             )
             return
         self._leave_lifecycle_route()
+
+    def _discard_pending_apply(self) -> None:
+        """Release a prepared contact when a non-running Apply route is abandoned."""
+        request = self._lifecycle_state.pending_apply
+        requests = self.lifecycle_requests
+        if (
+            request is not None
+            and requests is not None
+            and not self._lifecycle_state.apply_in_progress
+        ):
+            requests.discard_apply(request)
+        self._lifecycle_state.pending_apply = None
 
     def _record_apply_progress(
         self,
@@ -2415,6 +2472,13 @@ class CloudQuotaManagerApp(App[None]):
                     return
                 self._lifecycle_state.latest_resume = event.resume
                 self._render_watch_event(event)
+        except asyncio.CancelledError:
+            if (
+                self._lifecycle_state.route is LifecycleRoute.WATCH
+                and self._lifecycle_state.pending_watch is request
+            ):
+                self._set_status("WATCH INTERRUPTED — observation cancelled")
+            raise
         except WatchStartError as error:
             if (
                 self._lifecycle_state.route is LifecycleRoute.WATCH
@@ -2423,6 +2487,20 @@ class CloudQuotaManagerApp(App[None]):
                 self._set_status(
                     f"{error.code.value.upper()} — exit {int(error.exit_class)}"
                 )
+        except Exception:  # noqa: BLE001 - no typed result exists for worker failure
+            if (
+                self._lifecycle_state.route is LifecycleRoute.WATCH
+                and self._lifecycle_state.pending_watch is request
+            ):
+                self._set_status(
+                    "WATCH INTERRUPTED — observation unavailable; retry Watch"
+                )
+        finally:
+            if (
+                self._lifecycle_state.route is LifecycleRoute.WATCH
+                and self._lifecycle_state.pending_watch is request
+            ):
+                self.query_one("#lifecycle-watch", Button).disabled = False
 
     def _render_watch_event(self, event: WatchStreamEvent) -> None:
         subject = event.subject
@@ -2515,14 +2593,13 @@ class CloudQuotaManagerApp(App[None]):
         self.query_one("#lifecycle-detail", Static).update("\n".join(lines))
 
     def _lifecycle_copy_cli(self) -> str | None:
-        content = self.query_one("#lifecycle-copy-cli", Static).content
-        text = str(content)
-        return None if text.startswith("Copy CLI unavailable") else text
+        return self._lifecycle_state.copy_cli
 
     def _set_lifecycle_copy_cli(self, command: str | None) -> None:
         if command is not None and (not isinstance(command, str) or not command):
             msg = "lifecycle Copy CLI command must be non-empty or None"
             raise ValueError(msg)
+        self._lifecycle_state.copy_cli = command
         self.query_one("#lifecycle-copy-cli", Static).update(
             command or "Copy CLI unavailable until an operation is fully specified."
         )

@@ -34,6 +34,7 @@ _PROVIDER_GROUPS = frozenset(
         "pl",
     )
 )
+_NATIVE_PLAN_KEYRING_LOCK_FILENAME = ".native-plan-keyring.lock"
 
 
 class InvocationKind(StrEnum):
@@ -243,7 +244,7 @@ def build_lifecycle_runtime(  # noqa: PLR0915
     paths = runtime_paths(environment)
     clock = SystemClock()
     native_lock = NativePlanInterprocessLock(
-        paths.trust.parent / ".native-plan-keyring.lock"
+        paths.trust.parent / _NATIVE_PLAN_KEYRING_LOCK_FILENAME
     )
     secret_store = NativeSecretStore(
         cast("Any", keyring.get_keyring()),
@@ -391,7 +392,9 @@ def build_trust_initialization_operations(
     )
 
     path = runtime_paths(environment).trust
-    native_lock = NativePlanInterprocessLock(path.parent / ".native-plan-keyring.lock")
+    native_lock = NativePlanInterprocessLock(
+        path.parent / _NATIVE_PLAN_KEYRING_LOCK_FILENAME
+    )
     workflow_lock = NativePlanInterprocessLock(
         path.parent / ".installation-trust-init.lock"
     )

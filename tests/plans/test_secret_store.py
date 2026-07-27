@@ -316,7 +316,7 @@ def test_profile_quota_contact_reads_only_its_exact_native_reference(
         backend,
         NativePlanInterprocessLock(tmp_path / "contact-keyring.lock"),
     )
-    reference = QuotaContactKeyringReference("primary")
+    reference = QuotaContactKeyringReference("primary", "installation-test")
     backend.values[(reference.service, reference.account)] = (
         "cqmgr-secret/v1:cHJvZmlsZUBleGFtcGxlLmNvbQ=="
     )

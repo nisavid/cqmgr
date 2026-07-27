@@ -27,6 +27,8 @@ The first-release command tree is:
 cqmgr
 cqmgr tui
 
+cqmgr trust init
+
 cqmgr scope show
 cqmgr scope select
 cqmgr scope clear
@@ -71,14 +73,17 @@ The V1 alias table is a public compatibility surface:
 | `request compose`, `request preview`, `request watch` | `req c`, `req p`, `req w` |
 | `plan review`, `plan apply` | `pl r`, `pl a` |
 | `audit list`, `audit inspect`, `audit verify` | `aud l`, `aud i`, `aud v` |
+| `trust`, `trust init` | None |
 
-`tui` has no alias. Reusing an alias under a different parent does not make it
-ambiguous. Adding a sibling may not change or capture an existing alias.
+`tui` also has no alias. Reusing an alias under a different parent does not
+make it ambiguous. Adding a sibling may not change or capture an existing
+alias.
 
 The groups own these domain operations:
 
 | Group | Responsibility |
 | --- | --- |
+| `trust` | Explicitly initialize create-once installation signing trust in the native OS keyring. |
 | `scope` | Inspect, explicitly select, or clear the local resource-scope selection. |
 | `profile` | Inspect or explicitly select a named local profile. |
 | `config` | Inspect or change validated local interface settings. It never changes `gcloud` configuration. |

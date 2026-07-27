@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from typing import TYPE_CHECKING
 
@@ -35,9 +36,8 @@ RECOVERY_REFERENCE = SecretStoreReference.generate(
     RECOVERY_INSTALLATION_ID,
     SecretPurpose.PLAN_AUTHENTICATION,
 )
-KEY_COMMITMENT = bytes.fromhex(
-    "5e318f8cf9cbe249a30812b8ca132d691ded7a91991413558db5758575f5e01f"
-)
+KEY = b"k" * 32
+KEY_COMMITMENT = hashlib.sha256(KEY).digest()
 
 
 def _trust(phase: InstallationTrustPhase) -> InstallationTrust:
@@ -190,4 +190,24 @@ def test_trust_repository_rejects_invalid_key_commitment(tmp_path: Path) -> None
     )
 
     with pytest.raises(InstallationTrustPersistenceError, match="commitment"):
+        TomlInstallationTrustRepository(path).load()
+
+
+def test_trust_repository_rejects_noncanonical_key_commitment(tmp_path: Path) -> None:
+    """A valid-length uppercase digest is not canonical retained authority."""
+    path = tmp_path / "trust.toml"
+    path.write_text(
+        "\n".join(
+            (
+                'schema = "cqmgr.installation-trust/v2"',
+                f'installation_id = "{INSTALLATION_ID}"',
+                f'key_service = "{REFERENCE.service}"',
+                f'key_item_id = "{REFERENCE.item_id}"',
+                f'key_commitment = "{KEY_COMMITMENT.hex().upper()}"',
+                'phase = "active"',
+            )
+        )
+    )
+
+    with pytest.raises(InstallationTrustPersistenceError, match="canonical"):
         TomlInstallationTrustRepository(path).load()

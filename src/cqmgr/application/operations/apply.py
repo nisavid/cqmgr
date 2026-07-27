@@ -95,6 +95,7 @@ class ApplyRequest:
     contact_binding: ContactBinding
     contact_value: str = field(repr=False)
     now: datetime
+    contact_context_id: str | None = field(default=None, repr=False)
 
 
 class ApplyProgressState(StrEnum):
@@ -1744,7 +1745,7 @@ def _revalidation_drift(
 ) -> bool:
     expected_children = (
         *plan.children,
-        *getattr(plan, "no_op_children", ()),
+        *(plan.no_op_children if isinstance(plan, QuotaRequestBundlePlan) else ()),
     )
     if (
         refreshed.resource_scope != plan.resource_scope
@@ -1956,9 +1957,6 @@ def _result_for_record(  # noqa: PLR0913
         kind=record.kind,
         intent_id=record.intent_id,
         children=children,
-        verified_no_ops=(
-            plan.no_op_children if isinstance(plan, QuotaRequestBundlePlan) else ()
-        ),
         audit_record_ids=audit_record_ids,
         quarantine_identity=quarantine_identity,
     )

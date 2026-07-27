@@ -18,6 +18,7 @@ from cqmgr.application.operations.contacts import (
 from cqmgr.application.operations.lifecycle_requests import (
     LifecycleCompositionEvidence,
     LifecycleCompositionIntent,
+    LifecyclePreparationError,
     LifecycleRequestOperations,
     ReadOnlyLifecycleCompositionReader,
 )
@@ -402,6 +403,29 @@ def test_composition_intent_rejects_untyped_or_ambiguous_input(
         LifecycleCompositionIntent(**values)
 
 
+def test_composition_intent_rejects_exact_selector_with_real_workload() -> None:
+    """One lifecycle intent cannot select an exact slice and a workload together."""
+    with pytest.raises(ValueError, match="exactly one"):
+        LifecycleCompositionIntent(
+            scope_input=ReadOnlyScopeInput(explicit_resource_scope=SCOPE),
+            selector=QuotaInspectSelector(
+                "compute.googleapis.com",
+                "GPU-DIRECT",
+                "us-central1",
+            ),
+            workload=ComputeInstanceRequirement(
+                "a3-highgpu-8g",
+                1,
+                ProvisioningModel.STANDARD,
+                CandidateLocations(("us-central1-a",)),
+                "nvidia-h100-80gb",
+                8,
+            ),
+            target_strategy=TargetStrategy.MANUAL,
+            targets=((None, "8"),),
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "error"),
     [
@@ -658,6 +682,7 @@ def test_read_only_reader_refreshes_every_workload_constraint() -> None:
 
     assert evidence.kind is PlanKind.BUNDLE
     assert evidence.selected_location == "us-central1-a"
+    assert evidence.normalized_workload == "compute-instance:us-central1-a"
     assert evidence.principal == PlanPrincipal("principal://accounts/123")
     assert tuple(child.child_id for child in evidence.children) == (
         "direct",
@@ -676,3 +701,120 @@ def test_read_only_reader_refreshes_every_workload_constraint() -> None:
         direct_identity.quota_id,
         companion_identity.quota_id,
     )
+
+
+@pytest.mark.parametrize(
+    ("strategy", "targets", "message"),
+    [
+        (
+            TargetStrategy.MANUAL,
+            (("direct", "16"), ("direct", "17")),
+            "duplicate",
+        ),
+        (
+            TargetStrategy.MANUAL,
+            (("direct", "16"),),
+            "name every selected child",
+        ),
+        (
+            TargetStrategy.MINIMUM,
+            (("direct", "16"),),
+            "cannot contain manual targets",
+        ),
+    ],
+)
+def test_workload_reader_rejects_ambiguous_manual_target_intent(
+    strategy: TargetStrategy,
+    targets: tuple[tuple[str | None, str], ...],
+    message: str,
+) -> None:
+    """Workload target intent remains one-to-one before any child inspection."""
+    direct_identity = EffectiveQuotaSliceIdentity(
+        SCOPE,
+        "compute.googleapis.com",
+        "GPU-DIRECT",
+        NormalizedDimensions((("region", "us-central1"),)),
+        QuotaScope.REGIONAL,
+    )
+    companion_identity = EffectiveQuotaSliceIdentity(
+        SCOPE,
+        "compute.googleapis.com",
+        "GPU-COMPANION",
+        NormalizedDimensions((("region", "us-central1"),)),
+        QuotaScope.REGIONAL,
+    )
+    conversion = UnitConversionEvidence(
+        "card",
+        UNIT,
+        1,
+        "https://cloud.google.com/compute/docs/resource-usage",
+    )
+    requirements = tuple(
+        QuotaConstraintRequirement(
+            identity,
+            required,
+            QuotaQuantity(required, UNIT),
+            conversion,
+        )
+        for identity, required in (
+            (direct_identity, 8),
+            (companion_identity, 2),
+        )
+    )
+    assessments = tuple(
+        QuotaConstraintAssessment(
+            requirement.identity,
+            QuotaQuantity(12, UNIT),
+            QuotaQuantity(1, UNIT),
+            requirement.required,
+            permits=True,
+        )
+        for requirement in requirements
+    )
+    workload = ComputeInstanceRequirement(
+        "a3-highgpu-8g",
+        1,
+        ProvisioningModel.STANDARD,
+        CandidateLocations(("us-central1-a",)),
+        "nvidia-h100-80gb",
+        8,
+    )
+    location = ResolvedWorkloadLocation(
+        "us-central1-a",
+        WorkloadLocationDisposition.COMPATIBLE,
+        AcceleratorId("nvidia-h100"),
+        "compute.googleapis.com",
+        ManagementPlane.COMPUTE,
+        (WorkloadConsumer.COMPUTE_ENGINE,),
+        "standard",
+        8,
+        AcceleratorConstraintSet(
+            AcceleratorId("nvidia-h100"),
+            (
+                ConstraintReference(direct_identity),
+                ConstraintReference(companion_identity),
+            ),
+        ),
+        requirements,
+        (),
+        assessments,
+        attached_accelerator_type="nvidia-h100-80gb",
+        attached_accelerator_count=8,
+    )
+    read_only = _WorkloadReadOnly(
+        ResolvedWorkloadRequirement(workload, (location,), None),
+        {},
+    )
+    reader = ReadOnlyLifecycleCompositionReader(read_only)
+    intent = LifecycleCompositionIntent(
+        scope_input=ReadOnlyScopeInput(explicit_resource_scope=SCOPE),
+        selector=None,
+        workload=workload,
+        target_strategy=strategy,
+        targets=targets,
+    )
+
+    with pytest.raises(LifecyclePreparationError, match=message):
+        asyncio.run(reader.read(intent, deadline=DEADLINE))
+
+    assert read_only.inspect_calls == []

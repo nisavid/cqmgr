@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import secrets
 from collections import deque
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -82,6 +83,7 @@ class ResolvedContact:
 
     binding: ContactBinding
     value: SecretValue = field(repr=False)
+    apply_context_id: str | None = field(default=None, repr=False)
 
 
 class LifecycleContactResolver(Protocol):
@@ -100,6 +102,7 @@ class LifecycleContactResolver(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class _ApplyContactContext:
+    context_id: str
     explicit_value: SecretValue | None
     principal: PlanPrincipal
     trust: LoadedInstallationTrust
@@ -179,14 +182,32 @@ class ProtectedContactResolver:
             trust=trust,
         )
         contexts = self._apply_contexts.setdefault(binding, deque())
+        context_id = secrets.token_urlsafe(24)
         contexts.append(
             _ApplyContactContext(
+                context_id,
                 explicit_value,
                 principal,
                 trust,
             )
         )
-        return resolved
+        return ResolvedContact(resolved.binding, resolved.value, context_id)
+
+    def discard_apply(self, binding: ContactBinding, context_id: str) -> bool:
+        """Drop one exact abandoned Apply context without consuming a peer."""
+        if not isinstance(context_id, str) or not context_id:
+            message = "Apply quota contact context must be non-empty text"
+            raise ValueError(message)
+        contexts = self._apply_contexts.get(binding)
+        if contexts is None:
+            return False
+        for index, context in enumerate(contexts):
+            if hmac.compare_digest(context.context_id, context_id):
+                del contexts[index]
+                if not contexts:
+                    del self._apply_contexts[binding]
+                return True
+        return False
 
     async def refresh_contact(
         self,

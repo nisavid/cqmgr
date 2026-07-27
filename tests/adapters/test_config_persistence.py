@@ -185,7 +185,10 @@ def test_configuration_round_trip_preserves_safe_profile_fields(tmp_path: Path) 
                 name="primary",
                 resource_scope=project("123"),
                 adc_quota_project=project("456"),
-                quota_contact_keyring_reference=QuotaContactKeyringReference("primary"),
+                quota_contact_keyring_reference=QuotaContactKeyringReference(
+                    "primary",
+                    "installation-test",
+                ),
             ),
         ),
     )

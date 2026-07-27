@@ -68,6 +68,10 @@ def test_every_surface_shares_existing_typed_lifecycle_operations() -> None:
     """Every adapter delegates the same typed inputs to the same operations."""
 
     async def run() -> None:
+        assert await operations.apply(apply_request) == (  # type: ignore[arg-type]
+            "apply",
+            apply_request,
+        )
         progress: list[ApplyProgressEvent] = []
         assert await operations.apply(
             apply_request,  # type: ignore[arg-type]
@@ -116,5 +120,5 @@ def test_every_surface_shares_existing_typed_lifecycle_operations() -> None:
         ("preview", preview_request),
         ("review", review_request),
     ]
-    assert apply.calls == [apply_request]
+    assert apply.calls == [apply_request, apply_request]
     assert watch.calls == [watch_request]

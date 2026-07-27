@@ -1398,6 +1398,7 @@ class ScriptedLifecycleRequestFactory:
         self.watch_request = watch_request
         self.review_inputs: list[PlanReferenceInput] = []
         self.apply_inputs: list[tuple[PlanReferenceInput, str, SecretValue | None]] = []
+        self.discarded_apply_requests: list[ApplyRequest] = []
         self.watch_inputs: list[WatchCliInput] = []
 
     def review(self, value: PlanReferenceInput) -> PlanReviewRequest:
@@ -1413,6 +1414,10 @@ class ScriptedLifecycleRequestFactory:
     ) -> ApplyRequest:
         self.apply_inputs.append((value, acknowledgement, quota_contact))
         return self.apply_request
+
+    def discard_apply(self, request: ApplyRequest) -> bool:
+        self.discarded_apply_requests.append(request)
+        return True
 
     def watch(self, value: WatchCliInput) -> WatchRequest:
         self.watch_inputs.append(value)
@@ -1471,6 +1476,41 @@ class ProgressingApplyLifecycleOperations(ScriptedLifecycleOperations):
         await self.release_second_dispatch.wait()
         on_progress(ApplyProgressEvent(2, 2, "companion", ApplyProgressState.ACCEPTED))
         return self.apply_result
+
+
+class FailingLifecycleOperations(ScriptedLifecycleOperations):
+    """Raise one scripted boundary failure from Apply or Watch."""
+
+    def __init__(
+        self,
+        *,
+        apply_error: BaseException | None = None,
+        watch_error: BaseException | None = None,
+    ) -> None:
+        super().__init__(_apply_result())
+        self.apply_error = apply_error
+        self.watch_error = watch_error
+
+    @override
+    async def apply(
+        self,
+        request: ApplyRequest,
+        *,
+        on_progress: ApplyProgressObserver | None = None,
+    ) -> OperationResult[ApplyData]:
+        del on_progress
+        self.apply_calls.append(request)
+        if self.apply_error is not None:
+            raise self.apply_error
+        return self.apply_result
+
+    @override
+    async def watch(self, request: WatchRequest) -> Any:
+        self.watch_calls.append(request)
+        if self.watch_error is not None:
+            raise self.watch_error
+        if False:  # pragma: no cover - establish the async-generator protocol
+            yield None
 
 
 class DelayedPostApplyReads(ScriptedReadOnlyOperations):
@@ -2121,6 +2161,7 @@ def test_single_no_op_preview_preserves_drift_expert_and_contact_placeholders(  
             instruction = str(_static(app, "#lifecycle-copy-instruction").content)
             assert "provide exactly one protected quota-contact line" in instruction
             assert instruction not in command
+            _static(app, "#lifecycle-copy-cli").update("rendered display changed")
             copied_command = app._lifecycle_copy_cli()  # noqa: SLF001
             assert copied_command is not None
             app.copy_to_clipboard(copied_command)
@@ -2609,6 +2650,152 @@ def test_apply_renders_ordered_child_progress_before_terminal_completion() -> No
     asyncio.run(scenario())
 
 
+def test_apply_failure_clears_in_progress_and_reports_interruption() -> None:
+    """A raised dispatch failure cannot strand Apply in an in-progress state."""
+
+    async def scenario() -> None:
+        lifecycle = FailingLifecycleOperations(
+            apply_error=OSError("provider transport failed")
+        )
+        app = CloudQuotaManagerApp(
+            ScriptedReadOnlyOperations(_browse_result()),
+            ScriptedAuditOperations(),
+            lifecycle=lifecycle,  # type: ignore[arg-type]
+        )
+        request = ApplyRequest(
+            digest="sha256:" + ("a" * 64),
+            authentication_key=SecretValue(b"k" * 32),
+            local_installation_id="installation-42",
+            resource_scope_acknowledgement=SCOPE,
+            principal=PlanPrincipal("principal://accounts/42"),
+            contact_binding=ContactBinding(
+                StableSymbol("direct-user"),
+                "principal://accounts/42",
+                "hmac-sha256:" + ("c" * 64),
+            ),
+            contact_value="operator@example.com",
+            now=NOW,
+        )
+
+        async with app.run_test(size=(120, 42)) as pilot:
+            await pilot.pause()
+            app.prepare_apply(request)
+            acknowledgement = _input(app, "#apply-scope-acknowledgement")
+            acknowledgement.value = SCOPE.canonical_name
+            await pilot.pause()
+            await pilot.click("#lifecycle-apply")
+            await pilot.pause()
+
+            assert lifecycle.apply_calls == [request]
+            assert not app._lifecycle_state.apply_in_progress  # noqa: SLF001
+            assert app._lifecycle_state.pending_apply is None  # noqa: SLF001
+            assert acknowledgement.disabled
+            assert _button(app, "#lifecycle-apply").disabled
+            assert "Apply interrupted" in str(_static(app, "#lifecycle-detail").content)
+            assert "APPLY INTERRUPTED" in str(_static(app, "#status-line").content)
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_apply_releases_pending_protected_request() -> None:
+    """Cancellation cannot leave the protected Apply request in route state."""
+
+    async def scenario() -> None:
+        lifecycle = FailingLifecycleOperations(apply_error=asyncio.CancelledError())
+        app = CloudQuotaManagerApp(
+            ScriptedReadOnlyOperations(_browse_result()),
+            ScriptedAuditOperations(),
+            lifecycle=lifecycle,  # type: ignore[arg-type]
+        )
+        request = ApplyRequest(
+            digest="sha256:" + ("a" * 64),
+            authentication_key=SecretValue(b"k" * 32),
+            local_installation_id="installation-42",
+            resource_scope_acknowledgement=SCOPE,
+            principal=PlanPrincipal("principal://accounts/42"),
+            contact_binding=ContactBinding(
+                StableSymbol("direct-user"),
+                "principal://accounts/42",
+                "hmac-sha256:" + ("c" * 64),
+            ),
+            contact_value="operator@example.com",
+            now=NOW,
+        )
+
+        async with app.run_test(size=(120, 42)) as pilot:
+            await pilot.pause()
+            app.prepare_apply(request)
+            app._lifecycle_state.apply_in_progress = True  # noqa: SLF001
+
+            try:
+                await app._apply_lifecycle(request)  # noqa: SLF001
+            except asyncio.CancelledError:
+                pass
+            else:
+                message = "cancelled Apply must propagate cancellation"
+                raise AssertionError(message)
+
+            assert not app._lifecycle_state.apply_in_progress  # noqa: SLF001
+            assert app._lifecycle_state.pending_apply is None  # noqa: SLF001
+
+    asyncio.run(scenario())
+
+
+def test_unmount_discards_and_releases_prepared_apply_request() -> None:
+    """Unmount ends ownership of protected contact context and request data."""
+
+    async def scenario() -> None:
+        request = ApplyRequest(
+            digest="sha256:" + ("a" * 64),
+            authentication_key=SecretValue(b"k" * 32),
+            local_installation_id="installation-42",
+            resource_scope_acknowledgement=SCOPE,
+            principal=PlanPrincipal("principal://accounts/42"),
+            contact_binding=ContactBinding(
+                StableSymbol("direct-user"),
+                "principal://accounts/42",
+                "hmac-sha256:" + ("c" * 64),
+            ),
+            contact_value="operator@example.com",
+            now=NOW,
+        )
+        requests = ScriptedLifecycleRequestFactory(
+            PlanReviewRequest(
+                request.digest,
+                None,
+                SecretValue(b"k" * 32),
+                "installation-42",
+                NOW,
+            ),
+            request,
+            WatchRequest(
+                intent_id="intent-42",
+                condition=WatchCondition.GRANTED,
+                resume=None,
+                authentication_key=SecretValue(b"k" * 32),
+                installation_id="installation-42",
+                deadline=12345.0,
+                cancellation=CancellationToken(),
+            ),
+        )
+        app = CloudQuotaManagerApp(
+            ScriptedReadOnlyOperations(_browse_result()),
+            ScriptedAuditOperations(),
+            lifecycle=ScriptedLifecycleOperations(_successful_apply_result()),  # type: ignore[arg-type]
+            lifecycle_requests=requests,  # type: ignore[arg-type]
+        )
+
+        async with app.run_test(size=(120, 42)) as pilot:
+            await pilot.pause()
+            app.prepare_apply(request)
+            assert app._lifecycle_state.pending_apply is request  # noqa: SLF001
+
+        assert requests.discarded_apply_requests == [request]
+        assert app._lifecycle_state.pending_apply is None  # noqa: SLF001
+
+    asyncio.run(scenario())
+
+
 def test_successful_apply_returns_and_reconciles_under_its_bound_scope() -> None:
     """Apply owns navigation through bound-scope affected-slice reconciliation."""
 
@@ -3005,7 +3192,7 @@ def test_operator_can_reach_review_apply_and_watch_only_through_controls(  # noq
 ) -> None:
     """Production-shaped controls carry one Preview through protected Watch."""
 
-    async def scenario() -> None:
+    async def scenario() -> None:  # noqa: PLR0915
         preview_result = _preview_plan_result()
         plan = preview_result.data.plan
         assert plan is not None
@@ -3101,6 +3288,8 @@ def test_operator_can_reach_review_apply_and_watch_only_through_controls(  # noq
             await pilot.pause()
 
             assert lifecycle.apply_calls == [apply_request]
+            assert requests.discarded_apply_requests == [apply_request]
+            assert app._lifecycle_state.pending_apply is None  # noqa: SLF001
             assert _input(app, "#lifecycle-intent-id").value == "intent-success"
             _input(app, "#lifecycle-watch-deadline").value = "2026-07-25T00:00:00Z"
             await pilot.click("#lifecycle-prepare-watch")
@@ -3268,6 +3457,121 @@ def test_watch_timeout_interruption_and_resume_remain_explicit() -> None:
         await run_case("watch-timeout", ExitClass.TIMEOUT, resumed=False)
         await run_case("watch-interrupted", ExitClass.INTERRUPTED, resumed=False)
         await run_case("watch-timeout", ExitClass.TIMEOUT, resumed=True)
+
+    asyncio.run(scenario())
+
+
+def test_watch_transport_failure_reports_interruption_and_allows_retry() -> None:
+    """A transport failure leaves the same Watch request available to retry."""
+
+    async def scenario() -> None:
+        lifecycle = FailingLifecycleOperations(
+            watch_error=OSError("provider transport failed")
+        )
+        app = CloudQuotaManagerApp(
+            ScriptedReadOnlyOperations(_browse_result()),
+            ScriptedAuditOperations(),
+            lifecycle=lifecycle,  # type: ignore[arg-type]
+        )
+        request = WatchRequest(
+            intent_id="intent-42",
+            condition=WatchCondition.GRANTED,
+            resume=None,
+            authentication_key=SecretValue(b"k" * 32),
+            installation_id="installation-42",
+            deadline=12345.0,
+            cancellation=CancellationToken(),
+        )
+
+        async with app.run_test(size=(100, 34)) as pilot:
+            await pilot.pause()
+            app.prepare_watch(request, bound_scope=SCOPE)
+            app._submit_lifecycle_watch()  # noqa: SLF001 - exercise worker dispatch
+            await pilot.pause()
+
+            assert lifecycle.watch_calls == [request]
+            assert not _button(app, "#lifecycle-watch").disabled
+            assert "WATCH INTERRUPTED" in str(_static(app, "#status-line").content)
+
+    asyncio.run(scenario())
+
+
+def test_watch_cancellation_reports_interruption_and_allows_retry() -> None:
+    """Worker cancellation remains visible while preserving the pending Watch."""
+
+    async def scenario() -> None:
+        lifecycle = FailingLifecycleOperations(watch_error=asyncio.CancelledError())
+        app = CloudQuotaManagerApp(
+            ScriptedReadOnlyOperations(_browse_result()),
+            ScriptedAuditOperations(),
+            lifecycle=lifecycle,  # type: ignore[arg-type]
+        )
+        request = WatchRequest(
+            intent_id="intent-42",
+            condition=WatchCondition.GRANTED,
+            resume=None,
+            authentication_key=SecretValue(b"k" * 32),
+            installation_id="installation-42",
+            deadline=12345.0,
+            cancellation=CancellationToken(),
+        )
+
+        async with app.run_test(size=(100, 34)) as pilot:
+            await pilot.pause()
+            app.prepare_watch(request, bound_scope=SCOPE)
+            _button(app, "#lifecycle-watch").disabled = True
+
+            try:
+                await app._watch_lifecycle(request)  # noqa: SLF001
+            except asyncio.CancelledError:
+                pass
+            else:
+                message = "Watch cancellation must propagate to the worker"
+                raise AssertionError(message)
+
+            assert not _button(app, "#lifecycle-watch").disabled
+            assert "WATCH INTERRUPTED" in str(_static(app, "#status-line").content)
+
+    asyncio.run(scenario())
+
+
+def test_superseded_watch_failure_does_not_enable_current_request() -> None:
+    """Cleanup from an old Watch cannot mutate controls owned by its successor."""
+
+    async def scenario() -> None:
+        lifecycle = FailingLifecycleOperations(
+            watch_error=OSError("provider transport failed")
+        )
+        app = CloudQuotaManagerApp(
+            ScriptedReadOnlyOperations(_browse_result()),
+            ScriptedAuditOperations(),
+            lifecycle=lifecycle,  # type: ignore[arg-type]
+        )
+        old_request = WatchRequest(
+            intent_id="intent-old",
+            condition=WatchCondition.GRANTED,
+            resume=None,
+            authentication_key=SecretValue(b"k" * 32),
+            installation_id="installation-42",
+            deadline=12345.0,
+            cancellation=CancellationToken(),
+        )
+        current_request = replace(
+            old_request,
+            intent_id="intent-current",
+            cancellation=CancellationToken(),
+        )
+
+        async with app.run_test(size=(100, 34)) as pilot:
+            await pilot.pause()
+            app.prepare_watch(old_request, bound_scope=SCOPE)
+            app.prepare_watch(current_request, bound_scope=SCOPE)
+            _button(app, "#lifecycle-watch").disabled = True
+
+            await app._watch_lifecycle(old_request)  # noqa: SLF001
+
+            assert app._lifecycle_state.pending_watch is current_request  # noqa: SLF001
+            assert _button(app, "#lifecycle-watch").disabled
 
     asyncio.run(scenario())
 

@@ -165,7 +165,10 @@ def test_quota_contact_uses_a_closed_profile_bound_os_keyring_reference() -> Non
     with pytest.raises(ValueError, match="profile name"):
         Profile(
             name="primary",
-            quota_contact_keyring_reference=QuotaContactKeyringReference("secondary"),
+            quota_contact_keyring_reference=QuotaContactKeyringReference(
+                "secondary",
+                "installation-test",
+            ),
         )
 
 

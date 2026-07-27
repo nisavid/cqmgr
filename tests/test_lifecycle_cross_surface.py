@@ -352,6 +352,11 @@ class _RequestFactory:
             now=NOW + timedelta(minutes=1),
         )
 
+    def discard_apply(self, request: ApplyRequest) -> bool:
+        """Model an already-consumed fixture context during route cleanup."""
+        assert request.contact_context_id is None
+        return False
+
     def watch(self, value: WatchCliInput) -> WatchRequest:
         return WatchRequest(
             intent_id=value.intent_id,

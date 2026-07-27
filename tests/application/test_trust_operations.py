@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import override
@@ -31,9 +32,7 @@ REFERENCE = SecretStoreReference.generate(
     SecretPurpose.PLAN_AUTHENTICATION,
 )
 KEY = SecretValue(b"k" * 32)
-KEY_COMMITMENT = bytes.fromhex(
-    "5e318f8cf9cbe249a30812b8ca132d691ded7a91991413558db5758575f5e01f"
-)
+KEY_COMMITMENT = hashlib.sha256(KEY.reveal()).digest()
 RECOVERY_INSTALLATION_ID = "installation-recovery"
 RECOVERY_REFERENCE = SecretStoreReference.generate(
     RECOVERY_INSTALLATION_ID,
@@ -491,6 +490,7 @@ def test_existing_create_intent_rejects_replaced_key() -> None:
 
     assert not result.initialized
     assert result.reason == "trust-create-interrupted"
+    assert repository.value is not None
     assert repository.value.phase is InstallationTrustPhase.CREATE_INTENT
     assert store.create_calls == 0
 

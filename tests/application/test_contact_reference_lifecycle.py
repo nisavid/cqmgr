@@ -172,3 +172,35 @@ def test_apply_contexts_are_concurrent_safe_and_consumed_after_refresh() -> None
             await resolver.refresh_contact(binding, NOW)
 
     asyncio.run(exercise())
+
+
+def test_apply_context_discard_removes_only_the_abandoned_preparation() -> None:
+    """An abandoned route drops its exact retained context without consuming a peer."""
+    resolver = _resolver(_Configuration(ConfigSnapshot()), _Contacts())
+    binding = bind_protected_contact(CONTACT, KEY)
+
+    async def exercise() -> None:
+        retained = await resolver.prepare_apply(
+            binding,
+            explicit_value=CONTACT,
+            principal=PRINCIPAL,
+            trust=TRUST,
+        )
+        abandoned = await resolver.prepare_apply(
+            binding,
+            explicit_value=CONTACT,
+            principal=PRINCIPAL,
+            trust=TRUST,
+        )
+        assert retained.apply_context_id is not None
+        assert abandoned.apply_context_id is not None
+        assert retained.apply_context_id != abandoned.apply_context_id
+
+        resolver.discard_apply(binding, abandoned.apply_context_id)
+
+        refreshed = await resolver.refresh_contact(binding, NOW)
+        assert refreshed.value == "operator@example.com"
+        with pytest.raises(ContactResolutionError, match="source is unavailable"):
+            await resolver.refresh_contact(binding, NOW)
+
+    asyncio.run(exercise())

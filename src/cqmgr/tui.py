@@ -27,6 +27,9 @@ def build_app(
 
     lifecycle_requests = None
     lifecycle_shutdown = None
+    if (lifecycle is None) is not (lifecycle_preparation is None):
+        message = "lifecycle and lifecycle_preparation must be provided together"
+        raise RuntimeError(message)
     if lifecycle is None and lifecycle_preparation is None:
         runtime = build_lifecycle_runtime()
         lifecycle = runtime.operations

@@ -1022,6 +1022,38 @@ def test_apply_reports_ordered_dispatching_and_accepted_child_progress() -> None
 
 
 @pytest.mark.parametrize(
+    ("provider_result", "expected_state"),
+    [
+        (
+            QuotaPreferenceWriteResult(
+                accepted=False,
+                outcome=StableSymbol("provider-rejected"),
+            ),
+            ApplyProgressState.FAILED,
+        ),
+        (TimeoutError("transport outcome unknown"), ApplyProgressState.UNKNOWN),
+    ],
+)
+def test_apply_reports_terminal_nonaccepted_child_progress(
+    provider_result: QuotaPreferenceWriteResult | BaseException,
+    expected_state: ApplyProgressState,
+) -> None:
+    """Apply surfaces failed and unknown terminal child transitions explicitly."""
+    progress: list[ApplyProgressEvent] = []
+
+    _apply(
+        _plan(),
+        _ScriptedWriter(provider_result),
+        on_progress=progress.append,
+    )
+
+    assert [event.state for event in progress] == [
+        ApplyProgressState.DISPATCHING,
+        expected_state,
+    ]
+
+
+@pytest.mark.parametrize(
     ("event_args", "error", "message"),
     [
         (

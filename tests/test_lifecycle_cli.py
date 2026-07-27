@@ -16,6 +16,7 @@ from click.testing import CliRunner
 import cqmgr.cli as cli_module
 from cqmgr.adapters.cli.lifecycle import (
     LifecycleCliRuntime,
+    LifecyclePresentation,
     PlanReferenceInput,
     RequestCompositionInput,
     WatchCliInput,
@@ -111,6 +112,7 @@ class _Facade:
 class _Factory:
     def __init__(self) -> None:
         self.calls: list[tuple[str, object]] = []
+        self.discarded: list[object] = []
 
     def compose(self, value: RequestCompositionInput) -> object:
         self.calls.append(("compose", value))
@@ -133,6 +135,10 @@ class _Factory:
     ) -> object:
         self.calls.append(("apply", (value, acknowledgement, quota_contact)))
         return ("apply-request", value, acknowledgement)
+
+    def discard_apply(self, request: object) -> bool:
+        self.discarded.append(request)
+        return True
 
     def watch(self, value: object) -> object:
         self.calls.append(("watch", value))
@@ -509,7 +515,94 @@ def test_plan_review_and_apply_dispatch_exact_reference_and_acknowledgement(
         ),
     )
     assert [name for name, _ in facade.calls] == ["review", "apply"]
+    assert factory.discarded == [
+        (
+            "apply-request",
+            PlanReferenceInput(digest=None, path=Path("request.plan")),
+            "projects/123",
+        )
+    ]
     assert facade.close_calls == REVIEW_AND_APPLY_RUNTIME_COUNT
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("dispatch failed"),
+        asyncio.CancelledError("Apply cancelled"),
+    ],
+)
+def test_apply_route_discards_prepared_contact_when_operation_aborts(
+    monkeypatch: MonkeyPatch,
+    error: BaseException,
+) -> None:
+    """Cancellation or dispatch failure cannot retain prepared contact authority."""
+    facade, factory = _runtime(monkeypatch)
+
+    async def abort(_request: object) -> OperationResult[object]:
+        raise error
+
+    monkeypatch.setattr(facade, "apply", abort)
+    reference = PlanReferenceInput(digest="sha256:" + ("a" * 64), path=None)
+
+    async def exercise() -> None:
+        runtime = cli_module.build_lifecycle_cli_runtime()
+        await cli_module._apply_lifecycle_async(  # noqa: SLF001
+            runtime,
+            reference,
+            "projects/123",
+            None,
+            LifecyclePresentation("json", no_color=True, quiet=False),
+        )
+
+    with pytest.raises(type(error), match=str(error)):
+        asyncio.run(exercise())
+
+    assert factory.discarded == [
+        ("apply-request", reference, "projects/123"),
+    ]
+
+
+def test_apply_route_discards_prepared_contact_after_validation_result(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A non-success Apply result releases its prepared contact on route exit."""
+    facade, factory = _runtime(monkeypatch)
+
+    async def reject(_request: object) -> OperationResult[object]:
+        return OperationResult(
+            operation=OperationName("plan.apply"),
+            resource_scope=None,
+            boundary=OperationBoundary(StableSymbol("plan-applied"), reached=False),
+            outcome=Outcome(
+                StableSymbol("plan-invalidated"),
+                ExitClass.REJECTED_PRECONDITION,
+            ),
+            completeness=Completeness.complete(),
+            started_at=NOW,
+            finished_at=NOW,
+            data={},
+        )
+
+    monkeypatch.setattr(facade, "apply", reject)
+    reference = PlanReferenceInput(digest="sha256:" + ("a" * 64), path=None)
+
+    async def exercise() -> None:
+        runtime = cli_module.build_lifecycle_cli_runtime()
+        await cli_module._apply_lifecycle_async(  # noqa: SLF001
+            runtime,
+            reference,
+            "projects/123",
+            None,
+            LifecyclePresentation("json", no_color=True, quiet=False),
+        )
+
+    with pytest.raises(click.exceptions.Exit):
+        asyncio.run(exercise())
+
+    assert factory.discarded == [
+        ("apply-request", reference, "projects/123"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -714,3 +807,34 @@ def test_watch_rejects_incomplete_or_cross_wired_selectors(
     )
 
     assert result.exit_code == USAGE_EXIT
+
+
+def test_watch_runtime_value_error_is_an_execution_failure(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A valid Watch input does not reclassify runtime failure as bad syntax."""
+    _, factory = _runtime(monkeypatch)
+
+    def fail_at_runtime(value: object) -> object:
+        del value
+        message = "retained Watch state is inconsistent"
+        raise ValueError(message)
+
+    monkeypatch.setattr(factory, "watch", fail_at_runtime)
+
+    result = CliRunner().invoke(
+        cli_module.main,
+        [
+            "request",
+            "watch",
+            "--intent-id",
+            "sha256:" + ("b" * 64),
+            "--condition",
+            "granted",
+            "--deadline",
+            "2026-07-25T00:00:00Z",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "retained Watch state is inconsistent" in result.stderr
