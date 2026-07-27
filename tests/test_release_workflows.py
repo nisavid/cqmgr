@@ -4,11 +4,46 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import cast
+
+import yaml
 
 ROOT = Path(__file__).parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
-SHA_PIN = re.compile(r"^\s*uses:\s+[^@\s]+@[0-9a-f]{40}(?:\s+#.*)?$")
-CHECKOUT_USE = re.compile(r"^\s+uses:\s+actions/checkout@")
+SHA_PIN = re.compile(r"[^@\s]+@[0-9a-f]{40}\Z")
+
+
+def _mapping(value: object, context: str) -> dict[str, object]:
+    """Require one string-keyed YAML mapping."""
+    assert isinstance(value, dict), context
+    assert all(isinstance(key, str) for key in value), context
+    return cast("dict[str, object]", value)
+
+
+def _workflow_actions(
+    document: str,
+) -> tuple[tuple[str, dict[str, object] | None], ...]:
+    """Return only structural reusable-job and step action references."""
+    workflow_value = yaml.safe_load(document)
+    assert isinstance(workflow_value, dict), "workflow"
+    workflow = cast("dict[object, object]", workflow_value)
+    jobs = _mapping(workflow.get("jobs"), "jobs")
+    actions: list[tuple[str, dict[str, object] | None]] = []
+    for job_value in jobs.values():
+        job = _mapping(job_value, "job")
+        job_use = job.get("uses")
+        if job_use is not None:
+            assert isinstance(job_use, str), "reusable workflow reference"
+            actions.append((job_use, None))
+        steps = job.get("steps", [])
+        assert isinstance(steps, list), "job steps"
+        for step_value in steps:
+            step = _mapping(step_value, "step")
+            step_use = step.get("uses")
+            if step_use is not None:
+                assert isinstance(step_use, str), "step action reference"
+                actions.append((step_use, step))
+    return tuple(actions)
 
 
 def _yaml_block(document: str, header: str, *, indent: int) -> str:
@@ -79,26 +114,53 @@ def test_every_workflow_action_is_sha_pinned_and_checkout_drops_credentials() ->
     workflows = [*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")]
     assert workflows
     for workflow in workflows:
-        lines = workflow.read_text().splitlines()
-        uses = [line for line in lines if line.lstrip().startswith("uses:")]
-        assert uses, workflow
+        actions = _workflow_actions(workflow.read_text(encoding="utf-8"))
+        assert actions, workflow
         assert all(
-            SHA_PIN.fullmatch(line) or "uses: ./.github/workflows/" in line
-            for line in uses
+            SHA_PIN.fullmatch(reference) or reference.startswith("./.github/workflows/")
+            for reference, _step in actions
         ), workflow
         checkout_steps = [
-            block
-            for block in _yaml_list_item_blocks(workflow.read_text(), indent=6)
-            if any(CHECKOUT_USE.match(line) for line in block.splitlines())
+            step
+            for reference, step in actions
+            if reference.startswith("actions/checkout@") and step is not None
         ]
-        assert len(checkout_steps) == sum(
-            CHECKOUT_USE.match(line) is not None for line in lines
-        ), workflow
+        assert checkout_steps, workflow
         for checkout_step in checkout_steps:
-            assert re.search(r"(?m)^\s+with:\s*$", checkout_step), checkout_step
-            assert re.search(
-                r"(?m)^\s+persist-credentials:\s+false\s*$", checkout_step
-            ), checkout_step
+            inputs = _mapping(checkout_step.get("with"), "checkout inputs")
+            assert inputs.get("persist-credentials") is False, checkout_step
+
+
+def test_workflow_action_parser_ignores_block_scalar_payload() -> None:
+    """Comments and scalar payload cannot masquerade as workflow actions."""
+    document = """
+# run: |
+#   uses: attacker/comment@mutable
+jobs:
+  example:
+    runs-on: ubuntu-22.04
+    steps:
+      - run: |
+          uses: attacker/example@mutable
+          echo retained
+        env:
+          SIBLING: retained
+      - run: >-
+          uses: attacker/folded@mutable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+""".strip()
+
+    assert _workflow_actions(document) == (
+        (
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+            {
+                "uses": ("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"),
+                "with": {"persist-credentials": False},
+            },
+        ),
+    )
 
 
 def test_release_workflow_builds_once_and_cannot_publish_a_manual_run() -> None:

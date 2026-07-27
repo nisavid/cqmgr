@@ -23,6 +23,7 @@ MONITORING_METRICS = (
     "serviceruntime.googleapis.com/quota/allocation/usage",
     "serviceruntime.googleapis.com/quota/rate/net_usage",
 )
+MINIMUM_REQUEST_TIMEOUT_SECONDS = 0.1
 ALLOWED_GET_PATHS = frozenset(
     {
         "/v3/projects/{project}",
@@ -112,11 +113,14 @@ class RequestBudget:
 
     def claim_timeout(self, request_timeout: float) -> float:
         """Claim one request and cap its timeout at the remaining deadline."""
-        if request_timeout <= 0:
-            msg = "request timeout must be positive"
+        if request_timeout < MINIMUM_REQUEST_TIMEOUT_SECONDS:
+            msg = (
+                "request timeout must be at least "
+                f"{MINIMUM_REQUEST_TIMEOUT_SECONDS} seconds"
+            )
             raise ValueError(msg)
         remaining = self.max_seconds - (self.monotonic() - self._started)
-        if remaining <= 0:
+        if remaining < MINIMUM_REQUEST_TIMEOUT_SECONDS:
             msg = "canary exceeded its global wall-clock deadline"
             reason = "wall-clock-deadline"
             raise RequestBudgetError(reason, msg)

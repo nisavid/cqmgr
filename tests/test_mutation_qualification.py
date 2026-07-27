@@ -63,8 +63,25 @@ def test_reviewed_mutation_baseline_passes() -> None:
     }
 
     score = _verify()(stats, baseline["minimum_score"])
-    assert score > baseline["minimum_score"]
+    assert score >= baseline["minimum_score"]
     assert round(score, 2) == baseline["score"]
+
+
+def test_mutation_gate_accepts_exact_reviewed_minimum() -> None:
+    """Equality at the inclusive reviewed floor remains a passing result."""
+    minimum_score = 60.0
+    stats = {
+        "check_was_interrupted_by_user": 0,
+        "killed": 3,
+        "no_tests": 0,
+        "segfault": 0,
+        "survived": 2,
+        "suspicious": 0,
+        "timeout": 0,
+        "total": 5,
+    }
+
+    assert _verify()(stats, minimum_score) == minimum_score
 
 
 @pytest.mark.parametrize(

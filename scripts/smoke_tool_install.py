@@ -540,7 +540,7 @@ def _exercise_redirected_terminal_behavior(
     return frozenset(REDIRECTED_TERMINAL_QUALIFICATION_CASES)
 
 
-def _read_pty_process(
+def _read_pty_process(  # noqa: C901 - bounded PTY lifecycle cleanup
     command: list[str],
     *,
     cwd: Path,
@@ -579,11 +579,15 @@ def _read_pty_process(
                 except OSError as error:
                     if error.errno != errno.EIO:
                         raise
-                    completed = True
-                    break
+                    if process.poll() is not None:
+                        completed = True
+                        break
+                    continue
                 if not chunk:
-                    completed = True
-                    break
+                    if process.poll() is not None:
+                        completed = True
+                        break
+                    continue
                 chunks.append(chunk)
             elif process.poll() is not None:
                 completed = True
