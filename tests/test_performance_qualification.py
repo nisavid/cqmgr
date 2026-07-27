@@ -1,4 +1,4 @@
-"""Machine-readable performance evidence remains baseline-only until review."""
+"""Machine-readable performance evidence is checked against approved budgets."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ BASELINE = (
     / "release"
     / "performance-baseline-macos-arm64-python314.json"
 )
+BUDGETS = Path(__file__).parents[1] / "docs" / "release" / "performance-budgets.json"
 
 
 def test_performance_report_records_every_required_axis_without_invented_budgets() -> (
@@ -120,3 +121,72 @@ def test_committed_performance_baseline_is_loaded_and_validated() -> None:
     baseline = json.loads(BASELINE.read_text(encoding="utf-8"))
 
     assert validate(baseline) == baseline
+
+
+def test_committed_performance_budgets_are_exact_and_operator_approved() -> None:
+    """The retained policy records exactly the five approved regression ceilings."""
+    module = runpy.run_path(str(SCRIPT))
+    validate = cast("Any", module["validate_performance_budgets"])
+    budgets = json.loads(BUDGETS.read_text(encoding="utf-8"))
+
+    assert validate(budgets) == budgets
+    assert budgets == {
+        "budgets": {
+            "cold_start_seconds": 0.75,
+            "first_tui_render_seconds": 1.0,
+            "peak_python_memory_bytes": 48 * 1024 * 1024,
+            "resident_memory_bytes": 128 * 1024 * 1024,
+            "steady_refresh_seconds": 0.5,
+        },
+        "schema": "cqmgr.performance-budgets/v1",
+    }
+
+
+def test_performance_budgets_accept_exact_thresholds() -> None:
+    """A measurement equal to every ceiling remains qualified."""
+    module = runpy.run_path(str(SCRIPT))
+    enforce = cast("Any", module["enforce_performance_budgets"])
+    baseline = {
+        "environment": {"platform": "test", "python": "3.14"},
+        "measurements": {
+            "cold_start_seconds": {"maximum": 0.75, "median": 0.5, "runs": 3},
+            "first_tui_render_seconds": 1.0,
+            "peak_python_memory_bytes": 48 * 1024 * 1024,
+            "resident_memory_bytes": 128 * 1024 * 1024,
+            "steady_refresh_seconds": 0.5,
+        },
+        "schema": "cqmgr.performance-baseline/v1",
+    }
+    budgets = {
+        "budgets": {
+            "cold_start_seconds": 0.75,
+            "first_tui_render_seconds": 1.0,
+            "peak_python_memory_bytes": 48 * 1024 * 1024,
+            "resident_memory_bytes": 128 * 1024 * 1024,
+            "steady_refresh_seconds": 0.5,
+        },
+        "schema": "cqmgr.performance-budgets/v1",
+    }
+
+    assert enforce(baseline, budgets) == baseline
+
+
+def test_performance_budgets_report_every_exceeded_ceiling() -> None:
+    """Qualification fails closed with every actionable regression named."""
+    module = runpy.run_path(str(SCRIPT))
+    enforce = cast("Any", module["enforce_performance_budgets"])
+    baseline = json.loads(BASELINE.read_text(encoding="utf-8"))
+    budgets = json.loads(BUDGETS.read_text(encoding="utf-8"))
+    measurements = cast("dict[str, object]", baseline["measurements"])
+    measurements["cold_start_seconds"] = {
+        "maximum": 0.751,
+        "median": 0.5,
+        "runs": 3,
+    }
+    measurements["resident_memory_bytes"] = 128 * 1024 * 1024 + 1
+
+    with pytest.raises(
+        ValueError,
+        match=r"cold_start_seconds.*resident_memory_bytes",
+    ):
+        enforce(baseline, budgets)

@@ -10,12 +10,20 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
 BASELINE_SCHEMA = "cqmgr.performance-baseline/v1"
+BUDGET_SCHEMA = "cqmgr.performance-budgets/v1"
+BUDGET_FIELDS = (
+    "cold_start_seconds",
+    "first_tui_render_seconds",
+    "peak_python_memory_bytes",
+    "resident_memory_bytes",
+    "steady_refresh_seconds",
+)
 TUI_FIXTURE = (
     Path(__file__).resolve().parent.parent
     / "tests"
@@ -213,6 +221,69 @@ def validate_measurement_report(value: object) -> dict[str, object]:  # noqa: C9
     return value
 
 
+def validate_performance_budgets(value: object) -> dict[str, object]:
+    """Validate the exact operator-approved performance policy."""
+    if not isinstance(value, dict) or set(value) != {"budgets", "schema"}:
+        msg = "performance budgets must contain the exact V1 fields"
+        raise TypeError(msg)
+    if value["schema"] != BUDGET_SCHEMA:
+        msg = "performance budget schema is unsupported"
+        raise ValueError(msg)
+    budgets = value["budgets"]
+    if not isinstance(budgets, dict) or set(budgets) != set(BUDGET_FIELDS):
+        msg = "performance budgets must contain every exact measurement ceiling"
+        raise TypeError(msg)
+    for name in BUDGET_FIELDS:
+        budget = budgets[name]
+        if name.endswith("_bytes") and (
+            isinstance(budget, bool) or not isinstance(budget, int)
+        ):
+            msg = f"{name} budget must be an integer byte count"
+            raise TypeError(msg)
+        _positive(budget, f"{name} budget")
+    return value
+
+
+def enforce_performance_budgets(
+    measurement_value: object,
+    budget_value: object,
+) -> dict[str, object]:
+    """Fail closed when any executable measurement exceeds its approved ceiling."""
+    report = validate_measurement_report(measurement_value)
+    policy = validate_performance_budgets(budget_value)
+    measurements = cast("dict[str, object]", report["measurements"])
+    cold_start = cast("dict[str, object]", measurements["cold_start_seconds"])
+    actuals: dict[str, float | int] = {
+        "cold_start_seconds": cast("float", cold_start["maximum"]),
+        "first_tui_render_seconds": cast(
+            "float",
+            measurements["first_tui_render_seconds"],
+        ),
+        "peak_python_memory_bytes": cast(
+            "int",
+            measurements["peak_python_memory_bytes"],
+        ),
+        "resident_memory_bytes": cast(
+            "int",
+            measurements["resident_memory_bytes"],
+        ),
+        "steady_refresh_seconds": cast(
+            "float",
+            measurements["steady_refresh_seconds"],
+        ),
+    }
+    budgets = cast("dict[str, float | int]", policy["budgets"])
+    exceeded = [
+        f"{name}={actuals[name]} exceeds {budgets[name]}"
+        for name in BUDGET_FIELDS
+        if actuals[name] > budgets[name]
+    ]
+    if exceeded:
+        msg = "performance budgets exceeded: " + "; ".join(exceeded)
+        raise ValueError(msg)
+    return report
+
+
 def _run_timed(command: Sequence[str]) -> float:
     started = time.perf_counter()
     completed = subprocess.run(  # noqa: S603
@@ -312,10 +383,12 @@ def main(arguments: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--budgets", type=Path)
     parsed = parser.parse_args(arguments)
+    report = measure(parsed.runs)
     parsed.output.write_text(
         json.dumps(
-            measure(parsed.runs),
+            report,
             ensure_ascii=True,
             separators=(",", ":"),
             sort_keys=True,
@@ -324,6 +397,9 @@ def main(arguments: Sequence[str] | None = None) -> None:
         encoding="utf-8",
         newline="\n",
     )
+    if parsed.budgets is not None:
+        budgets = json.loads(parsed.budgets.read_text(encoding="utf-8"))
+        enforce_performance_budgets(report, budgets)
 
 
 if __name__ == "__main__":

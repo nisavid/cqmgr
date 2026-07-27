@@ -1,0 +1,1 @@
+{"budgets":{"cold_start_seconds":0.75,"first_tui_render_seconds":1.0,"peak_python_memory_bytes":50331648,"resident_memory_bytes":134217728,"steady_refresh_seconds":0.5},"schema":"cqmgr.performance-budgets/v1"}
