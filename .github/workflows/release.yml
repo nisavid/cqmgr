@@ -34,7 +34,7 @@ jobs:
         with:
           version: 0.11.30
           python-version: "3.14"
-          enable-cache: true
+          enable-cache: false
 
       - name: Synchronize locked environment
         run: uv sync --locked --python 3.14
@@ -46,6 +46,7 @@ jobs:
           set -euo pipefail
           VERSION="$(uv run --locked --no-sync python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
           MAIN_COMMIT="$(git ls-remote origin refs/heads/main | cut -f1)"
+          test -n "${MAIN_COMMIT}"
           echo "value=${VERSION}" >> "${GITHUB_OUTPUT}"
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             test "$(git cat-file -t "${GITHUB_REF}")" = "tag"
@@ -301,7 +302,7 @@ jobs:
         with:
           version: 0.11.30
           python-version: "3.14"
-          enable-cache: true
+          enable-cache: false
 
       - name: Synchronize locked environment
         run: uv sync --locked --python 3.14
@@ -314,6 +315,7 @@ jobs:
             mutants/mutmut-cicd-stats.json --minimum-score 60
 
       - name: Retain mutation evidence
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mutation-evidence
@@ -361,54 +363,12 @@ jobs:
           if-no-files-found: error
 
   live-read-only:
-    name: Exact-commit bounded provider reads
     needs: build
-    runs-on: ubuntu-22.04
-    timeout-minutes: 15
-    environment: live-read-only
+    uses: ./.github/workflows/live-read-only.yml
     permissions:
       contents: read
+      # Required by the reusable canary's OIDC-based GCP authentication.
       id-token: write
-    steps:
-      - name: Checkout exact release commit
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Authenticate with workload identity federation
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-
-      - name: Install uv and Python
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
-        with:
-          version: 0.11.30
-          python-version: "3.14"
-          enable-cache: true
-
-      - name: Synchronize locked runtime
-        run: uv sync --locked --no-dev --python 3.14
-
-      - name: Run bounded allowlisted canary
-        env:
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-        run: >-
-          uv run --locked --no-dev --no-sync
-          python scripts/live_read_only_canary.py
-          --project-env GCP_PROJECT_ID
-          --max-pages 20
-          --timeout 10
-          --output live-read-only-evidence.json
-
-      - name: Upload exact-commit sanitized evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: release-live-read-only-evidence
-          path: live-read-only-evidence.json
-          if-no-files-found: error
-          retention-days: 14
 
   publish:
     name: Publish exact qualified bytes
@@ -428,11 +388,32 @@ jobs:
       contents: write
       id-token: write
     steps:
+      - name: Checkout exact release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Download immutable release candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-candidate
           path: candidate
+
+      - name: Reverify candidate before publication
+        run: >-
+          python scripts/release_qualification.py verify
+          --release candidate/release
+          --identity candidate/release-identity.json
+
+      - name: Preflight immutable PyPI version
+        id: pypi-preflight
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: >-
+          python scripts/publication_preflight.py pypi
+          --candidate candidate/release
+          --version "${VERSION}"
+          --github-output "${GITHUB_OUTPUT}"
 
       - name: Generate GitHub artifact attestations
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.0.0
@@ -449,12 +430,25 @@ jobs:
           cp "candidate/release/cqmgr-${VERSION}-py3-none-any.whl" publish-dists/
 
       - name: Publish to PyPI with Trusted Publishing
+        if: steps.pypi-preflight.outputs.publish == 'true'
         uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247
         with:
           packages-dir: publish-dists
           attestations: true
 
+      - name: Preflight immutable GitHub Release
+        id: github-preflight
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/publication_preflight.py github
+          --candidate candidate/release
+          --repository "${GITHUB_REPOSITORY}"
+          --tag "${GITHUB_REF_NAME}"
+          --github-output "${GITHUB_OUTPUT}"
+
       - name: Publish immutable GitHub Release assets
+        if: steps.github-preflight.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
@@ -494,7 +488,18 @@ jobs:
       - name: Install exact published version
         shell: bash
         env:
+          PYTHON_VERSION: ${{ matrix.python }}
           VERSION: ${{ needs.build.outputs.version }}
         run: |
-          uv tool install --no-build --python "${{ matrix.python }}" "cqmgr==${VERSION}"
-          test "$(cqmgr --version)" = "cqmgr, version ${VERSION}"
+          for attempt in 1 2 3 4 5; do
+            if uv tool install --refresh --no-build \
+              --python "${PYTHON_VERSION}" "cqmgr==${VERSION}"; then
+              break
+            fi
+            if [[ "${attempt}" == "5" ]]; then
+              exit 1
+            fi
+            sleep 30
+          done
+          test "$(uv tool run --from "cqmgr==${VERSION}" cqmgr --version)" \
+            = "cqmgr, version ${VERSION}"

@@ -78,3 +78,11 @@ def test_packaged_schema_catalog_closes_single_and_bundle_discriminators() -> No
         "cqmgr.watch-event/v1",
     ]
     assert catalog["quota_request_plan"]["kinds"] == ["bundle", "single"]
+
+
+def test_packaged_overlay_uses_clean_quota_unit_symbols() -> None:
+    """Release resources never serialize dataclass representations as unit values."""
+    overlay = json.loads((RESOURCES / "accelerator-overlay.json").read_text())
+
+    units = {mapping["selector"]["unit"] for mapping in overlay["mappings"]}
+    assert units == {"1", "core"}

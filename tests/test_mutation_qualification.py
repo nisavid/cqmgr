@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import runpy
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
@@ -12,6 +13,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "verify_mutation_results.py"
+BASELINE = Path(__file__).parents[1] / "docs" / "release" / "mutation-baseline.json"
 EXPECTED_BASELINE_FLOOR = 64.0
 
 
@@ -35,19 +37,35 @@ def _verify() -> MutationVerifier:
 
 
 def test_reviewed_mutation_baseline_passes() -> None:
-    """The initial critical-core evidence establishes an explicit floor."""
-    stats = {
-        "check_was_interrupted_by_user": 0,
+    """The committed critical-core evidence establishes an explicit floor."""
+    baseline = json.loads(BASELINE.read_text())
+    assert baseline == {
         "killed": 78,
-        "no_tests": 0,
-        "segfault": 0,
+        "minimum_score": 60.0,
+        "score": 64.46,
+        "schema": "cqmgr.mutation-baseline/v1",
+        "source_paths": [
+            "src/cqmgr/domain/plan_consumption.py",
+            "src/cqmgr/domain/redaction.py",
+            "src/cqmgr/domain/status.py",
+        ],
         "survived": 43,
-        "suspicious": 0,
-        "timeout": 0,
         "total": 121,
     }
+    stats = {
+        "check_was_interrupted_by_user": 0,
+        "killed": baseline["killed"],
+        "no_tests": 0,
+        "segfault": 0,
+        "survived": baseline["survived"],
+        "suspicious": 0,
+        "timeout": 0,
+        "total": baseline["total"],
+    }
 
-    assert _verify()(stats, 60.0) > EXPECTED_BASELINE_FLOOR
+    score = _verify()(stats, baseline["minimum_score"])
+    assert score > EXPECTED_BASELINE_FLOOR
+    assert round(score, 2) == baseline["score"]
 
 
 @pytest.mark.parametrize(
@@ -81,4 +99,23 @@ def test_mutation_gate_rejects_regression_or_incomplete_execution(
     stats.update(change)
 
     with pytest.raises(ValueError, match=match):
+        _verify()(stats, 60.0)
+
+
+@pytest.mark.parametrize("name", ["killed", "survived", "total", "timeout"])
+def test_mutation_gate_rejects_boolean_statistics(name: str) -> None:
+    """Boolean JSON values cannot masquerade as integer mutation counts."""
+    stats: dict[str, object] = {
+        "check_was_interrupted_by_user": 0,
+        "killed": 78,
+        "no_tests": 0,
+        "segfault": 0,
+        "survived": 43,
+        "suspicious": 0,
+        "timeout": 0,
+        "total": 121,
+    }
+    stats[name] = True
+
+    with pytest.raises(TypeError, match="non-negative integer"):
         _verify()(stats, 60.0)

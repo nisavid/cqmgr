@@ -12,11 +12,16 @@ SHA_PIN = re.compile(r"^\s*uses:\s+[^@\s]+@[0-9a-f]{40}(?:\s+#.*)?$")
 
 def test_every_workflow_action_is_sha_pinned_and_checkout_drops_credentials() -> None:
     """Mutable action tags and persisted checkout credentials never enter CI."""
-    for workflow in WORKFLOWS.glob("*.yml"):
+    workflows = [*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")]
+    assert workflows
+    for workflow in workflows:
         lines = workflow.read_text().splitlines()
         uses = [line for line in lines if line.lstrip().startswith("uses:")]
         assert uses, workflow
-        assert all(SHA_PIN.fullmatch(line) for line in uses), workflow
+        assert all(
+            SHA_PIN.fullmatch(line) or "uses: ./.github/workflows/" in line
+            for line in uses
+        ), workflow
         for index, line in enumerate(lines):
             if "actions/checkout@" in line:
                 following = "\n".join(lines[index : index + 6])
@@ -45,6 +50,11 @@ def test_release_workflow_builds_once_and_cannot_publish_a_manual_run() -> None:
     assert "actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6" in workflow
     assert "PYPI_TOKEN" not in workflow
     assert "password:" not in workflow
+    assert "scripts/publication_preflight.py pypi" in workflow
+    assert "steps.pypi-preflight.outputs.publish == 'true'" in workflow
+    assert "scripts/publication_preflight.py github" in workflow
+    assert "steps.github-preflight.outputs.publish == 'true'" in workflow
+    assert "skip-existing" not in workflow
 
 
 def test_release_workflow_qualifies_resolutions_platforms_and_exact_install() -> None:
@@ -112,8 +122,5 @@ def test_release_publication_requires_the_exact_commit_live_canary() -> None:
     workflow = (WORKFLOWS / "release.yml").read_text()
 
     assert "live-read-only:" in workflow
-    assert "name: Exact-commit bounded provider reads" in workflow
-    assert "environment: live-read-only" in workflow
-    assert "python scripts/live_read_only_canary.py" in workflow
-    assert "name: release-live-read-only-evidence" in workflow
+    assert "uses: ./.github/workflows/live-read-only.yml" in workflow
     assert "      - live-read-only\n" in workflow

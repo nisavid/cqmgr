@@ -24,13 +24,17 @@ PROJECT_VERSION = tomllib.loads(Path("pyproject.toml").read_text())["project"][
 ]
 RUNTIME_GUARD_MARKER = "CQMGR-RUNTIME-GUARD-ACTIVE"
 TUI_DISPATCH_MARKER = "CQMGR-INSTALLED-TUI-DISPATCHED"
-TERMINAL_QUALIFICATION_CASES = (
+REDIRECTED_TERMINAL_QUALIFICATION_CASES = (
     "redirected-bare-cli-fallback",
     "redirected-explicit-tui-rejection",
     "structured-screen-reader-output",
     "no-color-output",
     "low-color-output",
-    "interactive-tui-dispatch",
+)
+INTERACTIVE_TERMINAL_QUALIFICATION_CASE = "interactive-tui-dispatch"
+TERMINAL_QUALIFICATION_CASES = (
+    *REDIRECTED_TERMINAL_QUALIFICATION_CASES,
+    INTERACTIVE_TERMINAL_QUALIFICATION_CASE,
 )
 READ_ONLY_HELP_INVOCATIONS = (
     ("tui", "--help"),
@@ -466,7 +470,7 @@ def _exercise_redirected_terminal_behavior(
     *,
     cwd: Path,
     environment: dict[str, str],
-) -> None:
+) -> frozenset[str]:
     """Qualify safe CLI fallback and accessible output without a terminal."""
     bare_output, bare_errors = _run_redirected(
         [str(executable)],
@@ -533,6 +537,7 @@ def _exercise_redirected_terminal_behavior(
     )
     assert low_color_output.startswith("Usage: cqmgr")
     _assert_plain_terminal_text(low_color_output, low_color_errors)
+    return frozenset(REDIRECTED_TERMINAL_QUALIFICATION_CASES)
 
 
 def _read_pty_process(
@@ -546,42 +551,47 @@ def _read_pty_process(
     import select  # noqa: PLC0415 - POSIX qualification only
 
     master, slave = pty.openpty()
+    process: subprocess.Popen[bytes] | None = None
     try:
-        process = subprocess.Popen(  # noqa: S603
-            command,
-            cwd=cwd,
-            env=environment,
-            stdin=slave,
-            stdout=slave,
-            stderr=slave,
-            close_fds=True,
-            start_new_session=True,
-        )
-    finally:
-        os.close(slave)
+        try:
+            process = subprocess.Popen(  # noqa: S603
+                command,
+                cwd=cwd,
+                env=environment,
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                close_fds=True,
+                start_new_session=True,
+            )
+        finally:
+            os.close(slave)
 
-    chunks: list[bytes] = []
-    deadline = time.monotonic() + 15
-    empty_fds: list[int] = []
-    try:
+        chunks: list[bytes] = []
+        deadline = time.monotonic() + 15
+        empty_fds: list[int] = []
         while time.monotonic() < deadline:
             readable, _, _ = select.select([master], empty_fds, empty_fds, 0.1)
             if readable:
                 try:
-                    chunks.append(os.read(master, 65536))
+                    chunk = os.read(master, 65536)
                 except OSError as error:
                     if error.errno != errno.EIO:
                         raise
                     break
+                if not chunk:
+                    break
+                chunks.append(chunk)
             elif process.poll() is not None:
                 break
         process.wait(timeout=max(0.1, deadline - time.monotonic()))
     finally:
         os.close(master)
-        if process.poll() is None:
+        if process is not None and process.poll() is None:
             process.kill()
             process.wait()
 
+    assert process is not None
     output = b"".join(chunks).decode("utf-8", errors="replace")
     assert process.returncode == 0, output
     return output.replace("\r\n", "\n")
@@ -592,7 +602,7 @@ def _exercise_posix_pty_dispatch(
     *,
     cwd: Path,
     environment: dict[str, str],
-) -> None:
+) -> frozenset[str]:
     """Prove both interactive entry points dispatch from a real PTY."""
     base_environment = environment.copy()
     base_environment["CQMGR_SMOKE_TUI_STUB"] = "1"
@@ -621,6 +631,7 @@ def _exercise_posix_pty_dispatch(
     assert TUI_DISPATCH_MARKER in output
     assert '"term": "dumb"' in output
     assert '"no_color": "1"' in output
+    return frozenset({INTERACTIVE_TERMINAL_QUALIFICATION_CASE})
 
 
 def _exercise_tty_dispatch(
@@ -628,7 +639,7 @@ def _exercise_tty_dispatch(
     *,
     cwd: Path,
     environment: dict[str, str],
-) -> None:
+) -> frozenset[str]:
     """Dispatch both installed interactive entry points through the safe stub."""
     output, errors = _run(
         [
@@ -642,6 +653,7 @@ def _exercise_tty_dispatch(
     )
     assert json.loads(output) == ["bare", "explicit"]
     assert _without_runtime_guard(errors) == ""
+    return frozenset({INTERACTIVE_TERMINAL_QUALIFICATION_CASE})
 
 
 def _exercise_offline_functional_cases(
@@ -777,16 +789,21 @@ def smoke_artifact(  # noqa: C901, PLR0915 - one installed-artifact acceptance f
         interpreter = tool_environment / (
             "Scripts/python.exe" if os.name == "nt" else "bin/python"
         )
-        _exercise_tty_dispatch(
-            interpreter,
-            cwd=temporary,
-            environment=runtime_environment,
-        )
-        if os.name != "nt":
-            _exercise_posix_pty_dispatch(
-                executable,
-                cwd=temporary,
-                environment=runtime_environment,
+        if os.name == "nt":
+            terminal_coverage = set(
+                _exercise_tty_dispatch(
+                    interpreter,
+                    cwd=temporary,
+                    environment=runtime_environment,
+                )
+            )
+        else:
+            terminal_coverage = set(
+                _exercise_posix_pty_dispatch(
+                    executable,
+                    cwd=temporary,
+                    environment=runtime_environment,
+                )
             )
         help_output, help_errors = _run(
             [str(executable), "--help"], cwd=temporary, environment=runtime_environment
@@ -840,11 +857,14 @@ def smoke_artifact(  # noqa: C901, PLR0915 - one installed-artifact acceptance f
                 "CQMGR_SELECTION_STATE_PATH": str(runtime_home / "selection.toml"),
             }
         )
-        _exercise_redirected_terminal_behavior(
-            executable,
-            cwd=temporary,
-            environment=runtime_environment,
+        terminal_coverage.update(
+            _exercise_redirected_terminal_behavior(
+                executable,
+                cwd=temporary,
+                environment=runtime_environment,
+            )
         )
+        assert terminal_coverage == set(TERMINAL_QUALIFICATION_CASES)
         _exercise_offline_functional_cases(
             executable,
             cwd=temporary,

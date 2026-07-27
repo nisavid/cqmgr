@@ -31,7 +31,7 @@ def verify_mutation_results(
     values: dict[str, int] = {}
     for name in ("killed", "survived", "total", *BLOCKING_STATUSES):
         value = stats.get(name)
-        if not isinstance(value, int) or value < 0:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             msg = f"mutation statistic {name!r} must be a non-negative integer"
             raise TypeError(msg)
         values[name] = value

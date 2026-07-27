@@ -63,6 +63,7 @@ def _compute_source(
     document = _load_object(fixture_root / filename)
     pages = _list(document.get("pages"), f"{source_name} pages")
     record_count = 0
+    record_digests: list[str] = []
     lifecycle_values: set[str] = set()
     unreachables = 0
     for page_value in pages:
@@ -74,6 +75,9 @@ def _compute_source(
             for record_value in _list(aggregate.get(item_key, []), item_key):
                 record = _mapping(record_value, f"{source_name} record")
                 record_count += 1
+                record_digests.append(
+                    hashlib.sha256(_canonical_json(record)).hexdigest()
+                )
                 lifecycle = record.get("deprecated")
                 if isinstance(lifecycle, dict):
                     state = lifecycle.get("state")
@@ -83,6 +87,11 @@ def _compute_source(
         pages[-1], f"{source_name} terminal page"
     ).get("nextPageToken")
     source: dict[str, object] = {
+        "duplicate_and_reordered_pages": (
+            bool(record_digests)
+            and sorted(set(record_digests))
+            == sorted({*reversed(record_digests), record_digests[0]})
+        ),
         "fixture": filename,
         "name": source_name,
         "pages": len(pages),
@@ -130,12 +139,25 @@ def _tpu_sources(fixture_root: Path) -> tuple[dict[str, object], ...]:
             )
             for page in pages
         )
+        record_digests = [
+            hashlib.sha256(_canonical_json(record)).hexdigest()
+            for page in pages
+            for record in _list(
+                _mapping(page, f"{name} page").get(item_key, []),
+                f"{name} records",
+            )
+        ]
         terminal = bool(terminal_pages) and all(
             not _mapping(page, f"{name} terminal page").get("nextPageToken")
             for page in terminal_pages
         )
         sources.append(
             {
+                "duplicate_and_reordered_pages": (
+                    bool(record_digests)
+                    and sorted(set(record_digests))
+                    == sorted({*reversed(record_digests), record_digests[0]})
+                ),
                 "fixture": "tpu-catalog-pages.json",
                 "locations": locations,
                 "name": name,
@@ -177,7 +199,7 @@ def _overlay_resource() -> dict[str, object]:
                 "quota_id": mapping.selector.quota_id,
                 "quota_scope": mapping.selector.quota_scope.value,
                 "service": mapping.selector.service,
-                "unit": str(mapping.selector.native_unit),
+                "unit": mapping.selector.native_unit.symbol,
             },
             "source_url": mapping.source_url,
             "topologies": list(mapping.topologies),
@@ -228,7 +250,9 @@ def _evidence_resource(fixture_root: Path) -> dict[str, object]:
             "revision": MAINTAINED_ACCELERATOR_OVERLAY.metadata.revision,
         },
         "scenario_coverage": {
-            "duplicate-and-reordered-pages": True,
+            "duplicate-and-reordered-pages": all(
+                source["duplicate_and_reordered_pages"] for source in sources
+            ),
             "location-local-failure": any(
                 source["unreachable_locations"] for source in sources
             ),

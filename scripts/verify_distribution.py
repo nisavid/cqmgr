@@ -152,6 +152,14 @@ def _assert_release_resources(read: Callable[[str], bytes]) -> None:
         )
         document = json.loads(text)
         assert isinstance(document, dict)
+    overlay = json.loads(
+        read(str(PACKAGE_PREFIX / "resources/accelerator-overlay.json"))
+    )
+    assert overlay["schema"] == "cqmgr.accelerator-catalog/v1"
+    assert isinstance(overlay["revision"], str)
+    assert overlay["revision"]
+    assert isinstance(overlay["mappings"], list)
+    assert overlay["mappings"]
     evidence = json.loads(read(str(PACKAGE_PREFIX / "resources/release-evidence.json")))
     assert evidence["schema"] == "cqmgr.release-evidence/v1"
     assert evidence["claims"] == {
