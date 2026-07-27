@@ -1949,13 +1949,12 @@ class CloudQuotaManagerApp(App[None]):
             self._set_status("INVALID REQUEST — target strategy is unsupported")
             return
         if workload is None:
-            if selection is None:  # pragma: no cover - guarded above
-                return
+            selected = cast("QuotaSelection", selection)
             if not target:
                 self._set_status("INVALID REQUEST — absolute target is required")
                 return
             targets = ((None, target),)
-            selector = selection.selector
+            selector = selected.selector
         else:
             selector = None
             if strategy is TargetStrategy.MANUAL:
