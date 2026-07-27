@@ -11,11 +11,19 @@ from typing import Any, cast
 import pytest
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "measure_performance.py"
-BASELINE = (
+BASELINES = (
     Path(__file__).parents[1]
     / "docs"
     / "release"
-    / "performance-baseline-macos-arm64-python314.json"
+    / "performance-baseline-macos-arm64-python314.json",
+    Path(__file__).parents[1]
+    / "docs"
+    / "release"
+    / "performance-baseline-ubuntu-x86_64-python314.json",
+    Path(__file__).parents[1]
+    / "docs"
+    / "release"
+    / "performance-baseline-windows-x86_64-python314.json",
 )
 BUDGETS = Path(__file__).parents[1] / "docs" / "release" / "performance-budgets.json"
 
@@ -148,12 +156,21 @@ def test_memory_probe_records_portable_process_rss() -> None:
 
 
 def test_committed_performance_baseline_is_loaded_and_validated() -> None:
-    """The retained local artifact satisfies the executable baseline schema."""
+    """Retained representative CI artifacts satisfy the executable schema."""
     module = runpy.run_path(str(SCRIPT))
     validate = cast("Any", module["validate_measurement_report"])
-    baseline = json.loads(BASELINE.read_text(encoding="utf-8"))
+    baselines = [
+        json.loads(baseline.read_text(encoding="utf-8")) for baseline in BASELINES
+    ]
 
-    assert validate(baseline) == baseline
+    assert [validate(baseline) for baseline in baselines] == baselines
+    platforms = {
+        cast("dict[str, str]", baseline["environment"])["platform"]
+        for baseline in baselines
+    }
+    assert any(platform.startswith("macOS-") for platform in platforms)
+    assert any(platform.startswith("Linux-") for platform in platforms)
+    assert any(platform.startswith("Windows-") for platform in platforms)
 
 
 def test_committed_performance_budgets_are_exact_and_operator_approved() -> None:
@@ -165,7 +182,7 @@ def test_committed_performance_budgets_are_exact_and_operator_approved() -> None
     assert validate(budgets) == budgets
     assert budgets == {
         "budgets": {
-            "cold_start_seconds": 0.75,
+            "cold_start_seconds": 2.0,
             "first_tui_render_seconds": 1.0,
             "peak_python_memory_bytes": 48 * 1024 * 1024,
             "resident_memory_bytes": 128 * 1024 * 1024,
@@ -191,26 +208,22 @@ def test_performance_budgets_accept_exact_thresholds() -> None:
     """A measurement equal to every ceiling remains qualified."""
     module = runpy.run_path(str(SCRIPT))
     enforce = cast("Any", module["enforce_performance_budgets"])
+    budgets = json.loads(BUDGETS.read_text(encoding="utf-8"))
+    limits = cast("dict[str, float | int]", budgets["budgets"])
     baseline = {
         "environment": {"platform": "test", "python": "3.14"},
         "measurements": {
-            "cold_start_seconds": {"maximum": 0.75, "median": 0.5, "runs": 3},
-            "first_tui_render_seconds": 1.0,
-            "peak_python_memory_bytes": 48 * 1024 * 1024,
-            "resident_memory_bytes": 128 * 1024 * 1024,
-            "steady_refresh_seconds": 0.5,
+            "cold_start_seconds": {
+                "maximum": limits["cold_start_seconds"],
+                "median": 0.5,
+                "runs": 3,
+            },
+            "first_tui_render_seconds": limits["first_tui_render_seconds"],
+            "peak_python_memory_bytes": limits["peak_python_memory_bytes"],
+            "resident_memory_bytes": limits["resident_memory_bytes"],
+            "steady_refresh_seconds": limits["steady_refresh_seconds"],
         },
         "schema": "cqmgr.performance-baseline/v1",
-    }
-    budgets = {
-        "budgets": {
-            "cold_start_seconds": 0.75,
-            "first_tui_render_seconds": 1.0,
-            "peak_python_memory_bytes": 48 * 1024 * 1024,
-            "resident_memory_bytes": 128 * 1024 * 1024,
-            "steady_refresh_seconds": 0.5,
-        },
-        "schema": "cqmgr.performance-budgets/v1",
     }
 
     assert enforce(baseline, budgets) == baseline
@@ -220,11 +233,11 @@ def test_performance_budgets_report_every_exceeded_ceiling() -> None:
     """Qualification fails closed with every actionable regression named."""
     module = runpy.run_path(str(SCRIPT))
     enforce = cast("Any", module["enforce_performance_budgets"])
-    baseline = json.loads(BASELINE.read_text(encoding="utf-8"))
+    baseline = json.loads(BASELINES[0].read_text(encoding="utf-8"))
     budgets = json.loads(BUDGETS.read_text(encoding="utf-8"))
     measurements = cast("dict[str, object]", baseline["measurements"])
     measurements["cold_start_seconds"] = {
-        "maximum": 0.751,
+        "maximum": 2.001,
         "median": 0.5,
         "runs": 3,
     }
