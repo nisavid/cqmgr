@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import platform
 import statistics
 import subprocess
@@ -35,8 +36,9 @@ MEMORY_PROBE = r"""
 import contextlib
 import io
 import json
-import sys
 import tracemalloc
+
+import psutil
 
 tracemalloc.start()
 with (
@@ -46,13 +48,7 @@ with (
     from cqmgr.cli import main
     main(["--help"], prog_name="cqmgr", standalone_mode=False)
 _current, peak = tracemalloc.get_traced_memory()
-try:
-    import resource
-    resident = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    if sys.platform != "darwin":
-        resident *= 1024
-except ImportError:
-    resident = peak
+resident = psutil.Process().memory_info().rss
 print(json.dumps({"peak_python_memory_bytes": peak, "resident_memory_bytes": resident}))
 """
 TUI_PROBE = r"""
@@ -105,6 +101,9 @@ def _positive(value: float, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         msg = f"{name} must be numeric executable evidence"
         raise TypeError(msg)
+    if not math.isfinite(value):
+        msg = f"{name} must contain finite executable evidence"
+        raise ValueError(msg)
     if value <= 0:
         msg = f"{name} must contain positive executable evidence"
         raise ValueError(msg)

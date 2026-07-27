@@ -85,6 +85,26 @@ def test_performance_report_rejects_missing_or_nonpositive_measurements(
         )
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_performance_report_rejects_non_finite_measurements(value: float) -> None:
+    """Non-finite executable evidence cannot bypass ceiling comparisons."""
+    measurement_report = cast(
+        "Any",
+        runpy.run_path(str(SCRIPT))["measurement_report"],
+    )
+
+    with pytest.raises(ValueError, match="finite"):
+        measurement_report(
+            cold_start_seconds=(value,),
+            resident_memory_bytes=1,
+            peak_python_memory_bytes=1,
+            first_tui_render_seconds=1.0,
+            steady_refresh_seconds=1.0,
+            platform_name="test",
+            python_version="3.14",
+        )
+
+
 def test_measure_uses_dedicated_tui_boundaries_not_pytest_process_time() -> None:
     """TUI evidence times actual render and refresh after probe startup."""
     module = runpy.run_path(str(SCRIPT))
@@ -114,6 +134,19 @@ def test_measure_uses_dedicated_tui_boundaries_not_pytest_process_time() -> None
     assert report["measurements"]["steady_refresh_seconds"] == steady_refresh
 
 
+def test_memory_probe_records_portable_process_rss() -> None:
+    """Resident memory is an OS process metric on every supported platform."""
+    module = runpy.run_path(str(SCRIPT))
+    probe = cast("str", module["MEMORY_PROBE"])
+    measure_memory = cast("Any", module["_memory_measurements"])
+
+    assert "psutil.Process().memory_info().rss" in probe
+    assert "resident = peak" not in probe
+    resident, peak = measure_memory()
+    assert resident > 0
+    assert peak > 0
+
+
 def test_committed_performance_baseline_is_loaded_and_validated() -> None:
     """The retained local artifact satisfies the executable baseline schema."""
     module = runpy.run_path(str(SCRIPT))
@@ -140,6 +173,18 @@ def test_committed_performance_budgets_are_exact_and_operator_approved() -> None
         },
         "schema": "cqmgr.performance-budgets/v1",
     }
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_performance_budgets_reject_non_finite_ceilings(value: float) -> None:
+    """Malformed policy values fail before qualification comparisons."""
+    module = runpy.run_path(str(SCRIPT))
+    validate = cast("Any", module["validate_performance_budgets"])
+    budgets = json.loads(BUDGETS.read_text(encoding="utf-8"))
+    cast("dict[str, object]", budgets["budgets"])["cold_start_seconds"] = value
+
+    with pytest.raises(ValueError, match="finite"):
+        validate(budgets)
 
 
 def test_performance_budgets_accept_exact_thresholds() -> None:
