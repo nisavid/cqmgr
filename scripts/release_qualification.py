@@ -34,7 +34,12 @@ def _project_version(project_path: Path) -> str:
     document = tomllib.loads(project_path.read_text(encoding="utf-8"))
     project = document.get("project")
     version = project.get("version") if isinstance(project, dict) else None
-    if not isinstance(version, str) or not version.strip():
+    dynamic = project.get("dynamic") if isinstance(project, dict) else None
+    if (
+        not isinstance(version, str)
+        or not version.strip()
+        or (isinstance(dynamic, list) and "version" in dynamic)
+    ):
         msg = "project version must be one static non-empty string"
         raise ValueError(msg)
     return version

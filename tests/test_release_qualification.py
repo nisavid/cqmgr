@@ -45,6 +45,7 @@ def test_release_identity_binds_static_version_tag_repository_and_main() -> None
 @pytest.mark.parametrize(
     "project_text",
     [
+        ('[project]\nname = "cqmgr"\nversion = "0.1.0"\ndynamic = ["version"]\n'),
         '[project]\nname = "cqmgr"\ndynamic = ["version"]\n',
         '[project]\nname = "cqmgr"\nversion = ""\n',
     ],

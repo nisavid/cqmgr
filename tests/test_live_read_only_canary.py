@@ -329,6 +329,35 @@ def test_shared_request_budget_bounds_wall_clock_and_request_timeout() -> None:
         budget.claim_timeout(10.0)
 
 
+def test_shared_request_budget_rejects_unusable_remaining_timeout() -> None:
+    """A near-zero remainder is classified as budget exhaustion before transport."""
+    module = _module()
+    request_budget_type = cast("Any", module["RequestBudget"])
+    threshold_budget = request_budget_type(
+        max_requests=1,
+        max_seconds=0.1,
+        monotonic=lambda: 10.0,
+    )
+
+    with pytest.raises(ValueError, match="request timeout must be at least"):
+        threshold_budget.claim_timeout(0.099)
+    assert threshold_budget.requests == 0
+
+    assert threshold_budget.claim_timeout(10.0) == pytest.approx(0.1)
+    assert threshold_budget.requests == 1
+
+    observed = iter((10.0, 14.95))
+    budget = request_budget_type(
+        max_requests=1,
+        max_seconds=5.0,
+        monotonic=lambda: next(observed),
+    )
+
+    with pytest.raises(RuntimeError, match="wall-clock deadline"):
+        budget.claim_timeout(10.0)
+    assert budget.requests == 0
+
+
 def test_budget_exhaustion_stops_fanout_and_retains_incomplete_evidence() -> None:
     """A global bound stops before transport and preserves partial safe evidence."""
     module = _module()
@@ -367,9 +396,12 @@ def test_budget_exhaustion_stops_fanout_and_retains_incomplete_evidence() -> Non
     assert evidence["total_requests"] == 1
     sources = cast("list[dict[str, object]]", evidence["sources"])
     assert sources[0]["path"] == "/v3/projects/{project}"
-    assert sources[-1] == {
+    terminal = sources[-1]
+    elapsed_ms = terminal.pop("elapsed_ms")
+    assert isinstance(elapsed_ms, int)
+    assert elapsed_ms >= 0
+    assert terminal == {
         "complete": False,
-        "elapsed_ms": sources[-1]["elapsed_ms"],
         "method": None,
         "pages": 0,
         "path": None,
