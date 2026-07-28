@@ -4,9 +4,6 @@ on:
   schedule:
     - cron: "41 8 * * 1"
   workflow_dispatch:
-  # The called job resolves secrets from its protected environment. GitHub does
-  # not support passing environment secrets through workflow_call.
-  workflow_call:
 
 concurrency:
   group: live-read-only
@@ -21,8 +18,8 @@ jobs:
     name: Bounded keyless provider reads
     # ubuntu-22.04 remains a supported stable GitHub-hosted runner label.
     runs-on: ubuntu-22.04
-    # The protected environment supplies all three GCP values for direct and
-    # reusable invocations; callers cannot override environment secrets.
+    # The protected environment supplies all three GCP values directly to this
+    # job; workflow callers cannot inject or override them.
     timeout-minutes: 15
     environment: live-read-only
     permissions:
