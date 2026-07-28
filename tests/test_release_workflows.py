@@ -199,6 +199,7 @@ def test_release_workflow_builds_once_and_cannot_publish_a_manual_run() -> None:
 def test_release_workflow_qualifies_resolutions_platforms_and_exact_install() -> None:
     """Cover dependency, Python, OS, architecture, and installed-artifact gates."""
     workflow = (WORKFLOWS / "release.yml").read_text()
+    project = (ROOT / "pyproject.toml").read_text()
     build = _workflow_job(workflow, "build")
     resolutions = _workflow_job(workflow, "dependency-resolutions")
     installed = _workflow_job(workflow, "installed-artifacts")
@@ -207,6 +208,10 @@ def test_release_workflow_qualifies_resolutions_platforms_and_exact_install() ->
 
     for resolution in ("locked", "lowest-direct", "fresh"):
         assert resolution in resolutions
+    lowest_direct = _job_step(resolutions, "Resolve lowest direct dependencies")
+    assert "uv lock --resolution lowest-direct" in lowest_direct
+    assert "uv sync --locked --resolution lowest-direct --python 3.12" in lowest_direct
+    assert '"pyyaml>=6.0.1,<7"' in project
     for python in ("3.12", "3.13", "3.14"):
         assert f'- "{python}"' in installed
     for runner in (

@@ -319,7 +319,7 @@ dev = [
     { name = "pyrefly", specifier = ">=1.1,<1.2" },
     { name = "pytest", specifier = ">=9,<10" },
     { name = "pytest-cov", specifier = ">=7,<8" },
-    { name = "pyyaml", specifier = ">=6,<7" },
+    { name = "pyyaml", specifier = ">=6.0.1,<7" },
     { name = "ruff", specifier = ">=0.15,<0.16" },
 ]
 

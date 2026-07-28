@@ -160,7 +160,7 @@ jobs:
         if: matrix.resolution == 'lowest-direct'
         run: |
           uv lock --resolution lowest-direct
-          uv sync --locked --python 3.12
+          uv sync --locked --resolution lowest-direct --python 3.12
 
       - name: Resolve fresh compatible dependencies
         if: matrix.resolution == 'fresh'
