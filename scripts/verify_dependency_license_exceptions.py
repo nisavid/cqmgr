@@ -7,8 +7,8 @@ import tomllib
 from pathlib import Path
 
 REVIEWED_LICENSE_EXCEPTIONS = {
-    "charset-normalizer": "3.4.9",
-    "protobuf": "7.35.1",
+    "charset-normalizer": frozenset({"3.4.9"}),
+    "protobuf": frozenset({"6.33.6", "7.35.1"}),
 }
 
 
@@ -20,16 +20,17 @@ def verify_dependency_license_exceptions(lock_path: Path) -> None:
         msg = "uv.lock must contain a package list"
         raise TypeError(msg)
 
-    for name, expected_version in REVIEWED_LICENSE_EXCEPTIONS.items():
+    for name, expected_versions in REVIEWED_LICENSE_EXCEPTIONS.items():
         versions = [
             package.get("version")
             for package in packages
             if isinstance(package, dict) and package.get("name") == name
         ]
-        if versions != [expected_version]:
+        if len(versions) != 1 or versions[0] not in expected_versions:
+            reviewed = ", ".join(sorted(expected_versions))
             msg = (
-                f"license exception for {name} requires exactly "
-                f"version {expected_version}; review the new artifact before updating"
+                f"license exception for {name} requires exactly one reviewed "
+                f"version ({reviewed}); review the new artifact before updating"
             )
             raise ValueError(msg)
 

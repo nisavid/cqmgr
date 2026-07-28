@@ -211,6 +211,7 @@ def test_release_workflow_qualifies_resolutions_platforms_and_exact_install() ->
     lowest_direct = _job_step(resolutions, "Resolve lowest direct dependencies")
     assert "uv lock --resolution lowest-direct" in lowest_direct
     assert "uv sync --locked --resolution lowest-direct --python 3.12" in lowest_direct
+    assert '"click>=8.2,<9"' in project
     assert '"pyyaml>=6.0.1,<7"' in project
     for python in ("3.12", "3.13", "3.14"):
         assert f'- "{python}"' in installed
