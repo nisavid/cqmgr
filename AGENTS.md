@@ -37,8 +37,7 @@ titles.
 
 For every Git-backed task, use `checkpointing-and-publishing-git-work` at the
 start, at clean checkpoints, and before stopping. Every change requires
-`git diff --check`. Changes to Serena configuration also require
-`serena project health-check .` and `serena memories check`.
+`git diff --check`.
 
 ## Safety
 
