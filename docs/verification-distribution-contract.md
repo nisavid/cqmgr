@@ -435,6 +435,8 @@ stored in CI.
 
 Implementation records cold start, resident and peak memory, first TUI render,
 and steady provider-refresh behavior on representative supported platforms.
+The cold-start budget applies to the median of exactly five isolated launches;
+the maximum remains retained evidence but does not fail qualification by itself.
 The first release cannot publish until reviewed budgets are recorded from that
 baseline. Later releases block material regressions against those budgets.
 This contract does not invent absolute limits before executable evidence

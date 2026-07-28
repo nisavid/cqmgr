@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 BASELINE_SCHEMA = "cqmgr.performance-baseline/v1"
 BUDGET_SCHEMA = "cqmgr.performance-budgets/v1"
+REQUIRED_BUDGET_COLD_START_RUNS = 5
 BUDGET_FIELDS = (
     "cold_start_seconds",
     "first_tui_render_seconds",
@@ -241,13 +242,20 @@ def enforce_performance_budgets(
     measurement_value: object,
     budget_value: object,
 ) -> dict[str, object]:
-    """Fail closed when any executable measurement exceeds its approved ceiling."""
+    """Fail closed when a robust executable measurement exceeds its ceiling."""
     report = validate_measurement_report(measurement_value)
     policy = validate_performance_budgets(budget_value)
     measurements = cast("dict[str, object]", report["measurements"])
     cold_start = cast("dict[str, object]", measurements["cold_start_seconds"])
+    cold_start_runs = cast("int", cold_start["runs"])
+    if cold_start_runs != REQUIRED_BUDGET_COLD_START_RUNS:
+        msg = (
+            "cold-start budget qualification requires exactly "
+            f"{REQUIRED_BUDGET_COLD_START_RUNS} samples"
+        )
+        raise ValueError(msg)
     actuals: dict[str, float | int] = {
-        "cold_start_seconds": cast("float", cold_start["maximum"]),
+        "cold_start_seconds": cast("float", cold_start["median"]),
         "first_tui_render_seconds": cast(
             "float",
             measurements["first_tui_render_seconds"],
@@ -374,7 +382,11 @@ def measure(runs: int) -> dict[str, object]:
 def main(arguments: Sequence[str] | None = None) -> None:
     """Measure the current executable environment and write canonical JSON."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--runs", type=int, default=5)
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=REQUIRED_BUDGET_COLD_START_RUNS,
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--budgets", type=Path)
     parsed = parser.parse_args(arguments)
