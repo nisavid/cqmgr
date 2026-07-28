@@ -25,7 +25,7 @@ class MutationVerifier(Protocol):
         minimum_score: float,
     ) -> float:
         """Verify one mutation result mapping."""
-        ...
+        raise NotImplementedError
 
 
 def _verify() -> MutationVerifier:

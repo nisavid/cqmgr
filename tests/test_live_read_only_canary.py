@@ -6,6 +6,7 @@ import json
 import runpy
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -490,15 +491,16 @@ def test_canary_uses_exact_single_metric_monitoring_filters() -> None:
         def request(self, method: str, url: str, **kwargs: object) -> Response:
             assert method == "GET"
             params = cast("dict[str, str]", kwargs["params"])
-            if "monitoring.googleapis.com" in url:
+            hostname = urlsplit(url).hostname
+            if hostname == "monitoring.googleapis.com":
                 self.monitoring_filters.append(params["filter"])
                 return Response({"timeSeries": []})
-            if "cloudquotas.googleapis.com" in url:
+            if hostname == "cloudquotas.googleapis.com":
                 item_key = (
                     "quotaPreferences" if "quotaPreferences" in url else "quotaInfos"
                 )
                 return Response({item_key: []})
-            if "compute.googleapis.com" in url:
+            if hostname == "compute.googleapis.com":
                 return Response({"items": {}})
             if url.endswith("/locations"):
                 return Response({"locations": []})
