@@ -296,7 +296,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "click", specifier = ">=8.1,<9" },
+    { name = "click", specifier = ">=8.2,<9" },
     { name = "google-auth", specifier = ">=2.38,<3" },
     { name = "google-cloud-compute", specifier = ">=1.49,<2" },
     { name = "google-cloud-monitoring", specifier = ">=2.28,<3" },

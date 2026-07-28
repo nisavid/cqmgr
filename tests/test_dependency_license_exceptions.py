@@ -1,5 +1,6 @@
 """Exact-version guard for dependency-license review exceptions."""
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,17 @@ def _verify(lock_path: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _with_protobuf_version(lock: str, version: str) -> str:
+    changed, replacements = re.subn(
+        r'(\[\[package\]\]\nname = "protobuf"\nversion = ")[^"]+',
+        rf"\g<1>{version}",
+        lock,
+        count=1,
+    )
+    assert replacements == 1
+    return changed
+
+
 def test_reviewed_license_exceptions_match_the_lock() -> None:
     """The committed exceptions describe exactly the current locked artifacts."""
     result = _verify(ROOT / "uv.lock")
@@ -30,12 +42,7 @@ def test_reviewed_license_exceptions_match_the_lock() -> None:
 def test_reviewed_license_exception_rejects_a_version_change(tmp_path: Path) -> None:
     """A dependency update fails until its license metadata is reviewed again."""
     current = (ROOT / "uv.lock").read_text()
-    changed = current.replace(
-        'name = "protobuf"\nversion = "7.35.1"',
-        'name = "protobuf"\nversion = "8.0.0"',
-        1,
-    )
-    assert changed != current
+    changed = _with_protobuf_version(current, "8.0.0")
     lock_path = tmp_path / "uv.lock"
     lock_path.write_text(changed)
 
