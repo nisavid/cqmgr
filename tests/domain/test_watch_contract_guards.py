@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import typing
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Any, cast
 
 import pytest
 
@@ -213,7 +213,7 @@ def test_unknown_watch_child_rejects_untyped_resolution() -> None:
     with pytest.raises(ValueError, match="unknown resolution"):
         replace(
             child,
-            unknown_resolution=cast("Any", "accepted"),
+            unknown_resolution=typing.cast("typing.Any", "accepted"),
             resolution_checkpoint=1,
         )
 
@@ -273,8 +273,13 @@ def test_watch_subject_rejects_child_from_another_resource_scope() -> None:
 @pytest.mark.parametrize(
     ("child", "status", "error", "match"),
     [
-        (cast("Any", None), None, TypeError, "summary child"),
-        (_child(), cast("Any", "pending"), TypeError, "summary status"),
+        (typing.cast("typing.Any", None), None, TypeError, "summary child"),
+        (
+            _child(),
+            typing.cast("typing.Any", "pending"),
+            TypeError,
+            "summary status",
+        ),
         (
             _child(disposition=ApplyChildDisposition.FAILED),
             _status(_child(disposition=ApplyChildDisposition.FAILED)),
@@ -349,7 +354,7 @@ def test_watch_checkpoint_requires_complete_local_identity(field_name: str) -> N
 def test_watch_checkpoint_requires_typed_subject_and_aggregate() -> None:
     """Checkpoint storage accepts only typed subject and aggregate evidence."""
     with pytest.raises(TypeError, match="subject and aggregate"):
-        replace(_checkpoint(), subject=cast("Any", None))
+        replace(_checkpoint(), subject=typing.cast("typing.Any", None))
 
 
 def test_watch_checkpoint_rejects_aggregate_from_another_subject() -> None:
@@ -368,8 +373,8 @@ def test_watch_checkpoint_rejects_aggregate_from_another_subject() -> None:
 @pytest.mark.parametrize(
     "lineages",
     [
-        cast("Any", []),
-        (cast("Any", "not-lineage"),),
+        typing.cast("typing.Any", []),
+        (typing.cast("typing.Any", "not-lineage"),),
         (WatchChildLineage("foreign", "etag-foreign", None),),
     ],
 )

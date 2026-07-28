@@ -6,7 +6,7 @@ import base64
 import hashlib
 import hmac
 import json
-from typing import Any, cast
+import typing
 
 import pytest
 
@@ -65,14 +65,20 @@ def test_resume_codec_round_trips_canonical_authenticated_claims() -> None:
 def test_resume_codec_rejects_untyped_encode_input() -> None:
     """Encoding accepts only the typed claims boundary."""
     with pytest.raises(TypeError, match="claims must be typed"):
-        HmacWatchResumeCodec().encode(cast("Any", _mapping()), KEY)
+        HmacWatchResumeCodec().encode(
+            typing.cast("typing.Any", _mapping()),
+            KEY,
+        )
 
 
-@pytest.mark.parametrize("token", [cast("Any", None), "unsupported:token"])
+@pytest.mark.parametrize(
+    "token",
+    [typing.cast("typing.Any", None), "unsupported:token"],
+)
 def test_resume_codec_rejects_unsupported_token_shapes(token: object) -> None:
     """Unknown prefixes and non-string tokens fail before decoding."""
     with pytest.raises(ValueError, match="unsupported Watch resume token"):
-        HmacWatchResumeCodec().decode(cast("Any", token), KEY)
+        HmacWatchResumeCodec().decode(typing.cast("typing.Any", token), KEY)
 
 
 def test_resume_codec_rejects_invalid_base64() -> None:

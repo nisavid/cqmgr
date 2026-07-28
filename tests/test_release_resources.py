@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import runpy
+import typing
 from pathlib import Path
-from typing import Any, cast
 
 from cqmgr.domain.accelerator_overlay import MAINTAINED_ACCELERATOR_OVERLAY
 
@@ -19,7 +19,10 @@ def test_checked_in_release_resources_match_the_deterministic_generator(
 ) -> None:
     """Reviewed resource bytes are reproducible from public hermetic fixtures."""
     module = runpy.run_path(str(SCRIPT))
-    generate_release_resources = cast("Any", module["generate_release_resources"])
+    generate_release_resources = typing.cast(
+        "typing.Any",
+        module["generate_release_resources"],
+    )
 
     generate_release_resources(ROOT / "tests" / "fixtures" / "google", tmp_path)
 
@@ -81,8 +84,8 @@ def test_release_evidence_records_exact_sources_and_honest_limitations() -> None
 def test_duplicate_and_reordered_coverage_is_a_derived_executable_scenario() -> None:
     """Coverage requires two identities and proves reorder plus dedup normalization."""
     module = runpy.run_path(str(SCRIPT))
-    covers = cast(
-        "Any",
+    covers = typing.cast(
+        "typing.Any",
         module["_covers_derived_duplicate_and_reordered_pages"],
     )
 

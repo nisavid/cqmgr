@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 import runpy
 import sys
+import typing
 from pathlib import Path
-from typing import Any, cast
 
 import pytest
 
@@ -32,8 +32,8 @@ def test_performance_report_records_every_required_axis_without_invented_budgets
     None
 ):
     """Executable measurements are evidence; operator-reviewed limits are separate."""
-    measurement_report = cast(
-        "Any",
+    measurement_report = typing.cast(
+        "typing.Any",
         runpy.run_path(str(SCRIPT))["measurement_report"],
     )
 
@@ -76,8 +76,8 @@ def test_performance_report_rejects_missing_or_nonpositive_measurements(
     cold_starts: tuple[float, ...],
 ) -> None:
     """Incomplete evidence cannot be mistaken for a reviewed baseline."""
-    measurement_report = cast(
-        "Any",
+    measurement_report = typing.cast(
+        "typing.Any",
         runpy.run_path(str(SCRIPT))["measurement_report"],
     )
 
@@ -96,8 +96,8 @@ def test_performance_report_rejects_missing_or_nonpositive_measurements(
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
 def test_performance_report_rejects_non_finite_measurements(value: float) -> None:
     """Non-finite executable evidence cannot bypass ceiling comparisons."""
-    measurement_report = cast(
-        "Any",
+    measurement_report = typing.cast(
+        "typing.Any",
         runpy.run_path(str(SCRIPT))["measurement_report"],
     )
 
@@ -116,7 +116,7 @@ def test_performance_report_rejects_non_finite_measurements(value: float) -> Non
 def test_measure_uses_dedicated_tui_boundaries_not_pytest_process_time() -> None:
     """TUI evidence times actual render and refresh after probe startup."""
     module = runpy.run_path(str(SCRIPT))
-    measure = cast("Any", module["measure"])
+    measure = typing.cast("typing.Any", module["measure"])
     commands: list[tuple[str, ...]] = []
     runs = 2
     first_render = 0.2
@@ -145,8 +145,8 @@ def test_measure_uses_dedicated_tui_boundaries_not_pytest_process_time() -> None
 def test_memory_probe_records_portable_process_rss() -> None:
     """Resident memory is an OS process metric on every supported platform."""
     module = runpy.run_path(str(SCRIPT))
-    probe = cast("str", module["MEMORY_PROBE"])
-    measure_memory = cast("Any", module["_memory_measurements"])
+    probe = typing.cast("str", module["MEMORY_PROBE"])
+    measure_memory = typing.cast("typing.Any", module["_memory_measurements"])
 
     assert "psutil.Process().memory_info().rss" in probe
     assert "resident = peak" not in probe
@@ -158,14 +158,14 @@ def test_memory_probe_records_portable_process_rss() -> None:
 def test_committed_performance_baseline_is_loaded_and_validated() -> None:
     """Retained representative CI artifacts satisfy the executable schema."""
     module = runpy.run_path(str(SCRIPT))
-    validate = cast("Any", module["validate_measurement_report"])
+    validate = typing.cast("typing.Any", module["validate_measurement_report"])
     baselines = [
         json.loads(baseline.read_text(encoding="utf-8")) for baseline in BASELINES
     ]
 
     assert [validate(baseline) for baseline in baselines] == baselines
     platforms = {
-        cast("dict[str, str]", baseline["environment"])["platform"]
+        typing.cast("dict[str, str]", baseline["environment"])["platform"]
         for baseline in baselines
     }
     assert any(platform.startswith("macOS-") for platform in platforms)
@@ -176,7 +176,7 @@ def test_committed_performance_baseline_is_loaded_and_validated() -> None:
 def test_committed_performance_budgets_are_exact_and_operator_approved() -> None:
     """The retained policy records exactly the five approved regression ceilings."""
     module = runpy.run_path(str(SCRIPT))
-    validate = cast("Any", module["validate_performance_budgets"])
+    validate = typing.cast("typing.Any", module["validate_performance_budgets"])
     budgets = json.loads(BUDGETS.read_text(encoding="utf-8"))
 
     assert validate(budgets) == budgets
@@ -196,9 +196,9 @@ def test_committed_performance_budgets_are_exact_and_operator_approved() -> None
 def test_performance_budgets_reject_non_finite_ceilings(value: float) -> None:
     """Malformed policy values fail before qualification comparisons."""
     module = runpy.run_path(str(SCRIPT))
-    validate = cast("Any", module["validate_performance_budgets"])
+    validate = typing.cast("typing.Any", module["validate_performance_budgets"])
     budgets = json.loads(BUDGETS.read_text(encoding="utf-8"))
-    cast("dict[str, object]", budgets["budgets"])["cold_start_seconds"] = value
+    typing.cast("dict[str, object]", budgets["budgets"])["cold_start_seconds"] = value
 
     with pytest.raises(ValueError, match="finite"):
         validate(budgets)
@@ -207,9 +207,9 @@ def test_performance_budgets_reject_non_finite_ceilings(value: float) -> None:
 def test_performance_budgets_accept_exact_thresholds() -> None:
     """A measurement equal to every ceiling remains qualified."""
     module = runpy.run_path(str(SCRIPT))
-    enforce = cast("Any", module["enforce_performance_budgets"])
+    enforce = typing.cast("typing.Any", module["enforce_performance_budgets"])
     budgets = json.loads(BUDGETS.read_text(encoding="utf-8"))
-    limits = cast("dict[str, float | int]", budgets["budgets"])
+    limits = typing.cast("dict[str, float | int]", budgets["budgets"])
     baseline = {
         "environment": {"platform": "test", "python": "3.14"},
         "measurements": {
@@ -232,10 +232,10 @@ def test_performance_budgets_accept_exact_thresholds() -> None:
 def test_performance_budgets_report_every_exceeded_ceiling() -> None:
     """Qualification fails closed with every actionable regression named."""
     module = runpy.run_path(str(SCRIPT))
-    enforce = cast("Any", module["enforce_performance_budgets"])
+    enforce = typing.cast("typing.Any", module["enforce_performance_budgets"])
     baseline = json.loads(BASELINES[0].read_text(encoding="utf-8"))
     budgets = json.loads(BUDGETS.read_text(encoding="utf-8"))
-    measurements = cast("dict[str, object]", baseline["measurements"])
+    measurements = typing.cast("dict[str, object]", baseline["measurements"])
     measurements["cold_start_seconds"] = {
         "maximum": 2.001,
         "median": 0.5,
