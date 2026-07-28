@@ -183,6 +183,149 @@ def test_page_limit_blocks_an_unexhausted_source() -> None:
         )
 
 
+def test_page_limit_retains_sanitized_incomplete_evidence(tmp_path: Path) -> None:
+    """A source bound stops fanout and preserves safe partial evidence."""
+    module = _module()
+    run_canary = cast("Any", module["run_canary"])
+    write_evidence = cast("Any", module["_write_evidence"])
+    project = "dedicated-canary"
+
+    class Response:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            return
+
+        def json(self) -> dict[str, object]:
+            return self.payload
+
+    class Session:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def request(self, method: str, url: str, **kwargs: object) -> Response:
+            del method, url, kwargs
+            self.calls += 1
+            if self.calls == 1:
+                return Response({"name": f"projects/{project}"})
+            return Response(
+                {
+                    "quotaInfos": [{"name": f"projects/{project}/quotaInfos/private"}],
+                    "nextPageToken": "private-token",
+                }
+            )
+
+    session = Session()
+    evidence = run_canary(
+        session,
+        project,
+        max_pages=1,
+        timeout=1.0,
+        max_requests=10,
+        max_seconds=30.0,
+        max_locations=10,
+    )
+
+    expected_requests = 2
+    assert session.calls == expected_requests
+    assert evidence["complete"] is False
+    assert evidence["failure"] == "page-limit"
+    assert evidence["total_requests"] == expected_requests
+    sources = cast("list[dict[str, object]]", evidence["sources"])
+    terminal = sources[-1]
+    assert terminal["complete"] is False
+    assert terminal["method"] == "GET"
+    assert terminal["pages"] == 1
+    assert terminal["path"] == (
+        "/v1/projects/{project}/locations/global/services/{service}/quotaInfos"
+    )
+    assert terminal["reason"] == "page-limit"
+    assert terminal["records"] == 1
+    assert str(terminal["digest"]).startswith("sha256:")
+    encoded = json.dumps(evidence, sort_keys=True)
+    assert project not in encoded
+    assert "private-token" not in encoded
+    assert "quotaInfos/private" not in encoded
+    output = tmp_path / "evidence.json"
+    with pytest.raises(SystemExit) as raised:
+        write_evidence(output, evidence)
+    assert raised.value.code == 1
+    assert json.loads(output.read_text()) == evidence
+
+
+def test_location_limit_retains_sanitized_incomplete_evidence() -> None:
+    """A TPU fanout bound stops before zone reads and preserves safe evidence."""
+    module = _module()
+    run_canary = cast("Any", module["run_canary"])
+
+    class Response:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            return
+
+        def json(self) -> dict[str, object]:
+            return self.payload
+
+    class Session:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        def request(self, method: str, url: str, **kwargs: object) -> Response:
+            del method, kwargs
+            self.urls.append(url)
+            hostname = urlsplit(url).hostname
+            if hostname == "cloudquotas.googleapis.com":
+                item_key = (
+                    "quotaPreferences" if "quotaPreferences" in url else "quotaInfos"
+                )
+                return Response({item_key: []})
+            if hostname == "monitoring.googleapis.com":
+                return Response({"timeSeries": []})
+            if hostname == "compute.googleapis.com":
+                return Response({"items": {}})
+            if url.endswith("/locations"):
+                return Response(
+                    {
+                        "locations": [
+                            {"locationId": "us-central1"},
+                            {"locationId": "us-east1"},
+                        ]
+                    }
+                )
+            return Response({})
+
+    session = Session()
+    evidence = run_canary(
+        session,
+        "dedicated-canary",
+        max_pages=1,
+        timeout=1.0,
+        max_requests=20,
+        max_seconds=30.0,
+        max_locations=1,
+    )
+
+    assert evidence["complete"] is False
+    assert evidence["failure"] == "location-limit"
+    terminal = cast("list[dict[str, object]]", evidence["sources"])[-1]
+    assert terminal["method"] is None
+    assert terminal["path"] == "/v2/projects/{project}/locations"
+    assert terminal["reason"] == "location-limit"
+    expected_locations = 2
+    assert terminal["records"] == expected_locations
+    encoded = json.dumps(evidence, sort_keys=True)
+    assert "us-central1" not in encoded
+    assert "us-east1" not in encoded
+    assert all(
+        f"/locations/{location}/" not in url
+        for url in session.urls
+        for location in ("us-central1", "us-east1")
+    )
+
+
 def test_compute_aggregated_pages_count_nested_records_not_scope_wrappers() -> None:
     """Warnings and scope wrappers never inflate specialized-hardware evidence."""
     module = _module()

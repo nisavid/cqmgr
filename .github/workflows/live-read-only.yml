@@ -56,7 +56,7 @@ jobs:
           uv run --locked --no-dev --no-sync
           python scripts/live_read_only_canary.py
           --project-env GCP_PROJECT_ID
-          --max-pages 20
+          --max-pages 50
           --max-requests 100
           --max-seconds 120
           --max-locations 100

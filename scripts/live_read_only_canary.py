@@ -91,6 +91,15 @@ class RequestBudgetError(RuntimeError):
         self.reason = reason
 
 
+class SourceLimitError(RuntimeError):
+    """One per-source bound stopped canary fanout with sanitized evidence."""
+
+    def __init__(self, message: str, evidence: dict[str, object]) -> None:
+        """Retain only public path shape, counts, and safe aggregate evidence."""
+        super().__init__(message)
+        self.evidence = evidence
+
+
 @dataclass(slots=True)
 class RequestBudget:
     """Enforce one request and wall-clock budget across the complete canary."""
@@ -254,8 +263,19 @@ def read_pages(  # noqa: PLR0913 - one explicit bounded request contract
             msg = "provider page token must be a string"
             raise TypeError(msg)
         request_params["pageToken"] = token
+    elapsed = time.monotonic() - started
+    evidence = {
+        "complete": False,
+        "digest": "sha256:" + hashlib.sha256("".join(digests).encode()).hexdigest(),
+        "elapsed_ms": round(elapsed * 1000),
+        "method": method,
+        "pages": max_pages,
+        "path": path_template,
+        "reason": "page-limit",
+        "records": record_count,
+    }
     msg = f"provider source exceeded page limit {max_pages}: {path_template}"
-    raise RuntimeError(msg)
+    raise SourceLimitError(msg, evidence)
 
 
 def read_once(  # noqa: PLR0913 - one explicit bounded request contract
@@ -311,8 +331,16 @@ def _location_ids(
             raise RuntimeError(msg)
         locations.add(location)
         if len(locations) > max_locations:
+            evidence: dict[str, object] = {
+                "complete": False,
+                "method": None,
+                "pages": 0,
+                "path": "/v2/projects/{project}/locations",
+                "reason": "location-limit",
+                "records": len(locations),
+            }
             msg = f"TPU location source exceeded location limit {max_locations}"
-            raise RuntimeError(msg)
+            raise SourceLimitError(msg, evidence)
     return tuple(sorted(locations))
 
 
@@ -505,6 +533,34 @@ def _budget_failure_evidence(
     }
 
 
+def _source_limit_failure_evidence(
+    error: SourceLimitError,
+    *,
+    budget: RequestBudget,
+    sources: list[dict[str, object]],
+    state: dict[str, int],
+) -> dict[str, object]:
+    """Retain sanitized partial evidence after one source reaches its bound."""
+    terminal = {
+        "elapsed_ms": budget.observed_elapsed_ms(),
+        **error.evidence,
+    }
+    return {
+        "claims": {
+            "physical_capacity": False,
+            "universal_availability": False,
+        },
+        "complete": False,
+        "failure": error.evidence["reason"],
+        "schema": CANARY_SCHEMA,
+        "services": list(SERVICES),
+        "sources": [*sources, terminal],
+        "tpu_locations": state["tpu_locations"],
+        "total_elapsed_ms": budget.observed_elapsed_ms(),
+        "total_requests": budget.requests,
+    }
+
+
 def run_canary(  # noqa: PLR0913 - explicit global and per-request bounds
     session: SessionLike,
     project: str,
@@ -544,6 +600,13 @@ def run_canary(  # noqa: PLR0913 - explicit global and per-request bounds
         )
     except RequestBudgetError as error:
         return _budget_failure_evidence(
+            error,
+            budget=budget,
+            sources=sources,
+            state=state,
+        )
+    except SourceLimitError as error:
+        return _source_limit_failure_evidence(
             error,
             budget=budget,
             sources=sources,
