@@ -234,7 +234,7 @@ def test_page_limit_retains_sanitized_incomplete_evidence(tmp_path: Path) -> Non
         project,
         max_pages=1,
         timeout=1.0,
-        max_requests=10,
+        max_requests=30,
         max_seconds=30.0,
         max_locations=10,
     )
@@ -397,6 +397,179 @@ def test_location_limit_retains_sanitized_incomplete_evidence() -> None:
         for url in session.urls
         for location in ("us-central1", "us-east1")
     )
+
+
+def test_ordinary_canary_completes_121_location_one_page_provider_inventory() -> None:
+    """The ordinary envelope covers current exhaustive TPU provider fanout."""
+    module = _module()
+    run_canary = cast("Any", module["run_canary"])
+    expected_max_requests = 275
+    expected_max_seconds = 180.0
+    expected_max_locations = 125
+    expected_max_pages = 50
+    expected_request_timeout = 10.0
+    expected_locations = 121
+    expected_requests = 252
+
+    assert module["DEFAULT_MAX_REQUESTS"] == expected_max_requests
+    assert module["DEFAULT_MAX_SECONDS"] == expected_max_seconds
+    assert module["DEFAULT_MAX_LOCATIONS"] == expected_max_locations
+    assert module["DEFAULT_MAX_PAGES"] == expected_max_pages
+    assert module["DEFAULT_REQUEST_TIMEOUT_SECONDS"] == expected_request_timeout
+
+    class Response:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            return
+
+        def json(self) -> dict[str, object]:
+            return self.payload
+
+    class Session:
+        def request(self, method: str, url: str, **kwargs: object) -> Response:
+            assert method == "GET"
+            assert cast("float", kwargs["timeout"]) <= expected_request_timeout
+            hostname = urlsplit(url).hostname
+            if hostname == "cloudquotas.googleapis.com":
+                item_key = (
+                    "quotaPreferences" if "quotaPreferences" in url else "quotaInfos"
+                )
+                return Response({item_key: []})
+            if hostname == "monitoring.googleapis.com":
+                return Response({"timeSeries": []})
+            if hostname == "compute.googleapis.com":
+                return Response({"items": {}})
+            if url.endswith("/locations"):
+                return Response(
+                    {
+                        "locations": [
+                            {"locationId": f"provider-location-{index}"}
+                            for index in range(expected_locations)
+                        ]
+                    }
+                )
+            return Response(
+                {
+                    (
+                        "acceleratorTypes"
+                        if url.endswith("/acceleratorTypes")
+                        else "runtimeVersions"
+                    ): []
+                }
+            )
+
+    evidence = run_canary(
+        Session(),
+        "dedicated-canary",
+        max_pages=module["DEFAULT_MAX_PAGES"],
+        timeout=module["DEFAULT_REQUEST_TIMEOUT_SECONDS"],
+        max_requests=module["DEFAULT_MAX_REQUESTS"],
+        max_seconds=module["DEFAULT_MAX_SECONDS"],
+        max_locations=module["DEFAULT_MAX_LOCATIONS"],
+    )
+
+    assert evidence["complete"] is True
+    assert evidence["tpu_locations"] == expected_locations
+    assert evidence["total_requests"] == expected_requests
+
+
+def test_ordinary_canary_rejects_126th_unique_location_before_child_fanout(  # noqa: C901 - explicit provider boundary fixture
+) -> None:
+    """The location boundary retains safe evidence before any TPU child read."""
+    run_canary = cast("Any", _module()["run_canary"])
+    expected_locations = 126
+    expected_fixed_requests = 10
+    locations = [f"private-location-{index}" for index in range(expected_locations)]
+
+    class Response:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            return
+
+        def json(self) -> dict[str, object]:
+            return self.payload
+
+    class Session:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        def request(self, method: str, url: str, **kwargs: object) -> Response:
+            del method, kwargs
+            self.urls.append(url)
+            hostname = urlsplit(url).hostname
+            if hostname == "cloudquotas.googleapis.com":
+                item_key = (
+                    "quotaPreferences" if "quotaPreferences" in url else "quotaInfos"
+                )
+                return Response({item_key: []})
+            if hostname == "monitoring.googleapis.com":
+                return Response({"timeSeries": []})
+            if hostname == "compute.googleapis.com":
+                return Response({"items": {}})
+            if url.endswith("/locations"):
+                return Response(
+                    {"locations": [{"locationId": location} for location in locations]}
+                )
+            if hostname == "cloudresourcemanager.googleapis.com":
+                return Response({})
+            pytest.fail(f"unexpected TPU child fanout: {url}")
+
+    session = Session()
+    evidence = run_canary(
+        session,
+        "dedicated-canary",
+        max_pages=50,
+        timeout=10.0,
+        max_requests=275,
+        max_seconds=180.0,
+        max_locations=125,
+    )
+
+    assert evidence["complete"] is False
+    assert evidence["failure"] == "location-limit"
+    assert evidence["total_requests"] == expected_fixed_requests
+    terminal = cast("list[dict[str, object]]", evidence["sources"])[-1]
+    assert terminal["path"] == "/v2/projects/{project}/locations"
+    assert terminal["reason"] == "location-limit"
+    assert terminal["records"] == expected_locations
+    assert not any(
+        f"/locations/{location}/" in url
+        for url in session.urls
+        for location in locations
+    )
+    encoded = json.dumps(evidence, sort_keys=True)
+    assert all(location not in encoded for location in locations)
+
+
+def test_canary_rejects_request_budget_that_cannot_cover_location_fanout() -> None:
+    """Impossible ordinary-canary bounds fail before provider transport."""
+    run_canary = cast("Any", _module()["run_canary"])
+
+    class Session:
+        def request(self, method: str, url: str, **kwargs: object) -> object:
+            pytest.fail(f"configuration reached transport: {method} {url} {kwargs}")
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"global request limit 259 cannot cover at least one request for each "
+            r"of 10 fixed sources "
+            r"plus 2 requests for each of 125 TPU locations; minimum is 260"
+        ),
+    ):
+        run_canary(
+            Session(),
+            "dedicated-canary",
+            max_pages=50,
+            timeout=10.0,
+            max_requests=259,
+            max_seconds=180.0,
+            max_locations=125,
+        )
 
 
 def test_compute_aggregated_pages_count_nested_records_not_scope_wrappers() -> None:
@@ -581,11 +754,14 @@ def test_budget_exhaustion_stops_fanout_and_retains_incomplete_evidence() -> Non
     run_canary = cast("Any", module["run_canary"])
 
     class Response:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.payload = payload
+
         def raise_for_status(self) -> None:
             return
 
         def json(self) -> dict[str, object]:
-            return {}
+            return self.payload
 
     class Session:
         def __init__(self) -> None:
@@ -594,23 +770,31 @@ def test_budget_exhaustion_stops_fanout_and_retains_incomplete_evidence() -> Non
         def request(self, method: str, url: str, **kwargs: object) -> Response:
             del method, url, kwargs
             self.calls += 1
-            return Response()
+            if self.calls == 1:
+                return Response({})
+            return Response(
+                {
+                    "quotaInfos": [],
+                    "nextPageToken": "opaque-page-token",
+                }
+            )
 
     session = Session()
+    expected_request_limit = 12
     evidence = run_canary(
         session,
         "dedicated-canary",
-        max_pages=1,
+        max_pages=50,
         timeout=1.0,
-        max_requests=1,
+        max_requests=expected_request_limit,
         max_seconds=30.0,
-        max_locations=10,
+        max_locations=1,
     )
 
-    assert session.calls == 1
+    assert session.calls == expected_request_limit
     assert evidence["complete"] is False
     assert evidence["failure"] == "budget-exhausted"
-    assert evidence["total_requests"] == 1
+    assert evidence["total_requests"] == expected_request_limit
     sources = cast("list[dict[str, object]]", evidence["sources"])
     assert sources[0]["path"] == "/v3/projects/{project}"
     terminal = sources[-1]
@@ -776,7 +960,7 @@ def test_canary_uses_exact_single_metric_monitoring_filters() -> None:
         "dedicated-canary",
         max_pages=1,
         timeout=1.0,
-        max_requests=20,
+        max_requests=30,
         max_seconds=30.0,
         max_locations=10,
     )
@@ -858,7 +1042,7 @@ def test_canary_bounds_compute_inventory_to_specialized_machine_shapes() -> None
         timeout=1.0,
         max_requests=100,
         max_seconds=30.0,
-        max_locations=100,
+        max_locations=10,
     )
 
     assert session.compute_params == {
@@ -1238,7 +1422,7 @@ def test_malformed_page_token_becomes_sanitized_incomplete_evidence() -> None:
         timeout=1.0,
         max_requests=100,
         max_seconds=30.0,
-        max_locations=100,
+        max_locations=10,
     )
 
     assert evidence["complete"] is False
@@ -1286,7 +1470,7 @@ def test_malformed_tpu_location_becomes_sanitized_incomplete_evidence() -> None:
         timeout=1.0,
         max_requests=100,
         max_seconds=30.0,
-        max_locations=100,
+        max_locations=10,
     )
 
     assert evidence["complete"] is False
@@ -1332,7 +1516,7 @@ def test_provider_failure_retains_sanitized_incomplete_evidence(
         timeout=1.0,
         max_requests=100,
         max_seconds=30.0,
-        max_locations=100,
+        max_locations=10,
     )
 
     assert evidence["complete"] is False
