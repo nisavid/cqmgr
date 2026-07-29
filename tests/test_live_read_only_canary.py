@@ -516,7 +516,7 @@ def test_ordinary_canary_rejects_126th_unique_location_before_child_fanout(  # n
                 )
             if hostname == "cloudresourcemanager.googleapis.com":
                 return Response({})
-            pytest.fail(f"unexpected TPU child fanout: {url}")
+            return pytest.fail(f"unexpected TPU child fanout: {url}")
 
     session = Session()
     evidence = run_canary(
