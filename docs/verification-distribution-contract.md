@@ -411,10 +411,15 @@ transport are explicit. Both canaries use exact resource and quota projects,
 services, regions, page limits, retry limits, and wall-clock deadlines.
 The ordinary release canary caps each pageable source at 50 pages, the complete
 run at 500 requests and 1,200 seconds, each request at 10 seconds, and TPU
-fanout at 125 locations. Configuration fails before transport unless its
-request limit can cover at least one request for each of the 10 fixed sources
-plus two child requests for every allowed TPU location. Exceeding any runtime
-bound fails closed after retaining sanitized incomplete evidence.
+fanout at 125 locations. A timeout, connection failure, HTTP `408`, HTTP `429`,
+or HTTP `5xx` response receives at most one retry after a one-second backoff
+under those same global bounds. Other HTTP failures and provider schema failures
+fail immediately. Sanitized source evidence records only the failure class and
+transient-retry count, never exception text, response bodies, resource names, or
+provider identifiers. Configuration fails before transport unless its request
+limit can cover at least one request for each of the 10 fixed sources plus two
+child requests for every allowed TPU location. Exceeding any runtime bound fails
+closed after retaining sanitized incomplete evidence.
 
 The identity deliberately lacks quota-update, service-enablement, and resource
 provisioning permissions. The ordinary canary composition contains no create,

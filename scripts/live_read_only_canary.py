@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -13,6 +14,8 @@ from datetime import UTC, datetime, timedelta
 from importlib.resources import files
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
+
+import requests
 
 from cqmgr.domain.accelerator_overlay import MAINTAINED_ACCELERATOR_OVERLAY
 
@@ -34,8 +37,15 @@ DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_REQUESTS = 500
 DEFAULT_MAX_SECONDS = 1200.0
 DEFAULT_MAX_LOCATIONS = 125
+DEFAULT_MAX_TRANSIENT_RETRIES = 1
+DEFAULT_RETRY_BACKOFF_SECONDS = 1.0
 MINIMUM_FIXED_SOURCE_REQUESTS = 10
 TPU_CHILD_REQUESTS_PER_LOCATION = 2
+TRANSIENT_HTTP_STATUS_CODES = frozenset({408, 429})
+HTTP_CLIENT_ERROR_MIN = 400
+HTTP_CLIENT_ERROR_MAX = 499
+HTTP_SERVER_ERROR_MIN = 500
+HTTP_SERVER_ERROR_MAX = 599
 ALLOWED_GET_PATHS = frozenset(
     {
         "/v3/projects/{project}",
@@ -195,13 +205,33 @@ class SourceEvidenceError(RuntimeError):
         self.evidence = evidence
 
 
+class ProviderReadError(RuntimeError):
+    """One provider boundary failed after its allowed transient retries."""
+
+    def __init__(
+        self,
+        failure_class: str,
+        *,
+        transient_retries: int,
+        last_transient_failure_class: str | None,
+    ) -> None:
+        """Retain only safe classification and retry counts."""
+        super().__init__("provider read failed safely")
+        self.failure_class = failure_class
+        self.transient_retries = transient_retries
+        self.last_transient_failure_class = last_transient_failure_class
+
+
 @dataclass(slots=True)
 class RequestBudget:
     """Enforce one request and wall-clock budget across the complete canary."""
 
     max_requests: int
     max_seconds: float
+    max_transient_retries: int = DEFAULT_MAX_TRANSIENT_RETRIES
+    retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS
     monotonic: Callable[[], float] = time.monotonic
+    sleeper: Callable[[float], None] = time.sleep
     requests: int = field(init=False, default=0)
     _started: float = field(init=False)
 
@@ -212,6 +242,18 @@ class RequestBudget:
             raise ValueError(msg)
         if self.max_seconds <= 0:
             msg = "global wall-clock limit must be positive"
+            raise ValueError(msg)
+        if (
+            isinstance(self.max_transient_retries, bool)
+            or self.max_transient_retries < 0
+        ):
+            msg = "transient retry limit must be a non-negative integer"
+            raise ValueError(msg)
+        if not math.isfinite(self.retry_backoff_seconds):
+            msg = "retry backoff must be finite"
+            raise ValueError(msg)
+        if self.retry_backoff_seconds < 0:
+            msg = "retry backoff must be non-negative"
             raise ValueError(msg)
         self._started = self.monotonic()
 
@@ -248,6 +290,16 @@ class RequestBudget:
             raise RequestBudgetError(reason, msg)
         return round(elapsed * 1000)
 
+    def wait_before_retry(self) -> None:
+        """Apply one fixed bounded delay before a transient retry."""
+        remaining = self.max_seconds - (self.monotonic() - self._started)
+        if remaining - self.retry_backoff_seconds < MINIMUM_REQUEST_TIMEOUT_SECONDS:
+            msg = "canary cannot fit retry backoff within its wall-clock deadline"
+            reason = "wall-clock-deadline"
+            raise RequestBudgetError(reason, msg)
+        if self.retry_backoff_seconds:
+            self.sleeper(self.retry_backoff_seconds)
+
 
 def _canonical_json(value: object) -> bytes:
     return (
@@ -272,6 +324,85 @@ def _response_mapping(response: ResponseLike) -> dict[str, object]:
         msg = "provider read returned a non-object response"
         raise TypeError(msg)
     return cast("dict[str, object]", payload)
+
+
+def _provider_failure(error: Exception) -> tuple[str, bool]:  # noqa: PLR0911
+    """Classify one provider boundary failure without retaining private detail."""
+    if isinstance(error, requests.Timeout):
+        return "transport-timeout", True
+    if isinstance(error, requests.ConnectionError):
+        return "transport-connectivity", True
+    if isinstance(error, requests.HTTPError):
+        status = getattr(error.response, "status_code", None)
+        if status in TRANSIENT_HTTP_STATUS_CODES:
+            return f"http-{status}", True
+        if (
+            isinstance(status, int)
+            and HTTP_SERVER_ERROR_MIN <= status <= HTTP_SERVER_ERROR_MAX
+        ):
+            return "http-5xx", True
+        if (
+            isinstance(status, int)
+            and HTTP_CLIENT_ERROR_MIN <= status <= HTTP_CLIENT_ERROR_MAX
+        ):
+            return "http-4xx", False
+        return "http-failure", False
+    if isinstance(error, (TypeError, ValueError)):
+        return "provider-schema-failure", False
+    return "provider-read-failure", False
+
+
+def _request_mapping(  # noqa: PLR0913 - explicit provider request boundary
+    session: SessionLike,
+    *,
+    method: str,
+    url: str,
+    params: Mapping[str, str],
+    timeout: float,
+    budget: RequestBudget,
+) -> tuple[dict[str, object], int, str | None]:
+    """Read one provider page with exactly bounded transient retries."""
+    transient_retries = 0
+    last_transient_failure_class: str | None = None
+    while True:
+        request_timeout = budget.claim_timeout(timeout)
+        try:
+            payload = _response_mapping(
+                session.request(
+                    method,
+                    url,
+                    params=dict(params),
+                    timeout=request_timeout,
+                )
+            )
+        except RequestBudgetError:
+            raise
+        except Exception as error:  # noqa: BLE001 - classify provider boundary
+            failure_class, transient = _provider_failure(error)
+            if transient and transient_retries < budget.max_transient_retries:
+                transient_retries += 1
+                last_transient_failure_class = failure_class
+                budget.wait_before_retry()
+                continue
+            raise ProviderReadError(
+                failure_class,
+                transient_retries=transient_retries,
+                last_transient_failure_class=last_transient_failure_class,
+            ) from None
+        return payload, transient_retries, last_transient_failure_class
+
+
+def _with_retry_evidence(
+    evidence: dict[str, object],
+    *,
+    transient_retries: int,
+    last_transient_failure_class: str | None,
+) -> dict[str, object]:
+    """Decorate explicit source evidence with safe retry provenance."""
+    decorated = {**evidence, "transient_retries": transient_retries}
+    if last_transient_failure_class is not None:
+        decorated["last_transient_failure_class"] = last_transient_failure_class
+    return decorated
 
 
 def _records(
@@ -400,7 +531,7 @@ def _coverage_failures(
     return failures
 
 
-def read_pages(  # noqa: C901, PLR0913, PLR0915 - explicit bounded source state
+def read_pages(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit bounded source state
     session: SessionLike,
     *,
     method: str,
@@ -425,17 +556,26 @@ def read_pages(  # noqa: C901, PLR0913, PLR0915 - explicit bounded source state
     records: list[object] = []
     record_count = 0
     digests: list[str] = []
+    transient_retries = 0
+    last_transient_failure_class: str | None = None
     started = time.monotonic()
     for page in range(1, max_pages + 1):
-        request_timeout = budget.claim_timeout(timeout)
         try:
-            response = session.request(
-                method,
-                url,
+            (
+                payload,
+                page_transient_retries,
+                page_last_transient_failure_class,
+            ) = _request_mapping(
+                session,
+                method=method,
+                url=url,
                 params=request_params,
-                timeout=request_timeout,
+                timeout=timeout,
+                budget=budget,
             )
-            payload = _response_mapping(response)
+            transient_retries += page_transient_retries
+            if page_last_transient_failure_class is not None:
+                last_transient_failure_class = page_last_transient_failure_class
             page_records = _records(
                 payload.get(item_key),
                 item_key,
@@ -451,15 +591,44 @@ def read_pages(  # noqa: C901, PLR0913, PLR0915 - explicit bounded source state
             raise
         except SourceEvidenceError:
             raise
-        except Exception:  # noqa: BLE001 - sanitize every provider boundary failure
-            evidence: dict[str, object] = {
-                "complete": False,
-                "method": method,
-                "pages": page - 1,
-                "path": path_template,
-                "reason": "provider-read-failure",
-                "records": record_count,
-            }
+        except ProviderReadError as error:
+            transient_retries += error.transient_retries
+            if error.last_transient_failure_class is not None:
+                last_transient_failure_class = error.last_transient_failure_class
+            evidence: dict[str, object] = _with_retry_evidence(
+                {
+                    "complete": False,
+                    "elapsed_ms": round((time.monotonic() - started) * 1000),
+                    "failure_class": error.failure_class,
+                    "method": method,
+                    "pages": page - 1,
+                    "path": path_template,
+                    "reason": "provider-read-failure",
+                    "records": record_count,
+                },
+                transient_retries=transient_retries,
+                last_transient_failure_class=last_transient_failure_class,
+            )
+            if public_selection is not None:
+                evidence["selection"] = public_selection
+            msg = f"provider source failed safely: {method} {path_template}"
+            raise SourceEvidenceError(msg, evidence) from None
+        except Exception as error:  # noqa: BLE001 - sanitize parsed provider data
+            failure_class, _transient = _provider_failure(error)
+            evidence = _with_retry_evidence(
+                {
+                    "complete": False,
+                    "elapsed_ms": round((time.monotonic() - started) * 1000),
+                    "failure_class": failure_class,
+                    "method": method,
+                    "pages": page - 1,
+                    "path": path_template,
+                    "reason": "provider-read-failure",
+                    "records": record_count,
+                },
+                transient_retries=transient_retries,
+                last_transient_failure_class=last_transient_failure_class,
+            )
             if public_selection is not None:
                 evidence["selection"] = public_selection
             msg = f"provider source failed safely: {method} {path_template}"
@@ -469,49 +638,61 @@ def read_pages(  # noqa: C901, PLR0913, PLR0915 - explicit bounded source state
             records.extend(page_records)
         digests.append(hashlib.sha256(_canonical_json(payload)).hexdigest())
         if coverage_failures:
-            evidence = {
-                "complete": False,
-                "coverage_failures": coverage_failures,
-                "digest": "sha256:"
-                + hashlib.sha256("".join(digests).encode()).hexdigest(),
-                "elapsed_ms": round((time.monotonic() - started) * 1000),
-                "method": method,
-                "pages": page,
-                "path": path_template,
-                "reason": "coverage-incomplete",
-                "records": record_count,
-            }
+            evidence = _with_retry_evidence(
+                {
+                    "complete": False,
+                    "coverage_failures": coverage_failures,
+                    "digest": "sha256:"
+                    + hashlib.sha256("".join(digests).encode()).hexdigest(),
+                    "elapsed_ms": round((time.monotonic() - started) * 1000),
+                    "method": method,
+                    "pages": page,
+                    "path": path_template,
+                    "reason": "coverage-incomplete",
+                    "records": record_count,
+                },
+                transient_retries=transient_retries,
+                last_transient_failure_class=last_transient_failure_class,
+            )
             if public_selection is not None:
                 evidence["selection"] = public_selection
             msg = f"provider source returned incomplete coverage: {path_template}"
             raise SourceEvidenceError(msg, evidence)
         if token is None:
             elapsed = time.monotonic() - started
-            evidence = {
-                "complete": True,
-                "digest": "sha256:"
-                + hashlib.sha256("".join(digests).encode()).hexdigest(),
-                "elapsed_ms": round(elapsed * 1000),
-                "method": method,
-                "pages": page,
-                "path": path_template,
-                "records": record_count,
-            }
+            evidence = _with_retry_evidence(
+                {
+                    "complete": True,
+                    "digest": "sha256:"
+                    + hashlib.sha256("".join(digests).encode()).hexdigest(),
+                    "elapsed_ms": round(elapsed * 1000),
+                    "method": method,
+                    "pages": page,
+                    "path": path_template,
+                    "records": record_count,
+                },
+                transient_retries=transient_retries,
+                last_transient_failure_class=last_transient_failure_class,
+            )
             if public_selection is not None:
                 evidence["selection"] = public_selection
             return evidence, tuple(records)
         request_params["pageToken"] = token
     elapsed = time.monotonic() - started
-    evidence = {
-        "complete": False,
-        "digest": "sha256:" + hashlib.sha256("".join(digests).encode()).hexdigest(),
-        "elapsed_ms": round(elapsed * 1000),
-        "method": method,
-        "pages": max_pages,
-        "path": path_template,
-        "reason": "page-limit",
-        "records": record_count,
-    }
+    evidence = _with_retry_evidence(
+        {
+            "complete": False,
+            "digest": "sha256:" + hashlib.sha256("".join(digests).encode()).hexdigest(),
+            "elapsed_ms": round(elapsed * 1000),
+            "method": method,
+            "pages": max_pages,
+            "path": path_template,
+            "reason": "page-limit",
+            "records": record_count,
+        },
+        transient_retries=transient_retries,
+        last_transient_failure_class=last_transient_failure_class,
+    )
     if public_selection is not None:
         evidence["selection"] = public_selection
     msg = f"provider source exceeded page limit {max_pages}: {path_template}"
@@ -530,38 +711,51 @@ def read_once(  # noqa: PLR0913 - one explicit bounded request contract
     """Read one non-pageable source and retain only shape and digest evidence."""
     require_allowlisted("GET", path_template)
     started = time.monotonic()
-    request_timeout = budget.claim_timeout(timeout)
     try:
-        payload = _response_mapping(
-            session.request(
-                "GET",
-                url,
-                params=dict(params),
-                timeout=request_timeout,
-            )
+        (
+            payload,
+            transient_retries,
+            last_transient_failure_class,
+        ) = _request_mapping(
+            session,
+            method="GET",
+            url=url,
+            params=params,
+            timeout=timeout,
+            budget=budget,
         )
     except RequestBudgetError:
         raise
-    except Exception:  # noqa: BLE001 - sanitize every provider boundary failure
-        evidence: dict[str, object] = {
-            "complete": False,
-            "method": "GET",
-            "pages": 0,
-            "path": path_template,
-            "reason": "provider-read-failure",
-            "records": 0,
-        }
+    except ProviderReadError as error:
+        evidence: dict[str, object] = _with_retry_evidence(
+            {
+                "complete": False,
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+                "failure_class": error.failure_class,
+                "method": "GET",
+                "pages": 0,
+                "path": path_template,
+                "reason": "provider-read-failure",
+                "records": 0,
+            },
+            transient_retries=error.transient_retries,
+            last_transient_failure_class=error.last_transient_failure_class,
+        )
         msg = f"provider source failed safely: GET {path_template}"
         raise SourceEvidenceError(msg, evidence) from None
-    return {
-        "complete": True,
-        "digest": "sha256:" + hashlib.sha256(_canonical_json(payload)).hexdigest(),
-        "elapsed_ms": round((time.monotonic() - started) * 1000),
-        "method": "GET",
-        "pages": 1,
-        "path": path_template,
-        "records": 1,
-    }
+    return _with_retry_evidence(
+        {
+            "complete": True,
+            "digest": "sha256:" + hashlib.sha256(_canonical_json(payload)).hexdigest(),
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+            "method": "GET",
+            "pages": 1,
+            "path": path_template,
+            "records": 1,
+        },
+        transient_retries=transient_retries,
+        last_transient_failure_class=last_transient_failure_class,
+    )
 
 
 def _location_ids(
@@ -730,14 +924,22 @@ def _run_canary_sources(  # noqa: PLR0913 - explicit bounded source composition
     except SourceEvidenceError:
         raise
     except (TypeError, ValueError, RuntimeError):
-        evidence = {
-            "complete": False,
-            "method": "GET",
-            "pages": location_evidence["pages"],
-            "path": location_path,
-            "reason": "provider-read-failure",
-            "records": location_evidence["records"],
-        }
+        evidence = _with_retry_evidence(
+            {
+                "complete": False,
+                "failure_class": "provider-schema-failure",
+                "method": "GET",
+                "pages": location_evidence["pages"],
+                "path": location_path,
+                "reason": "provider-read-failure",
+                "records": location_evidence["records"],
+            },
+            transient_retries=cast("int", location_evidence["transient_retries"]),
+            last_transient_failure_class=cast(
+                "str | None",
+                location_evidence.get("last_transient_failure_class"),
+            ),
+        )
         msg = f"provider source failed safely: GET {location_path}"
         raise SourceEvidenceError(msg, evidence) from None
     state["tpu_locations"] = len(locations)
@@ -848,6 +1050,8 @@ def run_canary(  # noqa: PLR0913 - explicit global and per-request bounds
     max_requests: int,
     max_seconds: float,
     max_locations: int,
+    max_transient_retries: int = DEFAULT_MAX_TRANSIENT_RETRIES,
+    retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
 ) -> dict[str, object]:
     """Run one bounded canary and retain budget-exhaustion evidence."""
     if not PROJECT_PATTERN.fullmatch(project):
@@ -874,6 +1078,8 @@ def run_canary(  # noqa: PLR0913 - explicit global and per-request bounds
     budget = RequestBudget(
         max_requests=max_requests,
         max_seconds=max_seconds,
+        max_transient_retries=max_transient_retries,
+        retry_backoff_seconds=retry_backoff_seconds,
     )
     sources: list[dict[str, object]] = []
     state = {"tpu_locations": 0}
@@ -925,6 +1131,16 @@ def main(arguments: Sequence[str] | None = None) -> None:
     parser.add_argument("--max-requests", type=int, default=DEFAULT_MAX_REQUESTS)
     parser.add_argument("--max-seconds", type=float, default=DEFAULT_MAX_SECONDS)
     parser.add_argument("--max-locations", type=int, default=DEFAULT_MAX_LOCATIONS)
+    parser.add_argument(
+        "--max-transient-retries",
+        type=int,
+        default=DEFAULT_MAX_TRANSIENT_RETRIES,
+    )
+    parser.add_argument(
+        "--retry-backoff-seconds",
+        type=float,
+        default=DEFAULT_RETRY_BACKOFF_SECONDS,
+    )
     parsed = parser.parse_args(arguments)
     project = os.environ.get(parsed.project_env)
     if project is None:
@@ -945,6 +1161,8 @@ def main(arguments: Sequence[str] | None = None) -> None:
         max_requests=parsed.max_requests,
         max_seconds=parsed.max_seconds,
         max_locations=parsed.max_locations,
+        max_transient_retries=parsed.max_transient_retries,
+        retry_backoff_seconds=parsed.retry_backoff_seconds,
     )
     _write_evidence(parsed.output, evidence)
 

@@ -300,6 +300,8 @@ def test_live_read_only_workflow_has_separate_identity_and_environment_gate() ->
     assert "--max-seconds 1200" in canary
     assert "--max-locations 125" in canary
     assert "--timeout 10" in canary
+    assert "--max-transient-retries 1" in canary
+    assert "--retry-backoff-seconds 1" in canary
     assert "GCP_PROJECT_ID" in canary
     assert "GCP_WORKLOAD_IDENTITY_PROVIDER" in canary
     assert "GCP_SERVICE_ACCOUNT" in canary
