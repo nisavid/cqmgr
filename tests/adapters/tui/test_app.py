@@ -58,6 +58,7 @@ from cqmgr.application.operations.plans import (
 )
 from cqmgr.application.operations.quotas import QuotaBrowseData, QuotaInspectData
 from cqmgr.application.operations.read_only import (
+    IncompleteQuotaInspectData,
     QuotaInspectSelector,
     ReadOnlyFailureData,
     ReadOnlyQuotaQuery,
@@ -3818,9 +3819,9 @@ def test_workload_routes_decode_both_shapes_and_preserve_canonical_copy_cli() ->
             await pilot.pause()
 
             await pilot.click("#resolve-compute")
-            _input(app, "#workload-machine-type").value = "n1-standard-16"
-            _input(app, "#workload-gpu-type").value = "nvidia-tesla-t4"
-            _input(app, "#workload-gpu-count").value = "2"
+            _input(app, "#workload-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#workload-gpu-type").value = "nvidia-h100-80gb"
+            _input(app, "#workload-gpu-count").value = "8"
             _input(app, "#workload-count").value = "2"
             _input(app, "#workload-provisioning").value = "spot"
             _input(app, "#workload-locations").value = "us-central1-a, us-east1-b"
@@ -3829,10 +3830,10 @@ def test_workload_routes_decode_both_shapes_and_preserve_canonical_copy_cli() ->
 
             compute, compute_options = operations.resolve_calls[0]
             assert isinstance(compute, ComputeInstanceRequirement)
-            assert compute.machine_type == "n1-standard-16"
+            assert compute.machine_type == "a3-highgpu-8g"
             assert compute.instance_count == 2
-            assert compute.attached_accelerator_type == "nvidia-tesla-t4"
-            assert compute.attached_accelerator_count == 2
+            assert compute.attached_accelerator_type == "nvidia-h100-80gb"
+            assert compute.attached_accelerator_count == 8
             assert isinstance(compute.locations, CandidateLocations)
             assert compute.locations.values == ("us-central1-a", "us-east1-b")
             assert compute_options["scope_input"] == ReadOnlyScopeInput()
@@ -3840,18 +3841,19 @@ def test_workload_routes_decode_both_shapes_and_preserve_canonical_copy_cli() ->
             assert app.last_copied_cli.startswith(
                 "cqmgr quota resolve compute-instance "
             )
-            assert "--attached-accelerator-type nvidia-tesla-t4" in (
+            assert "--attached-accelerator-type nvidia-h100-80gb" in (
                 app.last_copied_cli
             )
-            assert "--attached-accelerator-count 2" in app.last_copied_cli
+            assert "--attached-accelerator-count 8" in app.last_copied_cli
             assert "Location: us-central1-a" in str(
                 _static(app, "#quota-detail").content
             )
             assert "Disposition: incompatible" in str(
                 _static(app, "#quota-detail").content
             )
-            assert "Reason: unsupported-compatibility" in str(
-                _static(app, "#quota-detail").content
+            assert (
+                "Catalog evidence does not support this workload in this location."
+                in str(_static(app, "#quota-detail").content)
             )
 
             await pilot.click("#resolve-tpu")
@@ -3889,8 +3891,9 @@ def test_guided_workload_controls_use_fixed_selects_and_live_catalog_choices() -
         async with app.run_test(size=(140, 70)) as pilot:
             await pilot.pause()
             assert isinstance(app.query_one("#filter-service"), Select)
-            assert isinstance(app.query_one("#workload-provisioning"), Select)
+            provisioning = app.query_one("#workload-provisioning", Select)
             assert isinstance(app.query_one("#obtainability-distribution"), Select)
+            assert provisioning.name == "Provisioning model"
 
             await pilot.click("#resolve-compute")
             await pilot.pause()
@@ -3899,6 +3902,43 @@ def test_guided_workload_controls_use_fixed_selects_and_live_catalog_choices() -
             assert "VERIFIED CHOICES" in str(
                 _static(app, "#workload-choice-evidence").content
             )
+            machine = _input(app, "#workload-machine-type")
+            assert machine.name == "Machine type"
+            assert machine.has_focus
+            await pilot.press("tab")
+            assert _input(app, "#workload-gpu-type").has_focus
+            await pilot.press("tab")
+            assert _input(app, "#workload-gpu-count").has_focus
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "model",
+    [ProvisioningModel.FLEX_START, ProvisioningModel.RESERVATION_BOUND],
+)
+def test_workload_provisioning_select_preserves_every_typed_model(
+    model: ProvisioningModel,
+) -> None:
+    """The TUI fixed domain reaches the same parser values as the CLI."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 70)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-compute")
+            await pilot.pause()
+            _input(app, "#workload-machine-type").value = "n1-standard-16"
+            _input(app, "#workload-count").value = "1"
+            _input(app, "#workload-provisioning").value = model.value
+            _input(app, "#workload-locations").value = "us-central1-a"
+            _button(app, "#workload-submit").press()
+            await pilot.pause()
+
+            requirement, _ = operations.resolve_calls[0]
+            assert requirement.provisioning_model is model
 
     asyncio.run(scenario())
 
@@ -3981,6 +4021,66 @@ def test_complete_catalog_rejects_an_invalid_workload_combination_locally() -> N
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("accelerator_type", "accelerator_count"),
+    [("nvidia-h100-80gb", "2"), ("nvidia-tesla-t4", "8")],
+)
+def test_complete_catalog_rejects_machine_gpu_relationship_mismatches_locally(
+    accelerator_type: str,
+    accelerator_count: str,
+) -> None:
+    """Separate same-zone declarations do not prove machine attachment support."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 70)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-compute")
+            await pilot.pause()
+            _input(app, "#workload-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#workload-gpu-type").value = accelerator_type
+            _input(app, "#workload-gpu-count").value = accelerator_count
+            _input(app, "#workload-count").value = "1"
+            _input(app, "#workload-provisioning").value = "standard"
+            _input(app, "#workload-locations").value = "us-central1-a"
+            _button(app, "#workload-submit").press()
+            await pilot.pause()
+
+            assert operations.resolve_calls == []
+            status = str(_static(app, "#status-line").content)
+            assert "INVALID WORKLOAD CHOICE" in status
+            assert "machine attachment" in status.casefold()
+
+    asyncio.run(scenario())
+
+
+def test_complete_empty_catalog_is_explicit_and_remains_fail_closed() -> None:
+    """Exhausted provider evidence can prove that no supported choices exist."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        operations.catalog_result = replace(
+            operations.catalog_result,
+            data=WorkloadCatalogEvidence.empty(),
+        )
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 70)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-compute")
+            await pilot.pause()
+
+            evidence = str(_static(app, "#workload-choice-evidence").content)
+            assert "NO SUPPORTED CHOICES" in evidence
+            assert "complete" in evidence.casefold()
+            assert app.query_one("#workload-manual-entry", Checkbox).disabled
+            assert "NO SUPPORTED CHOICES" in str(_static(app, "#status-line").content)
+
+    asyncio.run(scenario())
+
+
 def test_incomplete_catalog_requires_explicit_unverified_manual_entry() -> None:
     """Partial choice evidence permits manual input only through its escape hatch."""
 
@@ -4041,10 +4141,41 @@ def test_standalone_obtainability_opens_with_safe_defaults_and_exact_example() -
                 "us-central1=us-central1-a us-east4=us-east4-a"
                 in _input(app, "#obtainability-candidates").placeholder
             )
+            example = str(_static(app, "#obtainability-detail").content)
+            assert (
+                "one Spot a3-highgpu-8g VM using any-single-zone with candidates "
+                "us-central1=us-central1-a us-east4=us-east4-a"
+            ) in example
             assert (
                 "explicit candidates only"
                 in str(_static(app, "#obtainability-expansion").content).casefold()
             )
+
+    asyncio.run(scenario())
+
+
+def test_complete_catalog_rejects_invalid_obtainability_gpu_count_locally() -> None:
+    """Standalone comparison cannot bypass a complete machine attachment fact."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 48)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            await pilot.pause()
+            _input(app, "#obtainability-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#obtainability-gpu-type").value = "nvidia-h100-80gb"
+            _input(app, "#obtainability-gpu-count").value = "2"
+            _input(app, "#obtainability-candidates").value = "us-central1=us-central1-a"
+            _button(app, "#obtainability-compare").press()
+            await pilot.pause()
+
+            assert operations.obtainability_prepared_calls == []
+            status = str(_static(app, "#status-line").content)
+            assert "INVALID OBTAINABILITY CHOICE" in status
+            assert "machine attachment" in status.casefold()
 
     asyncio.run(scenario())
 
@@ -4162,9 +4293,9 @@ def test_fully_specified_obtainability_exposes_copy_cli_before_provider_result()
         async with app.run_test(size=(140, 42)) as pilot:
             await pilot.pause()
             await pilot.click("#workspace-obtainability")
-            _input(app, "#obtainability-machine-type").value = "n1-standard-16"
-            _input(app, "#obtainability-gpu-type").value = "nvidia-tesla-t4"
-            _input(app, "#obtainability-gpu-count").value = "2"
+            _input(app, "#obtainability-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#obtainability-gpu-type").value = "nvidia-h100-80gb"
+            _input(app, "#obtainability-gpu-count").value = "8"
             _input(app, "#obtainability-vm-count").value = "2"
             _input(app, "#obtainability-distribution").value = "any-single-zone"
             _input(app, "#obtainability-candidates").value = "us-central1=us-central1-a"
@@ -4174,7 +4305,7 @@ def test_fully_specified_obtainability_exposes_copy_cli_before_provider_result()
             assert command is not None
             assert command.startswith("cqmgr obtainability compare ")
             assert "--resource-scope projects/123456789" in command
-            assert "--gpu-type nvidia-tesla-t4" in command
+            assert "--gpu-type nvidia-h100-80gb" in command
             assert "--candidate us-central1=us-central1-a" in command
             assert app.last_result is None
 
@@ -4182,8 +4313,8 @@ def test_fully_specified_obtainability_exposes_copy_cli_before_provider_result()
             await asyncio.wait_for(operations.compare_started.wait(), timeout=3)
             requirement, _options = operations.resolve_calls[-1]
             assert isinstance(requirement, ComputeInstanceRequirement)
-            assert requirement.attached_accelerator_type == "nvidia-tesla-t4"
-            assert requirement.attached_accelerator_count == 2
+            assert requirement.attached_accelerator_type == "nvidia-h100-80gb"
+            assert requirement.attached_accelerator_count == 8
             assert app.last_copied_cli == command
 
             operations.release_compare.set()
@@ -4246,12 +4377,12 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields(  # 
 
     async def scenario() -> None:  # noqa: PLR0915
         requirement = ComputeInstanceRequirement(
-            "n1-standard-16",
+            "a3-highgpu-8g",
             2,
             ProvisioningModel.SPOT,
             CandidateLocations(("us-central1-a",)),
-            attached_accelerator_type="nvidia-tesla-t4",
-            attached_accelerator_count=2,
+            attached_accelerator_type="nvidia-h100-80gb",
+            attached_accelerator_count=8,
         )
         operations = ScriptedReadOnlyOperations(_browse_result())
         operations.resolve_result = _resolved_compute_result(
@@ -4263,9 +4394,9 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields(  # 
         async with app.run_test(size=(140, 42)) as pilot:
             await pilot.pause()
             await pilot.click("#resolve-compute")
-            _input(app, "#workload-machine-type").value = "n1-standard-16"
-            _input(app, "#workload-gpu-type").value = "nvidia-tesla-t4"
-            _input(app, "#workload-gpu-count").value = "2"
+            _input(app, "#workload-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#workload-gpu-type").value = "nvidia-h100-80gb"
+            _input(app, "#workload-gpu-count").value = "8"
             _input(app, "#workload-count").value = "2"
             _input(app, "#workload-provisioning").value = "spot"
             _input(app, "#workload-locations").value = "us-central1-a"
@@ -4275,9 +4406,9 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields(  # 
             _button(app, "#workload-obtainability").press()
             await pilot.pause()
             assert app.active_workspace == "obtainability"
-            assert _input(app, "#obtainability-machine-type").value == "n1-standard-16"
-            assert _input(app, "#obtainability-gpu-type").value == "nvidia-tesla-t4"
-            assert _input(app, "#obtainability-gpu-count").value == "2"
+            assert _input(app, "#obtainability-machine-type").value == "a3-highgpu-8g"
+            assert _input(app, "#obtainability-gpu-type").value == "nvidia-h100-80gb"
+            assert _input(app, "#obtainability-gpu-count").value == "8"
             assert _input(app, "#obtainability-vm-count").value == "2"
             assert (
                 _input(app, "#obtainability-candidates").value
@@ -4304,8 +4435,8 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields(  # 
             await pilot.pause()
             assert app.last_copied_cli is not None
             assert "--candidate us-central1=us-central1-a" in app.last_copied_cli
-            assert "--gpu-type nvidia-tesla-t4" in app.last_copied_cli
-            assert "--gpu-count 2" in app.last_copied_cli
+            assert "--gpu-type nvidia-h100-80gb" in app.last_copied_cli
+            assert "--gpu-count 8" in app.last_copied_cli
             assert "Inherited from Quotas / Resolve / Compute instance" in str(
                 _static(app, "#obtainability-breadcrumb").content
             )
@@ -4319,8 +4450,8 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields(  # 
             candidates = prepared.candidates
             assert candidates[0].zones == ("us-central1-a",)
             assert candidates[0].machine.gpu == GpuAttachment(
-                "nvidia-tesla-t4",
-                2,
+                "nvidia-h100-80gb",
+                8,
             )
             assert "Return context: Quotas / Resolve / Compute instance" in str(
                 _static(app, "#obtainability-detail").content
@@ -4857,10 +4988,14 @@ def test_partial_failure_and_superseded_reads_remain_explicit_and_safe() -> None
             assert "Cloud TPU quotas: page-capped / incomplete" in coverage
             assert "Aggregate completeness: incomplete" in coverage
             assert "Refresh provider evidence, then retry" in coverage
-            assert "tpu-location-page-failed" not in coverage
-            assert "PAGE-CAPPED / INCOMPLETE" in str(
-                _static(app, "#status-line").content
+            assert "returned rows remain inspectable" in coverage
+            assert (
+                "mutation gates that depend on Cloud TPU quotas are blocked" in coverage
             )
+            assert "tpu-location-page-failed" not in coverage
+            status = str(_static(app, "#status-line").content)
+            assert "USABLE BUT NON-EXHAUSTIVE" in status
+            assert "PAGE-CAPPED / INCOMPLETE" in status
 
     async def failure_scenario() -> None:
         typed_failure = _failure_result()
@@ -4906,6 +5041,133 @@ def test_partial_failure_and_superseded_reads_remain_explicit_and_safe() -> None
     asyncio.run(partial_scenario())
     asyncio.run(failure_scenario())
     asyncio.run(cancellation_scenario())
+
+
+def test_incomplete_inspect_and_resolution_keep_raw_ids_in_technical_details() -> None:
+    """All provider-backed incomplete primary details use human evidence language."""
+
+    async def inspect_scenario() -> None:
+        selector = QuotaInspectSelector(
+            ITEMS[0].identity.service,
+            ITEMS[0].identity.quota_id,
+            ITEMS[0].location or "global",
+            ITEMS[0].identity.dimensions,
+        )
+        incomplete = OperationResult(
+            operation=OperationName("quota.inspect"),
+            resource_scope=SCOPE,
+            boundary=OperationBoundary(
+                StableSymbol("exact-slice-inspected"),
+                reached=False,
+            ),
+            outcome=Outcome(
+                StableSymbol("provider-source-incomplete"),
+                ExitClass.INCOMPLETE_EVIDENCE,
+            ),
+            completeness=Completeness.incomplete(
+                EvidenceGap(
+                    StableSymbol("tpu-quota-inventory"),
+                    StableSymbol("provider-source-incomplete"),
+                )
+            ),
+            started_at=NOW,
+            finished_at=NOW,
+            data=IncompleteQuotaInspectData(
+                selector,
+                (ITEMS[0],),
+                _browse_result(complete=False).data.source_coverage,
+                "provider-source-incomplete",
+            ),
+            diagnostics=(PARTIAL_DIAGNOSTIC,),
+        )
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        operations.inspect_result = incomplete  # type: ignore[assignment]
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app._render_instrument(incomplete)  # noqa: SLF001
+            app._render_quota_detail(incomplete)  # noqa: SLF001
+            detail = str(_static(app, "#quota-detail").content)
+            technical = str(_static(app, "#technical-details").content)
+            assert "Evidence: page-capped / incomplete" in detail
+            assert "provider-source-incomplete" not in detail
+            assert "Refresh provider evidence, then retry" in detail
+            assert "Outcome: provider-source-incomplete" in technical
+            assert "Detail reason: provider-source-incomplete" in technical
+
+    async def resolution_scenario() -> None:
+        requirement = ComputeInstanceRequirement(
+            "n1-standard-16",
+            1,
+            ProvisioningModel.STANDARD,
+            CandidateLocations(("us-central1-a",)),
+        )
+        incomplete = OperationResult(
+            operation=OperationName("quota.resolve"),
+            resource_scope=SCOPE,
+            boundary=OperationBoundary(
+                StableSymbol("workload-resolved"),
+                reached=False,
+            ),
+            outcome=Outcome(
+                StableSymbol("workload-resolved-incomplete"),
+                ExitClass.INCOMPLETE_EVIDENCE,
+            ),
+            completeness=Completeness.incomplete(
+                EvidenceGap(
+                    StableSymbol("compute-catalog"),
+                    StableSymbol("missing-location-evidence"),
+                )
+            ),
+            started_at=NOW,
+            finished_at=NOW,
+            data=ResolvedWorkloadRequirement(
+                requirement,
+                (
+                    ResolvedWorkloadLocation(
+                        location="us-central1-a",
+                        disposition=WorkloadLocationDisposition.INCOMPLETE,
+                        accelerator_id=None,
+                        owning_service=None,
+                        management_plane=None,
+                        supported_consumers=(),
+                        quota_pool=None,
+                        deployable_accelerator_quantity=None,
+                        constraint_set=None,
+                        constraint_requirements=(),
+                        coverage=(),
+                        failure_reason=(
+                            ResolutionFailureReason.MISSING_LOCATION_EVIDENCE
+                        ),
+                    ),
+                ),
+                None,
+            ),
+            diagnostics=(PARTIAL_DIAGNOSTIC,),
+        )
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        operations.resolve_result = incomplete
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app._render_instrument(incomplete)  # noqa: SLF001
+            app._render_workload_result(incomplete)  # noqa: SLF001
+            detail = str(_static(app, "#quota-detail").content)
+            technical = str(_static(app, "#technical-details").content)
+            assert "Evidence: page-capped / incomplete" in detail
+            assert "workload-resolved-incomplete" not in detail
+            assert "missing-location-evidence" not in detail
+            assert "Location evidence is incomplete." in detail
+            assert "Refresh provider evidence, then retry" in detail
+            assert "Outcome: workload-resolved-incomplete" in technical
+            assert (
+                "Location us-central1-a reason: missing-location-evidence" in technical
+            )
+
+    asyncio.run(inspect_scenario())
+    asyncio.run(resolution_scenario())
 
 
 @pytest.mark.parametrize(

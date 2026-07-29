@@ -10,7 +10,7 @@ status=COMPLETE — operation boundary reached
 coverage=Provider coverage:  Compute quotas: complete (1/1 pages)  Cloud TPU quotas: complete (1/1 pages)  Aggregate completeness: complete  Retry guidance: No retry guidance is available
 detail=Quota detail
 Operation: quota.inspect
-Outcome: succeeded
+Evidence: complete
 Complete: yes
 Service: compute.googleapis.com
 Quota ID: GPUS-ALL-REGIONS-per-project
