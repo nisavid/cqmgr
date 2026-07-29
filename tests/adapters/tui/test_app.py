@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, override
 
+import pytest
 from click.testing import CliRunner
 from textual.filter import Monochrome, NoColor
 from textual.widgets import Button, Checkbox, DataTable, Input, Select, Static
@@ -190,8 +191,6 @@ from cqmgr.domain.watch import (
 )
 
 if TYPE_CHECKING:
-    import pytest
-
     from cqmgr.application.operations.obtainability import (
         PreparedObtainabilityComparison,
     )
@@ -4484,7 +4483,7 @@ def test_obtainability_snapshot_preserves_incomplete_evidence_ties_and_n1_limits
                 snapshot
             )
             assert (
-                "WARNING capacity-history-incomplete: One candidate history source "
+                "WARNING notice: One candidate history source "
                 "is incomplete; ranking is partial."
             ) in snapshot
             assert (
@@ -4855,11 +4854,11 @@ def test_partial_failure_and_superseded_reads_remain_explicit_and_safe() -> None
             assert app.last_result is partial
             assert _table(app, "#quota-ledger").row_count == 3
             coverage = str(_static(app, "#coverage-summary").content)
-            assert "tpu.googleapis.com: incomplete" in coverage
+            assert "Cloud TPU quotas: page-capped / incomplete" in coverage
             assert "Aggregate completeness: incomplete" in coverage
-            assert "tpu-location-page-failed" in coverage
-            assert "Cloud TPU location evidence is incomplete" in coverage
-            assert "PROVIDER-SOURCE-INCOMPLETE" in str(
+            assert "Refresh provider evidence, then retry" in coverage
+            assert "tpu-location-page-failed" not in coverage
+            assert "PAGE-CAPPED / INCOMPLETE" in str(
                 _static(app, "#status-line").content
             )
 
@@ -4873,9 +4872,9 @@ def test_partial_failure_and_superseded_reads_remain_explicit_and_safe() -> None
             await pilot.pause()
             assert typed_app.last_result is typed_failure
             detail = str(_static(typed_app, "#quota-detail").content)
-            assert "Reason: provider-read-failed" in detail
-            assert "provider-read-failed" in detail
-            assert "retry after backoff" in detail
+            assert "Provider evidence: unavailable" in detail
+            assert "provider-read-failed" not in detail
+            assert "Wait, then retry" in detail
 
         app = CloudQuotaManagerApp(
             FailedReadOnlyOperations(_browse_result()),
@@ -4907,6 +4906,145 @@ def test_partial_failure_and_superseded_reads_remain_explicit_and_safe() -> None
     asyncio.run(partial_scenario())
     asyncio.run(failure_scenario())
     asyncio.run(cancellation_scenario())
+
+
+@pytest.mark.parametrize(
+    ("coverage", "diagnostics", "expected"),
+    [
+        (
+            ProviderSourceCoverage.complete(
+                "compute.googleapis.com",
+                pages_attempted=1,
+                pages_completed=1,
+                observed_at=NOW,
+            ),
+            (),
+            "complete",
+        ),
+        (
+            ProviderSourceCoverage.intentionally_unqueried("compute.googleapis.com"),
+            (),
+            "intentionally unqueried",
+        ),
+        (
+            ProviderSourceCoverage.incomplete(
+                "compute.googleapis.com",
+                pages_attempted=2,
+                pages_completed=1,
+                observed_at=NOW,
+                page_cap_reached=True,
+            ),
+            (),
+            "page-capped / incomplete",
+        ),
+        (
+            ProviderSourceCoverage.incomplete(
+                "compute.googleapis.com",
+                pages_attempted=1,
+                pages_completed=0,
+                observed_at=NOW,
+                diagnostic_codes=(DiagnosticCode("provider-read-timeout"),),
+            ),
+            (
+                replace(
+                    PARTIAL_DIAGNOSTIC,
+                    code=DiagnosticCode("provider-read-timeout"),
+                ),
+            ),
+            "timed out",
+        ),
+        (
+            ProviderSourceCoverage.incomplete(
+                "compute.googleapis.com",
+                pages_attempted=1,
+                pages_completed=0,
+                observed_at=NOW,
+                diagnostic_codes=(DiagnosticCode("provider-schema-malformed"),),
+            ),
+            (
+                replace(
+                    PARTIAL_DIAGNOSTIC,
+                    code=DiagnosticCode("provider-schema-malformed"),
+                ),
+            ),
+            "malformed",
+        ),
+        (
+            ProviderSourceCoverage.incomplete(
+                "compute.googleapis.com",
+                pages_attempted=1,
+                pages_completed=0,
+                observed_at=NOW,
+                diagnostic_codes=(DiagnosticCode("provider-unavailable"),),
+            ),
+            (
+                replace(
+                    PARTIAL_DIAGNOSTIC,
+                    code=DiagnosticCode("provider-unavailable"),
+                ),
+            ),
+            "unavailable",
+        ),
+    ],
+)
+def test_coverage_labels_combine_typed_state_and_diagnostics(
+    coverage: ProviderSourceCoverage,
+    diagnostics: tuple[Diagnostic, ...],
+    expected: str,
+) -> None:
+    """Primary source labels distinguish every settled incomplete state."""
+    assert CloudQuotaManagerApp._coverage_label(coverage, diagnostics) == expected  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("retry", "expected"),
+    [
+        (RetryDisposition.NEVER, "Do not retry"),
+        (RetryDisposition.AFTER_UPGRADE, "Upgrade cqmgr, then retry"),
+        (RetryDisposition.AFTER_REFRESH, "Refresh provider evidence, then retry"),
+        (RetryDisposition.AFTER_NEW_PREVIEW, "Create a new Preview, then retry"),
+        (RetryDisposition.AFTER_BACKOFF, "Wait, then retry"),
+        (RetryDisposition.UNKNOWN, "No retry guidance is available"),
+    ],
+)
+def test_retry_guidance_never_guesses_for_unknown(
+    retry: RetryDisposition,
+    expected: str,
+) -> None:
+    """Every typed retry disposition maps directly; unknown adds no advice."""
+    assert CloudQuotaManagerApp._retry_guidance(retry) == expected  # noqa: SLF001
+
+
+def test_failure_primary_copy_is_human_and_raw_ids_stay_in_technical_details() -> None:
+    """Raw outcome, exit, and diagnostic identifiers stay in a secondary view."""
+
+    async def scenario() -> None:
+        failure = _failure_result()
+        app = CloudQuotaManagerApp(
+            ScriptedReadOnlyOperations(failure),  # type: ignore[arg-type]
+            ScriptedAuditOperations(),
+        )
+
+        async with app.run_test(size=(110, 40)) as pilot:
+            await pilot.pause()
+            status = str(_static(app, "#status-line").content)
+            detail = str(_static(app, "#quota-detail").content)
+            technical = _static(app, "#technical-details")
+
+            assert "UNAVAILABLE" in status
+            assert "provider-read-failed" not in status
+            assert "exit 9" not in status
+            assert "Wait, then retry" in detail
+            assert "provider-read-failed" not in detail
+            assert technical.has_class("hidden")
+            assert "Outcome: provider-read-failed" in str(technical.content)
+            assert "Exit class: 9" in str(technical.content)
+
+            _button(app, "#toggle-technical-details").press()
+            await pilot.pause()
+            assert not technical.has_class("hidden")
+
+    asyncio.run(scenario())
 
 
 def test_quota_progress_exposes_elapsed_deadline_and_explicit_cancellation() -> None:

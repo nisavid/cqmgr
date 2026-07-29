@@ -14,8 +14,8 @@ discovered=yes cataloged=no guided=no mutable=no
 tpu.googleapis.com TPU-V6E-CHIPS us-central2
 discovered=yes cataloged=yes guided=no mutable=no
 copy-cli=cqmgr quota list --resource-scope projects/123456789 --limit 100 --output human
-status=PROVIDER-SOURCE-INCOMPLETE — exit 6; evidence incomplete
-coverage=Provider coverage:  compute.googleapis.com: complete (1/1 pages)  tpu.googleapis.com: incomplete (1/2 pages)  Aggregate completeness: incomplete  WARNING tpu-location-page-failed: Cloud TPU location evidence is incomplete; refresh the inventory.
+status=PAGE-CAPPED / INCOMPLETE — Partial results are retained. Refresh provider evidence, then retry
+coverage=Provider coverage:  Compute quotas: complete (1/1 pages)  Cloud TPU quotas: page-capped / incomplete (1/2 pages)  Aggregate completeness: incomplete  Retry guidance: Refresh provider evidence, then retry
 detail=Quota detail
 Select an exact effective quota slice.
 audit=Select a retained record to inspect its exact chain facts.

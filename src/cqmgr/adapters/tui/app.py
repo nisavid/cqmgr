@@ -77,6 +77,7 @@ from cqmgr.domain.apply_records import (
     UnknownDispatchResolution,
 )
 from cqmgr.domain.audit import AuditQuery
+from cqmgr.domain.diagnostics import RetryDisposition
 from cqmgr.domain.obtainability import (
     DistributionShape,
     GpuAttachment,
@@ -85,7 +86,12 @@ from cqmgr.domain.obtainability import (
     SpotMachineConfiguration,
 )
 from cqmgr.domain.plans import TargetStrategy
-from cqmgr.domain.quota_queries import QuotaQueryFilters, QuotaQueryItem
+from cqmgr.domain.quota_queries import (
+    ProviderSourceCoverage,
+    ProviderSourceCoverageState,
+    QuotaQueryFilters,
+    QuotaQueryItem,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -495,6 +501,14 @@ class CloudQuotaManagerApp(App[None]):
         color: #cbd3da;
     }
 
+    #technical-details {
+        height: auto;
+        margin-top: 1;
+        padding: 1;
+        border-top: solid #67727b;
+        color: #b8c4cc;
+    }
+
     #copy-cli-preview {
         height: auto;
         max-height: 5;
@@ -708,9 +722,19 @@ class CloudQuotaManagerApp(App[None]):
                 id="cancel-provider-read",
                 disabled=True,
             )
+            yield Button(
+                "Show technical details",
+                id="toggle-technical-details",
+            )
         yield Static(
             "READY — provider evidence not yet observed",
             id="status-line",
+            markup=False,
+        )
+        yield Static(
+            "Technical details are available after an operation.",
+            id="technical-details",
+            classes="hidden",
             markup=False,
         )
         with Horizontal(id="quota-workbench"):
@@ -1293,19 +1317,19 @@ class CloudQuotaManagerApp(App[None]):
                 )
                 self._show_copy_cli(command)
             return
-        reason = (
-            data.reason
-            if isinstance(data, ReadOnlyFailureData)
-            else result.outcome.code.value
+        evidence_label = self._result_evidence_label(result)
+        messages = tuple(
+            dict.fromkeys(str(diagnostic.message) for diagnostic in result.diagnostics)
         )
-        diagnostic_text = "\n".join(
-            f"{diagnostic.severity.value.upper()} {diagnostic.code.value}: "
-            f"{diagnostic.message} (retry: {diagnostic.retry.value})"
-            for diagnostic in result.diagnostics
-        )
+        guidance = self._result_retry_guidance(result)
         self.query_one("#quota-detail", Static).update(
-            f"Quota inspector unavailable\nReason: {reason}\n"
-            f"{diagnostic_text + chr(10) if diagnostic_text else ''}"
+            f"Quota inspector unavailable\nProvider evidence: {evidence_label}\n"
+            + (
+                "\n".join(f"Notice: {message}" for message in messages) + "\n"
+                if messages
+                else ""
+            )
+            + f"Retry guidance: {guidance}\n"
             "No provider mutation was attempted."
         )
         self._set_status(self._result_status(result))
@@ -1345,17 +1369,16 @@ class CloudQuotaManagerApp(App[None]):
         lines = [
             "Provider coverage:",
             *(
-                f"{coverage.service}: {coverage.state.value} "
+                f"{self._provider_source_label(coverage.service)}: "
+                f"{self._coverage_label_for_result(coverage)} "
                 f"({coverage.pages_completed}/{coverage.pages_attempted} pages)"
                 for coverage in data.source_coverage
             ),
             f"Aggregate completeness: {aggregate}",
         ]
         if self.last_result is not None:
-            lines.extend(
-                f"{diagnostic.severity.value.upper()} "
-                f"{diagnostic.code.value}: {diagnostic.message}"
-                for diagnostic in self.last_result.diagnostics
+            lines.append(
+                "Retry guidance: " + self._result_retry_guidance(self.last_result)
             )
         self.query_one("#coverage-summary", Static).update("  ".join(lines))
 
@@ -1378,6 +1401,7 @@ class CloudQuotaManagerApp(App[None]):
             f"Resource scope: {scope} [{lock}]\n"
             f"Authenticated principal: {principal} · Evidence: {complete}"
         )
+        self._render_technical_details(result)
 
     def _offline_instrument_text(self) -> str:
         return (
@@ -1402,11 +1426,142 @@ class CloudQuotaManagerApp(App[None]):
     def _result_status(result: OperationResult[Any]) -> str:
         if result.succeeded:
             return "COMPLETE — operation boundary reached"
+        label = CloudQuotaManagerApp._result_evidence_label(result).upper()
+        retained = (
+            " Partial results are retained."
+            if result.completeness.has_partial_data
+            else ""
+        )
         return (
-            f"{result.outcome.code.value.upper()} — "
-            f"exit {int(result.outcome.exit_class)}; "
-            "evidence "
-            f"{'complete' if result.completeness.is_complete else 'incomplete'}"
+            f"{label} —{retained} {CloudQuotaManagerApp._result_retry_guidance(result)}"
+        )
+
+    @staticmethod
+    def _provider_source_label(service: str) -> str:
+        """Return one stable human source label without exposing API spelling."""
+        return {
+            "compute.googleapis.com": "Compute quotas",
+            "tpu.googleapis.com": "Cloud TPU quotas",
+        }.get(service, "Provider quotas")
+
+    @staticmethod
+    def _coverage_label(
+        coverage: ProviderSourceCoverage,
+        diagnostics: tuple[Diagnostic, ...],
+    ) -> str:
+        """Classify one source from typed coverage plus diagnostic codes."""
+        if coverage.state is ProviderSourceCoverageState.COMPLETE:
+            return "complete"
+        if coverage.state is ProviderSourceCoverageState.INTENTIONALLY_UNQUERIED:
+            return "intentionally unqueried"
+        codes = {code.value for code in coverage.diagnostic_codes} | {
+            diagnostic.code.value for diagnostic in diagnostics
+        }
+        if any("timeout" in code or "deadline" in code for code in codes):
+            return "timed out"
+        if any(
+            marker in code
+            for code in codes
+            for marker in ("malformed", "schema", "decode", "invalid-response")
+        ):
+            return "malformed"
+        if (
+            coverage.page_cap_reached
+            or coverage.pages_completed > 0
+            or any("page-cap" in code or "incomplete" in code for code in codes)
+        ):
+            return "page-capped / incomplete"
+        return "unavailable"
+
+    def _coverage_label_for_result(
+        self,
+        coverage: ProviderSourceCoverage,
+    ) -> str:
+        diagnostics = self.last_result.diagnostics if self.last_result else ()
+        return self._coverage_label(
+            coverage,
+            self._coverage_diagnostics(coverage, diagnostics),
+        )
+
+    @staticmethod
+    def _coverage_diagnostics(
+        coverage: ProviderSourceCoverage,
+        diagnostics: tuple[Diagnostic, ...],
+    ) -> tuple[Diagnostic, ...]:
+        """Keep one source label from inheriting another source's failure."""
+        declared_codes = {code.value for code in coverage.diagnostic_codes}
+        if declared_codes:
+            return tuple(
+                diagnostic
+                for diagnostic in diagnostics
+                if diagnostic.code.value in declared_codes
+            )
+        service_token = "tpu" if coverage.service == "tpu.googleapis.com" else "compute"
+        return tuple(
+            diagnostic
+            for diagnostic in diagnostics
+            if service_token in diagnostic.source.value
+            or service_token in diagnostic.code.value
+        )
+
+    @staticmethod
+    def _retry_guidance(retry: RetryDisposition) -> str:
+        """Translate only the typed retry fact, including an honest unknown."""
+        return {
+            RetryDisposition.NEVER: "Do not retry",
+            RetryDisposition.AFTER_UPGRADE: "Upgrade cqmgr, then retry",
+            RetryDisposition.AFTER_REFRESH: "Refresh provider evidence, then retry",
+            RetryDisposition.AFTER_NEW_PREVIEW: ("Create a new Preview, then retry"),
+            RetryDisposition.AFTER_BACKOFF: "Wait, then retry",
+            RetryDisposition.UNKNOWN: "No retry guidance is available",
+        }[retry]
+
+    @staticmethod
+    def _result_retry_guidance(result: OperationResult[Any]) -> str:
+        guidance = tuple(
+            dict.fromkeys(
+                CloudQuotaManagerApp._retry_guidance(diagnostic.retry)
+                for diagnostic in result.diagnostics
+            )
+        )
+        return "; ".join(guidance) if guidance else "No retry guidance is available"
+
+    @staticmethod
+    def _result_evidence_label(result: OperationResult[Any]) -> str:
+        if result.completeness.is_complete:
+            return "complete"
+        codes = {diagnostic.code.value for diagnostic in result.diagnostics}
+        if any("timeout" in code or "deadline" in code for code in codes):
+            return "timed out"
+        if any(
+            marker in code
+            for code in codes
+            for marker in ("malformed", "schema", "decode", "invalid-response")
+        ):
+            return "malformed"
+        return (
+            "page-capped / incomplete"
+            if result.completeness.has_partial_data
+            else "unavailable"
+        )
+
+    def _render_technical_details(self, result: OperationResult[Any]) -> None:
+        """Populate raw identifiers in a collapsed secondary view."""
+        details = self.query_one("#technical-details", Static)
+        details.update(
+            "Technical details\n" + "\n".join(self._result_fact_lines(result))
+        )
+        details.add_class("hidden")
+        self.query_one(
+            "#toggle-technical-details", Button
+        ).label = "Show technical details"
+
+    def _toggle_technical_details(self) -> None:
+        details = self.query_one("#technical-details", Static)
+        hidden = details.has_class("hidden")
+        details.set_class(not hidden, "hidden")
+        self.query_one("#toggle-technical-details", Button).label = (
+            "Hide technical details" if hidden else "Show technical details"
         )
 
     def open_compose(
@@ -3627,6 +3782,8 @@ class CloudQuotaManagerApp(App[None]):
                 exclusive=True,
                 exit_on_error=False,
             )
+        elif button_id == "toggle-technical-details":
+            self._toggle_technical_details()
         elif button_id in {"copy-cli", "obtainability-copy"}:
             command = self.last_copied_cli
             if command is not None:
@@ -4892,7 +5049,7 @@ class CloudQuotaManagerApp(App[None]):
         data = result.data
         lines = [
             "Obtainability comparison",
-            f"Outcome: {result.outcome.code.value}",
+            f"Evidence: {self._result_evidence_label(result)}",
             "Complete: " + ("yes" if result.completeness.is_complete else "no"),
             "Partial evidence retained: "
             + ("yes" if result.completeness.has_partial_data else "no"),
@@ -4902,10 +5059,11 @@ class CloudQuotaManagerApp(App[None]):
             for gap in result.completeness.gaps
         )
         lines.extend(
-            f"{diagnostic.severity.value.upper()} {diagnostic.code.value}: "
-            f"{diagnostic.message} (retry: {diagnostic.retry.value})"
+            f"{diagnostic.severity.value.upper()} notice: {diagnostic.message}"
             for diagnostic in result.diagnostics
         )
+        if result.diagnostics:
+            lines.append("Retry guidance: " + self._result_retry_guidance(result))
         if isinstance(data, ObtainabilityComparison):
             if data.resolver_provenance is not None:
                 provenance = data.resolver_provenance

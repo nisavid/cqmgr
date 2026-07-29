@@ -5,10 +5,11 @@ scope-lock=unlocked
 principal=unavailable
 outcome=provider-read-failed
 complete=no
-status=PROVIDER-READ-FAILED — exit 9; evidence incomplete
+status=UNAVAILABLE — Wait, then retry
 coverage=Provider coverage: awaiting read
 detail=Quota inspector unavailable
-Reason: provider-read-failed
-ERROR provider-read-failed: The quota inventory could not be read; retry after backoff. (retry: after-backoff)
+Provider evidence: unavailable
+Notice: The quota inventory could not be read; retry after backoff.
+Retry guidance: Wait, then retry
 No provider mutation was attempted.
 audit=Select a retained record to inspect its exact chain facts.
