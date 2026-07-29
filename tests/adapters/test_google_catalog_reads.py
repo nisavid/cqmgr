@@ -626,6 +626,126 @@ def test_compute_exact_zone_readers_never_request_unrelated_zones() -> None:
     )
 
 
+def test_compute_exact_zone_machine_pages_yield_one_success_coverage() -> None:
+    """One exhausted zone chain retains every machine under one coverage record."""
+    zone = "us-central1-a"
+
+    def page(name: str, next_page_token: str) -> ComputeMachineTypesPage:
+        return ComputeMachineTypesPage(
+            (
+                ComputeMachineTypesScope(
+                    f"zones/{zone}",
+                    (
+                        compute_v1.MachineType(
+                            name=name,
+                            zone=zone,
+                            self_link=(
+                                "https://www.googleapis.com/compute/v1/projects/"
+                                f"public-schema-project/zones/{zone}/"
+                                f"machineTypes/{name}"
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            next_page_token,
+        )
+
+    result = asyncio.run(
+        GoogleComputeMachineTypeReader(
+            FakeComputePages(
+                (
+                    page("a3-highgpu-8g", "public-next-page"),
+                    page("g2-standard-4", ""),
+                )
+            ),
+            _policy(),
+            now=lambda: NOW,
+        ).read(ComputeMachineTypeReadRequest(_context(), (zone,)))
+    )
+
+    assert [item.name for item in result.values] == [
+        "a3-highgpu-8g",
+        "g2-standard-4",
+    ]
+    assert [
+        (
+            item.source,
+            item.location,
+            item.expectation,
+            item.state,
+        )
+        for item in result.location_coverage
+    ] == [
+        (
+            CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+            zone,
+            LocationCoverageExpectation.REQUESTED,
+            LocationCoverageState.SUCCESS,
+        )
+    ]
+
+
+def test_compute_exact_zone_accelerator_pages_yield_one_success_coverage() -> None:
+    """One exhausted zone chain retains every accelerator under one coverage record."""
+    zone = "us-central1-a"
+
+    def page(name: str, next_page_token: str) -> ComputeAcceleratorTypesPage:
+        return ComputeAcceleratorTypesPage(
+            (
+                ComputeAcceleratorTypesScope(
+                    f"zones/{zone}",
+                    (
+                        compute_v1.AcceleratorType(
+                            name=name,
+                            zone=zone,
+                            self_link=(
+                                "https://www.googleapis.com/compute/v1/projects/"
+                                f"public-schema-project/zones/{zone}/"
+                                f"acceleratorTypes/{name}"
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            next_page_token,
+        )
+
+    result = asyncio.run(
+        GoogleComputeAcceleratorTypeReader(
+            FakeComputeAcceleratorPages(
+                (
+                    page("nvidia-b200", "public-next-page"),
+                    page("nvidia-h100-80gb", ""),
+                )
+            ),
+            _policy(),
+            now=lambda: NOW,
+        ).read(ComputeAcceleratorTypeReadRequest(_context(), (zone,)))
+    )
+
+    assert [item.name for item in result.values] == [
+        "nvidia-b200",
+        "nvidia-h100-80gb",
+    ]
+    assert [
+        (
+            item.source,
+            item.location,
+            item.expectation,
+            item.state,
+        )
+        for item in result.location_coverage
+    ] == [
+        (
+            CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+            zone,
+            LocationCoverageExpectation.REQUESTED,
+            LocationCoverageState.SUCCESS,
+        )
+    ]
+
+
 def test_compute_zonal_subcalls_share_remaining_deadline_and_diagnostics() -> None:
     """Each zonal page gets remaining time and an expired zone keeps source/phase."""
 
