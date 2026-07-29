@@ -273,6 +273,39 @@ class ObtainabilityWorkflowState:
     confirmed_candidate_ids: tuple[str, ...] = ()
 
 
+class ProviderReadSource(StrEnum):
+    """Allowlisted provider families rendered in active read progress."""
+
+    QUOTA = "quota providers"
+    WORKLOAD_CATALOG = "workload catalogs"
+    SPOT_ADVICE = "Spot advice providers"
+
+
+class ProviderReadPhase(StrEnum):
+    """Operator-facing phases shared by current and planned provider reads."""
+
+    QUOTA_INVENTORY = "quota inventory"
+    QUOTA_INSPECTION = "exact quota inspection"
+    WORKLOAD_RESOLUTION = "workload resolution"
+    CATALOG_CHOICES = "catalog choices"
+    OBTAINABILITY_EXPANSION = "obtainability candidate expansion"
+    OBTAINABILITY_ELIGIBILITY = "obtainability eligibility"
+    OBTAINABILITY_COMPARISON = "obtainability comparison"
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderReadProgress:
+    """One generation-bound read with a shared caller-controlled deadline."""
+
+    workspace: str
+    source: ProviderReadSource
+    phase: ProviderReadPhase
+    started_at: float
+    deadline: float
+    generation: int
+    cancellation: CancellationToken
+
+
 class LifecycleRoute(StrEnum):
     """Focused mutation or observation route inside the Quotas workspace."""
 
@@ -520,7 +553,7 @@ class CloudQuotaManagerApp(App[None]):
         "obtainability-candidates",
     )
 
-    def __init__(  # noqa: PLR0913 - complete surface composition contract
+    def __init__(  # noqa: PLR0913, PLR0915 - complete surface composition contract
         self,
         read_only: ReadOnlyOperationsLike,
         audit: AuditOperationsLike,
@@ -570,6 +603,7 @@ class CloudQuotaManagerApp(App[None]):
         self._last_focus_id: str | None = None
         self._provider_worker: Worker[Any] | None = None
         self._cancellation: CancellationToken | None = None
+        self._provider_progress: ProviderReadProgress | None = None
         self._provider_generation = 0
         self._workspace_generation = 0
         self._audit_operation_generation = 0
@@ -603,6 +637,11 @@ class CloudQuotaManagerApp(App[None]):
             yield Button("Quotas", id="workspace-quotas")
             yield Button("Obtainability", id="workspace-obtainability")
             yield Button("Audit", id="workspace-audit")
+            yield Button(
+                "Cancel read",
+                id="cancel-provider-read",
+                disabled=True,
+            )
         yield Static(
             "READY — provider evidence not yet observed",
             id="status-line",
@@ -917,6 +956,11 @@ class CloudQuotaManagerApp(App[None]):
         audit_table.add_columns("Record", "Operation", "Outcome", "Occurred")
         self._set_layout(self.size.width)
         self._set_active_workspace("quotas")
+        self.set_interval(
+            0.25,
+            self._refresh_provider_progress,
+            name="provider-progress",
+        )
         self._start_quota_load(self.current_query)
 
     async def on_unmount(self) -> None:
@@ -956,17 +1000,38 @@ class CloudQuotaManagerApp(App[None]):
         if self.active_workspace != "quotas":
             return
         generation = self._claim_provider_view()
-        self._cancellation = CancellationToken()
+        cancellation = CancellationToken()
+        deadline = self._deadline()
+        self._cancellation = cancellation
+        self._begin_provider_progress(
+            workspace="quotas",
+            source=ProviderReadSource.QUOTA,
+            phase=ProviderReadPhase.QUOTA_INVENTORY,
+            generation=generation,
+            cancellation=cancellation,
+            deadline=deadline,
+        )
         self._provider_worker = self.run_worker(
-            self._load_quotas(query, self._cancellation, generation),
+            self._load_quotas(
+                query,
+                cancellation,
+                generation,
+                deadline,
+            ),
             group="quota-load",
             exclusive=True,
             exit_on_error=False,
         )
 
     def _claim_provider_view(self) -> int:
+        progress = self._provider_progress
         if self._cancellation is not None:
             self._cancellation.cancel()
+        self._provider_progress = None
+        if self.is_mounted:
+            self.query_one("#cancel-provider-read", Button).disabled = True
+            if progress is not None:
+                self._set_status(f"CANCELLED — {progress.phase.value} read superseded")
         self._provider_generation += 1
         return self._provider_generation
 
@@ -983,36 +1048,130 @@ class CloudQuotaManagerApp(App[None]):
             generation
         )
 
+    def _begin_provider_progress(  # noqa: PLR0913 - complete progress contract
+        self,
+        *,
+        workspace: str,
+        source: ProviderReadSource,
+        phase: ProviderReadPhase,
+        generation: int,
+        cancellation: CancellationToken,
+        deadline: float,
+    ) -> None:
+        """Render one cancellable provider read without weakening its deadline."""
+        if not self._owns_provider_view(generation):
+            return
+        self._provider_progress = ProviderReadProgress(
+            workspace=workspace,
+            source=source,
+            phase=phase,
+            started_at=cast("float", self._monotonic()),
+            deadline=deadline,
+            generation=generation,
+            cancellation=cancellation,
+        )
+        self.query_one("#cancel-provider-read", Button).disabled = False
+        self._refresh_provider_progress()
+
+    def _advance_provider_progress(
+        self,
+        *,
+        source: ProviderReadSource,
+        phase: ProviderReadPhase,
+        generation: int,
+    ) -> None:
+        """Advance a shared-deadline read while preserving its original start."""
+        progress = self._provider_progress
+        if progress is None or progress.generation != generation:
+            return
+        self._provider_progress = replace(
+            progress,
+            source=source,
+            phase=phase,
+        )
+        self._refresh_provider_progress()
+
+    def _refresh_provider_progress(self) -> None:
+        """Tick elapsed time and stop a read once its visible deadline is reached."""
+        progress = self._provider_progress
+        if (
+            progress is None
+            or not self._owns_provider_view(progress.generation)
+            or self.active_workspace != progress.workspace
+        ):
+            return
+        now = cast("float", self._monotonic())
+        elapsed = max(0.0, now - progress.started_at)
+        remaining = max(0.0, progress.deadline - now)
+        if remaining <= 0:
+            progress.cancellation.cancel()
+            self._provider_generation += 1
+            self._provider_progress = None
+            self.query_one("#cancel-provider-read", Button).disabled = True
+            self._set_status(
+                f"DEADLINE REACHED — {progress.phase.value} stopped after "
+                f"{elapsed:.1f}s"
+            )
+            return
+        self._set_status(
+            f"READING — {progress.source.value} / {progress.phase.value} · "
+            f"elapsed {elapsed:.1f}s · deadline in {remaining:.1f}s · "
+            "Cancel read available"
+        )
+
+    def _finish_provider_progress(self, generation: int) -> None:
+        """Clear active progress only for the generation that owns the view."""
+        progress = self._provider_progress
+        if progress is None or progress.generation != generation:
+            return
+        self._provider_progress = None
+        self.query_one("#cancel-provider-read", Button).disabled = True
+
+    def _cancel_provider_read(self) -> None:
+        """Stop the active read and invalidate every later worker repaint."""
+        progress = self._provider_progress
+        if progress is None or not self._owns_provider_view(progress.generation):
+            return
+        progress.cancellation.cancel()
+        self._provider_generation += 1
+        self._provider_progress = None
+        self.query_one("#cancel-provider-read", Button).disabled = True
+        self._set_status(f"CANCELLED — {progress.phase.value} read stopped")
+
     async def _load_quotas(
         self,
         query: ReadOnlyQuotaQuery,
         cancellation: CancellationToken,
         generation: int,
+        deadline: float,
     ) -> None:
         if cancellation.cancelled or not self._owns_quota_view(generation):
             return
-        self._set_status("READING — querying required provider inventory")
         try:
             result = await self.read_only.browse(
                 query,
-                deadline=self._deadline(),
+                deadline=deadline,
                 cancellation=cancellation,
                 scope_input=self.scope_input,
             )
         except asyncio.CancelledError:
             if self._owns_quota_view(generation):
+                self._finish_provider_progress(generation)
                 self._set_status("CANCELLED — prior provider read superseded")
             raise
         except Exception:  # noqa: BLE001 - no typed result exists for worker failure
             if self._owns_quota_view(generation):
+                self._finish_provider_progress(generation)
                 self._set_status(
                     "ERROR — quota inventory unavailable; retry the read-only operation"
                 )
             return
         if cancellation.cancelled or not self._owns_quota_view(generation):
             if self._owns_quota_view(generation):
+                self._finish_provider_progress(generation)
                 self._set_status("CANCELLED — prior provider read superseded")
             return
+        self._finish_provider_progress(generation)
         self.last_result = result
         self._render_instrument(result)
         self._render_quota_result(result)
@@ -3182,7 +3341,8 @@ class CloudQuotaManagerApp(App[None]):
         self._workspace_generation += 1
         workspace_generation = self._workspace_generation
         if workspace == "audit" or (
-            self.active_workspace == "quotas" and workspace != "quotas"
+            workspace != self.active_workspace
+            and self.active_workspace in {"quotas", "obtainability"}
         ):
             self._claim_provider_view()
         self.active_workspace = workspace
@@ -3286,6 +3446,8 @@ class CloudQuotaManagerApp(App[None]):
         button_id = event.button.id
         if button_id and button_id.startswith("workspace-"):
             self.action_workspace(button_id.removeprefix("workspace-"))
+        elif button_id == "cancel-provider-read":
+            self._cancel_provider_read()
         elif button_id == "apply-filters" and self.active_workspace == "quotas":
             self._apply_filters()
         elif button_id == "detail-back":
@@ -3541,8 +3703,16 @@ class CloudQuotaManagerApp(App[None]):
             self._set_status(f"INVALID WORKLOAD — {error}")
             return
         generation = self._claim_provider_view()
+        cancellation = CancellationToken()
+        deadline = self._deadline()
+        self._cancellation = cancellation
         self.run_worker(
-            self.resolve_workload(requirement, generation),
+            self.resolve_workload(
+                requirement,
+                generation,
+                cancellation=cancellation,
+                deadline=deadline,
+            ),
             group="workload-resolve",
             exclusive=True,
             exit_on_error=False,
@@ -3733,13 +3903,23 @@ class CloudQuotaManagerApp(App[None]):
             ):
                 generation = self._claim_provider_view()
                 cancellation = CancellationToken()
+                deadline = self._deadline()
                 self._cancellation = cancellation
                 self._mark_obtainability_submission(draft)
+                self._begin_provider_progress(
+                    workspace="obtainability",
+                    source=ProviderReadSource.WORKLOAD_CATALOG,
+                    phase=ProviderReadPhase.OBTAINABILITY_EXPANSION,
+                    generation=generation,
+                    cancellation=cancellation,
+                    deadline=deadline,
+                )
                 self.run_worker(
                     self._preview_contextual_obtainability(
                         draft,
                         cancellation,
                         generation,
+                        deadline,
                     ),
                     group="obtainability-expand",
                     exclusive=True,
@@ -3760,13 +3940,23 @@ class CloudQuotaManagerApp(App[None]):
                 return
             generation = self._claim_provider_view()
             cancellation = CancellationToken()
+            deadline = self._deadline()
             self._cancellation = cancellation
             self._mark_obtainability_submission(draft)
+            self._begin_provider_progress(
+                workspace="obtainability",
+                source=ProviderReadSource.SPOT_ADVICE,
+                phase=ProviderReadPhase.OBTAINABILITY_COMPARISON,
+                generation=generation,
+                cancellation=cancellation,
+                deadline=deadline,
+            )
             self.run_worker(
                 self._compare_obtainability_prepared(
                     state.pending_expansion,
                     cancellation,
                     generation,
+                    deadline,
                 ),
                 group="obtainability-compare",
                 exclusive=True,
@@ -3775,11 +3965,25 @@ class CloudQuotaManagerApp(App[None]):
             return
         generation = self._claim_provider_view()
         cancellation = CancellationToken()
+        deadline = self._deadline()
         self._cancellation = cancellation
         self._mark_obtainability_submission(draft)
         self._show_obtainability_copy_cli(draft.candidates)
+        self._begin_provider_progress(
+            workspace="obtainability",
+            source=ProviderReadSource.WORKLOAD_CATALOG,
+            phase=ProviderReadPhase.OBTAINABILITY_ELIGIBILITY,
+            generation=generation,
+            cancellation=cancellation,
+            deadline=deadline,
+        )
         self.run_worker(
-            self._compare_obtainability(draft, cancellation, generation),
+            self._compare_obtainability(
+                draft,
+                cancellation,
+                generation,
+                deadline,
+            ),
             group="obtainability-compare",
             exclusive=True,
             exit_on_error=False,
@@ -3813,14 +4017,24 @@ class CloudQuotaManagerApp(App[None]):
             )
             generation = self._claim_provider_view()
             cancellation = CancellationToken()
+            deadline = self._deadline()
             self._cancellation = cancellation
             self._mark_obtainability_submission(draft)
+            self._begin_provider_progress(
+                workspace="obtainability",
+                source=ProviderReadSource.WORKLOAD_CATALOG,
+                phase=ProviderReadPhase.OBTAINABILITY_EXPANSION,
+                generation=generation,
+                cancellation=cancellation,
+                deadline=deadline,
+            )
             self.run_worker(
                 self._preview_obtainability_expansion(
                     requirement,
                     draft,
                     cancellation,
                     generation,
+                    deadline,
                 ),
                 group="obtainability-expand",
                 exclusive=True,
@@ -3838,13 +4052,23 @@ class CloudQuotaManagerApp(App[None]):
             return
         generation = self._claim_provider_view()
         cancellation = CancellationToken()
+        deadline = self._deadline()
         self._cancellation = cancellation
         self._mark_obtainability_submission(draft)
+        self._begin_provider_progress(
+            workspace="obtainability",
+            source=ProviderReadSource.SPOT_ADVICE,
+            phase=ProviderReadPhase.OBTAINABILITY_COMPARISON,
+            generation=generation,
+            cancellation=cancellation,
+            deadline=deadline,
+        )
         self.run_worker(
             self._compare_obtainability_prepared(
                 state.pending_expansion,
                 cancellation,
                 generation,
+                deadline,
             ),
             group="obtainability-compare",
             exclusive=True,
@@ -3935,10 +4159,11 @@ class CloudQuotaManagerApp(App[None]):
         draft: ObtainabilityFormDraft,
         cancellation: CancellationToken,
         generation: int,
+        deadline: float,
     ) -> None:
         result = await self.read_only.resolve(
             requirement,
-            deadline=self._deadline(),
+            deadline=deadline,
             cancellation=cancellation,
             scope_input=self.scope_input,
         )
@@ -3946,6 +4171,7 @@ class CloudQuotaManagerApp(App[None]):
             return
         data = result.data
         if not isinstance(data, ResolvedWorkloadRequirement):
+            self._finish_provider_progress(generation)
             self._set_status(
                 "EXPANSION UNAVAILABLE — compatible locations were not resolved"
             )
@@ -3959,6 +4185,7 @@ class CloudQuotaManagerApp(App[None]):
             )
             prepared = prepare_obtainability_comparison(data, candidates)
         except (TypeError, ValueError):
+            self._finish_provider_progress(generation)
             self._set_status(
                 "EXPANSION UNAVAILABLE — no cataloged Spot Compute candidates"
             )
@@ -3979,6 +4206,7 @@ class CloudQuotaManagerApp(App[None]):
             "Candidate expansion before comparison: "
             + (", ".join(compatible) or "none proven compatible")
         )
+        self._finish_provider_progress(generation)
         self._set_status("CONFIRM CANDIDATE EXPANSION — no comparison has started")
 
     async def _preview_contextual_obtainability(
@@ -3986,6 +4214,7 @@ class CloudQuotaManagerApp(App[None]):
         draft: ObtainabilityFormDraft,
         cancellation: CancellationToken,
         generation: int,
+        deadline: float,
     ) -> None:
         """Prepare one edited contextual request before operator confirmation."""
         locations = tuple(
@@ -4000,16 +4229,16 @@ class CloudQuotaManagerApp(App[None]):
             locations=locations,
             all_compatible=False,
         )
-        self._set_status("READING — preparing edited inherited fields")
         result = await self.read_only.resolve(
             requirement,
-            deadline=self._deadline(),
+            deadline=deadline,
             cancellation=cancellation,
             scope_input=self.scope_input,
         )
         if cancellation.cancelled or not self._owns_obtainability_view(generation):
             return
         if not isinstance(result.data, ResolvedWorkloadRequirement):
+            self._finish_provider_progress(generation)
             self.last_result = result
             self._render_instrument(result)
             self._render_obtainability_result(result)
@@ -4020,6 +4249,7 @@ class CloudQuotaManagerApp(App[None]):
                 draft.candidates,
             )
         except (TypeError, ValueError):
+            self._finish_provider_progress(generation)
             self._set_status(
                 "PREPARATION UNAVAILABLE — exact candidates were not resolved"
             )
@@ -4032,6 +4262,7 @@ class CloudQuotaManagerApp(App[None]):
             confirmed_fingerprint=None,
             confirmed_candidate_ids=(),
         )
+        self._finish_provider_progress(generation)
         self._set_status("CONFIRM INHERITED FIELDS — no advice query has started")
 
     async def _compare_obtainability(
@@ -4039,6 +4270,7 @@ class CloudQuotaManagerApp(App[None]):
         draft: ObtainabilityFormDraft,
         cancellation: CancellationToken,
         generation: int,
+        deadline: float,
     ) -> None:
         if cancellation.cancelled or not self._owns_obtainability_view(generation):
             return
@@ -4054,11 +4286,15 @@ class CloudQuotaManagerApp(App[None]):
             locations=locations,
             all_compatible=False,
         )
-        self._set_status("READING — checking exact Spot Compute eligibility")
+        self._advance_provider_progress(
+            source=ProviderReadSource.WORKLOAD_CATALOG,
+            phase=ProviderReadPhase.OBTAINABILITY_ELIGIBILITY,
+            generation=generation,
+        )
         try:
             resolved_result = await self.read_only.resolve(
                 requirement,
-                deadline=self._deadline(),
+                deadline=deadline,
                 cancellation=cancellation,
                 scope_input=self.scope_input,
             )
@@ -4066,6 +4302,7 @@ class CloudQuotaManagerApp(App[None]):
             raise
         except Exception:  # noqa: BLE001 - no typed result exists for worker failure
             if self._owns_obtainability_view(generation):
+                self._finish_provider_progress(generation)
                 self._set_status(
                     "ERROR — obtainability comparison unavailable; retry the "
                     "read-only operation"
@@ -4074,6 +4311,7 @@ class CloudQuotaManagerApp(App[None]):
         if cancellation.cancelled or not self._owns_obtainability_view(generation):
             return
         if not isinstance(resolved_result.data, ResolvedWorkloadRequirement):
+            self._finish_provider_progress(generation)
             self.last_result = resolved_result
             self._render_instrument(resolved_result)
             self._render_obtainability_result(resolved_result)
@@ -4086,6 +4324,7 @@ class CloudQuotaManagerApp(App[None]):
             prepared,
             cancellation,
             generation,
+            deadline,
         )
 
     async def _compare_obtainability_prepared(
@@ -4093,19 +4332,25 @@ class CloudQuotaManagerApp(App[None]):
         prepared: PreparedObtainabilityComparison,
         cancellation: CancellationToken,
         generation: int,
+        deadline: float,
     ) -> None:
         """Compare the exact resolver-backed candidates already confirmed."""
         if cancellation.cancelled or not self._owns_obtainability_view(generation):
             return
-        self._set_status("READING — comparing exact Spot VM candidates")
+        self._advance_provider_progress(
+            source=ProviderReadSource.SPOT_ADVICE,
+            phase=ProviderReadPhase.OBTAINABILITY_COMPARISON,
+            generation=generation,
+        )
         result = await self.read_only.compare_obtainability_prepared(
             prepared,
-            deadline=self._deadline(),
+            deadline=deadline,
             cancellation=cancellation,
             scope_input=self.scope_input,
         )
         if cancellation.cancelled or not self._owns_obtainability_view(generation):
             return
+        self._finish_provider_progress(generation)
         self.last_result = result
         self._render_instrument(result)
         self._render_obtainability_result(result)
@@ -4410,8 +4655,24 @@ class CloudQuotaManagerApp(App[None]):
         self.set_class(self._detail_route, "detail-route")
         self._last_focus_id = "quota-ledger"
         generation = self._claim_provider_view()
+        cancellation = CancellationToken()
+        deadline = self._deadline()
+        self._cancellation = cancellation
+        self._begin_provider_progress(
+            workspace="quotas",
+            source=ProviderReadSource.QUOTA,
+            phase=ProviderReadPhase.QUOTA_INSPECTION,
+            generation=generation,
+            cancellation=cancellation,
+            deadline=deadline,
+        )
         self.run_worker(
-            self._inspect_quota(selector, generation),
+            self._inspect_quota(
+                selector,
+                generation,
+                cancellation,
+                deadline,
+            ),
             group="quota-inspect",
             exclusive=True,
             exit_on_error=False,
@@ -4421,16 +4682,20 @@ class CloudQuotaManagerApp(App[None]):
         self,
         selector: QuotaInspectSelector,
         generation: int,
+        cancellation: CancellationToken,
+        deadline: float,
     ) -> None:
         if not self._owns_quota_view(generation):
             return
         result = await self.read_only.inspect(
             selector,
-            deadline=self._deadline(),
+            deadline=deadline,
+            cancellation=cancellation,
             scope_input=self.scope_input,
         )
-        if not self._owns_quota_view(generation):
+        if cancellation.cancelled or not self._owns_quota_view(generation):
             return
+        self._finish_provider_progress(generation)
         self.last_result = result
         self._render_instrument(result)
         self._render_quota_detail(result)
@@ -4570,15 +4835,31 @@ class CloudQuotaManagerApp(App[None]):
         self,
         requirement: ComputeInstanceRequirement | CloudTpuSliceRequirement,
         generation: int,
+        *,
+        cancellation: CancellationToken | None = None,
+        deadline: float | None = None,
     ) -> OperationResult[Any]:
         """Resolve one typed workload and retain its exact cross-surface result."""
+        cancellation = cancellation or CancellationToken()
+        deadline = self._deadline() if deadline is None else deadline
+        self._cancellation = cancellation
+        self._begin_provider_progress(
+            workspace="quotas",
+            source=ProviderReadSource.WORKLOAD_CATALOG,
+            phase=ProviderReadPhase.WORKLOAD_RESOLUTION,
+            generation=generation,
+            cancellation=cancellation,
+            deadline=deadline,
+        )
         result = await self.read_only.resolve(
             requirement,
-            deadline=self._deadline(),
+            deadline=deadline,
+            cancellation=cancellation,
             scope_input=self.scope_input,
         )
-        if not self._owns_quota_view(generation):
+        if cancellation.cancelled or not self._owns_quota_view(generation):
             return result
+        self._finish_provider_progress(generation)
         self.last_result = result
         self._render_instrument(result)
         self._render_workload_result(result)
