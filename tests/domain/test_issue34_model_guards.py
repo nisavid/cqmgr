@@ -28,6 +28,7 @@ from cqmgr.domain.catalog import (
     TpuRuntimeVersion,
     UnitConversionEvidence,
     WorkloadConsumer,
+    is_canonical_region_or_zone,
     is_canonical_zone,
 )
 from cqmgr.domain.diagnostics import (
@@ -332,6 +333,40 @@ def test_canonical_zone_predicate_accepts_exact_zone_ids(value: object) -> None:
 def test_canonical_zone_predicate_rejects_ambiguous_values(value: object) -> None:
     """Region shapes and noncanonical values cannot cross exact-zone seams."""
     assert not is_canonical_zone(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "us-central1",
+        "northamerica-northeast2",
+        "us-central1-a",
+    ],
+)
+def test_canonical_region_or_zone_predicate_accepts_location_ids(
+    value: object,
+) -> None:
+    """Canonical region and zone identities share one accepting predicate."""
+    assert is_canonical_region_or_zone(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "global",
+        "a",
+        "not-a-region",
+        "US-CENTRAL1",
+        "regions/us-central1",
+        "us-central1-aa",
+        object(),
+    ],
+)
+def test_canonical_region_or_zone_predicate_rejects_ambiguous_values(
+    value: object,
+) -> None:
+    """Unscoped and malformed values cannot widen provider catalog reads."""
+    assert not is_canonical_region_or_zone(value)
 
 
 def test_query_sort_and_filters_require_public_typed_values() -> None:

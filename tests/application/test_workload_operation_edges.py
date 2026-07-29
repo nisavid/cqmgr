@@ -616,6 +616,31 @@ def test_read_catalog_compute_returns_typed_choices_without_quota_reads() -> Non
     assert machine_request.zones == ("us-central1-a",)
 
 
+@pytest.mark.parametrize("location", ["global", "a", "not-a-region"])
+def test_workload_choice_request_rejects_noncanonical_locations(
+    location: str,
+) -> None:
+    """Malformed scopes cannot widen a guided read to aggregated evidence."""
+    with pytest.raises(ValueError, match="canonical location IDs"):
+        WorkloadChoiceRequest(
+            _context(),
+            WorkloadKind.COMPUTE_INSTANCE,
+            (location,),
+        )
+
+
+@pytest.mark.parametrize("location", ["us-central1", "us-central1-a"])
+def test_workload_choice_request_accepts_canonical_locations(location: str) -> None:
+    """Guided reads retain canonical region and exact-zone scopes."""
+    request = WorkloadChoiceRequest(
+        _context(),
+        WorkloadKind.COMPUTE_INSTANCE,
+        (location,),
+    )
+
+    assert request.locations == (location,)
+
+
 def test_read_catalog_classifies_unavailable_evidence_as_operational_failure() -> None:
     """A catalog read with no usable choices is unavailable and operational."""
     operations = WorkloadResolutionOperations(
