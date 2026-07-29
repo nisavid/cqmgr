@@ -57,9 +57,9 @@ jobs:
           python scripts/live_read_only_canary.py
           --project-env GCP_PROJECT_ID
           --max-pages 50
-          --max-requests 100
-          --max-seconds 120
-          --max-locations 100
+          --max-requests 275
+          --max-seconds 180
+          --max-locations 125
           --timeout 10
           --output live-read-only-evidence.json
 

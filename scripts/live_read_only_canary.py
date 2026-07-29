@@ -29,6 +29,13 @@ MONITORING_METRICS = (
     "serviceruntime.googleapis.com/quota/rate/net_usage",
 )
 MINIMUM_REQUEST_TIMEOUT_SECONDS = 0.1
+DEFAULT_MAX_PAGES = 50
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
+DEFAULT_MAX_REQUESTS = 275
+DEFAULT_MAX_SECONDS = 180.0
+DEFAULT_MAX_LOCATIONS = 125
+MINIMUM_FIXED_SOURCE_REQUESTS = 10
+TPU_CHILD_REQUESTS_PER_LOCATION = 2
 ALLOWED_GET_PATHS = frozenset(
     {
         "/v3/projects/{project}",
@@ -852,6 +859,18 @@ def run_canary(  # noqa: PLR0913 - explicit global and per-request bounds
     if max_locations < 1:
         msg = "TPU location limit must be positive"
         raise ValueError(msg)
+    minimum_requests = (
+        MINIMUM_FIXED_SOURCE_REQUESTS + TPU_CHILD_REQUESTS_PER_LOCATION * max_locations
+    )
+    if max_requests < minimum_requests:
+        msg = (
+            f"global request limit {max_requests} cannot cover "
+            f"at least one request for each of {MINIMUM_FIXED_SOURCE_REQUESTS} "
+            "fixed sources plus "
+            f"{TPU_CHILD_REQUESTS_PER_LOCATION} requests for each of "
+            f"{max_locations} TPU locations; minimum is {minimum_requests}"
+        )
+        raise ValueError(msg)
     budget = RequestBudget(
         max_requests=max_requests,
         max_seconds=max_seconds,
@@ -897,11 +916,15 @@ def main(arguments: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project-env", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--max-pages", type=int, default=10)
-    parser.add_argument("--timeout", type=float, default=10.0)
-    parser.add_argument("--max-requests", type=int, default=100)
-    parser.add_argument("--max-seconds", type=float, default=120.0)
-    parser.add_argument("--max-locations", type=int, default=100)
+    parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    )
+    parser.add_argument("--max-requests", type=int, default=DEFAULT_MAX_REQUESTS)
+    parser.add_argument("--max-seconds", type=float, default=DEFAULT_MAX_SECONDS)
+    parser.add_argument("--max-locations", type=int, default=DEFAULT_MAX_LOCATIONS)
     parsed = parser.parse_args(arguments)
     project = os.environ.get(parsed.project_env)
     if project is None:
