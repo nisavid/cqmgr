@@ -375,10 +375,19 @@ def test_release_publication_qualifies_installed_live_read_adapters() -> None:
         "candidate/release/cqmgr-${{ needs.build.outputs.version }}-py3-none-any.whl"
         in qualification
     )
-    assert "if: always()" in _job_step(
+    candidate = _job_step(qualification, "Download immutable release candidate")
+    assert "uses: actions/download-artifact@" in candidate
+    assert "name: release-candidate" in candidate
+    assert "path: candidate" in candidate
+
+    evidence = _job_step(
         qualification,
         "Upload sanitized installed-adapter evidence",
     )
+    assert "if: always()" in evidence
+    assert "uses: actions/upload-artifact@" in evidence
+    assert "name: installed-live-adapter-evidence" in evidence
+    assert "path: installed-live-adapter-evidence.json" in evidence
     assert "installed-live-adapters" in _yaml_list_values(
         publish_needs,
         indent=6,
