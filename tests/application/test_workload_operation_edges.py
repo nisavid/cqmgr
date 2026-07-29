@@ -17,11 +17,7 @@ from cqmgr.application.operations.quotas import (
     QuotaResolveRequest,
     WorkloadResolutionOperations,
 )
-from cqmgr.application.ports.catalog_reads import (
-    CatalogRead,
-    ComputeAcceleratorTypeReadRequest,
-    ComputeMachineTypeReadRequest,
-)
+from cqmgr.application.ports.catalog_reads import CatalogRead
 from cqmgr.application.ports.coordination import CancellationToken
 from cqmgr.application.ports.provider_reads import ProviderReadContext
 from cqmgr.domain.accelerator_overlay import (
@@ -74,6 +70,10 @@ from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from cqmgr.application.ports.catalog_reads import (
+        ComputeAcceleratorTypeReadRequest,
+        ComputeMachineTypeReadRequest,
+    )
     from cqmgr.application.ports.provider_reads import (
         EffectiveQuotaReader,
         QuotaPreferenceReader,
