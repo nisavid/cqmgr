@@ -203,7 +203,7 @@ def _map_time_series(
         series.metric.type != _ALLOCATION_USAGE_METRIC
         or series.metric_kind != metric_pb2.MetricDescriptor.MetricKind.GAUGE
         or series.value_type != metric_pb2.MetricDescriptor.ValueType.INT64
-        or series.unit != "1"
+        or series.unit not in ("", "1")
         or not metric_labels.get("quota_metric")
         or series.resource.type != _CONSUMER_QUOTA_RESOURCE
         or resource_labels.get("project_id") != request.context.project.project_id
@@ -221,7 +221,7 @@ def _map_time_series(
         points=tuple(
             _map_point(point, value_field="int64_value") for point in series.points
         ),
-        unit=series.unit or None,
+        unit="1",
     )
 
 
