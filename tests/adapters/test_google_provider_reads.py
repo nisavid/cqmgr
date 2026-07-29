@@ -1394,6 +1394,34 @@ def test_monitoring_reader_preserves_all_points_intervals_values_and_labels() ->
     assert client.calls[0][1] == EXPECTED_USAGE_FILTER
 
 
+@pytest.mark.parametrize("provider_unit", ["", "1"])
+def test_monitoring_normalizes_unitless_allocation_usage(
+    provider_unit: str,
+) -> None:
+    """Empty and explicit dimensionless metadata produce the same usage unit."""
+    series = monitoring_v3.TimeSeries(_monitoring_page().items[0])
+    series.unit = provider_unit
+    request = UsageReadRequest(
+        _context(),
+        "compute.googleapis.com",
+        datetime(2026, 7, 22, tzinfo=UTC),
+        datetime(2026, 7, 23, tzinfo=UTC),
+    )
+
+    result = asyncio.run(
+        GoogleUsageReader(
+            FakeMonitoringPages([TimeSeriesPage((series,), "")]),
+            _policy(RecordingBudget()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(request)
+    )
+
+    assert result.complete
+    assert result.values[0].unit == "1"
+    assert result.values[0].points[0].value.value == 2**63 - 1
+
+
 def test_monitoring_usage_query_is_typed_and_complete_when_empty() -> None:
     """A valid exact service query may complete with no observations, never zero."""
     client = FakeMonitoringPages([TimeSeriesPage((), "")])
@@ -1433,6 +1461,7 @@ def test_monitoring_schema_skew_and_partial_page_fail_closed() -> None:
     """Unsupported point shapes and a failed required page remain incomplete."""
     page = _monitoring_page()
     bad = page.items[0]
+    bad.unit = ""
     bad.metric.type = "future.googleapis.com/not-quota-usage"
     client = FakeMonitoringPages(
         [
@@ -1485,6 +1514,7 @@ def test_monitoring_declarations_and_project_attribution_fail_closed(
 ) -> None:
     """Schema-skewed or cross-project usage never becomes complete evidence."""
     series = monitoring_v3.TimeSeries(_monitoring_page().items[0])
+    series.unit = ""
     if mutation == "metric-kind":
         series.metric_kind = metric_pb2.MetricDescriptor.MetricKind.CUMULATIVE
     elif mutation == "value-type":
@@ -1502,6 +1532,40 @@ def test_monitoring_declarations_and_project_attribution_fail_closed(
         series.resource.labels["service"] = "storage.googleapis.com"
     else:
         series.resource.labels.pop("location")
+    result = asyncio.run(
+        GoogleUsageReader(
+            FakeMonitoringPages([TimeSeriesPage((series,), "")]),
+            _policy(RecordingBudget()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(
+            UsageReadRequest(
+                _context(),
+                "compute.googleapis.com",
+                datetime(2026, 7, 22, tzinfo=UTC),
+                datetime(2026, 7, 23, tzinfo=UTC),
+            )
+        )
+    )
+
+    assert not result.complete
+    assert result.values == ()
+    assert result.diagnostics[0].code.value == "provider-schema-invalid"
+
+
+@pytest.mark.parametrize("mutation", ["point-value-kind", "non-instantaneous"])
+def test_monitoring_usage_points_remain_int64_and_instantaneous(
+    mutation: str,
+) -> None:
+    """Unit normalization cannot admit a wrong point kind or interval shape."""
+    series = monitoring_v3.TimeSeries(_monitoring_page().items[0])
+    series.unit = ""
+    if mutation == "point-value-kind":
+        series.points[0].value.double_value = 12.5
+    else:
+        point_pb = monitoring_v3.Point.pb(series.points[0])
+        point_pb.interval.start_time.FromDatetime(datetime(2026, 7, 22, 1, tzinfo=UTC))
+
     result = asyncio.run(
         GoogleUsageReader(
             FakeMonitoringPages([TimeSeriesPage((series,), "")]),
