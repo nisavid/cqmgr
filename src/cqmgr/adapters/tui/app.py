@@ -4129,14 +4129,15 @@ class CloudQuotaManagerApp(App[None]):
             workspace == "obtainability"
             or self._workload_kind == WorkloadKind.COMPUTE_INSTANCE.value
         ):
-            return bool(
-                catalog.compute_machine_types or catalog.compute_accelerator_types
-            )
-        return bool(
-            catalog.tpu_locations
-            or catalog.tpu_accelerator_types
-            or catalog.tpu_runtime_versions
-        )
+            return bool(catalog.compute_machine_types)
+        location_zones = {location.location_id for location in catalog.tpu_locations}
+        accelerator_zones = {
+            accelerator.zone
+            for accelerator in catalog.tpu_accelerator_types
+            if accelerator.configurations
+        }
+        runtime_zones = {runtime.zone for runtime in catalog.tpu_runtime_versions}
+        return bool(location_zones.intersection(accelerator_zones, runtime_zones))
 
     def _replace_catalog_suggestions(
         self,

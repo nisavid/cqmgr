@@ -4081,6 +4081,90 @@ def test_complete_empty_catalog_is_explicit_and_remains_fail_closed() -> None:
     asyncio.run(scenario())
 
 
+def test_complete_compute_catalog_without_machine_choices_is_explicitly_empty() -> None:
+    """Accelerator evidence alone cannot form a selectable Compute workload."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        operations.catalog_result = replace(
+            operations.catalog_result,
+            data=replace(
+                operations.catalog_result.data,
+                compute_machine_types=(),
+            ),
+        )
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 70)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-compute")
+            await pilot.pause()
+
+            evidence = str(_static(app, "#workload-choice-evidence").content)
+            status = str(_static(app, "#status-line").content)
+            assert "NO SUPPORTED CHOICES" in evidence
+            assert "VERIFIED CHOICES" not in evidence
+            assert "NO SUPPORTED CHOICES" in status
+            assert "GUIDED CHOICES READY" not in status
+
+    asyncio.run(scenario())
+
+
+def test_complete_tpu_catalog_without_a_colocated_choice_is_explicitly_empty() -> None:
+    """Separate TPU fields cannot form a selectable workload across zones."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        operations.catalog_result = replace(
+            operations.catalog_result,
+            data=replace(
+                operations.catalog_result.data,
+                tpu_locations=(
+                    TpuLocation(
+                        "projects/123456789/locations/us-central1-a",
+                        "us-central1-a",
+                    ),
+                ),
+                tpu_accelerator_types=(
+                    TpuAcceleratorType(
+                        (
+                            "projects/123456789/locations/us-central1-a/"
+                            "acceleratorTypes/v6e-8"
+                        ),
+                        "us-central1-a",
+                        "v6e-8",
+                        (TpuAcceleratorConfig("V6E", "2x4"),),
+                    ),
+                ),
+                tpu_runtime_versions=(
+                    TpuRuntimeVersion(
+                        (
+                            "projects/123456789/locations/us-central1-b/"
+                            "runtimeVersions/tpu-vm-base"
+                        ),
+                        "us-central1-b",
+                        "tpu-vm-base",
+                    ),
+                ),
+            ),
+        )
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 70)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-tpu")
+            await pilot.pause()
+
+            evidence = str(_static(app, "#workload-choice-evidence").content)
+            status = str(_static(app, "#status-line").content)
+            assert "NO SUPPORTED CHOICES" in evidence
+            assert "VERIFIED CHOICES" not in evidence
+            assert "NO SUPPORTED CHOICES" in status
+            assert "GUIDED CHOICES READY" not in status
+
+    asyncio.run(scenario())
+
+
 def test_incomplete_catalog_requires_explicit_unverified_manual_entry() -> None:
     """Partial choice evidence permits manual input only through its escape hatch."""
 
