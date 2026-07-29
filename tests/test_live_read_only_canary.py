@@ -399,17 +399,21 @@ def test_location_limit_retains_sanitized_incomplete_evidence() -> None:
     )
 
 
-def test_ordinary_canary_completes_121_location_one_page_provider_inventory() -> None:
-    """The ordinary envelope covers current exhaustive TPU provider fanout."""
+def test_ordinary_canary_completes_live_shaped_121_location_inventory(  # noqa: C901 - explicit provider replay fixture
+) -> None:
+    """The ordinary envelope covers measured TPU pagination and latency."""
     module = _module()
     run_canary = cast("Any", module["run_canary"])
-    expected_max_requests = 275
-    expected_max_seconds = 180.0
+    request_budget_type = cast("Any", module["RequestBudget"])
+    expected_max_requests = 500
+    expected_max_seconds = 1200.0
     expected_max_locations = 125
     expected_max_pages = 50
     expected_request_timeout = 10.0
     expected_locations = 121
-    expected_requests = 252
+    expected_requests = 378
+    expected_elapsed_ms = 975_500
+    second_page = 2
 
     assert module["DEFAULT_MAX_REQUESTS"] == expected_max_requests
     assert module["DEFAULT_MAX_SECONDS"] == expected_max_seconds
@@ -427,41 +431,95 @@ def test_ordinary_canary_completes_121_location_one_page_provider_inventory() ->
         def json(self) -> dict[str, object]:
             return self.payload
 
+    class Clock:
+        def __init__(self) -> None:
+            self.now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+        def advance(self, seconds: float) -> None:
+            self.now += seconds
+
     class Session:
-        def request(self, method: str, url: str, **kwargs: object) -> Response:
+        def __init__(self, clock: Clock) -> None:
+            self.clock = clock
+            self.pages_by_url: dict[str, int] = {}
+
+        def request(  # noqa: C901, PLR0911 - explicit provider replay fixture
+            self,
+            method: str,
+            url: str,
+            **kwargs: object,
+        ) -> Response:
             assert method == "GET"
             assert cast("float", kwargs["timeout"]) <= expected_request_timeout
             hostname = urlsplit(url).hostname
+            page = self.pages_by_url.get(url, 0) + 1
+            self.pages_by_url[url] = page
+            if hostname == "tpu.googleapis.com" and "/locations/" in url:
+                latency = (
+                    1.5
+                    if url.endswith("/acceleratorTypes")
+                    else (4.0 if page == 1 else 2.5)
+                )
+            else:
+                latency = 0.5
+            assert latency <= cast("float", kwargs["timeout"])
+            self.clock.advance(latency)
             if hostname == "cloudquotas.googleapis.com":
                 item_key = (
                     "quotaPreferences" if "quotaPreferences" in url else "quotaInfos"
                 )
-                return Response({item_key: []})
+                payload: dict[str, object] = {item_key: []}
+                if (
+                    item_key == "quotaInfos"
+                    and "/services/compute.googleapis.com/" in url
+                    and page == 1
+                ):
+                    payload["nextPageToken"] = "opaque-token"
+                return Response(payload)
             if hostname == "monitoring.googleapis.com":
                 return Response({"timeSeries": []})
             if hostname == "compute.googleapis.com":
-                return Response({"items": {}})
+                desired_pages = 3 if url.endswith("/machineTypes") else 2
+                payload = {"items": {}}
+                if page < desired_pages:
+                    payload["nextPageToken"] = "opaque-token"
+                return Response(payload)
             if url.endswith("/locations"):
-                return Response(
-                    {
-                        "locations": [
+                payload = {
+                    "locations": (
+                        [
                             {"locationId": f"provider-location-{index}"}
                             for index in range(expected_locations)
                         ]
-                    }
-                )
-            return Response(
-                {
-                    (
-                        "acceleratorTypes"
-                        if url.endswith("/acceleratorTypes")
-                        else "runtimeVersions"
-                    ): []
+                        if page == second_page
+                        else []
+                    )
                 }
-            )
+                if page == 1:
+                    payload["nextPageToken"] = "opaque-token"
+                return Response(payload)
+            if url.endswith("/acceleratorTypes"):
+                return Response({"acceleratorTypes": []})
+            if url.endswith("/runtimeVersions"):
+                payload = {"runtimeVersions": []}
+                if page == 1:
+                    payload["nextPageToken"] = "opaque-token"
+                return Response(payload)
+            return Response({})
 
+    clock = Clock()
+    run_canary.__globals__["RequestBudget"] = lambda *, max_requests, max_seconds: (
+        request_budget_type(
+            max_requests=max_requests,
+            max_seconds=max_seconds,
+            monotonic=clock,
+        )
+    )
     evidence = run_canary(
-        Session(),
+        Session(clock),
         "dedicated-canary",
         max_pages=module["DEFAULT_MAX_PAGES"],
         timeout=module["DEFAULT_REQUEST_TIMEOUT_SECONDS"],
@@ -473,6 +531,7 @@ def test_ordinary_canary_completes_121_location_one_page_provider_inventory() ->
     assert evidence["complete"] is True
     assert evidence["tpu_locations"] == expected_locations
     assert evidence["total_requests"] == expected_requests
+    assert evidence["total_elapsed_ms"] == expected_elapsed_ms
 
 
 def test_ordinary_canary_rejects_126th_unique_location_before_child_fanout(  # noqa: C901 - explicit provider boundary fixture
