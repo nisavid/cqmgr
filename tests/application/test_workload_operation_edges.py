@@ -17,7 +17,11 @@ from cqmgr.application.operations.quotas import (
     QuotaResolveRequest,
     WorkloadResolutionOperations,
 )
-from cqmgr.application.ports.catalog_reads import CatalogRead
+from cqmgr.application.ports.catalog_reads import (
+    CatalogRead,
+    ComputeAcceleratorTypeReadRequest,
+    ComputeMachineTypeReadRequest,
+)
 from cqmgr.application.ports.coordination import CancellationToken
 from cqmgr.application.ports.provider_reads import ProviderReadContext
 from cqmgr.domain.accelerator_overlay import (
@@ -70,10 +74,6 @@ from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from cqmgr.application.ports.catalog_reads import (
-        ComputeAcceleratorTypeReadRequest,
-        ComputeMachineTypeReadRequest,
-    )
     from cqmgr.application.ports.provider_reads import (
         EffectiveQuotaReader,
         QuotaPreferenceReader,
@@ -518,10 +518,10 @@ def test_resolve_compute_exact_zone_scopes_both_catalog_reads() -> None:
     )
 
     assert result.data is not None
-    accelerator_request = cast(
-        "ComputeAcceleratorTypeReadRequest", accelerator_reader.calls[0]
-    )
-    machine_request = cast("ComputeMachineTypeReadRequest", machine_reader.calls[0])
+    accelerator_request = accelerator_reader.calls[0]
+    machine_request = machine_reader.calls[0]
+    assert isinstance(accelerator_request, ComputeAcceleratorTypeReadRequest)
+    assert isinstance(machine_request, ComputeMachineTypeReadRequest)
     assert accelerator_request.zones == ("us-central1-a",)
     assert machine_request.zones == ("us-central1-a",)
 
@@ -551,10 +551,10 @@ def test_resolve_compute_nonzonal_candidates_retain_aggregated_catalog_reads(
 
     _ = asyncio.run(operations.resolve(QuotaResolveRequest(_context(), requirement)))
 
-    accelerator_request = cast(
-        "ComputeAcceleratorTypeReadRequest", accelerator_reader.calls[0]
-    )
-    machine_request = cast("ComputeMachineTypeReadRequest", machine_reader.calls[0])
+    accelerator_request = accelerator_reader.calls[0]
+    machine_request = machine_reader.calls[0]
+    assert isinstance(accelerator_request, ComputeAcceleratorTypeReadRequest)
+    assert isinstance(machine_request, ComputeMachineTypeReadRequest)
     assert accelerator_request.zones is None
     assert machine_request.zones is None
 
