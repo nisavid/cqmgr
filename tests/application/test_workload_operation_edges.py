@@ -17,7 +17,11 @@ from cqmgr.application.operations.quotas import (
     QuotaResolveRequest,
     WorkloadResolutionOperations,
 )
-from cqmgr.application.ports.catalog_reads import CatalogRead
+from cqmgr.application.ports.catalog_reads import (
+    CatalogRead,
+    ComputeAcceleratorTypeReadRequest,
+    ComputeMachineTypeReadRequest,
+)
 from cqmgr.application.ports.coordination import CancellationToken
 from cqmgr.application.ports.provider_reads import ProviderReadContext
 from cqmgr.domain.accelerator_overlay import (
@@ -491,6 +495,68 @@ def test_resolve_classifies_wholly_unavailable_effective_evidence_as_operational
     assert result.data is None
     assert not result.completeness.is_complete
     assert not result.completeness.has_partial_data
+
+
+def test_resolve_compute_exact_zone_scopes_both_catalog_reads() -> None:
+    """One exact candidate reads only that zone through both Compute catalog ports."""
+    accelerator_reader = ScriptedCatalogReader((_compute_accelerator_catalog_read(),))
+    machine_reader = ScriptedCatalogReader((_gpu_catalog_read(),))
+    operations = WorkloadResolutionOperations(
+        ScriptedReader((_complete(),)),
+        ScriptedReader((_complete(),)),
+        accelerator_reader,
+        machine_reader,
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+
+    result = asyncio.run(
+        operations.resolve(QuotaResolveRequest(_context(), _gpu_requirement()))
+    )
+
+    assert result.data is not None
+    accelerator_request = cast(
+        "ComputeAcceleratorTypeReadRequest", accelerator_reader.calls[0]
+    )
+    machine_request = cast("ComputeMachineTypeReadRequest", machine_reader.calls[0])
+    assert accelerator_request.zones == ("us-central1-a",)
+    assert machine_request.zones == ("us-central1-a",)
+
+
+@pytest.mark.parametrize(
+    "locations",
+    [CandidateLocations(("us-central1",)), AllCompatibleLocations()],
+)
+def test_resolve_compute_nonzonal_candidates_retain_aggregated_catalog_reads(
+    locations: CandidateLocations | AllCompatibleLocations,
+) -> None:
+    """Regional and all-compatible resolution keep the aggregated Compute seam."""
+    accelerator_reader = ScriptedCatalogReader((_compute_accelerator_catalog_read(),))
+    machine_reader = ScriptedCatalogReader((_gpu_catalog_read(),))
+    operations = WorkloadResolutionOperations(
+        ScriptedReader((_complete(),)),
+        ScriptedReader((_complete(),)),
+        accelerator_reader,
+        machine_reader,
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+    requirement = replace(_gpu_requirement(), locations=locations)
+
+    _ = asyncio.run(operations.resolve(QuotaResolveRequest(_context(), requirement)))
+
+    accelerator_request = cast(
+        "ComputeAcceleratorTypeReadRequest", accelerator_reader.calls[0]
+    )
+    machine_request = cast("ComputeMachineTypeReadRequest", machine_reader.calls[0])
+    assert accelerator_request.zones is None
+    assert machine_request.zones is None
 
 
 def test_resolve_all_compatible_accepts_an_authoritatively_empty_tpu_inventory() -> (

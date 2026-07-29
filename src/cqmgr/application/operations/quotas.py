@@ -372,7 +372,11 @@ class WorkloadResolutionOperations:
     ]:
         requirement = request.requirement
         if isinstance(requirement, ComputeInstanceRequirement):
-            return await self._read_compute_evidence(request.context, observed_at)
+            return await self._read_compute_evidence(
+                request.context,
+                requirement,
+                observed_at,
+            )
         return await self._read_cloud_tpu_evidence(
             request.context,
             requirement,
@@ -382,6 +386,7 @@ class WorkloadResolutionOperations:
     async def _read_compute_evidence(
         self,
         context: ProviderReadContext,
+        requirement: ComputeInstanceRequirement,
         observed_at: datetime,
     ) -> tuple[
         ProviderRead[EffectiveQuotaEvidence],
@@ -389,6 +394,15 @@ class WorkloadResolutionOperations:
         WorkloadCatalogEvidence,
         tuple[Diagnostic, ...],
     ]:
+        zones = (
+            requirement.locations.values
+            if isinstance(requirement.locations, CandidateLocations)
+            and all(
+                _is_canonical_zone(location)
+                for location in requirement.locations.values
+            )
+            else None
+        )
         (
             effective_read,
             usage_read,
@@ -407,9 +421,11 @@ class WorkloadResolutionOperations:
                 )
             ),
             self._compute_accelerator_types.read(
-                ComputeAcceleratorTypeReadRequest(context)
+                ComputeAcceleratorTypeReadRequest(context, zones)
             ),
-            self._compute_machine_types.read(ComputeMachineTypeReadRequest(context)),
+            self._compute_machine_types.read(
+                ComputeMachineTypeReadRequest(context, zones)
+            ),
         )
         coverage = (
             *accelerator_read.location_coverage,
