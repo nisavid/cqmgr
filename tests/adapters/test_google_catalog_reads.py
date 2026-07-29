@@ -430,6 +430,9 @@ def test_compute_accelerator_reader_preserves_identity_lifecycle_and_coverage() 
     assert {item.source for item in result.location_coverage} == {
         CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES
     }
+    assert "provider-schema-invalid" not in {
+        item.code.value for item in result.read.diagnostics
+    }
     assert not result.complete
     assert all(call[0] == "public-schema-project" for call in client.calls)
     assert all(call[3] is True for call in client.calls)
@@ -475,6 +478,9 @@ def test_compute_reader_preserves_scopes_lifecycle_accelerators_and_warnings() -
         LocationCoverageState.EMPTY,
         LocationCoverageState.FAILED,
     ]
+    assert "provider-schema-invalid" not in {
+        item.code.value for item in result.read.diagnostics
+    }
     assert not result.complete
     assert all(call[0] == "public-schema-project" for call in client.calls)
     assert all(call[3] is True for call in client.calls)
@@ -595,6 +601,88 @@ def test_invalid_compute_scope_is_explicit_failed_coverage(scope: str) -> None:
     assert result.location_coverage[0].location == "global"
     assert result.location_coverage[0].state is LocationCoverageState.FAILED
     assert not result.complete
+
+
+@pytest.mark.parametrize(
+    ("zone", "self_link"),
+    [
+        (
+            "https://compute.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-central1-a",
+            "https://www.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-central1-a/"
+            "machineTypes/a3-highgpu-8g",
+        ),
+        (
+            "https://www.googleapis.com/compute/v1/projects/other/"
+            "zones/us-central1-a",
+            "https://www.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-central1-a/"
+            "machineTypes/a3-highgpu-8g",
+        ),
+        (
+            "https://www.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-east1-b",
+            "https://www.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-central1-a/"
+            "machineTypes/a3-highgpu-8g",
+        ),
+        (
+            "https://www.googleapis.com/compute/v1/projects/"
+            "public-schema-project/regions/us-central1",
+            "https://www.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-central1-a/"
+            "machineTypes/a3-highgpu-8g",
+        ),
+        (
+            "https://www.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-central1-a",
+            "https://compute.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-central1-a/"
+            "machineTypes/a3-highgpu-8g",
+        ),
+        (
+            "https://www.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-central1-a",
+            "https://www.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-central1-a/"
+            "acceleratorTypes/a3-highgpu-8g",
+        ),
+    ],
+)
+def test_compute_reader_rejects_nonmatching_full_resource_identities(
+    zone: str,
+    self_link: str,
+) -> None:
+    """Full identities must match the API, project, zone, collection, and name."""
+    page = ComputeMachineTypesPage(
+        scopes=(
+            ComputeMachineTypesScope(
+                "zones/us-central1-a",
+                (
+                    compute_v1.MachineType(
+                        name="a3-highgpu-8g",
+                        zone=zone,
+                        self_link=self_link,
+                    ),
+                ),
+            ),
+        ),
+        next_page_token="",
+    )
+
+    result = asyncio.run(
+        GoogleComputeMachineTypeReader(
+            FakeComputePages((page,)), _policy(), now=lambda: NOW
+        ).read(ComputeMachineTypeReadRequest(_context()))
+    )
+
+    assert result.values == ()
+    assert result.location_coverage[0].state is LocationCoverageState.FAILED
+    assert [item.code.value for item in result.read.diagnostics] == [
+        "provider-schema-invalid",
+        "compute-catalog-scope-invalid",
+    ]
 
 
 def test_invalid_tpu_location_is_explicit_failed_coverage() -> None:

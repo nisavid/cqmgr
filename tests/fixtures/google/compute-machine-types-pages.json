@@ -6,7 +6,7 @@
           "machineTypes": [
             {
               "name": "a3-highgpu-8g",
-              "zone": "us-central1-a",
+              "zone": "https://www.googleapis.com/compute/v1/projects/public-schema-project/zones/us-central1-a",
               "selfLink": "https://www.googleapis.com/compute/v1/projects/public-schema-project/zones/us-central1-a/machineTypes/a3-highgpu-8g",
               "accelerators": [
                 {
