@@ -4015,6 +4015,41 @@ def test_incomplete_catalog_requires_explicit_unverified_manual_entry() -> None:
     asyncio.run(scenario())
 
 
+def test_standalone_obtainability_opens_with_safe_defaults_and_exact_example() -> None:
+    """Standalone entry needs no inherited confirmation and defaults conservatively."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 48)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            await pilot.pause()
+
+            assert _input(app, "#obtainability-vm-count").value == "1"
+            assert _input(app, "#obtainability-distribution").value == "any"
+            assert _input(app, "#obtainability-candidates").value == ""
+            assert _button(app, "#obtainability-confirm").has_class("hidden")
+            assert (
+                "a3-highgpu-8g"
+                in _input(
+                    app,
+                    "#obtainability-machine-type",
+                ).placeholder
+            )
+            assert (
+                "us-central1=us-central1-a us-east4=us-east4-a"
+                in _input(app, "#obtainability-candidates").placeholder
+            )
+            assert (
+                "explicit candidates only"
+                in str(_static(app, "#obtainability-expansion").content).casefold()
+            )
+
+    asyncio.run(scenario())
+
+
 def test_obtainability_standalone_explicit_candidates_share_typed_cli_semantics() -> (
     None
 ):
