@@ -333,7 +333,7 @@ class TokenAwareCatalogSuggester(Suggester):
 
     def __init__(self) -> None:
         """Start empty until typed provider evidence arrives."""
-        super().__init__(case_sensitive=False)
+        super().__init__(use_cache=False, case_sensitive=False)
         self._values: tuple[str, ...] = ()
 
     def replace(self, values: tuple[str, ...]) -> None:
@@ -1177,6 +1177,8 @@ class CloudQuotaManagerApp(App[None]):
         progress = self._provider_progress
         if self._cancellation is not None:
             self._cancellation.cancel()
+        if progress is not None:
+            self._restore_interrupted_catalog_choices(progress)
         self._provider_progress = None
         if self.is_mounted:
             self.query_one("#cancel-provider-read", Button).disabled = True
@@ -1255,6 +1257,7 @@ class CloudQuotaManagerApp(App[None]):
         remaining = max(0.0, progress.deadline - now)
         if remaining <= 0:
             progress.cancellation.cancel()
+            self._restore_interrupted_catalog_choices(progress)
             self._provider_generation += 1
             self._provider_progress = None
             self.query_one("#cancel-provider-read", Button).disabled = True
@@ -1277,12 +1280,40 @@ class CloudQuotaManagerApp(App[None]):
         self._provider_progress = None
         self.query_one("#cancel-provider-read", Button).disabled = True
 
+    def _set_provider_failure(
+        self,
+        generation: int,
+        *,
+        workspace: str,
+        status: str,
+    ) -> None:
+        """Render one worker failure only while its generation owns the workspace."""
+        if self._owns_provider_view(generation) and self.active_workspace == workspace:
+            self._finish_provider_progress(generation)
+            self._set_status(status)
+
+    def _restore_interrupted_catalog_choices(
+        self,
+        progress: ProviderReadProgress,
+    ) -> None:
+        """Turn an interrupted catalog read into explicit incomplete evidence."""
+        if (
+            progress.phase is ProviderReadPhase.CATALOG_CHOICES
+            and self.active_workspace == progress.workspace
+        ):
+            self._bind_catalog_evidence(
+                progress.workspace,
+                None,
+                complete=False,
+            )
+
     def _cancel_provider_read(self) -> None:
         """Stop the active read and invalidate every later worker repaint."""
         progress = self._provider_progress
         if progress is None or not self._owns_provider_view(progress.generation):
             return
         progress.cancellation.cancel()
+        self._restore_interrupted_catalog_choices(progress)
         self._provider_generation += 1
         self._provider_progress = None
         self.query_one("#cancel-provider-read", Button).disabled = True
@@ -1590,7 +1621,7 @@ class CloudQuotaManagerApp(App[None]):
         )
 
     def _render_technical_details(self, result: OperationResult[Any]) -> None:
-        """Populate raw identifiers in a collapsed secondary view."""
+        """Refresh raw identifiers without changing the disclosure state."""
         details = self.query_one("#technical-details", Static)
         details.update(
             "Technical details\n"
@@ -1601,10 +1632,6 @@ class CloudQuotaManagerApp(App[None]):
                 )
             )
         )
-        details.add_class("hidden")
-        self.query_one(
-            "#toggle-technical-details", Button
-        ).label = "Show technical details"
 
     def _toggle_technical_details(self) -> None:
         details = self.query_one("#technical-details", Static)
@@ -3895,6 +3922,11 @@ class CloudQuotaManagerApp(App[None]):
 
     def _invalidate_obtainability_edit(self, input_id: str, value: str) -> None:
         """Invalidate every provider-backed Obtainability artifact on edit."""
+        if (
+            self._active_obtainability_fingerprint is None
+            and self._active_obtainability_inputs.get(input_id) == value
+        ):
+            return
         try:
             current = self._decode_obtainability_form(
                 all_compatible=self._active_obtainability_all_compatible,
@@ -4473,6 +4505,9 @@ class CloudQuotaManagerApp(App[None]):
         confirm.label = "Confirm inherited fields and candidate expansion"
         confirm.add_class("hidden")
         self.query_one("#obtainability-return").add_class("hidden")
+        self._active_obtainability_fingerprint = None
+        self._active_obtainability_all_compatible = False
+        self._active_obtainability_inputs = self._obtainability_input_values()
 
     @staticmethod
     def _standalone_obtainability_prompt() -> str:
@@ -4903,7 +4938,11 @@ class CloudQuotaManagerApp(App[None]):
         """Keep already-submitted form events from superseding their own worker."""
         self._active_obtainability_fingerprint = draft.fingerprint
         self._active_obtainability_all_compatible = draft.all_compatible
-        self._active_obtainability_inputs = {
+        self._active_obtainability_inputs = self._obtainability_input_values()
+
+    def _obtainability_input_values(self) -> dict[str, str]:
+        """Snapshot every value whose edit invalidates provider-backed evidence."""
+        return {
             input_id: (
                 self._select_text(f"#{input_id}")
                 if input_id == "obtainability-distribution"
@@ -4986,12 +5025,30 @@ class CloudQuotaManagerApp(App[None]):
         generation: int,
         deadline: float,
     ) -> None:
-        result = await self.read_only.resolve(
-            requirement,
-            deadline=deadline,
-            cancellation=cancellation,
-            scope_input=self.scope_input,
-        )
+        try:
+            result = await self.read_only.resolve(
+                requirement,
+                deadline=deadline,
+                cancellation=cancellation,
+                scope_input=self.scope_input,
+            )
+        except asyncio.CancelledError:
+            self._set_provider_failure(
+                generation,
+                workspace="obtainability",
+                status="CANCELLED — obtainability candidate expansion stopped",
+            )
+            raise
+        except Exception:  # noqa: BLE001 - no typed result exists to render
+            self._set_provider_failure(
+                generation,
+                workspace="obtainability",
+                status=(
+                    "ERROR — candidate expansion unavailable; retry the "
+                    "read-only operation"
+                ),
+            )
+            return
         if cancellation.cancelled or not self._owns_obtainability_view(generation):
             return
         data = result.data
@@ -5057,12 +5114,30 @@ class CloudQuotaManagerApp(App[None]):
             locations=locations,
             all_compatible=False,
         )
-        result = await self.read_only.resolve(
-            requirement,
-            deadline=deadline,
-            cancellation=cancellation,
-            scope_input=self.scope_input,
-        )
+        try:
+            result = await self.read_only.resolve(
+                requirement,
+                deadline=deadline,
+                cancellation=cancellation,
+                scope_input=self.scope_input,
+            )
+        except asyncio.CancelledError:
+            self._set_provider_failure(
+                generation,
+                workspace="obtainability",
+                status="CANCELLED — obtainability preparation stopped",
+            )
+            raise
+        except Exception:  # noqa: BLE001 - no typed result exists to render
+            self._set_provider_failure(
+                generation,
+                workspace="obtainability",
+                status=(
+                    "ERROR — obtainability preparation unavailable; retry the "
+                    "read-only operation"
+                ),
+            )
+            return
         if cancellation.cancelled or not self._owns_obtainability_view(generation):
             return
         if not isinstance(result.data, ResolvedWorkloadRequirement):
@@ -5127,14 +5202,21 @@ class CloudQuotaManagerApp(App[None]):
                 scope_input=self.scope_input,
             )
         except asyncio.CancelledError:
+            self._set_provider_failure(
+                generation,
+                workspace="obtainability",
+                status="CANCELLED — obtainability comparison stopped",
+            )
             raise
         except Exception:  # noqa: BLE001 - no typed result exists for worker failure
-            if self._owns_obtainability_view(generation):
-                self._finish_provider_progress(generation)
-                self._set_status(
+            self._set_provider_failure(
+                generation,
+                workspace="obtainability",
+                status=(
                     "ERROR — obtainability comparison unavailable; retry the "
                     "read-only operation"
-                )
+                ),
+            )
             return
         if cancellation.cancelled or not self._owns_obtainability_view(generation):
             return
@@ -5144,10 +5226,18 @@ class CloudQuotaManagerApp(App[None]):
             self._render_instrument(resolved_result)
             self._render_obtainability_result(resolved_result)
             return
-        prepared = prepare_obtainability_comparison(
-            resolved_result.data,
-            draft.candidates,
-        )
+        try:
+            prepared = prepare_obtainability_comparison(
+                resolved_result.data,
+                draft.candidates,
+            )
+        except (TypeError, ValueError):
+            self._set_provider_failure(
+                generation,
+                workspace="obtainability",
+                status=("PREPARATION UNAVAILABLE — exact candidates were not resolved"),
+            )
+            return
         await self._compare_obtainability_prepared(
             prepared,
             cancellation,
@@ -5170,12 +5260,30 @@ class CloudQuotaManagerApp(App[None]):
             phase=ProviderReadPhase.OBTAINABILITY_COMPARISON,
             generation=generation,
         )
-        result = await self.read_only.compare_obtainability_prepared(
-            prepared,
-            deadline=deadline,
-            cancellation=cancellation,
-            scope_input=self.scope_input,
-        )
+        try:
+            result = await self.read_only.compare_obtainability_prepared(
+                prepared,
+                deadline=deadline,
+                cancellation=cancellation,
+                scope_input=self.scope_input,
+            )
+        except asyncio.CancelledError:
+            self._set_provider_failure(
+                generation,
+                workspace="obtainability",
+                status="CANCELLED — obtainability comparison stopped",
+            )
+            raise
+        except Exception:  # noqa: BLE001 - no typed result exists to render
+            self._set_provider_failure(
+                generation,
+                workspace="obtainability",
+                status=(
+                    "ERROR — obtainability comparison unavailable; retry the "
+                    "read-only operation"
+                ),
+            )
+            return
         if cancellation.cancelled or not self._owns_obtainability_view(generation):
             return
         self._finish_provider_progress(generation)
@@ -5516,12 +5624,30 @@ class CloudQuotaManagerApp(App[None]):
     ) -> None:
         if not self._owns_quota_view(generation):
             return
-        result = await self.read_only.inspect(
-            selector,
-            deadline=deadline,
-            cancellation=cancellation,
-            scope_input=self.scope_input,
-        )
+        try:
+            result = await self.read_only.inspect(
+                selector,
+                deadline=deadline,
+                cancellation=cancellation,
+                scope_input=self.scope_input,
+            )
+        except asyncio.CancelledError:
+            self._set_provider_failure(
+                generation,
+                workspace="quotas",
+                status="CANCELLED — exact quota inspection stopped",
+            )
+            raise
+        except Exception:  # noqa: BLE001 - no typed result exists to render
+            self._set_provider_failure(
+                generation,
+                workspace="quotas",
+                status=(
+                    "ERROR — quota inspection unavailable; retry the "
+                    "read-only operation"
+                ),
+            )
+            return
         if cancellation.cancelled or not self._owns_quota_view(generation):
             return
         self._finish_provider_progress(generation)
@@ -5682,12 +5808,30 @@ class CloudQuotaManagerApp(App[None]):
             cancellation=cancellation,
             deadline=deadline,
         )
-        result = await self.read_only.resolve(
-            requirement,
-            deadline=deadline,
-            cancellation=cancellation,
-            scope_input=self.scope_input,
-        )
+        try:
+            result = await self.read_only.resolve(
+                requirement,
+                deadline=deadline,
+                cancellation=cancellation,
+                scope_input=self.scope_input,
+            )
+        except asyncio.CancelledError:
+            self._set_provider_failure(
+                generation,
+                workspace="quotas",
+                status="CANCELLED — workload resolution stopped",
+            )
+            raise
+        except Exception:
+            self._set_provider_failure(
+                generation,
+                workspace="quotas",
+                status=(
+                    "ERROR — workload resolution unavailable; retry the "
+                    "read-only operation"
+                ),
+            )
+            raise
         if cancellation.cancelled or not self._owns_quota_view(generation):
             return result
         self._finish_provider_progress(generation)

@@ -1277,6 +1277,36 @@ class FailedReadOnlyOperations(ScriptedReadOnlyOperations):
         raise RuntimeError(msg)
 
 
+class FailedProviderDetailOperations(ScriptedReadOnlyOperations):
+    """Raise before exact inspection or workload resolution returns evidence."""
+
+    @override
+    async def inspect(
+        self,
+        selector: QuotaInspectSelector,
+        *,
+        deadline: float,
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[QuotaInspectData]:
+        del selector, deadline, cancellation, scope_input
+        msg = "simulated exact provider read failure"
+        raise RuntimeError(msg)
+
+    @override
+    async def resolve(
+        self,
+        requirement: ComputeInstanceRequirement | CloudTpuSliceRequirement,
+        *,
+        deadline: float,
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[ResolvedWorkloadRequirement]:
+        del requirement, deadline, cancellation, scope_input
+        msg = "simulated workload resolution failure"
+        raise RuntimeError(msg)
+
+
 class BrowseInspectRaceOperations(ScriptedReadOnlyOperations):
     """Delay a refresh past a completed exact-slice inspection."""
 
@@ -3958,8 +3988,37 @@ def test_catalog_autocomplete_replaces_only_the_active_token() -> None:
     )
 
 
+def test_catalog_autocomplete_never_reuses_a_replaced_catalog_result() -> None:
+    """The same typed prefix reflects the latest provider catalog."""
+
+    class SuggestionRecorder:
+        def __init__(self) -> None:
+            self.suggestions: list[str] = []
+
+        def post_message(self, message: Any) -> None:
+            self.suggestions.append(message.suggestion)
+
+    async def scenario() -> None:
+        suggester = TokenAwareCatalogSuggester()
+        recorder: Any = SuggestionRecorder()
+        suggester.replace(("us-east1-b",))
+        await suggester._get_suggestion(  # type: ignore[arg-type]  # noqa: SLF001
+            recorder,
+            "us-e",
+        )
+        suggester.replace(("us-east4-a",))
+        await suggester._get_suggestion(  # type: ignore[arg-type]  # noqa: SLF001
+            recorder,
+            "us-e",
+        )
+
+        assert recorder.suggestions == ["us-east1-b", "us-east4-a"]
+
+    asyncio.run(scenario())
+
+
 def test_catalog_choice_progress_is_visible_cancellable_and_generation_bound() -> None:
-    """A stopped catalog worker cannot replace newer route evidence."""
+    """A stopped catalog worker restores manual entry and cannot repaint it."""
 
     async def scenario() -> None:
         operations = DelayedCatalogOperations()
@@ -3980,6 +4039,9 @@ def test_catalog_choice_progress_is_visible_cancellable_and_generation_bound() -
             assert operations.catalog_cancellation.cancelled
 
             cancelled_evidence = str(_static(app, "#workload-choice-evidence").content)
+            assert "PARTIAL CHOICES" in cancelled_evidence
+            manual = app.query_one("#workload-manual-entry", Checkbox)
+            assert not manual.disabled
             operations.release_catalog.set()
             await operations.catalog_returned.wait()
             await pilot.pause()
@@ -3991,6 +4053,124 @@ def test_catalog_choice_progress_is_visible_cancellable_and_generation_bound() -
             assert "CANCELLED — catalog choices read stopped" in str(
                 _static(app, "#status-line").content
             )
+
+            _input(app, "#workload-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#workload-gpu-type").value = "nvidia-h100-80gb"
+            _input(app, "#workload-gpu-count").value = "8"
+            _input(app, "#workload-count").value = "1"
+            _input(app, "#workload-provisioning").value = "standard"
+            _input(app, "#workload-locations").value = "us-central1-a"
+            manual.value = True
+            _button(app, "#workload-submit").press()
+            await pilot.pause()
+
+            assert len(operations.resolve_calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_catalog_cancellation_restores_obtainability_manual_entry() -> None:
+    """Cancellation restores the escape hatch in the affected workspace."""
+
+    async def scenario() -> None:
+        operations = DelayedCatalogOperations()
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(100, 36)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            await operations.catalog_started.wait()
+            assert app.active_workspace == "obtainability"
+            assert app._provider_progress is not None  # noqa: SLF001
+            assert app._provider_progress.workspace == "obtainability"  # noqa: SLF001
+            assert not _button(app, "#cancel-provider-read").disabled
+            _button(app, "#cancel-provider-read").press()
+            await pilot.pause()
+            assert operations.catalog_cancellation is not None
+            assert operations.catalog_cancellation.cancelled
+
+            evidence = str(_static(app, "#obtainability-choice-evidence").content)
+            manual = app.query_one("#obtainability-manual-entry", Checkbox)
+            assert "PARTIAL CHOICES" in evidence
+            assert not manual.disabled
+
+            operations.release_catalog.set()
+            await operations.catalog_returned.wait()
+            await pilot.pause()
+            assert (
+                str(_static(app, "#obtainability-choice-evidence").content) == evidence
+            )
+
+    asyncio.run(scenario())
+
+
+def test_catalog_supersession_by_form_edit_restores_manual_entry() -> None:
+    """Editing during a catalog read replaces loading state with incomplete evidence."""
+
+    async def scenario() -> None:
+        operations = DelayedCatalogOperations()
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(100, 36)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            await operations.catalog_started.wait()
+            _input(app, "#obtainability-machine-type").value = "a3-highgpu-8g"
+            await pilot.pause()
+
+            assert operations.catalog_cancellation is not None
+            assert operations.catalog_cancellation.cancelled
+            assert app._provider_progress is None  # noqa: SLF001
+            evidence = str(_static(app, "#obtainability-choice-evidence").content)
+            manual = app.query_one("#obtainability-manual-entry", Checkbox)
+            assert "PARTIAL CHOICES" in evidence
+            assert not manual.disabled
+
+            operations.release_catalog.set()
+            await operations.catalog_returned.wait()
+            await pilot.pause()
+            assert (
+                str(_static(app, "#obtainability-choice-evidence").content) == evidence
+            )
+
+    asyncio.run(scenario())
+
+
+def test_catalog_deadline_restores_manual_entry_without_stale_repaint() -> None:
+    """A catalog deadline leaves the form usable through explicit manual entry."""
+
+    async def scenario() -> None:
+        clock = ManualMonotonic(300.0)
+        operations = DelayedCatalogOperations()
+        app = CloudQuotaManagerApp(
+            operations,
+            ScriptedAuditOperations(),
+            monotonic=clock,
+        )
+
+        async with app.run_test(size=(140, 70)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-compute")
+            await operations.catalog_started.wait()
+            clock.advance(60.1)
+            app._refresh_provider_progress()  # noqa: SLF001
+            await pilot.pause()
+
+            assert operations.catalog_cancellation is not None
+            assert operations.catalog_cancellation.cancelled
+            evidence = str(_static(app, "#workload-choice-evidence").content)
+            manual = app.query_one("#workload-manual-entry", Checkbox)
+            assert "PARTIAL CHOICES" in evidence
+            assert not manual.disabled
+            assert (
+                str(_static(app, "#status-line").content)
+                == "DEADLINE REACHED — catalog choices stopped after 60.1s"
+            )
+
+            operations.release_catalog.set()
+            await operations.catalog_returned.wait()
+            await pilot.pause()
+            assert str(_static(app, "#workload-choice-evidence").content) == evidence
 
     asyncio.run(scenario())
 
@@ -5389,6 +5569,110 @@ def test_failure_primary_copy_is_human_and_raw_ids_stay_in_technical_details() -
             _button(app, "#toggle-technical-details").press()
             await pilot.pause()
             assert not technical.has_class("hidden")
+            assert (
+                str(_button(app, "#toggle-technical-details").label)
+                == "Hide technical details"
+            )
+
+            app.action_refresh()
+            await pilot.pause()
+            assert not technical.has_class("hidden")
+            assert (
+                str(_button(app, "#toggle-technical-details").label)
+                == "Hide technical details"
+            )
+
+    asyncio.run(scenario())
+
+
+def test_exact_provider_failures_clear_progress_and_restore_retry_status() -> None:
+    """Failed detail workers cannot leave cancellation controls active."""
+
+    async def inspect_scenario() -> None:
+        operations = FailedProviderDetailOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            app._select_quota(operations.result.data.items[0])  # noqa: SLF001
+            await pilot.pause()
+
+            assert app._provider_progress is None  # noqa: SLF001
+            assert _button(app, "#cancel-provider-read").disabled
+            assert (
+                str(_static(app, "#status-line").content)
+                == "ERROR — quota inspection unavailable; retry the read-only operation"
+            )
+
+    async def resolution_scenario() -> None:
+        operations = FailedProviderDetailOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-compute")
+            await pilot.pause()
+            _input(app, "#workload-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#workload-gpu-type").value = "nvidia-h100-80gb"
+            _input(app, "#workload-gpu-count").value = "8"
+            _input(app, "#workload-count").value = "1"
+            _input(app, "#workload-provisioning").value = "standard"
+            _input(app, "#workload-locations").value = "us-central1-a"
+            _button(app, "#workload-submit").press()
+            await pilot.pause()
+
+            assert app._provider_progress is None  # noqa: SLF001
+            assert _button(app, "#cancel-provider-read").disabled
+            assert (
+                str(_static(app, "#status-line").content)
+                == "ERROR — workload resolution unavailable; retry the "
+                "read-only operation"
+            )
+
+    asyncio.run(inspect_scenario())
+    asyncio.run(resolution_scenario())
+
+
+def test_invalid_obtainability_preparation_clears_provider_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rejected resolved candidates return control without waiting for a deadline."""
+
+    def reject_preparation(*_args: Any, **_kwargs: Any) -> Any:
+        msg = "simulated invalid prepared comparison"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(
+        "cqmgr.adapters.tui.app.prepare_obtainability_comparison",
+        reject_preparation,
+    )
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(100, 36)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            await pilot.pause()
+            _input(app, "#obtainability-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#obtainability-gpu-type").value = "nvidia-h100-80gb"
+            _input(app, "#obtainability-gpu-count").value = "8"
+            _input(app, "#obtainability-vm-count").value = "1"
+            _input(app, "#obtainability-distribution").value = "any"
+            _input(
+                app,
+                "#obtainability-candidates",
+            ).value = "us-central1=us-central1-a"
+            _button(app, "#obtainability-compare").press()
+            await pilot.pause()
+
+            assert app._provider_progress is None  # noqa: SLF001
+            assert _button(app, "#cancel-provider-read").disabled
+            assert (
+                str(_static(app, "#status-line").content)
+                == "PREPARATION UNAVAILABLE — exact candidates were not resolved"
+            )
 
     asyncio.run(scenario())
 
@@ -5417,7 +5701,8 @@ def test_quota_progress_exposes_elapsed_deadline_and_explicit_cancellation() -> 
             assert not _button(app, "#cancel-provider-read").disabled
 
             clock.advance(12.5)
-            await pilot.pause(0.3)
+            app._refresh_provider_progress()  # noqa: SLF001
+            await pilot.pause()
 
             status = str(_static(app, "#status-line").content)
             assert "elapsed 12.5s" in status
@@ -5470,7 +5755,8 @@ def test_obtainability_progress_reaches_deadline_without_stale_repaint() -> None
             assert "deadline in 60.0s" in status
 
             clock.advance(60.1)
-            await pilot.pause(0.3)
+            app._refresh_provider_progress()  # noqa: SLF001
+            await pilot.pause()
 
             assert operations.compare_cancellation is not None
             assert operations.compare_cancellation.cancelled
