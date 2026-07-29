@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast
 
 import pytest
 
+from cqmgr.adapters.cli.read_only import Presentation, emit_read_only_result
 from cqmgr.application.operations.quotas import (
     QuotaBrowseRequest,
     QuotaInspectRequest,
@@ -1564,6 +1566,69 @@ def test_incomplete_browse_retains_filtered_items_without_order_or_cursor() -> N
         code.value for code in result.data.source_coverage[0].diagnostic_codes
     ) == ("provider-page-cap-reached",)
     assert fixture.snapshots.snapshots == {}
+
+
+@pytest.mark.parametrize("output", ["human", "json"])
+def test_incomplete_browse_limit_bounds_cli_page_and_metadata(
+    output: str,
+    capsys: object,
+) -> None:
+    """Human and JSON output bound incomplete evidence without global claims."""
+    page_limit = 2
+    evidences = (
+        _evidence("encountered-first"),
+        _evidence("encountered-second"),
+        _evidence("known-off-page"),
+        *(_evidence(f"off-page-{index}") for index in range(20)),
+    )
+    fixture = _fixture((_incomplete(*evidences),))
+
+    result = asyncio.run(
+        fixture.operations.browse(
+            QuotaBrowseRequest(_context(), _query(), limit=page_limit)
+        )
+    )
+    exit_class = emit_read_only_result(
+        result,
+        Presentation(output=output, no_color=True, quiet=True),
+    )
+
+    captured = capsys.readouterr()  # type: ignore[union-attr]
+    rendered = captured.out if output == "json" else captured.err
+    assert exit_class == ExitClass.INCOMPLETE_EVIDENCE
+    assert [item.identity.quota_id for item in result.data.items] == [
+        "encountered-first",
+        "encountered-second",
+    ]
+    assert result.data.constraint_sets == ()
+    assert not result.data.ordered
+    assert result.data.total is None
+    assert result.data.next_cursor is None
+    assert result.data.snapshot_id is None
+    assert result.data.source_coverage[0].state is (
+        ProviderSourceCoverageState.INCOMPLETE
+    )
+    assert result.diagnostics
+    if output == "json":
+        payload = json.loads(rendered)
+        assert [item["identity"]["quota_id"] for item in payload["data"]["items"]] == [
+            "encountered-first",
+            "encountered-second",
+        ]
+        assert payload["data"]["constraint_sets"] == []
+        assert payload["data"]["ordered"] is False
+        assert payload["data"]["total"] is None
+        assert payload["data"]["next_cursor"] is None
+        assert payload["data"]["snapshot_id"] is None
+    else:
+        assert rendered.count("Quota slice ") == page_limit
+        assert "Slice quota ID: encountered-first" in rendered
+        assert "Slice quota ID: encountered-second" in rendered
+        assert "known-off-page" not in rendered
+        assert "Ordered: false" in rendered
+        assert "Total: unavailable" in rendered
+        assert "Cursor: none" in rendered
+        assert "Snapshot: none" in rendered
 
 
 def test_incomplete_browse_with_no_filtered_rows_uses_incomplete_exit() -> None:

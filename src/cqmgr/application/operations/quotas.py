@@ -940,12 +940,12 @@ class QuotaOperations:
             return self._browse_rejection(request, started_at, "ambiguous-evidence")
 
         filtered = tuple(item for item in items if query.filters.matches(item))
-        constraint_sets = _constraint_sets(filtered)
         if not complete:
+            page_items = filtered[: request.limit]
             data = QuotaBrowseData(
                 query=query,
-                items=filtered,
-                constraint_sets=constraint_sets,
+                items=page_items,
+                constraint_sets=_constraint_sets(page_items),
                 ordered=False,
                 total=None,
                 next_cursor=None,
