@@ -67,6 +67,7 @@ from cqmgr.domain.accelerator_overlay import (
     CloudTpuSliceRequirement,
     ComputeInstanceRequirement,
     ProvisioningModel,
+    ResolutionFailureReason,
     ResolvedWorkloadRequirement,
     WorkloadCatalogEvidence,
     WorkloadKind,
@@ -779,44 +780,59 @@ class CloudQuotaManagerApp(App[None]):
                     )
                     yield Input(
                         placeholder="Machine type",
+                        name="Machine type",
                         id="workload-machine-type",
                         suggester=self._catalog_suggesters["workload-machine-type"],
                     )
                     yield Input(
                         placeholder="Optional attached GPU type",
+                        name="Attached GPU type",
                         id="workload-gpu-type",
                         suggester=self._catalog_suggesters["workload-gpu-type"],
                     )
                     yield Input(
                         placeholder="Optional attached GPU count",
+                        name="Attached GPU count",
                         id="workload-gpu-count",
                     )
                     yield Input(
                         placeholder="Cloud TPU accelerator type",
+                        name="Cloud TPU accelerator type",
                         id="workload-accelerator-type",
                         suggester=self._catalog_suggesters["workload-accelerator-type"],
                     )
                     yield Input(
                         placeholder="Cloud TPU topology",
+                        name="Cloud TPU topology",
                         id="workload-topology",
                         suggester=self._catalog_suggesters["workload-topology"],
                     )
                     yield Input(
                         placeholder="Cloud TPU runtime version",
+                        name="Cloud TPU runtime version",
                         id="workload-runtime-version",
                         suggester=self._catalog_suggesters["workload-runtime-version"],
                     )
                     yield Input(
                         placeholder="Instance or slice count",
+                        name="Instance or slice count",
                         id="workload-count",
                     )
                     yield Select(
-                        (("Standard", "standard"), ("Spot", "spot")),
+                        tuple(
+                            (
+                                model.value.replace("-", " ").title(),
+                                model.value,
+                            )
+                            for model in ProvisioningModel
+                        ),
                         prompt="Provisioning model",
+                        name="Provisioning model",
                         id="workload-provisioning",
                     )
                     yield Input(
                         placeholder="Comma-separated candidates, or all",
+                        name="Candidate locations",
                         id="workload-locations",
                         suggester=self._catalog_suggesters["workload-locations"],
                     )
@@ -972,20 +988,24 @@ class CloudQuotaManagerApp(App[None]):
                 )
                 yield Input(
                     placeholder="Machine type, e.g. a3-highgpu-8g",
+                    name="Machine type",
                     id="obtainability-machine-type",
                     suggester=self._catalog_suggesters["obtainability-machine-type"],
                 )
                 yield Input(
                     placeholder="Optional attached GPU type",
+                    name="Attached GPU type",
                     id="obtainability-gpu-type",
                     suggester=self._catalog_suggesters["obtainability-gpu-type"],
                 )
                 yield Input(
                     placeholder="Optional attached GPU count",
+                    name="Attached GPU count",
                     id="obtainability-gpu-count",
                 )
                 yield Input(
                     placeholder="VM count",
+                    name="VM count",
                     id="obtainability-vm-count",
                 )
                 yield Select(
@@ -995,6 +1015,7 @@ class CloudQuotaManagerApp(App[None]):
                         ("Balanced", "balanced"),
                     ),
                     prompt="Distribution",
+                    name="Distribution",
                     id="obtainability-distribution",
                 )
                 yield Input(
@@ -1002,6 +1023,7 @@ class CloudQuotaManagerApp(App[None]):
                         "Explicit candidates, e.g. us-central1=us-central1-a "
                         "us-east4=us-east4-a"
                     ),
+                    name="Candidate regions and zones",
                     id="obtainability-candidates",
                     suggester=self._catalog_suggesters["obtainability-candidates"],
                 )
@@ -1376,6 +1398,11 @@ class CloudQuotaManagerApp(App[None]):
             ),
             f"Aggregate completeness: {aggregate}",
         ]
+        lines.extend(
+            self._coverage_blocked_capability(coverage)
+            for coverage in data.source_coverage
+            if coverage.state is not ProviderSourceCoverageState.COMPLETE
+        )
         if self.last_result is not None:
             lines.append(
                 "Retry guidance: " + self._result_retry_guidance(self.last_result)
@@ -1427,14 +1454,13 @@ class CloudQuotaManagerApp(App[None]):
         if result.succeeded:
             return "COMPLETE — operation boundary reached"
         label = CloudQuotaManagerApp._result_evidence_label(result).upper()
-        retained = (
-            " Partial results are retained."
-            if result.completeness.has_partial_data
-            else ""
-        )
-        return (
-            f"{label} —{retained} {CloudQuotaManagerApp._result_retry_guidance(result)}"
-        )
+        guidance = CloudQuotaManagerApp._result_retry_guidance(result)
+        if result.completeness.has_partial_data:
+            return (
+                f"USABLE BUT NON-EXHAUSTIVE ({label}) — "
+                f"Returned evidence may be inspected. {guidance}"
+            )
+        return f"{label} — {guidance}"
 
     @staticmethod
     def _provider_source_label(service: str) -> str:
@@ -1443,6 +1469,24 @@ class CloudQuotaManagerApp(App[None]):
             "compute.googleapis.com": "Compute quotas",
             "tpu.googleapis.com": "Cloud TPU quotas",
         }.get(service, "Provider quotas")
+
+    @classmethod
+    def _coverage_blocked_capability(
+        cls,
+        coverage: ProviderSourceCoverage,
+    ) -> str:
+        """State what remains usable and what one missing source blocks."""
+        source = cls._provider_source_label(coverage.service)
+        if coverage.state is ProviderSourceCoverageState.INTENTIONALLY_UNQUERIED:
+            return (
+                f"{source} was intentionally unqueried; exhaustive inventory "
+                f"conclusions and mutation gates that depend on {source} are blocked "
+                "for this view."
+            )
+        return (
+            f"{source}: returned rows remain inspectable; exhaustive inventory "
+            f"conclusions and mutation gates that depend on {source} are blocked."
+        )
 
     @staticmethod
     def _coverage_label(
@@ -1549,7 +1593,13 @@ class CloudQuotaManagerApp(App[None]):
         """Populate raw identifiers in a collapsed secondary view."""
         details = self.query_one("#technical-details", Static)
         details.update(
-            "Technical details\n" + "\n".join(self._result_fact_lines(result))
+            "Technical details\n"
+            + "\n".join(
+                (
+                    *self._result_fact_lines(result),
+                    *self._result_data_fact_lines(result),
+                )
+            )
         )
         details.add_class("hidden")
         self.query_one(
@@ -1563,6 +1613,24 @@ class CloudQuotaManagerApp(App[None]):
         self.query_one("#toggle-technical-details", Button).label = (
             "Hide technical details" if hidden else "Show technical details"
         )
+
+    @staticmethod
+    def _result_data_fact_lines(
+        result: OperationResult[Any],
+    ) -> tuple[str, ...]:
+        """Retain machine-facing data reasons outside the primary result copy."""
+        data = result.data
+        if isinstance(data, (IncompleteQuotaInspectData, ReadOnlyFailureData)):
+            return (f"Detail reason: {data.reason}",)
+        if isinstance(data, QuotaInspectData) and data.reason is not None:
+            return (f"Detail reason: {data.reason}",)
+        if isinstance(data, ResolvedWorkloadRequirement):
+            return tuple(
+                f"Location {location.location} reason: {location.failure_reason.value}"
+                for location in data.locations
+                if location.failure_reason is not None
+            )
+        return ()
 
     def open_compose(
         self,
@@ -3860,8 +3928,12 @@ class CloudQuotaManagerApp(App[None]):
             self._offline_instrument_text()
         )
         self.query_one("#obtainability-detail", Static).update(
-            "Complete the fixed request and choose an explicit candidate mode.\n"
-            "Obtainability is Preview evidence, not capacity."
+            self._standalone_obtainability_prompt()
+            if entry_mode is ObtainabilityEntryMode.STANDALONE
+            else (
+                "Complete the fixed request and choose an explicit candidate mode.\n"
+                "Obtainability is Preview evidence, not capacity."
+            )
         )
         self._sync_copy_cli_preview()
         self._set_status("INPUT CHANGED — confirm the exact request before comparison")
@@ -3968,10 +4040,24 @@ class CloudQuotaManagerApp(App[None]):
         )
         complete = catalog is not None and result.completeness.is_complete
         self._bind_catalog_evidence(workspace, catalog, complete=complete)
+        empty = (
+            complete
+            and catalog is not None
+            and not self._catalog_has_supported_choices(workspace, catalog)
+        )
         self._set_status(
-            "GUIDED CHOICES READY — complete provider catalog verified"
-            if complete
-            else "PARTIAL CHOICES — manual values require explicit unverified entry"
+            (
+                "NO SUPPORTED CHOICES — complete provider catalog returned "
+                "no choices for this workload"
+            )
+            if empty
+            else (
+                "GUIDED CHOICES READY — complete provider catalog verified"
+                if complete
+                else (
+                    "PARTIAL CHOICES — manual values require explicit unverified entry"
+                )
+            )
         )
 
     def _owns_catalog_view(
@@ -4009,16 +4095,47 @@ class CloudQuotaManagerApp(App[None]):
         manual = self.query_one(manual_selector, Checkbox)
         manual.value = False
         manual.disabled = complete
+        empty = (
+            complete
+            and catalog is not None
+            and not self._catalog_has_supported_choices(workspace, catalog)
+        )
         self.query_one(evidence_selector, Static).update(
             (
-                "VERIFIED CHOICES — provider catalog coverage is complete; "
-                "unsupported combinations are blocked locally."
+                "NO SUPPORTED CHOICES — provider catalog coverage is complete "
+                "but returned no choices for this workload."
             )
-            if complete
+            if empty
             else (
-                "PARTIAL CHOICES — catalog coverage is incomplete or unavailable. "
-                "Manual values require explicit unverified entry."
+                (
+                    "VERIFIED CHOICES — provider catalog coverage is complete; "
+                    "unsupported combinations are blocked locally."
+                )
+                if complete
+                else (
+                    "PARTIAL CHOICES — catalog coverage is incomplete or unavailable. "
+                    "Manual values require explicit unverified entry."
+                )
             )
+        )
+
+    def _catalog_has_supported_choices(
+        self,
+        workspace: str,
+        catalog: WorkloadCatalogEvidence,
+    ) -> bool:
+        """Distinguish complete empty evidence from a loading or partial state."""
+        if (
+            workspace == "obtainability"
+            or self._workload_kind == WorkloadKind.COMPUTE_INSTANCE.value
+        ):
+            return bool(
+                catalog.compute_machine_types or catalog.compute_accelerator_types
+            )
+        return bool(
+            catalog.tpu_locations
+            or catalog.tpu_accelerator_types
+            or catalog.tpu_runtime_versions
         )
 
     def _replace_catalog_suggestions(
@@ -4227,32 +4344,61 @@ class CloudQuotaManagerApp(App[None]):
             else (None,)
         )
         for candidate in candidates:
-            machines = tuple(
-                machine
-                for machine in catalog.compute_machine_types
-                if machine.name == requirement.machine_type
-                and (
-                    candidate is None or self._location_matches(machine.zone, candidate)
-                )
+            error = self._compute_catalog_choice_error(
+                catalog,
+                machine_type=requirement.machine_type,
+                accelerator_type=requirement.attached_accelerator_type,
+                accelerator_count=requirement.attached_accelerator_count,
+                candidate=candidate,
             )
-            if not machines:
-                return f"{requirement.machine_type} is not available" + (
-                    "" if candidate is None else f" in {candidate}"
-                )
-            accelerator_type = requirement.attached_accelerator_type
-            if accelerator_type is None:
-                continue
-            machine_zones = {machine.zone for machine in machines}
-            if not any(
-                accelerator.name == accelerator_type
-                and accelerator.zone in machine_zones
-                for accelerator in catalog.compute_accelerator_types
-            ):
-                return (
-                    f"{accelerator_type} is not available with "
-                    f"{requirement.machine_type}"
-                    + ("" if candidate is None else f" in {candidate}")
-                )
+            if error is not None:
+                return error
+        return None
+
+    def _compute_catalog_choice_error(
+        self,
+        catalog: WorkloadCatalogEvidence,
+        *,
+        machine_type: str,
+        accelerator_type: str | None,
+        accelerator_count: int | None,
+        candidate: str | None,
+    ) -> str | None:
+        """Validate one machine/attachment relationship in matching zones."""
+        machines = tuple(
+            machine
+            for machine in catalog.compute_machine_types
+            if machine.name == machine_type
+            and (candidate is None or self._location_matches(machine.zone, candidate))
+        )
+        location_suffix = "" if candidate is None else f" in {candidate}"
+        if not machines:
+            return f"{machine_type} is not available{location_suffix}"
+        if accelerator_type is None:
+            return None
+        compatible_zones = {
+            machine.zone
+            for machine in machines
+            if any(
+                attachment.accelerator_type == accelerator_type
+                and attachment.count == accelerator_count
+                for attachment in machine.guest_accelerators
+            )
+        }
+        if not compatible_zones:
+            return (
+                f"{accelerator_type} x{accelerator_count} is not a supported "
+                f"machine attachment for {machine_type}{location_suffix}"
+            )
+        if not any(
+            accelerator.name == accelerator_type
+            and accelerator.zone in compatible_zones
+            for accelerator in catalog.compute_accelerator_types
+        ):
+            return (
+                f"{accelerator_type} is not available with "
+                f"{machine_type}{location_suffix}"
+            )
         return None
 
     def _validate_tpu_catalog_choice(
@@ -4316,6 +4462,9 @@ class CloudQuotaManagerApp(App[None]):
             "Obtainability / Standalone\n"
             "Fix one exact Spot VM request. Candidate locations never expand silently."
         )
+        self.query_one("#obtainability-detail", Static).update(
+            self._standalone_obtainability_prompt()
+        )
         self.query_one("#obtainability-expansion", Static).update(
             "Candidate expansion: explicit candidates only."
         )
@@ -4323,6 +4472,17 @@ class CloudQuotaManagerApp(App[None]):
         confirm.label = "Confirm inherited fields and candidate expansion"
         confirm.add_class("hidden")
         self.query_one("#obtainability-return").add_class("hidden")
+
+    @staticmethod
+    def _standalone_obtainability_prompt() -> str:
+        return (
+            "Complete the fixed request and choose an explicit candidate mode.\n"
+            "Example: one Spot a3-highgpu-8g VM using any-single-zone with "
+            "candidates us-central1=us-central1-a us-east4=us-east4-a. "
+            "Question: can this exact request be obtained across these explicit "
+            "candidates?\n"
+            "Obtainability is Preview evidence, not capacity."
+        )
 
     def _open_contextual_obtainability(self) -> None:
         resolved = self._resolved_compute
@@ -4697,7 +4857,7 @@ class CloudQuotaManagerApp(App[None]):
             exit_on_error=False,
         )
 
-    def _validate_obtainability_choices(  # noqa: PLR0911
+    def _validate_obtainability_choices(
         self,
         draft: ObtainabilityFormDraft,
     ) -> str | None:
@@ -4726,30 +4886,16 @@ class CloudQuotaManagerApp(App[None]):
             else (None,)
         )
         for candidate in candidates:
-            machines = tuple(
-                machine
-                for machine in catalog.compute_machine_types
-                if machine.name == draft.machine.machine_type
-                and (
-                    candidate is None or self._location_matches(machine.zone, candidate)
-                )
+            gpu = draft.machine.gpu
+            error = self._compute_catalog_choice_error(
+                catalog,
+                machine_type=draft.machine.machine_type,
+                accelerator_type=(gpu.accelerator_type if gpu is not None else None),
+                accelerator_count=(gpu.count if gpu is not None else None),
+                candidate=candidate,
             )
-            if not machines:
-                return f"{draft.machine.machine_type} is not available" + (
-                    "" if candidate is None else f" in {candidate}"
-                )
-            if draft.machine.gpu is not None:
-                machine_zones = {machine.zone for machine in machines}
-                if not any(
-                    accelerator.name == draft.machine.gpu.accelerator_type
-                    and accelerator.zone in machine_zones
-                    for accelerator in catalog.compute_accelerator_types
-                ):
-                    return (
-                        f"{draft.machine.gpu.accelerator_type} is not available "
-                        f"with {draft.machine.machine_type}"
-                        + ("" if candidate is None else f" in {candidate}")
-                    )
+            if error is not None:
+                return error
         return None
 
     def _mark_obtainability_submission(self, draft: ObtainabilityFormDraft) -> None:
@@ -5389,21 +5535,23 @@ class CloudQuotaManagerApp(App[None]):
         lines = [
             "Quota detail",
             f"Operation: {result.operation.value}",
-            f"Outcome: {result.outcome.code.value}",
+            f"Evidence: {self._result_evidence_label(result)}",
             "Complete: " + ("yes" if result.completeness.is_complete else "no"),
         ]
+        if not result.completeness.is_complete or result.diagnostics:
+            lines.append("Retry guidance: " + self._result_retry_guidance(result))
         if isinstance(data, QuotaInspectData):
             lines.extend(self._inspect_lines(data))
         elif isinstance(data, IncompleteQuotaInspectData):
             lines.extend(
                 (
                     f"Selector: {data.selector.service} / {data.selector.quota_id}",
-                    f"Reason: {data.reason}",
+                    "Evidence limitation: the exact quota inventory is incomplete.",
                     f"Retained matching slices: {len(data.matching_items)}",
                 )
             )
         elif isinstance(data, ReadOnlyFailureData):
-            lines.append(f"Reason: {data.reason}")
+            lines.append("Provider evidence is unavailable for this selector.")
         self.query_one("#quota-detail", Static).update("\n".join(lines))
         self.query_one("#quota-compose-request", Button).disabled = not (
             isinstance(data, QuotaInspectData)
@@ -5446,7 +5594,7 @@ class CloudQuotaManagerApp(App[None]):
                 )
             )
         if data.reason is not None:
-            lines.append(f"Reason: {data.reason}")
+            lines.append("Evidence limitation: exact quota evidence is incomplete.")
         return tuple(lines)
 
     async def _inspect_audit(
@@ -5560,9 +5708,11 @@ class CloudQuotaManagerApp(App[None]):
         self._resolved_workload = None
         lines = [
             "Workload resolution",
-            f"Outcome: {result.outcome.code.value}",
+            f"Evidence: {self._result_evidence_label(result)}",
             "Complete: " + ("yes" if result.completeness.is_complete else "no"),
         ]
+        if not result.completeness.is_complete or result.diagnostics:
+            lines.append("Retry guidance: " + self._result_retry_guidance(result))
         if isinstance(result.data, ResolvedWorkloadRequirement):
             if (
                 result.completeness.is_complete
@@ -5591,7 +5741,10 @@ class CloudQuotaManagerApp(App[None]):
                     )
                 )
                 if location.failure_reason is not None:
-                    lines.append(f"Reason: {location.failure_reason.value}")
+                    lines.append(
+                        "Explanation: "
+                        + self._workload_failure_explanation(location.failure_reason)
+                    )
             requirement = result.data.requirement
             if (
                 isinstance(requirement, ComputeInstanceRequirement)
@@ -5604,6 +5757,32 @@ class CloudQuotaManagerApp(App[None]):
                 self._resolved_compute = result.data
                 self.query_one("#workload-obtainability").remove_class("hidden")
         elif isinstance(result.data, ReadOnlyFailureData):
-            lines.append(f"Reason: {result.data.reason}")
+            lines.append("Provider evidence is unavailable for this workload.")
         self.query_one("#quota-detail", Static).update("\n".join(lines))
         self._set_status(self._result_status(result))
+
+    @staticmethod
+    def _workload_failure_explanation(
+        reason: ResolutionFailureReason,
+    ) -> str:
+        """Translate stable resolution reasons into primary human guidance."""
+        return {
+            ResolutionFailureReason.AMBIGUOUS: (
+                "Provider evidence supports conflicting interpretations."
+            ),
+            ResolutionFailureReason.UNSUPPORTED_CONVERSION: (
+                "No supported quota conversion exists for this workload."
+            ),
+            ResolutionFailureReason.UNSUPPORTED_COMPATIBILITY: (
+                "Catalog evidence does not support this workload in this location."
+            ),
+            ResolutionFailureReason.PROVIDER_IDENTITY: (
+                "Provider identity evidence could not be verified."
+            ),
+            ResolutionFailureReason.MISSING_LOCATION_EVIDENCE: (
+                "Location evidence is incomplete."
+            ),
+            ResolutionFailureReason.INELIGIBLE: (
+                "This workload is not eligible in this location."
+            ),
+        }[reason]

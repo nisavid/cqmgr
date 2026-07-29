@@ -9,11 +9,11 @@ copy-cli=cqmgr quota resolve compute-instance --resource-scope projects/12345678
 status=COMPLETE — operation boundary reached
 coverage=Provider coverage:  Compute quotas: complete (1/1 pages)  Cloud TPU quotas: complete (1/1 pages)  Aggregate completeness: complete  Retry guidance: No retry guidance is available
 detail=Workload resolution
-Outcome: succeeded
+Evidence: complete
 Complete: yes
 Requirement: compute-instance
 Location: us-central1-a
 Disposition: incompatible
 Permits: unavailable
-Reason: unsupported-compatibility
+Explanation: Catalog evidence does not support this workload in this location.
 audit=Select a retained record to inspect its exact chain facts.
