@@ -7,7 +7,7 @@ outcome=succeeded
 complete=yes
 copy-cli=cqmgr quota resolve compute-instance --resource-scope projects/123456789 --machine-type a3-highgpu-8g --instance-count 1 --provisioning-model spot --candidate us-central1-a --output human
 status=COMPLETE — operation boundary reached
-coverage=Provider coverage:  compute.googleapis.com: complete (1/1 pages)  tpu.googleapis.com: complete (1/1 pages)  Aggregate completeness: complete
+coverage=Provider coverage:  Compute quotas: complete (1/1 pages)  Cloud TPU quotas: complete (1/1 pages)  Aggregate completeness: complete  Retry guidance: No retry guidance is available
 detail=Workload resolution
 Outcome: succeeded
 Complete: yes
