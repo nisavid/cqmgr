@@ -15,6 +15,7 @@ from cqmgr.application.operations.quotas import (
     QuotaInspectRequest,
     QuotaOperations,
     QuotaResolveRequest,
+    WorkloadChoiceRequest,
     WorkloadResolutionOperations,
 )
 from cqmgr.application.ports.catalog_reads import (
@@ -31,6 +32,7 @@ from cqmgr.domain.accelerator_overlay import (
     CloudTpuSliceRequirement,
     ComputeInstanceRequirement,
     ProvisioningModel,
+    WorkloadKind,
     WorkloadLocationDisposition,
 )
 from cqmgr.domain.catalog import (
@@ -524,6 +526,77 @@ def test_resolve_compute_exact_zone_scopes_both_catalog_reads() -> None:
     assert isinstance(machine_request, ComputeMachineTypeReadRequest)
     assert accelerator_request.zones == ("us-central1-a",)
     assert machine_request.zones == ("us-central1-a",)
+
+
+def test_read_catalog_compute_returns_typed_choices_without_quota_reads() -> None:
+    """Guided Compute choices retain typed relationships and exact-zone coverage."""
+    accelerator_reader = ScriptedCatalogReader((_compute_accelerator_catalog_read(),))
+    machine_reader = ScriptedCatalogReader((_gpu_catalog_read(),))
+    operations = WorkloadResolutionOperations(
+        ScriptedReader(()),
+        ScriptedReader(()),
+        accelerator_reader,
+        machine_reader,
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+
+    result = asyncio.run(
+        operations.read_catalog(
+            WorkloadChoiceRequest(
+                _context(),
+                WorkloadKind.COMPUTE_INSTANCE,
+                ("us-central1-a",),
+            )
+        )
+    )
+
+    assert result.outcome.exit_class is ExitClass.SUCCESS
+    assert result.completeness.is_complete
+    assert result.data.compute_machine_types == _gpu_catalog_read().values
+    assert (
+        result.data.compute_accelerator_types
+        == _compute_accelerator_catalog_read().values
+    )
+    accelerator_request = cast(
+        "ComputeAcceleratorTypeReadRequest", accelerator_reader.calls[0]
+    )
+    machine_request = cast("ComputeMachineTypeReadRequest", machine_reader.calls[0])
+    assert accelerator_request.zones == ("us-central1-a",)
+    assert machine_request.zones == ("us-central1-a",)
+
+
+def test_read_catalog_tpu_expands_returned_locations_and_preserves_relationships() -> (
+    None
+):
+    """Guided TPU choices remain related to the exact provider-returned zones."""
+    location_read, accelerator_read, runtime_read = _legacy_tpu_catalog_reads()
+    operations = WorkloadResolutionOperations(
+        ScriptedReader(()),
+        ScriptedReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader((location_read,)),
+        ScriptedCatalogReader((accelerator_read,)),
+        ScriptedCatalogReader((runtime_read,)),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+
+    result = asyncio.run(
+        operations.read_catalog(
+            WorkloadChoiceRequest(_context(), WorkloadKind.CLOUD_TPU_SLICE)
+        )
+    )
+
+    assert result.outcome.exit_class is ExitClass.SUCCESS
+    assert result.completeness.is_complete
+    assert result.data.tpu_locations == location_read.values
+    assert result.data.tpu_accelerator_types == accelerator_read.values
+    assert result.data.tpu_runtime_versions == runtime_read.values
 
 
 @pytest.mark.parametrize(

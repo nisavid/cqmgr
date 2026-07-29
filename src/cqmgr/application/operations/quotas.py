@@ -35,6 +35,7 @@ from cqmgr.domain.accelerator_overlay import (
     ResolvedWorkloadLocation,
     ResolvedWorkloadRequirement,
     WorkloadCatalogEvidence,
+    WorkloadKind,
     WorkloadLocationDisposition,
     WorkloadResolutionError,
 )
@@ -149,6 +150,33 @@ class QuotaResolveRequest:
             raise TypeError(msg)
 
 
+@dataclass(frozen=True, slots=True)
+class WorkloadChoiceRequest:
+    """Read live provider choices for one workload kind and optional locations."""
+
+    context: ProviderReadContext
+    kind: WorkloadKind
+    locations: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Require explicit context, typed workload kind, and canonical locations."""
+        if not isinstance(self.context, ProviderReadContext):
+            msg = "workload choices require ProviderReadContext"
+            raise TypeError(msg)
+        if not isinstance(self.kind, WorkloadKind):
+            msg = "workload choices require WorkloadKind"
+            raise TypeError(msg)
+        if not isinstance(self.locations, tuple):
+            msg = "workload choice locations must be a tuple"
+            raise TypeError(msg)
+        if any(not _is_catalog_location(location) for location in self.locations):
+            msg = "workload choice locations must be canonical location IDs"
+            raise ValueError(msg)
+        if len(set(self.locations)) != len(self.locations):
+            msg = "workload choice locations must not contain duplicates"
+            raise ValueError(msg)
+
+
 class WorkloadResolutionOperations:
     """Resolve workload shapes from live quota and compatibility evidence."""
 
@@ -177,6 +205,141 @@ class WorkloadResolutionOperations:
         self._overlay = overlay
         self._clock = clock
         self._usage_window = usage_window
+
+    async def read_catalog(
+        self,
+        request: WorkloadChoiceRequest,
+    ) -> OperationResult[WorkloadCatalogEvidence]:
+        """Read typed live choices without dispatching quota or usage reads."""
+        started_at = self._clock.now()
+        if request.kind is WorkloadKind.COMPUTE_INSTANCE:
+            zones = (
+                request.locations
+                if request.locations
+                and all(_is_canonical_zone(location) for location in request.locations)
+                else None
+            )
+            accelerator_read, machine_read = await asyncio.gather(
+                self._compute_accelerator_types.read(
+                    ComputeAcceleratorTypeReadRequest(request.context, zones)
+                ),
+                self._compute_machine_types.read(
+                    ComputeMachineTypeReadRequest(request.context, zones)
+                ),
+            )
+            coverage = (
+                *accelerator_read.location_coverage,
+                *machine_read.location_coverage,
+            )
+            catalog = WorkloadCatalogEvidence(
+                compute_machine_types=machine_read.values,
+                tpu_locations=(),
+                tpu_accelerator_types=(),
+                tpu_runtime_versions=(),
+                coverage=coverage,
+                compute_accelerator_types=accelerator_read.values,
+            )
+            diagnostics = _resolution_diagnostics(
+                (),
+                (
+                    *accelerator_read.read.diagnostics,
+                    *machine_read.read.diagnostics,
+                ),
+                coverage,
+            )
+            complete = accelerator_read.complete and machine_read.complete
+            return self._catalog_result(
+                request,
+                started_at,
+                catalog,
+                diagnostics,
+                complete=complete,
+            )
+
+        location_read = await self._tpu_locations.read(
+            TpuLocationReadRequest(request.context)
+        )
+        inventory_zones = tuple(
+            location.location_id for location in location_read.values
+        )
+        zones = (
+            tuple(
+                dict.fromkeys(
+                    zone
+                    for location in request.locations
+                    for zone in (
+                        (location,)
+                        if _is_canonical_zone(location)
+                        else tuple(
+                            inventory_zone
+                            for inventory_zone in inventory_zones
+                            if _zone_belongs_to_region(inventory_zone, location)
+                        )
+                    )
+                )
+            )
+            if request.locations
+            else inventory_zones
+        )
+        accelerator_reads, runtime_reads = await asyncio.gather(
+            asyncio.gather(
+                *(
+                    self._tpu_accelerator_types.read(
+                        TpuAcceleratorTypeReadRequest(request.context, zone)
+                    )
+                    for zone in zones
+                )
+            ),
+            asyncio.gather(
+                *(
+                    self._tpu_runtime_versions.read(
+                        TpuRuntimeVersionReadRequest(request.context, zone)
+                    )
+                    for zone in zones
+                )
+            ),
+        )
+        coverage = (
+            *location_read.location_coverage,
+            *(
+                item
+                for read in (*accelerator_reads, *runtime_reads)
+                for item in read.location_coverage
+            ),
+        )
+        catalog = WorkloadCatalogEvidence(
+            compute_machine_types=(),
+            tpu_locations=location_read.values,
+            tpu_accelerator_types=tuple(
+                value for read in accelerator_reads for value in read.values
+            ),
+            tpu_runtime_versions=tuple(
+                value for read in runtime_reads for value in read.values
+            ),
+            coverage=coverage,
+        )
+        diagnostics = _resolution_diagnostics(
+            (),
+            (
+                *location_read.read.diagnostics,
+                *(
+                    diagnostic
+                    for read in (*accelerator_reads, *runtime_reads)
+                    for diagnostic in read.read.diagnostics
+                ),
+            ),
+            coverage,
+        )
+        complete = location_read.complete and all(
+            read.complete for read in (*accelerator_reads, *runtime_reads)
+        )
+        return self._catalog_result(
+            request,
+            started_at,
+            catalog,
+            diagnostics,
+            complete=complete,
+        )
 
     async def resolve(  # noqa: PLR0911
         self,
@@ -583,6 +746,56 @@ class WorkloadResolutionOperations:
             started_at=started_at,
             finished_at=self._clock.now(),
             data=data,
+            diagnostics=diagnostics,
+        )
+
+    def _catalog_result(
+        self,
+        request: WorkloadChoiceRequest,
+        started_at: datetime,
+        catalog: WorkloadCatalogEvidence,
+        diagnostics: tuple[Diagnostic, ...],
+        *,
+        complete: bool,
+    ) -> OperationResult[WorkloadCatalogEvidence]:
+        """Describe complete, partial, and unavailable choice evidence."""
+        has_data = any(
+            (
+                catalog.compute_machine_types,
+                catalog.compute_accelerator_types,
+                catalog.tpu_locations,
+                catalog.tpu_accelerator_types,
+                catalog.tpu_runtime_versions,
+            )
+        )
+        gaps = () if complete else _catalog_coverage_gaps(catalog)
+        return OperationResult(
+            operation=OperationName("quota.workload-catalog"),
+            resource_scope=request.context.project.resource_scope,
+            boundary=OperationBoundary(
+                StableSymbol("workload-catalog-read"),
+                complete,
+            ),
+            outcome=Outcome(
+                StableSymbol(
+                    "workload-catalog-read"
+                    if complete
+                    else "workload-catalog-read-incomplete"
+                ),
+                ExitClass.SUCCESS if complete else ExitClass.INCOMPLETE_EVIDENCE,
+            ),
+            completeness=(
+                Completeness.complete()
+                if complete
+                else (
+                    Completeness.incomplete(*gaps)
+                    if has_data
+                    else Completeness.unavailable(*gaps)
+                )
+            ),
+            started_at=started_at,
+            finished_at=self._clock.now(),
+            data=catalog,
             diagnostics=diagnostics,
         )
 
@@ -2121,6 +2334,19 @@ def _candidate_source_coverage_complete(
         and all(
             coverage.complete for coverage in (*child_records, *global_or_exact_records)
         )
+    )
+
+def _is_catalog_location(location: object) -> bool:
+    """Return whether one value is a canonical provider location identifier."""
+    allowed = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
+    return (
+        isinstance(location, str)
+        and bool(location)
+        and location.isascii()
+        and location == location.lower()
+        and location[0].isalnum()
+        and location[-1].isalnum()
+        and all(character in allowed for character in location)
     )
 
 
