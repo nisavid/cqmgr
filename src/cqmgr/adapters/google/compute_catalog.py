@@ -765,7 +765,12 @@ class GoogleComputeAcceleratorTypeReader:
             observed_at=self._now(),
             diagnostics=tuple(diagnostics),
         )
-        return CatalogRead(read, tuple(location_coverage))
+        finalized_coverage = (
+            _finalize_requested_coverage(location_coverage)
+            if zones is not None
+            else tuple(location_coverage)
+        )
+        return CatalogRead(read, finalized_coverage)
 
 
 class GoogleComputeMachineTypeReader:
@@ -964,7 +969,12 @@ class GoogleComputeMachineTypeReader:
             observed_at=self._now(),
             diagnostics=tuple(diagnostics),
         )
-        return CatalogRead(read, tuple(location_coverage))
+        finalized_coverage = (
+            _finalize_requested_coverage(location_coverage)
+            if zones is not None
+            else tuple(location_coverage)
+        )
+        return CatalogRead(read, finalized_coverage)
 
 
 def _consume_accelerator_scope(  # noqa: PLR0913 - explicit coverage evidence
@@ -1105,6 +1115,49 @@ def _accelerator_coverage_diagnostic(code: str) -> Diagnostic:
             "Compute returned incomplete accelerator-type evidence for one location."
         ),
     )
+
+
+def _finalize_requested_coverage(
+    coverage: list[CatalogLocationCoverage],
+) -> tuple[CatalogLocationCoverage, ...]:
+    """Collapse paged exact-zone evidence into one fail-closed source record."""
+    grouped: dict[
+        tuple[
+            CatalogEvidenceSource,
+            str,
+            LocationCoverageExpectation,
+        ],
+        list[CatalogLocationCoverage],
+    ] = {}
+    for item in coverage:
+        grouped.setdefault(
+            (item.source, item.location, item.expectation),
+            [],
+        ).append(item)
+
+    finalized: list[CatalogLocationCoverage] = []
+    for (source, location, expectation), items in grouped.items():
+        states = {item.state for item in items}
+        if LocationCoverageState.FAILED in states:
+            state = LocationCoverageState.FAILED
+        elif LocationCoverageState.NOT_SCANNED in states:
+            state = LocationCoverageState.NOT_SCANNED
+        elif LocationCoverageState.SUCCESS in states:
+            state = LocationCoverageState.SUCCESS
+        else:
+            state = LocationCoverageState.EMPTY
+        finalized.append(
+            CatalogLocationCoverage(
+                source=source,
+                location=location,
+                expectation=expectation,
+                state=state,
+                diagnostics=tuple(
+                    diagnostic for item in items for diagnostic in item.diagnostics
+                ),
+            )
+        )
+    return tuple(finalized)
 
 
 def _consume_scope(  # noqa: PLR0913 - explicit coverage evidence
