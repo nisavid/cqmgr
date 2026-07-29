@@ -947,7 +947,7 @@ class CloudQuotaManagerApp(App[None]):
                     markup=False,
                 )
                 yield Input(
-                    placeholder="Machine type",
+                    placeholder="Machine type, e.g. a3-highgpu-8g",
                     id="obtainability-machine-type",
                     suggester=self._catalog_suggesters["obtainability-machine-type"],
                 )
@@ -975,8 +975,8 @@ class CloudQuotaManagerApp(App[None]):
                 )
                 yield Input(
                     placeholder=(
-                        "Explicit candidates separated by spaces: "
-                        "REGION[=ZONE[,ZONE...]]"
+                        "Explicit candidates, e.g. us-central1=us-central1-a "
+                        "us-east4=us-east4-a"
                     ),
                     id="obtainability-candidates",
                     suggester=self._catalog_suggesters["obtainability-candidates"],
@@ -1002,6 +1002,7 @@ class CloudQuotaManagerApp(App[None]):
                 yield Button(
                     "Confirm inherited fields and candidate expansion",
                     id="obtainability-confirm",
+                    classes="hidden",
                 )
                 yield Static(
                     "Candidate expansion: explicit candidates only.",
@@ -4143,6 +4144,17 @@ class CloudQuotaManagerApp(App[None]):
 
     def _prepare_standalone_obtainability(self) -> None:
         self._obtainability_state = ObtainabilityWorkflowState()
+        for selector in (
+            "#obtainability-machine-type",
+            "#obtainability-gpu-type",
+            "#obtainability-gpu-count",
+            "#obtainability-candidates",
+        ):
+            self.query_one(selector, Input).value = ""
+        self.query_one("#obtainability-vm-count", Input).value = "1"
+        self.query_one(
+            "#obtainability-distribution", Select
+        ).value = DistributionShape.ANY.value
         self.query_one("#obtainability-breadcrumb", Static).update(
             "Obtainability / Standalone\n"
             "Fix one exact Spot VM request. Candidate locations never expand silently."
@@ -4150,6 +4162,9 @@ class CloudQuotaManagerApp(App[None]):
         self.query_one("#obtainability-expansion", Static).update(
             "Candidate expansion: explicit candidates only."
         )
+        confirm = self.query_one("#obtainability-confirm", Button)
+        confirm.label = "Confirm inherited fields and candidate expansion"
+        confirm.add_class("hidden")
         self.query_one("#obtainability-return").add_class("hidden")
 
     def _open_contextual_obtainability(self) -> None:
@@ -4244,6 +4259,9 @@ class CloudQuotaManagerApp(App[None]):
             + (", ".join(compatible) if compatible else "none proven compatible")
         )
         self.query_one("#obtainability-return").remove_class("hidden")
+        confirm = self.query_one("#obtainability-confirm", Button)
+        confirm.label = "Confirm inherited fields and candidate expansion"
+        confirm.remove_class("hidden")
         self._set_active_workspace("obtainability")
         self._bind_catalog_evidence(
             "obtainability",
@@ -4314,7 +4332,13 @@ class CloudQuotaManagerApp(App[None]):
             self._show_obtainability_all_compatible_copy_cli(draft)
         else:
             self._show_obtainability_copy_cli(candidates)
-        self._set_status("CONFIRMED — inherited fields and candidate mode are explicit")
+        if state.entry_mode is ObtainabilityEntryMode.STANDALONE:
+            self.query_one("#obtainability-confirm").add_class("hidden")
+            self._set_status("CONFIRMED — candidate expansion is explicit")
+        else:
+            self._set_status(
+                "CONFIRMED — inherited fields and candidate mode are explicit"
+            )
 
     def _submit_obtainability(self) -> None:
         """Decode an explicit fixed request through the same parser as Click."""
@@ -4486,6 +4510,9 @@ class CloudQuotaManagerApp(App[None]):
             state.confirmed_fingerprint != draft.fingerprint
             or state.confirmed_candidate_ids != confirmed_ids
         ):
+            confirm = self.query_one("#obtainability-confirm", Button)
+            confirm.label = "Confirm candidate expansion"
+            confirm.remove_class("hidden")
             self._set_status("CONFIRM CANDIDATE EXPANSION — no comparison has started")
             return
         generation = self._claim_provider_view()
@@ -4700,6 +4727,9 @@ class CloudQuotaManagerApp(App[None]):
             "Candidate expansion before comparison: "
             + (", ".join(compatible) or "none proven compatible")
         )
+        confirm = self.query_one("#obtainability-confirm", Button)
+        confirm.label = "Confirm candidate expansion"
+        confirm.remove_class("hidden")
         self._finish_provider_progress(generation)
         self._set_status("CONFIRM CANDIDATE EXPANSION — no comparison has started")
 
