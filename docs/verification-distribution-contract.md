@@ -394,6 +394,17 @@ The ordinary canary may perform only bounded:
 - Compute aggregated accelerator-type and machine-type lists; and
 - TPU location, accelerator-type, and runtime-version lists.
 
+A live release canary is bounded qualification evidence, not the hermetic
+exhaustive catalog. Its Compute machine-type read selects every provider row
+with an assigned accelerator configuration plus every machine type named by
+the release overlay. The canonical server filter is derived from the packaged
+overlay, sorted and deduplicated, and fails before transport if a name is
+invalid or the filter exceeds its fixed term or byte bound. Evidence binds that
+declared selection to the exact filter digest, overlay content digest, overlay
+term count, and partial-success setting without retaining the raw provider
+response. Runtime inventory remains unfiltered, and the hermetic release
+manifest remains the exhaustive release-relative provider evidence.
+
 A separate canary may call the documented read-only Spot capacity advice
 operation on a known-supported configuration. Its Preview lifecycle and `POST`
 transport are explicit. Both canaries use exact resource and quota projects,
@@ -418,15 +429,20 @@ never enables an API, changes quota, creates capacity, or relies on ambient
 `gcloud` state.
 
 Scheduled canaries and the exact release commit's canaries are release gates.
-The release canary exhausts every page and every discovered supported Cloud TPU
-location required by its declared two-provider evidence set; any warning,
-unreachable scope, failed subsource, or unexhausted page is explicit coverage
-and prevents an exhaustive live claim. Live evidence retains only normalized
-source, coverage, lifecycle, shape, timing, method/path identity, safe digests,
-and pass/fail facts; no raw body, credential, principal email, quota contact,
-or private identifier is retained. Even complete canary evidence describes
-catalog visibility for the named project and observation time, never physical
-capacity or universal regional availability.
+The release canary exhausts every page matching each declared source selection
+and every discovered supported Cloud TPU location required by its declared
+two-provider evidence set. A complete filtered Compute machine-type source is
+complete only for the accelerator-relevant selection recorded in that evidence;
+it is not a complete-machine-inventory claim. Any partial-success warning other
+than an explicit `NO_RESULTS_ON_PAGE` empty-result warning, any unreachable
+scope, failed source, or unexhausted page is explicit coverage and prevents a
+complete live claim. A provider transport, HTTP, or schema failure also writes
+sanitized incomplete evidence before failing the gate. Live evidence retains
+only normalized source, coverage, lifecycle, shape, timing, method/path
+identity, safe digests, and pass/fail facts; no raw body, credential, principal
+email, quota contact, or private identifier is retained. Even complete canary
+evidence describes catalog visibility for the named project and observation
+time, never physical capacity or universal regional availability.
 
 Direct-user ADC receives hermetic `authorized_user` discovery, refresh,
 identity-scope, quota-project, failure, and redaction contracts on every

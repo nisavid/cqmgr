@@ -10,14 +10,19 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from importlib.resources import files
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
+
+from cqmgr.domain.accelerator_overlay import MAINTAINED_ACCELERATOR_OVERLAY
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
 CANARY_SCHEMA = "cqmgr.live-read-only-evidence/v1"
 PROJECT_PATTERN = re.compile(r"[a-z][a-z0-9-]{4,28}[a-z0-9]\Z")
+MACHINE_TYPE_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)+\Z")
+DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 SERVICES = ("compute.googleapis.com", "tpu.googleapis.com")
 MONITORING_METRICS = (
     "serviceruntime.googleapis.com/quota/allocation/usage",
@@ -36,6 +41,89 @@ ALLOWED_GET_PATHS = frozenset(
         "/v2/projects/{project}/locations/{location}/acceleratorTypes",
         "/v2/projects/{project}/locations/{location}/runtimeVersions",
     }
+)
+MAX_MACHINE_TYPE_FILTER_TERMS = 100
+MAX_MACHINE_TYPE_FILTER_BYTES = 8192
+MACHINE_TYPE_SELECTION_KIND = "accelerator-relevant-machine-types/v1"
+COMPUTE_RETURN_PARTIAL_SUCCESS = True
+
+
+def _machine_type_query(  # noqa: C901 - strict fail-closed overlay validation
+    payload: object,
+    *,
+    expected_content_digest: str,
+    expected_machine_types: frozenset[str],
+) -> tuple[str, dict[str, object]]:
+    """Build one canonical bounded query from public release-overlay names."""
+    if not isinstance(payload, dict):
+        msg = "accelerator overlay must be an object"
+        raise TypeError(msg)
+    overlay_digest = payload.get("content_digest")
+    if not isinstance(overlay_digest, str) or not DIGEST_PATTERN.fullmatch(
+        overlay_digest
+    ):
+        msg = "accelerator overlay content digest is invalid"
+        raise ValueError(msg)
+    if overlay_digest != expected_content_digest:
+        msg = "accelerator overlay content digest does not match the canonical overlay"
+        raise ValueError(msg)
+    mappings = payload.get("mappings")
+    if not isinstance(mappings, list):
+        msg = "accelerator overlay mappings must be a list"
+        raise TypeError(msg)
+    machine_types: set[str] = set()
+    for mapping in mappings:
+        if not isinstance(mapping, dict):
+            msg = "accelerator overlay mapping must be an object"
+            raise TypeError(msg)
+        values = mapping.get("machine_types")
+        if not isinstance(values, list):
+            msg = "accelerator overlay machine_types must be a list"
+            raise TypeError(msg)
+        for value in values:
+            if not isinstance(value, str) or not MACHINE_TYPE_PATTERN.fullmatch(value):
+                msg = "accelerator overlay contains an invalid machine type"
+                raise ValueError(msg)
+            machine_types.add(value)
+    if len(machine_types) > MAX_MACHINE_TYPE_FILTER_TERMS:
+        msg = "accelerator overlay contains too many machine types for the canary"
+        raise ValueError(msg)
+    if machine_types != expected_machine_types:
+        msg = "accelerator overlay machine types do not match the canonical overlay"
+        raise ValueError(msg)
+    filter_value = " OR ".join(
+        [
+            "(accelerators.guestAcceleratorType:*)",
+            *(f'(name = "{machine_type}")' for machine_type in sorted(machine_types)),
+        ]
+    )
+    if len(filter_value.encode()) > MAX_MACHINE_TYPE_FILTER_BYTES:
+        msg = "accelerator overlay machine-type filter is too large for the canary"
+        raise ValueError(msg)
+    selection: dict[str, object] = {
+        "filter_digest": "sha256:" + hashlib.sha256(filter_value.encode()).hexdigest(),
+        "kind": MACHINE_TYPE_SELECTION_KIND,
+        "overlay_content_digest": overlay_digest,
+        "overlay_machine_type_terms": len(machine_types),
+        "return_partial_success": COMPUTE_RETURN_PARTIAL_SUCCESS,
+    }
+    return filter_value, selection
+
+
+EXPECTED_OVERLAY_CONTENT_DIGEST = MAINTAINED_ACCELERATOR_OVERLAY.metadata.content_digest
+EXPECTED_OVERLAY_MACHINE_TYPES = frozenset(
+    machine_type
+    for mapping in MAINTAINED_ACCELERATOR_OVERLAY.mappings
+    for machine_type in mapping.machine_types
+)
+MACHINE_TYPE_FILTER, MACHINE_TYPE_SELECTION = _machine_type_query(
+    json.loads(
+        files("cqmgr.resources")
+        .joinpath("accelerator-overlay.json")
+        .read_text(encoding="utf-8")
+    ),
+    expected_content_digest=EXPECTED_OVERLAY_CONTENT_DIGEST,
+    expected_machine_types=EXPECTED_OVERLAY_MACHINE_TYPES,
 )
 
 
@@ -91,8 +179,8 @@ class RequestBudgetError(RuntimeError):
         self.reason = reason
 
 
-class SourceLimitError(RuntimeError):
-    """One per-source bound stopped canary fanout with sanitized evidence."""
+class SourceEvidenceError(RuntimeError):
+    """One source failure stopped canary fanout with sanitized evidence."""
 
     def __init__(self, message: str, evidence: dict[str, object]) -> None:
         """Retain only public path shape, counts, and safe aggregate evidence."""
@@ -194,17 +282,118 @@ def _records(
             records: list[object] = []
             for wrapper in value.values():
                 if not isinstance(wrapper, dict):
-                    continue
-                nested = wrapper.get(nested_key)
-                if isinstance(nested, list):
-                    records.extend(nested)
+                    msg = f"provider field {item_key!r} contains a non-object scope"
+                    raise TypeError(msg)
+                if nested_key not in wrapper:
+                    if "warning" in wrapper:
+                        continue
+                    msg = f"provider field {item_key!r} scope is missing {nested_key!r}"
+                    raise RuntimeError(msg)
+                nested = wrapper[nested_key]
+                if not isinstance(nested, list):
+                    msg = (
+                        f"provider field {item_key!r} nested value "
+                        f"{nested_key!r} is not a list"
+                    )
+                    raise TypeError(msg)
+                records.extend(nested)
             return tuple(records)
         return tuple(value.values())
     msg = f"provider field {item_key!r} is neither a list nor an object"
     raise RuntimeError(msg)
 
 
-def read_pages(  # noqa: PLR0913 - one explicit bounded request contract
+def _selection_evidence(
+    selection: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    """Accept only the exact public machine-selection evidence shape."""
+    if selection is None:
+        return None
+    expected_keys = {
+        "filter_digest",
+        "kind",
+        "overlay_content_digest",
+        "overlay_machine_type_terms",
+        "return_partial_success",
+    }
+    if set(selection) != expected_keys:
+        msg = "evidence selection has an unsupported shape"
+        raise ValueError(msg)
+    filter_digest = selection["filter_digest"]
+    overlay_digest = selection["overlay_content_digest"]
+    terms = selection["overlay_machine_type_terms"]
+    if (
+        selection["kind"] != MACHINE_TYPE_SELECTION_KIND
+        or not isinstance(filter_digest, str)
+        or not DIGEST_PATTERN.fullmatch(filter_digest)
+        or not isinstance(overlay_digest, str)
+        or not DIGEST_PATTERN.fullmatch(overlay_digest)
+        or not isinstance(terms, int)
+        or isinstance(terms, bool)
+        or not 0 <= terms <= MAX_MACHINE_TYPE_FILTER_TERMS
+        or selection["return_partial_success"] is not True
+    ):
+        msg = "evidence selection contains an invalid public value"
+        raise ValueError(msg)
+    return dict(selection)
+
+
+def _next_page_token(payload: Mapping[str, object]) -> str | None:
+    """Return one validated provider page cursor without retaining it."""
+    token = payload.get("nextPageToken")
+    if token in (None, ""):
+        return None
+    if not isinstance(token, str):
+        msg = "provider page token must be a string"
+        raise TypeError(msg)
+    return token
+
+
+def _warning_is_failure(value: object) -> bool:
+    """Classify one provider warning without retaining its text or scope."""
+    if value is None:
+        return False
+    if not isinstance(value, dict):
+        msg = "provider warning must be an object"
+        raise TypeError(msg)
+    code = value.get("code")
+    if not isinstance(code, str) or not code:
+        msg = "provider warning code must be a non-empty string"
+        raise TypeError(msg)
+    return code != "NO_RESULTS_ON_PAGE"
+
+
+def _coverage_failures(
+    payload: Mapping[str, object],
+    *,
+    item_key: str,
+    nested_key: str | None,
+) -> int:
+    """Count sanitized partial-success failures in one provider page."""
+    failures = int(_warning_is_failure(payload.get("warning")))
+    unreachables = payload.get("unreachables")
+    if unreachables is not None:
+        if not isinstance(unreachables, list):
+            msg = "provider unreachables must be a list"
+            raise TypeError(msg)
+        failures += len(unreachables)
+    if nested_key is None:
+        return failures
+    wrappers = payload.get(item_key)
+    if wrappers is None:
+        return failures
+    if not isinstance(wrappers, dict):
+        msg = "Compute aggregated items must be an object"
+        raise TypeError(msg)
+    for wrapper in wrappers.values():
+        if not isinstance(wrapper, dict):
+            msg = "Compute aggregated scope must be an object"
+            raise TypeError(msg)
+        failures += int(_warning_is_failure(wrapper.get("warning")))
+    return failures
+
+
+def read_pages(  # noqa: C901, PLR0913, PLR0915 - explicit bounded source state
     session: SessionLike,
     *,
     method: str,
@@ -217,38 +406,81 @@ def read_pages(  # noqa: PLR0913 - one explicit bounded request contract
     budget: RequestBudget,
     nested_key: str | None = None,
     collect_records: bool = False,
+    selection: Mapping[str, object] | None = None,
 ) -> tuple[dict[str, object], tuple[object, ...]]:
     """Return evidence and only records explicitly requested by the caller."""
     require_allowlisted(method, path_template)
     if max_pages < 1:
         msg = "page limit must be positive"
         raise ValueError(msg)
+    public_selection = _selection_evidence(selection)
     request_params = dict(params)
     records: list[object] = []
     record_count = 0
     digests: list[str] = []
     started = time.monotonic()
     for page in range(1, max_pages + 1):
-        response = session.request(
-            method,
-            url,
-            params=request_params,
-            timeout=budget.claim_timeout(timeout),
-        )
-        payload = _response_mapping(response)
-        page_records = _records(
-            payload.get(item_key),
-            item_key,
-            nested_key=nested_key,
-        )
+        request_timeout = budget.claim_timeout(timeout)
+        try:
+            response = session.request(
+                method,
+                url,
+                params=request_params,
+                timeout=request_timeout,
+            )
+            payload = _response_mapping(response)
+            page_records = _records(
+                payload.get(item_key),
+                item_key,
+                nested_key=nested_key,
+            )
+            coverage_failures = _coverage_failures(
+                payload,
+                item_key=item_key,
+                nested_key=nested_key,
+            )
+            token = _next_page_token(payload)
+        except RequestBudgetError:
+            raise
+        except SourceEvidenceError:
+            raise
+        except Exception:  # noqa: BLE001 - sanitize every provider boundary failure
+            evidence: dict[str, object] = {
+                "complete": False,
+                "method": method,
+                "pages": page - 1,
+                "path": path_template,
+                "reason": "provider-read-failure",
+                "records": record_count,
+            }
+            if public_selection is not None:
+                evidence["selection"] = public_selection
+            msg = f"provider source failed safely: {method} {path_template}"
+            raise SourceEvidenceError(msg, evidence) from None
         record_count += len(page_records)
         if collect_records:
             records.extend(page_records)
         digests.append(hashlib.sha256(_canonical_json(payload)).hexdigest())
-        token = payload.get("nextPageToken")
-        if token in (None, ""):
+        if coverage_failures:
+            evidence = {
+                "complete": False,
+                "coverage_failures": coverage_failures,
+                "digest": "sha256:"
+                + hashlib.sha256("".join(digests).encode()).hexdigest(),
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+                "method": method,
+                "pages": page,
+                "path": path_template,
+                "reason": "coverage-incomplete",
+                "records": record_count,
+            }
+            if public_selection is not None:
+                evidence["selection"] = public_selection
+            msg = f"provider source returned incomplete coverage: {path_template}"
+            raise SourceEvidenceError(msg, evidence)
+        if token is None:
             elapsed = time.monotonic() - started
-            evidence: dict[str, object] = {
+            evidence = {
                 "complete": True,
                 "digest": "sha256:"
                 + hashlib.sha256("".join(digests).encode()).hexdigest(),
@@ -258,10 +490,9 @@ def read_pages(  # noqa: PLR0913 - one explicit bounded request contract
                 "path": path_template,
                 "records": record_count,
             }
+            if public_selection is not None:
+                evidence["selection"] = public_selection
             return evidence, tuple(records)
-        if not isinstance(token, str):
-            msg = "provider page token must be a string"
-            raise TypeError(msg)
         request_params["pageToken"] = token
     elapsed = time.monotonic() - started
     evidence = {
@@ -274,8 +505,10 @@ def read_pages(  # noqa: PLR0913 - one explicit bounded request contract
         "reason": "page-limit",
         "records": record_count,
     }
+    if public_selection is not None:
+        evidence["selection"] = public_selection
     msg = f"provider source exceeded page limit {max_pages}: {path_template}"
-    raise SourceLimitError(msg, evidence)
+    raise SourceEvidenceError(msg, evidence)
 
 
 def read_once(  # noqa: PLR0913 - one explicit bounded request contract
@@ -290,14 +523,29 @@ def read_once(  # noqa: PLR0913 - one explicit bounded request contract
     """Read one non-pageable source and retain only shape and digest evidence."""
     require_allowlisted("GET", path_template)
     started = time.monotonic()
-    payload = _response_mapping(
-        session.request(
-            "GET",
-            url,
-            params=dict(params),
-            timeout=budget.claim_timeout(timeout),
+    request_timeout = budget.claim_timeout(timeout)
+    try:
+        payload = _response_mapping(
+            session.request(
+                "GET",
+                url,
+                params=dict(params),
+                timeout=request_timeout,
+            )
         )
-    )
+    except RequestBudgetError:
+        raise
+    except Exception:  # noqa: BLE001 - sanitize every provider boundary failure
+        evidence: dict[str, object] = {
+            "complete": False,
+            "method": "GET",
+            "pages": 0,
+            "path": path_template,
+            "reason": "provider-read-failure",
+            "records": 0,
+        }
+        msg = f"provider source failed safely: GET {path_template}"
+        raise SourceEvidenceError(msg, evidence) from None
     return {
         "complete": True,
         "digest": "sha256:" + hashlib.sha256(_canonical_json(payload)).hexdigest(),
@@ -340,7 +588,7 @@ def _location_ids(
                 "records": len(locations),
             }
             msg = f"TPU location source exceeded location limit {max_locations}"
-            raise SourceLimitError(msg, evidence)
+            raise SourceEvidenceError(msg, evidence)
     return tuple(sorted(locations))
 
 
@@ -431,6 +679,14 @@ def _run_canary_sources(  # noqa: PLR0913 - explicit bounded source composition
     compute_sources = ("acceleratorTypes", "machineTypes")
     for resource in compute_sources:
         path = f"/compute/v1/projects/{{project}}/aggregated/{resource}"
+        params = {
+            "maxResults": "500",
+            "returnPartialSuccess": str(COMPUTE_RETURN_PARTIAL_SUCCESS).lower(),
+        }
+        selection: Mapping[str, object] | None = None
+        if resource == "machineTypes":
+            params["filter"] = MACHINE_TYPE_FILTER
+            selection = MACHINE_TYPE_SELECTION
         evidence, _records_value = read_pages(
             quota_session,
             method="GET",
@@ -440,11 +696,12 @@ def _run_canary_sources(  # noqa: PLR0913 - explicit bounded source composition
                 f"aggregated/{resource}"
             ),
             item_key="items",
-            params={"maxResults": "500"},
+            params=params,
             max_pages=max_pages,
             timeout=timeout,
             nested_key=resource,
             budget=budget,
+            selection=selection,
         )
         sources.append(evidence)
     location_path = "/v2/projects/{project}/locations"
@@ -461,7 +718,21 @@ def _run_canary_sources(  # noqa: PLR0913 - explicit bounded source composition
         collect_records=True,
     )
     sources.append(location_evidence)
-    locations = _location_ids(location_records, max_locations=max_locations)
+    try:
+        locations = _location_ids(location_records, max_locations=max_locations)
+    except SourceEvidenceError:
+        raise
+    except (TypeError, ValueError, RuntimeError):
+        evidence = {
+            "complete": False,
+            "method": "GET",
+            "pages": location_evidence["pages"],
+            "path": location_path,
+            "reason": "provider-read-failure",
+            "records": location_evidence["records"],
+        }
+        msg = f"provider source failed safely: GET {location_path}"
+        raise SourceEvidenceError(msg, evidence) from None
     state["tpu_locations"] = len(locations)
     for location in locations:
         for resource, item_key in (
@@ -533,14 +804,14 @@ def _budget_failure_evidence(
     }
 
 
-def _source_limit_failure_evidence(
-    error: SourceLimitError,
+def _source_failure_evidence(
+    error: SourceEvidenceError,
     *,
     budget: RequestBudget,
     sources: list[dict[str, object]],
     state: dict[str, int],
 ) -> dict[str, object]:
-    """Retain sanitized partial evidence after one source reaches its bound."""
+    """Retain sanitized partial evidence after one source fails closed."""
     terminal = {
         "elapsed_ms": budget.observed_elapsed_ms(),
         **error.evidence,
@@ -605,8 +876,8 @@ def run_canary(  # noqa: PLR0913 - explicit global and per-request bounds
             sources=sources,
             state=state,
         )
-    except SourceLimitError as error:
-        return _source_limit_failure_evidence(
+    except SourceEvidenceError as error:
+        return _source_failure_evidence(
             error,
             budget=budget,
             sources=sources,
