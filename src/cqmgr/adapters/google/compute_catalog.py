@@ -1294,16 +1294,7 @@ def _scope_location(scope: str) -> str:
         msg = "Compute machine-type scope must identify one zone"
         raise ValueError(msg)
     location = scope.removeprefix(prefix)
-    allowed = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
-    if (
-        not location
-        or not location.isascii()
-        or location != location.lower()
-        or not location[0].isalnum()
-        or not location[-1].isalnum()
-        or any(character not in allowed for character in location)
-        or not is_canonical_zone(location)
-    ):
+    if not is_canonical_zone(location):
         msg = "Compute machine-type scope must identify one zone"
         raise ValueError(msg)
     return location
