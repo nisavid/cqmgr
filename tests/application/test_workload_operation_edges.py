@@ -239,6 +239,53 @@ def _compute_accelerator_catalog_read() -> CatalogRead[ComputeAcceleratorType]:
     )
 
 
+def _empty_compute_machine_catalog_read() -> CatalogRead[ComputeMachineType]:
+    """Return authoritative empty Compute machine evidence."""
+    return CatalogRead(
+        _complete(),
+        (
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+                "us-central1-a",
+                LocationCoverageExpectation.REQUESTED,
+                LocationCoverageState.EMPTY,
+            ),
+        ),
+    )
+
+
+def _incomplete_compute_accelerator_catalog_read(
+    diagnostic_code: str = "catalog-location-not-scanned",
+    *values: ComputeAcceleratorType,
+) -> CatalogRead[ComputeAcceleratorType]:
+    """Return incomplete Compute accelerator evidence with a public diagnostic."""
+    diagnostic = Diagnostic(
+        DiagnosticCode(diagnostic_code),
+        Severity.WARNING,
+        DiagnosticPhase("catalog-read"),
+        DiagnosticSource("compute-accelerator-types"),
+        RetryDisposition.AFTER_REFRESH,
+        RedactedText("The provider did not complete the accelerator catalog read."),
+    )
+    return CatalogRead(
+        ProviderRead(
+            values,
+            ProviderReadCoverage(1, 0),
+            NOW,
+            (diagnostic,),
+        ),
+        (
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+                "us-central1-a",
+                LocationCoverageExpectation.REQUESTED,
+                LocationCoverageState.NOT_SCANNED,
+                (diagnostic,),
+            ),
+        ),
+    )
+
+
 def _legacy_tpu_requirement() -> CloudTpuSliceRequirement:
     """Return one public Cloud TPU slice workload input."""
     return CloudTpuSliceRequirement(
@@ -567,6 +614,132 @@ def test_read_catalog_compute_returns_typed_choices_without_quota_reads() -> Non
     machine_request = cast("ComputeMachineTypeReadRequest", machine_reader.calls[0])
     assert accelerator_request.zones == ("us-central1-a",)
     assert machine_request.zones == ("us-central1-a",)
+
+
+def test_read_catalog_classifies_unavailable_evidence_as_operational_failure() -> None:
+    """A catalog read with no usable choices is unavailable and operational."""
+    operations = WorkloadResolutionOperations(
+        ScriptedReader(()),
+        ScriptedReader(()),
+        ScriptedCatalogReader((_incomplete_compute_accelerator_catalog_read(),)),
+        ScriptedCatalogReader((_empty_compute_machine_catalog_read(),)),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+
+    result = asyncio.run(
+        operations.read_catalog(
+            WorkloadChoiceRequest(
+                _context(),
+                WorkloadKind.COMPUTE_INSTANCE,
+                ("us-central1-a",),
+            )
+        )
+    )
+
+    assert result.outcome.exit_class is ExitClass.OPERATIONAL_FAILURE
+    assert result.outcome.code == StableSymbol("workload-catalog-read-incomplete")
+    assert not result.completeness.is_complete
+    assert not result.completeness.has_partial_data
+
+
+def test_read_catalog_retains_partial_choices_as_incomplete_evidence() -> None:
+    """Usable choices remain visible with incomplete-evidence classification."""
+    operations = WorkloadResolutionOperations(
+        ScriptedReader(()),
+        ScriptedReader(()),
+        ScriptedCatalogReader((_incomplete_compute_accelerator_catalog_read(),)),
+        ScriptedCatalogReader((_gpu_catalog_read(),)),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+
+    result = asyncio.run(
+        operations.read_catalog(
+            WorkloadChoiceRequest(
+                _context(),
+                WorkloadKind.COMPUTE_INSTANCE,
+                ("us-central1-a",),
+            )
+        )
+    )
+
+    assert result.outcome.exit_class is ExitClass.INCOMPLETE_EVIDENCE
+    assert result.outcome.code == StableSymbol("workload-catalog-read-incomplete")
+    assert result.completeness.has_partial_data
+    assert result.data.compute_machine_types == _gpu_catalog_read().values
+
+
+def test_read_catalog_preserves_provider_deadline_outcome() -> None:
+    """A stopped catalog read retains invocation-wide timeout semantics."""
+    operations = WorkloadResolutionOperations(
+        ScriptedReader(()),
+        ScriptedReader(()),
+        ScriptedCatalogReader(
+            (
+                _incomplete_compute_accelerator_catalog_read(
+                    "provider-read-deadline-exceeded"
+                ),
+            )
+        ),
+        ScriptedCatalogReader((_empty_compute_machine_catalog_read(),)),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+
+    result = asyncio.run(
+        operations.read_catalog(
+            WorkloadChoiceRequest(
+                _context(),
+                WorkloadKind.COMPUTE_INSTANCE,
+                ("us-central1-a",),
+            )
+        )
+    )
+
+    assert result.outcome.exit_class is ExitClass.TIMEOUT
+    assert result.outcome.code == StableSymbol("operation-deadline-exceeded")
+    assert not result.completeness.has_partial_data
+
+
+def test_read_catalog_preserves_provider_cancellation_outcome() -> None:
+    """A stopped catalog read retains invocation-wide interruption semantics."""
+    operations = WorkloadResolutionOperations(
+        ScriptedReader(()),
+        ScriptedReader(()),
+        ScriptedCatalogReader(
+            (_incomplete_compute_accelerator_catalog_read("provider-read-cancelled"),)
+        ),
+        ScriptedCatalogReader((_empty_compute_machine_catalog_read(),)),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+
+    result = asyncio.run(
+        operations.read_catalog(
+            WorkloadChoiceRequest(
+                _context(),
+                WorkloadKind.COMPUTE_INSTANCE,
+                ("us-central1-a",),
+            )
+        )
+    )
+
+    assert result.outcome.exit_class is ExitClass.INTERRUPTED
+    assert result.outcome.code == StableSymbol("operation-interrupted")
+    assert not result.completeness.has_partial_data
 
 
 def test_read_catalog_tpu_expands_returned_locations_and_preserves_relationships() -> (

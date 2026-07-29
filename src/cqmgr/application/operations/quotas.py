@@ -769,6 +769,21 @@ class WorkloadResolutionOperations:
             )
         )
         gaps = () if complete else _catalog_coverage_gaps(catalog)
+        outcome, exit_class = (
+            ("workload-catalog-read", ExitClass.SUCCESS)
+            if complete
+            else (
+                _provider_stop_outcome(diagnostics)
+                or (
+                    "workload-catalog-read-incomplete",
+                    (
+                        ExitClass.INCOMPLETE_EVIDENCE
+                        if has_data
+                        else ExitClass.OPERATIONAL_FAILURE
+                    ),
+                )
+            )
+        )
         return OperationResult(
             operation=OperationName("quota.workload-catalog"),
             resource_scope=request.context.project.resource_scope,
@@ -776,14 +791,7 @@ class WorkloadResolutionOperations:
                 StableSymbol("workload-catalog-read"),
                 complete,
             ),
-            outcome=Outcome(
-                StableSymbol(
-                    "workload-catalog-read"
-                    if complete
-                    else "workload-catalog-read-incomplete"
-                ),
-                ExitClass.SUCCESS if complete else ExitClass.INCOMPLETE_EVIDENCE,
-            ),
+            outcome=Outcome(StableSymbol(outcome), exit_class),
             completeness=(
                 Completeness.complete()
                 if complete
