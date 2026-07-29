@@ -769,11 +769,14 @@ def _verify_accelerator_type_identity(
     project: str,
     zone: str,
 ) -> None:
+    if not _is_canonical_compute_resource_name(item.name):
+        msg = "Compute accelerator type must have one canonical resource name"
+        raise ValueError(msg)
     expected_zone_link = (
         f"https://www.googleapis.com/compute/v1/projects/{project}/zones/{zone}"
     )
     expected_self_link = f"{expected_zone_link}/acceleratorTypes/{item.name}"
-    if item.zone != zone:
+    if _canonical_resource_zone(item.zone, project) != zone:
         msg = "Compute accelerator type zone must match its project and scope"
         raise ValueError(msg)
     if item.self_link != expected_self_link:
@@ -881,11 +884,14 @@ def _verify_machine_type_identity(
     project: str,
     zone: str,
 ) -> None:
+    if not _is_canonical_compute_resource_name(item.name):
+        msg = "Compute machine type must have one canonical resource name"
+        raise ValueError(msg)
     expected_zone_link = (
         f"https://www.googleapis.com/compute/v1/projects/{project}/zones/{zone}"
     )
     expected_self_link = f"{expected_zone_link}/machineTypes/{item.name}"
-    if item.zone != zone:
+    if _canonical_resource_zone(item.zone, project) != zone:
         msg = "Compute machine type zone must match its requested project and scope"
         raise ValueError(msg)
     if item.self_link != expected_self_link:
@@ -916,6 +922,16 @@ def _scope_location(scope: str) -> str:
 
 def _is_canonical_zone(value: str) -> bool:
     """Distinguish one exact zone from a region-shaped location."""
+    if (
+        not value
+        or not value.isascii()
+        or value != value.lower()
+        or any(
+            character not in "abcdefghijklmnopqrstuvwxyz0123456789-"
+            for character in value
+        )
+    ):
+        return False
     region, separator, suffix = value.rpartition("-")
     return (
         separator == "-"
@@ -924,6 +940,36 @@ def _is_canonical_zone(value: str) -> bool:
         and region[-1:].isdigit()
         and len(suffix) == 1
         and suffix.isalpha()
+    )
+
+
+def _canonical_resource_zone(value: object, project: str) -> str:
+    """Normalize the two official Compute zone identity representations."""
+    if isinstance(value, str) and _is_canonical_zone(value):
+        return value
+    prefix = (
+        f"https://www.googleapis.com/compute/v1/projects/{project}/zones/"
+    )
+    if not isinstance(value, str) or not value.startswith(prefix):
+        msg = "Compute resource zone must be a canonical short or full identity"
+        raise ValueError(msg)
+    zone = value.removeprefix(prefix)
+    if not _is_canonical_zone(zone) or value != f"{prefix}{zone}":
+        msg = "Compute resource zone must be a canonical short or full identity"
+        raise ValueError(msg)
+    return zone
+
+
+def _is_canonical_compute_resource_name(value: object) -> bool:
+    """Require one unambiguous Compute collection resource name."""
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value.isascii()
+        and value == value.lower()
+        and value[0].isalnum()
+        and value[-1].isalnum()
+        and all(character.isalnum() or character == "-" for character in value)
     )
 
 

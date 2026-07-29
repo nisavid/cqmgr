@@ -6,7 +6,7 @@
           "acceleratorTypes": [
             {
               "name": "nvidia-b200",
-              "zone": "us-central1-a",
+              "zone": "https://www.googleapis.com/compute/v1/projects/public-schema-project/zones/us-central1-a",
               "selfLink": "https://www.googleapis.com/compute/v1/projects/public-schema-project/zones/us-central1-a/acceleratorTypes/nvidia-b200",
               "deprecated": {"state": "DEPRECATED"}
             }
