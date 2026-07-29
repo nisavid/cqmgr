@@ -23,6 +23,7 @@ from cqmgr.domain.diagnostics import (
     DiagnosticCode,
     DiagnosticPhase,
     DiagnosticSource,
+    FieldPath,
     RetryDisposition,
     Severity,
 )
@@ -370,14 +371,23 @@ def _provider_failure(phase: str, provider: str, error: Exception) -> Diagnostic
     )
 
 
-def schema_diagnostic(phase: str, provider: str) -> Diagnostic:
+def schema_diagnostic(
+    phase: str,
+    provider: str,
+    *,
+    field_path: FieldPath | None = None,
+) -> Diagnostic:
     """Return static safe evidence for malformed or skewed provider schema."""
-    return _diagnostic(
-        phase,
-        provider,
-        "provider-schema-invalid",
-        "The provider returned unsupported or malformed read evidence.",
-        RetryDisposition.AFTER_UPGRADE,
+    return Diagnostic(
+        code=DiagnosticCode("provider-schema-invalid"),
+        severity=Severity.ERROR,
+        phase=DiagnosticPhase(phase),
+        source=DiagnosticSource(provider),
+        retry=RetryDisposition.AFTER_UPGRADE,
+        message=RedactedText(
+            "The provider returned unsupported or malformed read evidence."
+        ),
+        field_paths=() if field_path is None else (field_path,),
     )
 
 
