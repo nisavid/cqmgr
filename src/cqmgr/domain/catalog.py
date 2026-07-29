@@ -71,6 +71,30 @@ class LocationCoverageState(StrEnum):
     NOT_SCANNED = "not-scanned"
 
 
+def is_canonical_zone(value: object) -> bool:
+    """Return whether a value is one lowercase canonical zone identity."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or not value.isascii()
+        or value != value.lower()
+        or any(
+            character not in "abcdefghijklmnopqrstuvwxyz0123456789-"
+            for character in value
+        )
+    ):
+        return False
+    region, separator, suffix = value.rpartition("-")
+    return (
+        separator == "-"
+        and "-" in region
+        and all(region.split("-"))
+        and region[-1:].isdigit()
+        and len(suffix) == 1
+        and suffix.isalpha()
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class AcceleratorId:
     """One stable public accelerator-catalog identifier."""

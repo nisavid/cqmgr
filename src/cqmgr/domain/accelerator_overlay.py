@@ -26,6 +26,7 @@ from cqmgr.domain.catalog import (
     TpuRuntimeVersion,
     UnitConversionEvidence,
     WorkloadConsumer,
+    is_canonical_zone,
 )
 from cqmgr.domain.quota_queries import QuotaQueryItem
 from cqmgr.domain.quotas import (
@@ -1754,7 +1755,7 @@ def _compute_quota_region(location: str) -> str:
 
 
 def _zone_belongs_to_region(location: str, region: str) -> bool:
-    return _is_canonical_zone(location) and location.startswith(f"{region}-")
+    return is_canonical_zone(location) and location.startswith(f"{region}-")
 
 
 def _unresolved_location(
@@ -2116,7 +2117,7 @@ def _require_location(value: object, field_name: str) -> None:
 
 def _require_canonical_zone(value: object, field_name: str) -> None:
     _require_location(value, field_name)
-    if not _is_canonical_zone(value):
+    if not is_canonical_zone(value):
         msg = f"{field_name} must be an exact canonical zone"
         raise ValueError(msg)
 
@@ -2162,18 +2163,6 @@ def _is_canonical_service_dns(service: object) -> bool:
     )
 
 
-def _is_canonical_zone(value: object) -> bool:
-    if not isinstance(value, str):
-        return False
-    region, separator, suffix = value.rpartition("-")
-    return (
-        separator == "-"
-        and _is_canonical_region(region)
-        and len(suffix) == 1
-        and suffix.isalpha()
-    )
-
-
 def _is_canonical_region(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -2185,7 +2174,7 @@ def _is_canonical_region(value: object) -> bool:
 
 
 def _is_canonical_region_or_zone(value: object) -> bool:
-    return _is_canonical_region(value) or _is_canonical_zone(value)
+    return _is_canonical_region(value) or is_canonical_zone(value)
 
 
 _B200_A4_REGIONAL = OverlayMapping(

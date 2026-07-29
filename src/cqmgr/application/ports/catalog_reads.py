@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 from cqmgr.application.ports.provider_reads import ProviderReadContext
-from cqmgr.domain.catalog import CatalogLocationCoverage
+from cqmgr.domain.catalog import CatalogLocationCoverage, is_canonical_zone
 from cqmgr.domain.quotas import ProviderRead
 
 if TYPE_CHECKING:
@@ -128,7 +128,7 @@ def _require_context_and_zone(
     if not isinstance(context, ProviderReadContext):
         msg = f"{request_name} request requires ProviderReadContext"
         raise TypeError(msg)
-    if not _is_canonical_zone(zone):
+    if not is_canonical_zone(zone):
         msg = f"{request_name} zone must be a lowercase canonical location ID"
         raise ValueError(msg)
 
@@ -146,35 +146,15 @@ def _require_compute_context_and_zones(
     if not isinstance(zones, tuple):
         msg = f"{request_name} zones must be a tuple or None"
         raise TypeError(msg)
-    if not zones or any(not _is_canonical_zone(zone) for zone in zones):
+    if not zones:
+        msg = f"{request_name} zones must contain at least one location"
+        raise ValueError(msg)
+    if any(not is_canonical_zone(zone) for zone in zones):
         msg = f"{request_name} zones must contain canonical location IDs"
         raise ValueError(msg)
     if len(set(zones)) != len(zones):
         msg = f"{request_name} zones must not contain duplicates"
         raise ValueError(msg)
-
-
-def _is_canonical_zone(value: object) -> bool:
-    if (
-        not isinstance(value, str)
-        or not value
-        or not value.isascii()
-        or value != value.lower()
-        or any(
-            character not in "abcdefghijklmnopqrstuvwxyz0123456789-"
-            for character in value
-        )
-    ):
-        return False
-    region, separator, suffix = value.rpartition("-")
-    return (
-        separator == "-"
-        and "-" in region
-        and all(region.split("-"))
-        and region[-1:].isdigit()
-        and len(suffix) == 1
-        and suffix.isalpha()
-    )
 
 
 class ComputeMachineTypeReader(Protocol):

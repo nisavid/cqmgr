@@ -45,6 +45,7 @@ from cqmgr.domain.catalog import (
     CatalogLocationCoverage,
     LocationCoverageExpectation,
     LocationCoverageState,
+    is_canonical_zone,
 )
 from cqmgr.domain.diagnostics import (
     Diagnostic,
@@ -398,8 +399,7 @@ class WorkloadResolutionOperations:
             requirement.locations.values
             if isinstance(requirement.locations, CandidateLocations)
             and all(
-                _is_canonical_zone(location)
-                for location in requirement.locations.values
+                is_canonical_zone(location) for location in requirement.locations.values
             )
             else None
         )
@@ -488,7 +488,7 @@ class WorkloadResolutionOperations:
                 tuple(
                     location
                     for location in requirement.locations.values
-                    if _is_canonical_zone(location)
+                    if is_canonical_zone(location)
                 )
                 if isinstance(requirement.locations, CandidateLocations)
                 else tuple(location.location_id for location in location_read.values)
@@ -624,7 +624,7 @@ def _selected_tpu_location_coverage(
     for location in requirement.locations.values:
         matching_zones = (
             ((location,) if location in inventory_zones else ())
-            if _is_canonical_zone(location)
+            if is_canonical_zone(location)
             else tuple(
                 zone
                 for zone in inventory_zones
@@ -2070,7 +2070,7 @@ def _required_catalog_gaps(
                     CatalogEvidenceSource.TPU_ACCELERATOR_TYPES,
                     CatalogEvidenceSource.TPU_RUNTIME_VERSIONS,
                 )
-                if _is_canonical_zone(location)
+                if is_canonical_zone(location)
                 else (CatalogEvidenceSource.TPU_LOCATIONS,)
             )
         )
@@ -2093,7 +2093,7 @@ def _candidate_source_coverage_complete(
     source: CatalogEvidenceSource,
     location: str,
 ) -> bool:
-    if _is_canonical_zone(location):
+    if is_canonical_zone(location):
         records = tuple(
             coverage
             for coverage in catalog.coverage
@@ -2124,20 +2124,8 @@ def _candidate_source_coverage_complete(
     )
 
 
-def _is_canonical_zone(location: str) -> bool:
-    region, separator, suffix = location.rpartition("-")
-    return (
-        separator == "-"
-        and "-" in region
-        and all(region.split("-"))
-        and region[-1:].isdigit()
-        and len(suffix) == 1
-        and suffix.isalpha()
-    )
-
-
 def _zone_belongs_to_region(location: str, region: str) -> bool:
-    return _is_canonical_zone(location) and location.startswith(f"{region}-")
+    return is_canonical_zone(location) and location.startswith(f"{region}-")
 
 
 def _catalog_coverage_gaps(

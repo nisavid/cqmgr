@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from threading import Lock, Thread
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from google.cloud import compute_v1
 
@@ -31,6 +31,7 @@ from cqmgr.domain.catalog import (
     ComputeMachineType,
     LocationCoverageExpectation,
     LocationCoverageState,
+    is_canonical_zone,
 )
 from cqmgr.domain.diagnostics import (
     Diagnostic,
@@ -591,6 +592,18 @@ class GoogleComputeAcceleratorTypeReader:
             raise TypeError(msg)
         project = request.context.project.project_id
         zones = request.zones
+        aggregated_client: ComputeAcceleratorTypesPageClient | None = None
+        zonal_client: ComputeAcceleratorTypesZonalPageClient | None = None
+        if zones is None:
+            if not isinstance(self._client, ComputeAcceleratorTypesPageClient):
+                msg = "Compute accelerator client lacks aggregated list support"
+                raise TypeError(msg)
+            aggregated_client = self._client
+        else:
+            if not isinstance(self._client, ComputeAcceleratorTypesZonalPageClient):
+                msg = "Compute accelerator client lacks exact-zone list support"
+                raise TypeError(msg)
+            zonal_client = self._client
         expectation = (
             LocationCoverageExpectation.REQUESTED
             if zones is not None
@@ -610,19 +623,17 @@ class GoogleComputeAcceleratorTypeReader:
             zone = zones[zone_index] if zones is not None else None
             attempted += 1
             if zone is None:
-                if not isinstance(
-                    self._client,
-                    ComputeAcceleratorTypesPageClient,
-                ):
-                    msg = "Compute accelerator client lacks aggregated list support"
-                    raise TypeError(msg)
+                client = cast(
+                    "ComputeAcceleratorTypesPageClient",
+                    aggregated_client,
+                )
                 result = await self._policy.call(
                     request.context,
                     provider="compute",
                     phase="compute-accelerator-types-read",
                     identity=f"compute-accelerator-types:{project}:{token}",
-                    dispatch=lambda timeout, page_token=token: (
-                        self._client.accelerator_types(
+                    dispatch=lambda timeout, page_token=token, client=client: (
+                        client.accelerator_types(
                             project=project,
                             max_results=self._page_size,
                             page_token=page_token,
@@ -632,24 +643,24 @@ class GoogleComputeAcceleratorTypeReader:
                     ),
                 )
             else:
-                if not isinstance(
-                    self._client,
-                    ComputeAcceleratorTypesZonalPageClient,
-                ):
-                    msg = "Compute accelerator client lacks exact-zone list support"
-                    raise TypeError(msg)
+                client = cast(
+                    "ComputeAcceleratorTypesZonalPageClient",
+                    zonal_client,
+                )
                 result = await self._policy.call(
                     request.context,
                     provider="compute",
                     phase="compute-accelerator-types-read",
                     identity=(f"compute-accelerator-types:{project}:{zone}:{token}"),
-                    dispatch=lambda timeout, page_token=token, zone=zone: (
-                        self._client.accelerator_types_for_zone(
-                            project=project,
-                            zone=zone,
-                            max_results=self._page_size,
-                            page_token=page_token,
-                            timeout_seconds=timeout,
+                    dispatch=(
+                        lambda timeout, page_token=token, zone=zone, client=client: (
+                            client.accelerator_types_for_zone(
+                                project=project,
+                                zone=zone,
+                                max_results=self._page_size,
+                                page_token=page_token,
+                                timeout_seconds=timeout,
+                            )
                         )
                     ),
                 )
@@ -804,6 +815,18 @@ class GoogleComputeMachineTypeReader:
             raise TypeError(msg)
         project = request.context.project.project_id
         zones = request.zones
+        aggregated_client: ComputeMachineTypesPageClient | None = None
+        zonal_client: ComputeMachineTypesZonalPageClient | None = None
+        if zones is None:
+            if not isinstance(self._client, ComputeMachineTypesPageClient):
+                msg = "Compute machine client lacks aggregated list support"
+                raise TypeError(msg)
+            aggregated_client = self._client
+        else:
+            if not isinstance(self._client, ComputeMachineTypesZonalPageClient):
+                msg = "Compute machine client lacks exact-zone list support"
+                raise TypeError(msg)
+            zonal_client = self._client
         expectation = (
             LocationCoverageExpectation.REQUESTED
             if zones is not None
@@ -823,19 +846,14 @@ class GoogleComputeMachineTypeReader:
             zone = zones[zone_index] if zones is not None else None
             attempted += 1
             if zone is None:
-                if not isinstance(
-                    self._client,
-                    ComputeMachineTypesPageClient,
-                ):
-                    msg = "Compute machine client lacks aggregated list support"
-                    raise TypeError(msg)
+                client = cast("ComputeMachineTypesPageClient", aggregated_client)
                 result = await self._policy.call(
                     request.context,
                     provider="compute",
                     phase="compute-machine-types-read",
                     identity=f"compute-machine-types:{project}:{token}",
-                    dispatch=lambda timeout, page_token=token: (
-                        self._client.machine_types(
+                    dispatch=lambda timeout, page_token=token, client=client: (
+                        client.machine_types(
                             project=project,
                             max_results=self._page_size,
                             page_token=page_token,
@@ -845,24 +863,21 @@ class GoogleComputeMachineTypeReader:
                     ),
                 )
             else:
-                if not isinstance(
-                    self._client,
-                    ComputeMachineTypesZonalPageClient,
-                ):
-                    msg = "Compute machine client lacks exact-zone list support"
-                    raise TypeError(msg)
+                client = cast("ComputeMachineTypesZonalPageClient", zonal_client)
                 result = await self._policy.call(
                     request.context,
                     provider="compute",
                     phase="compute-machine-types-read",
                     identity=f"compute-machine-types:{project}:{zone}:{token}",
-                    dispatch=lambda timeout, page_token=token, zone=zone: (
-                        self._client.machine_types_for_zone(
-                            project=project,
-                            zone=zone,
-                            max_results=self._page_size,
-                            page_token=page_token,
-                            timeout_seconds=timeout,
+                    dispatch=(
+                        lambda timeout, page_token=token, zone=zone, client=client: (
+                            client.machine_types_for_zone(
+                                project=project,
+                                zone=zone,
+                                max_results=self._page_size,
+                                page_token=page_token,
+                                timeout_seconds=timeout,
+                            )
                         )
                     ),
                 )
@@ -1142,6 +1157,8 @@ def _finalize_requested_coverage(
             state = LocationCoverageState.FAILED
         elif LocationCoverageState.NOT_SCANNED in states:
             state = LocationCoverageState.NOT_SCANNED
+        elif LocationCoverageState.UNSUPPORTED in states:
+            state = LocationCoverageState.UNSUPPORTED
         elif LocationCoverageState.SUCCESS in states:
             state = LocationCoverageState.SUCCESS
         else:
@@ -1285,46 +1302,23 @@ def _scope_location(scope: str) -> str:
         or not location[0].isalnum()
         or not location[-1].isalnum()
         or any(character not in allowed for character in location)
-        or not _is_canonical_zone(location)
+        or not is_canonical_zone(location)
     ):
         msg = "Compute machine-type scope must identify one zone"
         raise ValueError(msg)
     return location
 
 
-def _is_canonical_zone(value: str) -> bool:
-    """Distinguish one exact zone from a region-shaped location."""
-    if (
-        not value
-        or not value.isascii()
-        or value != value.lower()
-        or any(
-            character not in "abcdefghijklmnopqrstuvwxyz0123456789-"
-            for character in value
-        )
-    ):
-        return False
-    region, separator, suffix = value.rpartition("-")
-    return (
-        separator == "-"
-        and "-" in region
-        and all(region.split("-"))
-        and region[-1:].isdigit()
-        and len(suffix) == 1
-        and suffix.isalpha()
-    )
-
-
 def _canonical_resource_zone(value: object, project: str) -> str:
     """Normalize the two official Compute zone identity representations."""
-    if isinstance(value, str) and _is_canonical_zone(value):
+    if isinstance(value, str) and is_canonical_zone(value):
         return value
     prefix = f"https://www.googleapis.com/compute/v1/projects/{project}/zones/"
     if not isinstance(value, str) or not value.startswith(prefix):
         msg = "Compute resource zone must be a canonical short or full identity"
         raise ValueError(msg)
     zone = value.removeprefix(prefix)
-    if not _is_canonical_zone(zone) or value != f"{prefix}{zone}":
+    if not is_canonical_zone(zone):
         msg = "Compute resource zone must be a canonical short or full identity"
         raise ValueError(msg)
     return zone

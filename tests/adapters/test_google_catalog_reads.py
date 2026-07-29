@@ -26,8 +26,9 @@ from cqmgr.adapters.google.compute_catalog import (
     GoogleComputeMachineTypeReader,
     OfficialComputeAcceleratorTypesPageClient,
     OfficialComputeMachineTypesPageClient,
+    _finalize_requested_coverage,
 )
-from cqmgr.adapters.google.read_policy import GoogleReadPolicy
+from cqmgr.adapters.google.read_policy import GoogleReadPolicy, schema_diagnostic
 from cqmgr.adapters.google.tpu_catalog import (
     GoogleTpuAcceleratorTypeReader,
     GoogleTpuLocationReader,
@@ -52,6 +53,7 @@ from cqmgr.application.ports.provider_reads import ProviderReadContext
 from cqmgr.domain.catalog import (
     CatalogEvidenceSource,
     CatalogLifecycle,
+    CatalogLocationCoverage,
     LocationCoverageExpectation,
     LocationCoverageState,
 )
@@ -1047,6 +1049,20 @@ def test_compute_requests_reject_invalid_explicit_zones(
         ComputeAcceleratorTypeReadRequest(_context(), zones)
 
 
+@pytest.mark.parametrize(
+    "request_type",
+    [ComputeMachineTypeReadRequest, ComputeAcceleratorTypeReadRequest],
+)
+def test_compute_requests_reject_an_empty_explicit_zone_set(
+    request_type: type[
+        ComputeMachineTypeReadRequest | ComputeAcceleratorTypeReadRequest
+    ],
+) -> None:
+    """An empty exact-zone selection is distinct from malformed zone identities."""
+    with pytest.raises(ValueError, match="zones must contain at least one location"):
+        request_type(_context(), ())
+
+
 def test_compute_requests_reject_mutable_explicit_zones() -> None:
     """A mutable sequence cannot cross the immutable catalog request seam."""
     with pytest.raises(TypeError, match="zones"):
@@ -1054,6 +1070,40 @@ def test_compute_requests_reject_mutable_explicit_zones() -> None:
             _context(),
             cast("tuple[str, ...]", ["us-central1-a"]),
         )
+
+
+def test_requested_coverage_preserves_unsupported_precedence_and_reason() -> None:
+    """Unsupported exact-zone evidence remains complete and keeps its reason."""
+    zone = "us-central1-a"
+    diagnostic = schema_diagnostic("compute-machine-types-read", "compute")
+
+    result = _finalize_requested_coverage(
+        [
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+                zone,
+                LocationCoverageExpectation.REQUESTED,
+                LocationCoverageState.EMPTY,
+            ),
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+                zone,
+                LocationCoverageExpectation.REQUESTED,
+                LocationCoverageState.UNSUPPORTED,
+                (diagnostic,),
+            ),
+        ]
+    )
+
+    assert result == (
+        CatalogLocationCoverage(
+            CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+            zone,
+            LocationCoverageExpectation.REQUESTED,
+            LocationCoverageState.UNSUPPORTED,
+            (diagnostic,),
+        ),
+    )
 
 
 def test_official_compute_wrapper_uses_partial_success_without_retry() -> None:
