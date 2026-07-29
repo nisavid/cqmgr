@@ -355,6 +355,36 @@ def test_release_publication_requires_the_exact_commit_live_canary() -> None:
     assert "live-read-only" in _yaml_list_values(publish_needs, indent=6)
 
 
+def test_release_publication_qualifies_installed_live_read_adapters() -> None:
+    """Publication requires sanitized live evidence from the exact candidate wheel."""
+    workflow = (WORKFLOWS / "release.yml").read_text()
+    qualification = _workflow_job(workflow, "installed-live-adapters")
+    publish = _workflow_job(workflow, "publish")
+    publish_needs = _yaml_block(publish, "needs", indent=4)
+
+    assert "needs: build" in qualification
+    assert "environment: live-read-only" in qualification
+    assert "runs-on: ubuntu-22.04" in qualification
+    assert "id-token: write" in qualification
+    assert "GCP_WORKLOAD_IDENTITY_PROVIDER" in qualification
+    assert "GCP_SERVICE_ACCOUNT" in qualification
+    assert "GCP_PROJECT_ID" in qualification
+    assert "scripts/installed_live_adapter_qualification.py" in qualification
+    assert "--project-env GCP_PROJECT_ID" in qualification
+    assert (
+        "candidate/release/cqmgr-${{ needs.build.outputs.version }}-py3-none-any.whl"
+        in qualification
+    )
+    assert "if: always()" in _job_step(
+        qualification,
+        "Upload sanitized installed-adapter evidence",
+    )
+    assert "installed-live-adapters" in _yaml_list_values(
+        publish_needs,
+        indent=6,
+    )
+
+
 def test_release_performance_job_enforces_budgets_and_retains_failure_evidence() -> (
     None
 ):
