@@ -46,6 +46,7 @@ from cqmgr.domain.catalog import (
     CatalogLocationCoverage,
     LocationCoverageExpectation,
     LocationCoverageState,
+    is_canonical_region_or_zone,
     is_canonical_zone,
 )
 from cqmgr.domain.diagnostics import (
@@ -169,7 +170,9 @@ class WorkloadChoiceRequest:
         if not isinstance(self.locations, tuple):
             msg = "workload choice locations must be a tuple"
             raise TypeError(msg)
-        if any(not _is_catalog_location(location) for location in self.locations):
+        if any(
+            not is_canonical_region_or_zone(location) for location in self.locations
+        ):
             msg = "workload choice locations must be canonical location IDs"
             raise ValueError(msg)
         if len(set(self.locations)) != len(self.locations):
@@ -2342,20 +2345,6 @@ def _candidate_source_coverage_complete(
         and all(
             coverage.complete for coverage in (*child_records, *global_or_exact_records)
         )
-    )
-
-
-def _is_catalog_location(location: object) -> bool:
-    """Return whether one value is a canonical provider location identifier."""
-    allowed = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
-    return (
-        isinstance(location, str)
-        and bool(location)
-        and location.isascii()
-        and location == location.lower()
-        and location[0].isalnum()
-        and location[-1].isalnum()
-        and all(character in allowed for character in location)
     )
 
 
