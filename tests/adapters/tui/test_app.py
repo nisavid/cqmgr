@@ -189,6 +189,19 @@ KEY = SecretValue(b"k" * 32)
 DEFAULT_SCOPE_INPUT = ReadOnlyScopeInput()
 
 
+class ManualMonotonic:
+    """Advance injected UI time without delaying the test process."""
+
+    def __init__(self, initial: float) -> None:
+        self.value = initial
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
 def _static(app: CloudQuotaManagerApp, selector: str) -> Static:
     return app.query_one(selector, Static)
 
@@ -1199,6 +1212,7 @@ class DelayedObtainabilityOperations(ScriptedReadOnlyOperations):
         self.compare_started = asyncio.Event()
         self.release_compare = asyncio.Event()
         self.compare_returned = asyncio.Event()
+        self.compare_cancellation: CancellationToken | None = None
 
     @override
     async def compare_obtainability_prepared(
@@ -1209,6 +1223,7 @@ class DelayedObtainabilityOperations(ScriptedReadOnlyOperations):
         cancellation: CancellationToken | None = None,
         scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
     ) -> OperationResult[ObtainabilityComparison]:
+        self.compare_cancellation = cancellation
         self.compare_started.set()
         await self.release_compare.wait()
         result = await super().compare_obtainability_prepared(
@@ -4535,6 +4550,106 @@ def test_partial_failure_and_superseded_reads_remain_explicit_and_safe() -> None
     asyncio.run(partial_scenario())
     asyncio.run(failure_scenario())
     asyncio.run(cancellation_scenario())
+
+
+def test_quota_progress_exposes_elapsed_deadline_and_explicit_cancellation() -> None:
+    """A slow quota read stays visibly active and can be cancelled from the UI."""
+
+    async def scenario() -> None:
+        clock = ManualMonotonic(100.0)
+        operations = SupersededReadOnlyOperations()
+        app = CloudQuotaManagerApp(
+            operations,
+            ScriptedAuditOperations(),
+            monotonic=clock,
+        )
+
+        async with app.run_test(size=(100, 32)) as pilot:
+            await operations.first_started.wait()
+            await pilot.pause()
+
+            status = str(_static(app, "#status-line").content)
+            assert "READING — quota providers / quota inventory" in status
+            assert "elapsed 0.0s" in status
+            assert "deadline in 60.0s" in status
+            assert "Cancel read available" in status
+            assert not _button(app, "#cancel-provider-read").disabled
+
+            clock.advance(12.5)
+            await pilot.pause(0.3)
+
+            status = str(_static(app, "#status-line").content)
+            assert "elapsed 12.5s" in status
+            assert "deadline in 47.5s" in status
+
+            _button(app, "#cancel-provider-read").press()
+            await pilot.pause()
+
+            assert operations.tokens[0].cancelled
+            assert _button(app, "#cancel-provider-read").disabled
+            assert (
+                str(_static(app, "#status-line").content)
+                == "CANCELLED — quota inventory read stopped"
+            )
+
+    asyncio.run(scenario())
+
+
+def test_obtainability_progress_reaches_deadline_without_stale_repaint() -> None:
+    """One shared deadline replaces active advice progress deterministically."""
+
+    async def scenario() -> None:
+        clock = ManualMonotonic(200.0)
+        operations = DelayedObtainabilityOperations()
+        app = CloudQuotaManagerApp(
+            operations,
+            ScriptedAuditOperations(),
+            monotonic=clock,
+        )
+
+        async with app.run_test(size=(100, 36)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            _input(app, "#obtainability-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#obtainability-vm-count").value = "2"
+            _input(app, "#obtainability-distribution").value = "balanced"
+            _input(
+                app, "#obtainability-candidates"
+            ).value = "us-central1=us-central1-a,us-central1-b"
+            _button(app, "#obtainability-compare").press()
+            await operations.compare_started.wait()
+            await pilot.pause()
+            active_result = app.last_result
+
+            status = str(_static(app, "#status-line").content)
+            assert "READING — Spot advice providers / obtainability comparison" in (
+                status
+            )
+            assert "elapsed 0.0s" in status
+            assert "deadline in 60.0s" in status
+
+            clock.advance(60.1)
+            await pilot.pause(0.3)
+
+            assert operations.compare_cancellation is not None
+            assert operations.compare_cancellation.cancelled
+            assert _button(app, "#cancel-provider-read").disabled
+            assert (
+                str(_static(app, "#status-line").content)
+                == "DEADLINE REACHED — obtainability comparison stopped after 60.1s"
+            )
+
+            operations.release_compare.set()
+            await operations.compare_returned.wait()
+            await pilot.pause()
+
+            assert app.last_result is active_result
+            assert (
+                str(_static(app, "#status-line").content)
+                == "DEADLINE REACHED — obtainability comparison stopped after 60.1s"
+            )
+
+    asyncio.run(scenario())
 
 
 def test_completed_inspection_owns_result_and_copy_cli_over_older_refresh() -> None:
