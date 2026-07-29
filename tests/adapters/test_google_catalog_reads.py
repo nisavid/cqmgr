@@ -676,6 +676,7 @@ def test_official_compute_wrapper_uses_partial_success_without_retry() -> None:
         cast("tuple[object, object, object]", client.call)[0],
     )
     assert request.return_partial_success
+    assert not request.filter
     assert request.page_token == "public-page"
     assert cast("tuple[object, object, object]", client.call)[1:] == (None, 2.5)
     assert result.next_page_token == "public-next"
