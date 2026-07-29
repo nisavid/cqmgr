@@ -216,7 +216,7 @@ class WorkloadResolutionOperations:
             zones = (
                 request.locations
                 if request.locations
-                and all(_is_canonical_zone(location) for location in request.locations)
+                and all(is_canonical_zone(location) for location in request.locations)
                 else None
             )
             accelerator_read, machine_read = await asyncio.gather(
@@ -269,7 +269,7 @@ class WorkloadResolutionOperations:
                     for location in request.locations
                     for zone in (
                         (location,)
-                        if _is_canonical_zone(location)
+                        if is_canonical_zone(location)
                         else tuple(
                             inventory_zone
                             for inventory_zone in inventory_zones
@@ -2343,6 +2343,7 @@ def _candidate_source_coverage_complete(
             coverage.complete for coverage in (*child_records, *global_or_exact_records)
         )
     )
+
 
 def _is_catalog_location(location: object) -> bool:
     """Return whether one value is a canonical provider location identifier."""
