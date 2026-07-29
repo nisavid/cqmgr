@@ -373,6 +373,8 @@ jobs:
           --max-seconds 1200
           --max-locations 125
           --timeout 10
+          --max-transient-retries 1
+          --retry-backoff-seconds 1
           --output live-read-only-evidence.json
 
       - name: Upload sanitized evidence

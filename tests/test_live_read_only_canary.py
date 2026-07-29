@@ -11,6 +11,8 @@ from typing import Any, cast
 from urllib.parse import urlsplit
 
 import pytest
+from requests import ConnectionError as RequestsConnectionError
+from requests import HTTPError, Timeout
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "live_read_only_canary.py"
 OVERLAY = files("cqmgr.resources").joinpath("accelerator-overlay.json")
@@ -410,9 +412,11 @@ def test_ordinary_canary_completes_live_shaped_121_location_inventory(  # noqa: 
     expected_max_locations = 125
     expected_max_pages = 50
     expected_request_timeout = 10.0
+    expected_max_transient_retries = 1
+    expected_retry_backoff_seconds = 1.0
     expected_locations = 121
-    expected_requests = 378
-    expected_elapsed_ms = 975_500
+    expected_requests = 379
+    expected_elapsed_ms = 986_500
     second_page = 2
 
     assert module["DEFAULT_MAX_REQUESTS"] == expected_max_requests
@@ -420,6 +424,8 @@ def test_ordinary_canary_completes_live_shaped_121_location_inventory(  # noqa: 
     assert module["DEFAULT_MAX_LOCATIONS"] == expected_max_locations
     assert module["DEFAULT_MAX_PAGES"] == expected_max_pages
     assert module["DEFAULT_REQUEST_TIMEOUT_SECONDS"] == expected_request_timeout
+    assert module["DEFAULT_MAX_TRANSIENT_RETRIES"] == expected_max_transient_retries
+    assert module["DEFAULT_RETRY_BACKOFF_SECONDS"] == expected_retry_backoff_seconds
 
     class Response:
         def __init__(self, payload: dict[str, object]) -> None:
@@ -445,8 +451,9 @@ def test_ordinary_canary_completes_live_shaped_121_location_inventory(  # noqa: 
         def __init__(self, clock: Clock) -> None:
             self.clock = clock
             self.pages_by_url: dict[str, int] = {}
+            self.injected_transient = False
 
-        def request(  # noqa: C901, PLR0911 - explicit provider replay fixture
+        def request(  # noqa: C901, PLR0911, PLR0912 - explicit replay fixture
             self,
             method: str,
             url: str,
@@ -455,6 +462,11 @@ def test_ordinary_canary_completes_live_shaped_121_location_inventory(  # noqa: 
             assert method == "GET"
             assert cast("float", kwargs["timeout"]) <= expected_request_timeout
             hostname = urlsplit(url).hostname
+            if url.endswith("/runtimeVersions") and not self.injected_transient:
+                self.injected_transient = True
+                self.clock.advance(cast("float", kwargs["timeout"]))
+                detail = "private timeout detail"
+                raise Timeout(detail)
             page = self.pages_by_url.get(url, 0) + 1
             self.pages_by_url[url] = page
             if hostname == "tpu.googleapis.com" and "/locations/" in url:
@@ -511,13 +523,24 @@ def test_ordinary_canary_completes_live_shaped_121_location_inventory(  # noqa: 
             return Response({})
 
     clock = Clock()
-    run_canary.__globals__["RequestBudget"] = lambda *, max_requests, max_seconds: (
-        request_budget_type(
+
+    def request_budget(
+        *,
+        max_requests: int,
+        max_seconds: float,
+        max_transient_retries: int,
+        retry_backoff_seconds: float,
+    ) -> object:
+        return request_budget_type(
             max_requests=max_requests,
             max_seconds=max_seconds,
+            max_transient_retries=max_transient_retries,
+            retry_backoff_seconds=retry_backoff_seconds,
             monotonic=clock,
+            sleeper=clock.advance,
         )
-    )
+
+    run_canary.__globals__["RequestBudget"] = request_budget
     evidence = run_canary(
         Session(clock),
         "dedicated-canary",
@@ -532,6 +555,13 @@ def test_ordinary_canary_completes_live_shaped_121_location_inventory(  # noqa: 
     assert evidence["tpu_locations"] == expected_locations
     assert evidence["total_requests"] == expected_requests
     assert evidence["total_elapsed_ms"] == expected_elapsed_ms
+    assert (
+        sum(
+            cast("int", source["transient_retries"])
+            for source in cast("list[dict[str, object]]", evidence["sources"])
+        )
+        == 1
+    )
 
 
 def test_ordinary_canary_rejects_126th_unique_location_before_child_fanout(  # noqa: C901 - explicit provider boundary fixture
@@ -807,6 +837,29 @@ def test_shared_request_budget_rejects_unusable_remaining_timeout() -> None:
     assert budget.requests == 0
 
 
+def test_retry_backoff_fails_before_sleep_when_deadline_cannot_fit_retry() -> None:
+    """Retry delay plus its minimum request timeout must fit the global bound."""
+    module = _module()
+    request_budget_type = cast("Any", module["RequestBudget"])
+    request_budget_error = cast("Any", module["RequestBudgetError"])
+    delays: list[float] = []
+    observed = iter((10.0, 14.95))
+    budget = request_budget_type(
+        max_requests=2,
+        max_seconds=5.0,
+        max_transient_retries=1,
+        retry_backoff_seconds=0.1,
+        monotonic=lambda: next(observed),
+        sleeper=delays.append,
+    )
+
+    with pytest.raises(request_budget_error) as raised:
+        budget.wait_before_retry()
+
+    assert raised.value.reason == "wall-clock-deadline"
+    assert delays == []
+
+
 def test_budget_exhaustion_stops_fanout_and_retains_incomplete_evidence() -> None:
     """A global bound stops before transport and preserves partial safe evidence."""
     module = _module()
@@ -917,6 +970,181 @@ def test_transport_budget_errors_are_not_reclassified_as_provider_failures() -> 
             budget=request_budget_type(max_requests=1, max_seconds=5.0),
         )
     assert raised_pages.value.reason == reason
+
+
+@pytest.mark.parametrize(
+    ("failure", "failure_class"),
+    [
+        (Timeout("private timeout detail"), "transport-timeout"),
+        (
+            RequestsConnectionError("private connection detail"),
+            "transport-connectivity",
+        ),
+        (
+            HTTPError(
+                "private provider detail",
+                response=type("Response", (), {"status_code": 408})(),
+            ),
+            "http-408",
+        ),
+        (
+            HTTPError(
+                "private provider detail",
+                response=type("Response", (), {"status_code": 429})(),
+            ),
+            "http-429",
+        ),
+        (
+            HTTPError(
+                "private provider detail",
+                response=type("Response", (), {"status_code": 503})(),
+            ),
+            "http-5xx",
+        ),
+    ],
+)
+def test_transient_provider_failure_retries_once_within_shared_bounds(
+    failure: Exception,
+    failure_class: str,
+) -> None:
+    """One classified transient read retries under the same global envelope."""
+    module = _module()
+    read_once = cast("Any", module["read_once"])
+    request_budget_type = cast("Any", module["RequestBudget"])
+    delays: list[float] = []
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return
+
+        def json(self) -> dict[str, object]:
+            return {"name": "projects/private"}
+
+    class Session:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def request(self, method: str, url: str, **kwargs: object) -> Response:
+            del method, url, kwargs
+            self.calls += 1
+            if self.calls == 1:
+                raise failure
+            return Response()
+
+    session = Session()
+    expected_attempts = 2
+    budget = request_budget_type(
+        max_requests=expected_attempts,
+        max_seconds=5.0,
+        max_transient_retries=1,
+        retry_backoff_seconds=0.25,
+        sleeper=delays.append,
+    )
+
+    evidence = read_once(
+        session,
+        path_template="/v3/projects/{project}",
+        url="https://cloudresourcemanager.googleapis.com/v3/projects/private",
+        params={},
+        timeout=1.0,
+        budget=budget,
+    )
+
+    assert session.calls == expected_attempts
+    assert budget.requests == expected_attempts
+    assert delays == [0.25]
+    assert evidence["transient_retries"] == 1
+    assert evidence["last_transient_failure_class"] == failure_class
+    assert "private" not in json.dumps(evidence)
+
+
+def test_transient_provider_failure_exhaustion_is_safely_classified() -> None:
+    """A second timeout fails closed without retaining provider details."""
+    module = _module()
+    read_pages = cast("Any", module["read_pages"])
+    request_budget_type = cast("Any", module["RequestBudget"])
+    source_evidence_error = cast("Any", module["SourceEvidenceError"])
+
+    class Session:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def request(self, method: str, url: str, **kwargs: object) -> object:
+            del method, url, kwargs
+            self.calls += 1
+            detail = "private timeout detail"
+            raise Timeout(detail)
+
+    session = Session()
+    expected_attempts = 2
+    with pytest.raises(source_evidence_error) as raised:
+        read_pages(
+            session,
+            method="GET",
+            path_template=(
+                "/v1/projects/{project}/locations/global/services/{service}/quotaInfos"
+            ),
+            url="https://cloudquotas.googleapis.com/v1/projects/private/quotaInfos",
+            item_key="quotaInfos",
+            params={"pageSize": "200"},
+            max_pages=1,
+            timeout=1.0,
+            budget=request_budget_type(
+                max_requests=expected_attempts,
+                max_seconds=5.0,
+                max_transient_retries=1,
+                retry_backoff_seconds=0.0,
+            ),
+        )
+
+    evidence = raised.value.evidence
+    assert session.calls == expected_attempts
+    assert evidence["reason"] == "provider-read-failure"
+    assert evidence["failure_class"] == "transport-timeout"
+    assert evidence["transient_retries"] == 1
+    assert "private" not in json.dumps(evidence)
+
+
+def test_permanent_http_failure_is_not_retried() -> None:
+    """Permanent HTTP failures fail immediately with a safe status class."""
+    module = _module()
+    read_once = cast("Any", module["read_once"])
+    request_budget_type = cast("Any", module["RequestBudget"])
+    source_evidence_error = cast("Any", module["SourceEvidenceError"])
+
+    class Session:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def request(self, method: str, url: str, **kwargs: object) -> object:
+            del method, url, kwargs
+            self.calls += 1
+            detail = "private provider detail"
+            raise HTTPError(
+                detail,
+                response=type("Response", (), {"status_code": 404})(),
+            )
+
+    session = Session()
+    with pytest.raises(source_evidence_error) as raised:
+        read_once(
+            session,
+            path_template="/v3/projects/{project}",
+            url="https://cloudresourcemanager.googleapis.com/v3/projects/private",
+            params={},
+            timeout=1.0,
+            budget=request_budget_type(
+                max_requests=2,
+                max_seconds=5.0,
+                max_transient_retries=1,
+                retry_backoff_seconds=0.0,
+            ),
+        )
+
+    assert session.calls == 1
+    assert raised.value.evidence["failure_class"] == "http-4xx"
+    assert raised.value.evidence["transient_retries"] == 0
+    assert "private" not in json.dumps(raised.value.evidence)
 
 
 def test_incomplete_evidence_is_written_before_the_process_fails(
@@ -1545,11 +1773,13 @@ def test_malformed_tpu_location_becomes_sanitized_incomplete_evidence() -> None:
     assert elapsed_ms >= 0
     assert terminal == {
         "complete": False,
+        "failure_class": "provider-schema-failure",
         "method": "GET",
         "pages": 1,
         "path": "/v2/projects/{project}/locations",
         "reason": "provider-read-failure",
         "records": 1,
+        "transient_retries": 0,
     }
     assert private not in json.dumps(evidence)
 
@@ -1586,11 +1816,13 @@ def test_provider_failure_retains_sanitized_incomplete_evidence(
     assert elapsed_ms >= 0
     assert terminal == {
         "complete": False,
+        "failure_class": "provider-read-failure",
         "method": "GET",
         "pages": 0,
         "path": "/v3/projects/{project}",
         "reason": "provider-read-failure",
         "records": 0,
+        "transient_retries": 0,
     }
     assert private not in json.dumps(evidence)
     output = tmp_path / "evidence.json"
