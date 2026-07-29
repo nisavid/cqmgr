@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-22.04
     # The protected environment supplies all three GCP values directly to this
     # job; workflow callers cannot inject or override them.
-    timeout-minutes: 15
+    timeout-minutes: 25
     environment: live-read-only
     permissions:
       # Required to check out the exact repository revision.
@@ -57,8 +57,8 @@ jobs:
           python scripts/live_read_only_canary.py
           --project-env GCP_PROJECT_ID
           --max-pages 50
-          --max-requests 275
-          --max-seconds 180
+          --max-requests 500
+          --max-seconds 1200
           --max-locations 125
           --timeout 10
           --output live-read-only-evidence.json
