@@ -7,7 +7,7 @@ import math
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Final, Protocol, cast
 
 from google.api_core import exceptions as google_exceptions
 from google.cloud import cloudquotas_v1
@@ -30,6 +30,7 @@ from cqmgr.application.ports.watch import (
     WatchObservationRequest,
     WatchObservationTransientError,
 )
+from cqmgr.domain.diagnostics import FieldPath
 from cqmgr.domain.quotas import (
     EffectiveQuotaEvidence,
     EffectiveQuotaSliceIdentity,
@@ -52,6 +53,48 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from cqmgr.domain.watch import WatchChildIdentity
+
+_QUOTA_INFO_IDENTITY_PATH: Final = FieldPath(("quota-info", "identity"))
+_QUOTA_INFO_ELIGIBILITY_PATH: Final = FieldPath(
+    ("quota-info", "quota-increase-eligibility")
+)
+_QUOTA_INFO_METRIC_PATH: Final = FieldPath(("quota-info", "metric"))
+_QUOTA_INFO_DIMENSIONS_PATH: Final = FieldPath(("quota-info", "dimensions"))
+_QUOTA_INFO_DIMENSIONS_INFOS_PATH: Final = FieldPath(("quota-info", "dimensions-infos"))
+_QUOTA_INFO_SLICE_DIMENSIONS_PATH: Final = FieldPath(
+    ("quota-info", "dimensions-infos", "dimensions")
+)
+_QUOTA_INFO_DETAILS_PATH: Final = FieldPath(
+    ("quota-info", "dimensions-infos", "details")
+)
+_QUOTA_INFO_LOCATIONS_PATH: Final = FieldPath(
+    ("quota-info", "dimensions-infos", "applicable-locations")
+)
+_QUOTA_INFO_INVARIANT_PATH: Final = FieldPath(("quota-info", "invariant"))
+_QUOTA_INFO_SCHEMA_PATHS: Final[frozenset[FieldPath]] = frozenset(
+    (
+        _QUOTA_INFO_IDENTITY_PATH,
+        _QUOTA_INFO_ELIGIBILITY_PATH,
+        _QUOTA_INFO_METRIC_PATH,
+        _QUOTA_INFO_DIMENSIONS_PATH,
+        _QUOTA_INFO_DIMENSIONS_INFOS_PATH,
+        _QUOTA_INFO_SLICE_DIMENSIONS_PATH,
+        _QUOTA_INFO_DETAILS_PATH,
+        _QUOTA_INFO_LOCATIONS_PATH,
+        _QUOTA_INFO_INVARIANT_PATH,
+    )
+)
+
+
+class _QuotaInfoSchemaError(ValueError):
+    """A QuotaInfo failure classified by a static safe field path."""
+
+    def __init__(self, field_path: FieldPath, message: str) -> None:
+        if field_path not in _QUOTA_INFO_SCHEMA_PATHS:
+            msg = "QuotaInfo schema field path must be allowlisted"
+            raise ValueError(msg)
+        super().__init__(message)
+        self.field_path = field_path
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,9 +334,21 @@ class GoogleEffectiveQuotaReader(_CloudQuotasReader):
             for item in page.items:
                 try:
                     values.extend(_map_quota_info(item, request))
+                except _QuotaInfoSchemaError as error:
+                    diagnostics.append(
+                        schema_diagnostic(
+                            "effective-quota-read",
+                            "cloud-quotas",
+                            field_path=error.field_path,
+                        )
+                    )
                 except (TypeError, ValueError, OverflowError):
                     diagnostics.append(
-                        schema_diagnostic("effective-quota-read", "cloud-quotas")
+                        schema_diagnostic(
+                            "effective-quota-read",
+                            "cloud-quotas",
+                            field_path=_QUOTA_INFO_INVARIANT_PATH,
+                        )
                     )
             token = page.next_page_token
             if not token:
@@ -522,12 +577,28 @@ def _map_quota_info(
     info_pb = cloudquotas_v1.QuotaInfo.pb(info)
     if (
         info.service != request.service
+        or not info.quota_id
         or info.name != expected_name
-        or not info_pb.HasField("quota_increase_eligibility")
-        or not info.dimensions_infos
     ):
-        msg = "QuotaInfo identity does not match request"
-        raise ValueError(msg)
+        raise _QuotaInfoSchemaError(
+            _QUOTA_INFO_IDENTITY_PATH,
+            "QuotaInfo identity does not match request",
+        )
+    if not info.metric:
+        raise _QuotaInfoSchemaError(
+            _QUOTA_INFO_METRIC_PATH,
+            "QuotaInfo metric is required",
+        )
+    if not info_pb.HasField("quota_increase_eligibility"):
+        raise _QuotaInfoSchemaError(
+            _QUOTA_INFO_ELIGIBILITY_PATH,
+            "QuotaInfo eligibility is required",
+        )
+    if not info.dimensions_infos:
+        raise _QuotaInfoSchemaError(
+            _QUOTA_INFO_DIMENSIONS_INFOS_PATH,
+            "QuotaInfo dimension slices are required",
+        )
     reason = _ineligibility_symbol(info.quota_increase_eligibility)
     eligibility = QuotaIncreaseEligibility(
         eligible=info.quota_increase_eligibility.is_eligible,
@@ -538,22 +609,16 @@ def _map_quota_info(
     if any(not dimension for dimension in declared_dimensions) or len(
         declared_dimension_set
     ) != len(declared_dimensions):
-        msg = "QuotaInfo declared dimensions are invalid"
-        raise ValueError(msg)
+        raise _QuotaInfoSchemaError(
+            _QUOTA_INFO_DIMENSIONS_PATH,
+            "QuotaInfo declared dimensions are invalid",
+        )
     results = []
     for dimensions_info in info.dimensions_infos:
-        dimensions_pb = cloudquotas_v1.DimensionsInfo.pb(dimensions_info)
-        dimension_keys = set(dimensions_info.dimensions)
-        applicable_locations = tuple(dimensions_info.applicable_locations)
-        if (
-            not dimensions_pb.HasField("details")
-            or not applicable_locations
-            or any(not location for location in applicable_locations)
-            or not dimension_keys.issubset(declared_dimension_set)
-        ):
-            msg = "QuotaInfo dimension slice requires details"
-            raise ValueError(msg)
-        dimensions = NormalizedDimensions(dimensions_info.dimensions.items())
+        dimensions, applicable_locations = _quota_info_slice(
+            dimensions_info,
+            declared_dimension_set,
+        )
         identity = EffectiveQuotaSliceIdentity(
             resource_scope=request.context.project.resource_scope,
             service=info.service,
@@ -566,7 +631,7 @@ def _map_quota_info(
                 identity=identity,
                 effective_value=QuotaQuantity(
                     dimensions_info.details.value,
-                    QuotaUnit(info.metric_unit),
+                    _quota_unit(info.metric_unit),
                 ),
                 metric=info.metric,
                 declared_dimensions=declared_dimensions,
@@ -583,6 +648,44 @@ def _map_quota_info(
             )
         )
     return results
+
+
+def _quota_info_slice(
+    dimensions_info: cloudquotas_v1.DimensionsInfo,
+    declared_dimension_set: set[str],
+) -> tuple[NormalizedDimensions, tuple[str, ...]]:
+    dimensions_pb = cloudquotas_v1.DimensionsInfo.pb(dimensions_info)
+    if not dimensions_pb.HasField("details"):
+        raise _QuotaInfoSchemaError(
+            _QUOTA_INFO_DETAILS_PATH,
+            "QuotaInfo dimension slice requires details",
+        )
+    applicable_locations = tuple(dimensions_info.applicable_locations)
+    if not applicable_locations or any(
+        not location for location in applicable_locations
+    ):
+        raise _QuotaInfoSchemaError(
+            _QUOTA_INFO_LOCATIONS_PATH,
+            "QuotaInfo dimension slice requires applicable locations",
+        )
+    if not set(dimensions_info.dimensions).issubset(declared_dimension_set):
+        raise _QuotaInfoSchemaError(
+            _QUOTA_INFO_SLICE_DIMENSIONS_PATH,
+            "QuotaInfo slice dimensions must be declared",
+        )
+    try:
+        dimensions = NormalizedDimensions(dimensions_info.dimensions.items())
+    except (TypeError, ValueError) as error:
+        raise _QuotaInfoSchemaError(
+            _QUOTA_INFO_SLICE_DIMENSIONS_PATH,
+            "QuotaInfo slice dimensions are invalid",
+        ) from error
+    return dimensions, applicable_locations
+
+
+def _quota_unit(metric_unit: str) -> QuotaUnit:
+    """Normalize Cloud Quotas' empty scalar to its dimensionless unit."""
+    return QuotaUnit(metric_unit or "1")
 
 
 def _quota_info_name(child: WatchChildIdentity) -> str:
@@ -661,7 +764,7 @@ def _watch_effective_value(
         info.name != _quota_info_name(child)
         or info.service != identity.service
         or info.quota_id != identity.quota_id
-        or info.metric_unit != child.target.unit.symbol
+        or _quota_unit(info.metric_unit) != child.target.unit
         or any(not dimension for dimension in declared_dimensions)
         or len(declared_dimension_set) != len(declared_dimensions)
         or not {key for key, _ in identity.dimensions.items}.issubset(

@@ -64,9 +64,10 @@ from cqmgr.domain.catalog import (
     LocationCoverageExpectation,
     LocationCoverageState,
 )
+from cqmgr.domain.diagnostics import FieldPath
 from cqmgr.domain.identity import ADCIdentityEvidence, ADCQuotaProject, CredentialKind
 from cqmgr.domain.projects import CanonicalProject
-from cqmgr.domain.quotas import QuotaScope
+from cqmgr.domain.quotas import QuotaContainerType, QuotaScope
 from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 
 if TYPE_CHECKING:
@@ -1050,10 +1051,25 @@ def test_unknown_provider_enum_is_preserved_without_known_semantics() -> None:
     assert result.values[0].eligibility.reason.known is None
 
 
-def test_schema_skew_keeps_page_evidence_incomplete() -> None:
-    """Malformed required quota fields cannot satisfy a future mutation gate."""
-    item = _quota_info_pages()[1].items[0]
-    item.metric_unit = ""
+@pytest.mark.parametrize(
+    ("container_number", "expected_raw", "expected_known"),
+    [
+        (0, "CONTAINER_TYPE_UNSPECIFIED", QuotaContainerType.UNSPECIFIED),
+        (1, "PROJECT", QuotaContainerType.PROJECT),
+        (2, "FOLDER", QuotaContainerType.FOLDER),
+        (3, "ORGANIZATION", QuotaContainerType.ORGANIZATION),
+        (99, "UNRECOGNIZED_99", None),
+    ],
+)
+def test_quota_info_preserves_open_container_variants(
+    container_number: int,
+    expected_raw: str,
+    expected_known: QuotaContainerType | None,
+) -> None:
+    """Known and future container variants cross the reader as open symbols."""
+    item = cloudquotas_v1.QuotaInfo(_quota_info_pages()[0].items[0])
+    cloudquotas_v1.QuotaInfo.pb(item).container_type = container_number
+
     result = asyncio.run(
         GoogleEffectiveQuotaReader(
             FakeCloudQuotasPages(info_pages=[QuotaInfoPage((item,), "")]),
@@ -1063,13 +1079,129 @@ def test_schema_skew_keeps_page_evidence_incomplete() -> None:
         ).read(EffectiveQuotaReadRequest(_context(), "compute.googleapis.com"))
     )
 
-    assert result.values == ()
+    assert result.complete
+    assert result.values[0].container_type.raw == expected_raw
+    assert result.values[0].container_type.known is expected_known
+
+
+@pytest.mark.parametrize(
+    ("declared_dimensions", "slice_dimensions", "locations", "expected_scope"),
+    [
+        (
+            ("zone",),
+            {"zone": "us-central1-a"},
+            ("us-central1-a",),
+            QuotaScope.ZONAL,
+        ),
+        ((), {}, ("us-central1",), QuotaScope.UNKNOWN),
+    ],
+)
+def test_quota_info_derives_zonal_and_unknown_scope_without_inference(
+    declared_dimensions: tuple[str, ...],
+    slice_dimensions: dict[str, str],
+    locations: tuple[str, ...],
+    expected_scope: QuotaScope,
+) -> None:
+    """Only explicit dimension and global-location evidence determines scope."""
+    item = cloudquotas_v1.QuotaInfo(_quota_info_pages()[0].items[0])
+    del item.dimensions[:]
+    item.dimensions.extend(declared_dimensions)
+    item.dimensions_infos[0].dimensions = slice_dimensions
+    del item.dimensions_infos[0].applicable_locations[:]
+    item.dimensions_infos[0].applicable_locations.extend(locations)
+
+    result = asyncio.run(
+        GoogleEffectiveQuotaReader(
+            FakeCloudQuotasPages(info_pages=[QuotaInfoPage((item,), "")]),
+            _policy(RecordingBudget()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(EffectiveQuotaReadRequest(_context(), "compute.googleapis.com"))
+    )
+
+    assert result.complete
+    assert result.values[0].identity.quota_scope is expected_scope
+
+
+@pytest.mark.parametrize(
+    ("provider_unit", "unit_shape", "expected_unit"),
+    [
+        ("unused", "omitted", "1"),
+        ("", "empty", "1"),
+        ("1", "explicit", "1"),
+        ("{requests}", "explicit", "{requests}"),
+    ],
+)
+def test_quota_info_normalizes_dimensionless_units_and_preserves_other_symbols(
+    provider_unit: str,
+    unit_shape: str,
+    expected_unit: str,
+) -> None:
+    """Omitted and empty units are dimensionless; other symbols remain exact."""
+    item = cloudquotas_v1.QuotaInfo(_quota_info_pages()[1].items[0])
+    if unit_shape == "omitted":
+        cloudquotas_v1.QuotaInfo.pb(item).ClearField("metric_unit")
+    else:
+        item.metric_unit = provider_unit
+    result = asyncio.run(
+        GoogleEffectiveQuotaReader(
+            FakeCloudQuotasPages(info_pages=[QuotaInfoPage((item,), "")]),
+            _policy(RecordingBudget()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(EffectiveQuotaReadRequest(_context(), "compute.googleapis.com"))
+    )
+
+    assert result.complete
+    assert result.values[0].effective_value.unit.symbol == expected_unit
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_path"),
+    [
+        ("metric", FieldPath(("quota-info", "metric"))),
+        ("dimension-slices", FieldPath(("quota-info", "dimensions-infos"))),
+        ("declared-dimension", FieldPath(("quota-info", "dimensions"))),
+    ],
+)
+def test_quota_info_field_failures_use_static_safe_diagnostic_paths(
+    mutation: str,
+    expected_path: FieldPath,
+) -> None:
+    """Unsupported QuotaInfo evidence names only its failed field or invariant."""
+    item = cloudquotas_v1.QuotaInfo(_quota_info_pages()[0].items[0])
+    if mutation == "metric":
+        item.metric = ""
+    elif mutation == "dimension-slices":
+        del item.dimensions_infos[:]
+    else:
+        item.dimensions.append("")
+
+    result = asyncio.run(
+        GoogleEffectiveQuotaReader(
+            FakeCloudQuotasPages(info_pages=[QuotaInfoPage((item,), "")]),
+            _policy(RecordingBudget()),
+            page_size=1,
+            now=lambda: NOW,
+        ).read(EffectiveQuotaReadRequest(_context(), "compute.googleapis.com"))
+    )
+
     assert not result.complete
-    assert result.diagnostics[0].code.value == "provider-schema-invalid"
+    assert result.values == ()
+    assert result.diagnostics[0].field_paths == (expected_path,)
 
 
-@pytest.mark.parametrize("missing", ["eligibility", "details"])
-def test_missing_required_quota_info_messages_are_incomplete(missing: str) -> None:
+@pytest.mark.parametrize(
+    ("missing", "expected_path"),
+    [
+        ("eligibility", FieldPath(("quota-info", "quota-increase-eligibility"))),
+        ("details", FieldPath(("quota-info", "dimensions-infos", "details"))),
+    ],
+)
+def test_missing_required_quota_info_messages_are_incomplete(
+    missing: str,
+    expected_path: FieldPath,
+) -> None:
     """Absent nested messages cannot become false or zero effective evidence."""
     item = cloudquotas_v1.QuotaInfo(_quota_info_pages()[0].items[0])
     pb = cloudquotas_v1.QuotaInfo.pb(item)
@@ -1090,10 +1222,30 @@ def test_missing_required_quota_info_messages_are_incomplete(missing: str) -> No
     assert result.values == ()
     assert not result.complete
     assert result.diagnostics[0].code.value == "provider-schema-invalid"
+    assert result.diagnostics[0].field_paths == (expected_path,)
 
 
-@pytest.mark.parametrize("mutation", ["locations", "location-value", "dimension"])
-def test_incomplete_quota_info_slice_identity_is_rejected(mutation: str) -> None:
+@pytest.mark.parametrize(
+    ("mutation", "expected_path"),
+    [
+        (
+            "locations",
+            FieldPath(("quota-info", "dimensions-infos", "applicable-locations")),
+        ),
+        (
+            "location-value",
+            FieldPath(("quota-info", "dimensions-infos", "applicable-locations")),
+        ),
+        (
+            "dimension",
+            FieldPath(("quota-info", "dimensions-infos", "dimensions")),
+        ),
+    ],
+)
+def test_incomplete_quota_info_slice_identity_is_rejected(
+    mutation: str,
+    expected_path: FieldPath,
+) -> None:
     """A slice requires covered locations and only declared dimension keys."""
     item = cloudquotas_v1.QuotaInfo(_quota_info_pages()[0].items[0])
     slice_ = item.dimensions_infos[0]
@@ -1116,6 +1268,7 @@ def test_incomplete_quota_info_slice_identity_is_rejected(mutation: str) -> None
     assert not result.complete
     assert result.values == ()
     assert result.diagnostics[0].code.value == "provider-schema-invalid"
+    assert result.diagnostics[0].field_paths == (expected_path,)
 
 
 def test_missing_preference_config_is_incomplete() -> None:
@@ -1168,6 +1321,9 @@ def test_provider_resource_names_must_match_normalized_identity() -> None:
 
     assert not info_result.complete
     assert info_result.values == ()
+    assert info_result.diagnostics[0].field_paths == (
+        FieldPath(("quota-info", "identity")),
+    )
     assert not preference_result.complete
     assert preference_result.values == ()
 

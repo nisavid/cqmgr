@@ -255,6 +255,60 @@ def test_watch_observation_reads_bound_preference_and_exact_effective_slice() ->
     assert observation.trace_id == "trace-1"
 
 
+@pytest.mark.parametrize("unit_shape", ["empty", "omitted"])
+def test_watch_observation_accepts_empty_and_omitted_dimensionless_units(
+    unit_shape: str,
+) -> None:
+    """The exact QuotaInfo check treats both empty proto shapes as unit ``1``."""
+    child = _child()
+    info = _quota_info(child)
+    if unit_shape == "omitted":
+        cloudquotas_v1.QuotaInfo.pb(info).ClearField("metric_unit")
+    else:
+        info.metric_unit = ""
+    reader = GoogleWatchObservationReader(
+        FakeObservationClient(_preference(child), info),
+        now=lambda: NOW,
+        monotonic=iter((100.0, 101.0)).__next__,
+    )
+
+    observation = asyncio.run(
+        reader.observe(
+            WatchObservationRequest(
+                child=child,
+                deadline=110,
+                cancellation=CancellationToken(),
+            )
+        )
+    )
+
+    assert observation.status.effective == child.target
+    assert observation.status.effective_confirmation is EffectiveConfirmation.CONFIRMED
+
+
+def test_watch_observation_rejects_a_different_nonempty_unit() -> None:
+    """A dimensionless child cannot accept a different explicit provider unit."""
+    child = _child()
+    info = _quota_info(child)
+    info.metric_unit = "{requests}"
+    reader = GoogleWatchObservationReader(
+        FakeObservationClient(_preference(child), info),
+        now=lambda: NOW,
+        monotonic=iter((100.0, 101.0)).__next__,
+    )
+
+    with pytest.raises(ValueError, match="QuotaInfo"):
+        asyncio.run(
+            reader.observe(
+                WatchObservationRequest(
+                    child=child,
+                    deadline=110,
+                    cancellation=CancellationToken(),
+                )
+            )
+        )
+
+
 def test_watch_observation_without_grant_is_not_settled() -> None:
     """A cleared reconciling flag cannot prove settlement without a grant."""
     child = _child()
