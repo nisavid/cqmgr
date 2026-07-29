@@ -112,6 +112,8 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from cqmgr.application.ports.catalog_reads import (
+        ComputeAcceleratorTypeReadRequest,
+        ComputeMachineTypeReadRequest,
         TpuAcceleratorTypeReadRequest,
         TpuRuntimeVersionReadRequest,
     )
@@ -781,6 +783,13 @@ def test_resolve_gpu_retains_unrelated_catalog_failures() -> None:
     assert result.diagnostics == (_catalog_diagnostic(),)
     assert len(compute_accelerators.calls) == 1
     assert len(compute.calls) == 1
+    assert cast(
+        "ComputeAcceleratorTypeReadRequest",
+        compute_accelerators.calls[0],
+    ).zones == ("us-central1-a",)
+    assert cast("ComputeMachineTypeReadRequest", compute.calls[0]).zones == (
+        "us-central1-a",
+    )
     assert tpu_locations.calls == []
     assert tpu_accelerators.calls == []
     assert tpu_runtimes.calls == []

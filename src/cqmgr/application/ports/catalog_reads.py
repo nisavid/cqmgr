@@ -56,12 +56,15 @@ class ComputeAcceleratorTypeReadRequest:
     """Read project-visible Compute accelerator types across returned scopes."""
 
     context: ProviderReadContext
+    zones: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
-        """Require explicit bounded provider context."""
-        if not isinstance(self.context, ProviderReadContext):
-            msg = "Compute accelerator catalog request requires ProviderReadContext"
-            raise TypeError(msg)
+        """Require explicit bounded context and optional exact zones."""
+        _require_compute_context_and_zones(
+            self.context,
+            self.zones,
+            "Compute accelerator catalog",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,12 +72,15 @@ class ComputeMachineTypeReadRequest:
     """Read project-visible Compute machine types across returned scopes."""
 
     context: ProviderReadContext
+    zones: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
-        """Require explicit bounded provider context."""
-        if not isinstance(self.context, ProviderReadContext):
-            msg = "Compute catalog request requires ProviderReadContext"
-            raise TypeError(msg)
+        """Require explicit bounded context and optional exact zones."""
+        _require_compute_context_and_zones(
+            self.context,
+            self.zones,
+            "Compute catalog",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +130,27 @@ def _require_context_and_zone(
         raise TypeError(msg)
     if not _is_canonical_zone(zone):
         msg = f"{request_name} zone must be a lowercase canonical location ID"
+        raise ValueError(msg)
+
+
+def _require_compute_context_and_zones(
+    context: object,
+    zones: object,
+    request_name: str,
+) -> None:
+    if not isinstance(context, ProviderReadContext):
+        msg = f"{request_name} request requires ProviderReadContext"
+        raise TypeError(msg)
+    if zones is None:
+        return
+    if not isinstance(zones, tuple):
+        msg = f"{request_name} zones must be a tuple or None"
+        raise TypeError(msg)
+    if not zones or any(not _is_canonical_zone(zone) for zone in zones):
+        msg = f"{request_name} zones must contain canonical location IDs"
+        raise ValueError(msg)
+    if len(set(zones)) != len(zones):
+        msg = f"{request_name} zones must not contain duplicates"
         raise ValueError(msg)
 
 

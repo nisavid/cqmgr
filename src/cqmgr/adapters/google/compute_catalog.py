@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from threading import Lock, Thread
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from google.cloud import compute_v1
 
@@ -187,6 +187,7 @@ class ComputeAcceleratorTypesPage:
     warning_code: str | None = None
 
 
+@runtime_checkable
 class ComputeAcceleratorTypesPageClient(Protocol):
     """Materialize one official Compute accelerator-types page asynchronously."""
 
@@ -200,6 +201,23 @@ class ComputeAcceleratorTypesPageClient(Protocol):
         timeout_seconds: float,
     ) -> ComputeAcceleratorTypesPage:
         """Return one materialized aggregated-list page."""
+        raise NotImplementedError
+
+
+@runtime_checkable
+class ComputeAcceleratorTypesZonalPageClient(Protocol):
+    """Materialize official Compute accelerator pages for exact zones."""
+
+    async def accelerator_types_for_zone(
+        self,
+        *,
+        project: str,
+        zone: str,
+        max_results: int,
+        page_token: str,
+        timeout_seconds: float,
+    ) -> ComputeAcceleratorTypesPage:
+        """Return one materialized zonal-list page."""
         raise NotImplementedError
 
 
@@ -238,6 +256,27 @@ class OfficialComputeAcceleratorTypesPageClient:
                 max_results=max_results,
                 page_token=page_token,
                 return_partial_success=return_partial_success,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+
+    async def accelerator_types_for_zone(
+        self,
+        *,
+        project: str,
+        zone: str,
+        max_results: int,
+        page_token: str,
+        timeout_seconds: float,
+    ) -> ComputeAcceleratorTypesPage:
+        """Run exactly one sync generated-client zonal page in a bounded worker."""
+        return await self._workers.run(
+            partial(
+                self._accelerator_types_for_zone,
+                project=project,
+                zone=zone,
+                max_results=max_results,
+                page_token=page_token,
                 timeout_seconds=timeout_seconds,
             )
         )
@@ -286,6 +325,38 @@ class OfficialComputeAcceleratorTypesPageClient:
             warning_code=_warning_code(response.warning),
         )
 
+    def _accelerator_types_for_zone(
+        self,
+        *,
+        project: str,
+        zone: str,
+        max_results: int,
+        page_token: str,
+        timeout_seconds: float,
+    ) -> ComputeAcceleratorTypesPage:
+        request = compute_v1.ListAcceleratorTypesRequest(
+            project=project,
+            zone=zone,
+            max_results=max_results,
+            page_token=page_token,
+        )
+        pager = self._client.list(
+            request=request,
+            retry=None,
+            timeout=timeout_seconds,
+        )
+        response = next(pager.pages)
+        return ComputeAcceleratorTypesPage(
+            scopes=(
+                ComputeAcceleratorTypesScope(
+                    scope=f"zones/{zone}",
+                    accelerator_types=tuple(response.items),
+                    warning_code=_warning_code(response.warning),
+                ),
+            ),
+            next_page_token=response.next_page_token,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ComputeMachineTypesScope:
@@ -306,6 +377,7 @@ class ComputeMachineTypesPage:
     warning_code: str | None = None
 
 
+@runtime_checkable
 class ComputeMachineTypesPageClient(Protocol):
     """Materialize one official Compute aggregated-list page asynchronously."""
 
@@ -319,6 +391,23 @@ class ComputeMachineTypesPageClient(Protocol):
         timeout_seconds: float,
     ) -> ComputeMachineTypesPage:
         """Return one materialized aggregated-list page."""
+        ...
+
+
+@runtime_checkable
+class ComputeMachineTypesZonalPageClient(Protocol):
+    """Materialize official Compute machine pages for exact zones."""
+
+    async def machine_types_for_zone(
+        self,
+        *,
+        project: str,
+        zone: str,
+        max_results: int,
+        page_token: str,
+        timeout_seconds: float,
+    ) -> ComputeMachineTypesPage:
+        """Return one materialized zonal-list page."""
         ...
 
 
@@ -357,6 +446,27 @@ class OfficialComputeMachineTypesPageClient:
                 max_results=max_results,
                 page_token=page_token,
                 return_partial_success=return_partial_success,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+
+    async def machine_types_for_zone(
+        self,
+        *,
+        project: str,
+        zone: str,
+        max_results: int,
+        page_token: str,
+        timeout_seconds: float,
+    ) -> ComputeMachineTypesPage:
+        """Run exactly one sync generated-client zonal page in a bounded worker."""
+        return await self._workers.run(
+            partial(
+                self._machine_types_for_zone,
+                project=project,
+                zone=zone,
+                max_results=max_results,
+                page_token=page_token,
                 timeout_seconds=timeout_seconds,
             )
         )
@@ -405,6 +515,38 @@ class OfficialComputeMachineTypesPageClient:
             warning_code=_warning_code(response.warning),
         )
 
+    def _machine_types_for_zone(
+        self,
+        *,
+        project: str,
+        zone: str,
+        max_results: int,
+        page_token: str,
+        timeout_seconds: float,
+    ) -> ComputeMachineTypesPage:
+        request = compute_v1.ListMachineTypesRequest(
+            project=project,
+            zone=zone,
+            max_results=max_results,
+            page_token=page_token,
+        )
+        pager = self._client.list(
+            request=request,
+            retry=None,
+            timeout=timeout_seconds,
+        )
+        response = next(pager.pages)
+        return ComputeMachineTypesPage(
+            scopes=(
+                ComputeMachineTypesScope(
+                    scope=f"zones/{zone}",
+                    machine_types=tuple(response.items),
+                    warning_code=_warning_code(response.warning),
+                ),
+            ),
+            next_page_token=response.next_page_token,
+        )
+
 
 def _warning_code(warning: object) -> str | None:
     code = getattr(warning, "code", None)
@@ -419,7 +561,9 @@ class GoogleComputeAcceleratorTypeReader:
 
     def __init__(
         self,
-        client: ComputeAcceleratorTypesPageClient,
+        client: (
+            ComputeAcceleratorTypesPageClient | ComputeAcceleratorTypesZonalPageClient
+        ),
         policy: GoogleReadPolicy,
         *,
         page_size: int = 100,
@@ -435,7 +579,7 @@ class GoogleComputeAcceleratorTypeReader:
         self._maximum_pages = maximum_pages
         self._now = now
 
-    async def read(  # noqa: C901, PLR0912 - preserves every scoped coverage outcome
+    async def read(  # noqa: C901, PLR0912, PLR0915 - preserve scoped outcomes
         self,
         request: ComputeAcceleratorTypeReadRequest,
     ) -> CatalogRead[ComputeAcceleratorType]:
@@ -446,6 +590,13 @@ class GoogleComputeAcceleratorTypeReader:
             )
             raise TypeError(msg)
         project = request.context.project.project_id
+        zones = request.zones
+        expectation = (
+            LocationCoverageExpectation.REQUESTED
+            if zones is not None
+            else LocationCoverageExpectation.EXPECTED
+        )
+        zone_index = 0
         token = ""
         attempted = 0
         completed = 0
@@ -454,32 +605,84 @@ class GoogleComputeAcceleratorTypeReader:
         diagnostics: list[Diagnostic] = []
         location_coverage: list[CatalogLocationCoverage] = []
         while attempted < self._maximum_pages:
+            if zones is not None and zone_index >= len(zones):
+                break
+            zone = zones[zone_index] if zones is not None else None
             attempted += 1
-            result = await self._policy.call(
-                request.context,
-                provider="compute",
-                phase="compute-accelerator-types-read",
-                identity=f"compute-accelerator-types:{project}:{token}",
-                dispatch=lambda timeout, page_token=token: (
-                    self._client.accelerator_types(
-                        project=project,
-                        max_results=self._page_size,
-                        page_token=page_token,
-                        return_partial_success=True,
-                        timeout_seconds=timeout,
-                    )
-                ),
-            )
+            if zone is None:
+                if not isinstance(
+                    self._client,
+                    ComputeAcceleratorTypesPageClient,
+                ):
+                    msg = "Compute accelerator client lacks aggregated list support"
+                    raise TypeError(msg)
+                result = await self._policy.call(
+                    request.context,
+                    provider="compute",
+                    phase="compute-accelerator-types-read",
+                    identity=f"compute-accelerator-types:{project}:{token}",
+                    dispatch=lambda timeout, page_token=token: (
+                        self._client.accelerator_types(
+                            project=project,
+                            max_results=self._page_size,
+                            page_token=page_token,
+                            return_partial_success=True,
+                            timeout_seconds=timeout,
+                        )
+                    ),
+                )
+            else:
+                if not isinstance(
+                    self._client,
+                    ComputeAcceleratorTypesZonalPageClient,
+                ):
+                    msg = "Compute accelerator client lacks exact-zone list support"
+                    raise TypeError(msg)
+                result = await self._policy.call(
+                    request.context,
+                    provider="compute",
+                    phase="compute-accelerator-types-read",
+                    identity=(f"compute-accelerator-types:{project}:{zone}:{token}"),
+                    dispatch=lambda timeout, page_token=token, zone=zone: (
+                        self._client.accelerator_types_for_zone(
+                            project=project,
+                            zone=zone,
+                            max_results=self._page_size,
+                            page_token=page_token,
+                            timeout_seconds=timeout,
+                        )
+                    ),
+                )
             if result.diagnostic is not None:
                 diagnostics.append(result.diagnostic)
                 location_coverage.append(
                     _accelerator_coverage(
-                        "global",
+                        zone or "global",
                         LocationCoverageState.FAILED,
                         result.diagnostic,
+                        expectation=expectation,
                     )
                 )
-                break
+                if zones is None:
+                    break
+                zone_index += 1
+                token = ""
+                if result.diagnostic.code.value in {
+                    "provider-read-cancelled",
+                    "provider-read-deadline-exceeded",
+                }:
+                    location_coverage.extend(
+                        _accelerator_coverage(
+                            pending_zone,
+                            LocationCoverageState.NOT_SCANNED,
+                            result.diagnostic,
+                            expectation=expectation,
+                        )
+                        for pending_zone in zones[zone_index:]
+                    )
+                    zone_index = len(zones)
+                    break
+                continue
             page = result.value
             if page is None:
                 msg = "successful Compute accelerator page call must contain a page"
@@ -492,6 +695,7 @@ class GoogleComputeAcceleratorTypeReader:
                     values,
                     diagnostics,
                     location_coverage,
+                    expectation,
                 )
             for unreachable in page.unreachable_scopes:
                 diagnostic = _accelerator_coverage_diagnostic(
@@ -507,14 +711,16 @@ class GoogleComputeAcceleratorTypeReader:
                         location,
                         LocationCoverageState.FAILED,
                         diagnostic,
+                        expectation=expectation,
                     )
                 )
             if page.warning_code is not None:
                 if page.warning_code == "NO_RESULTS_ON_PAGE":
                     location_coverage.append(
                         _accelerator_coverage(
-                            "global",
+                            zone or "global",
                             LocationCoverageState.EMPTY,
+                            expectation=expectation,
                         )
                     )
                 else:
@@ -524,30 +730,34 @@ class GoogleComputeAcceleratorTypeReader:
                     diagnostics.append(diagnostic)
                     location_coverage.append(
                         _accelerator_coverage(
-                            "global",
+                            zone or "global",
                             LocationCoverageState.FAILED,
                             diagnostic,
+                            expectation=expectation,
                         )
                     )
             token = page.next_page_token
             if not token:
-                break
-        else:
-            cap = bool(token)
+                if zones is None:
+                    break
+                zone_index += 1
+        cap = bool(token) or (zones is not None and zone_index < len(zones))
         if cap:
             diagnostic = page_cap_diagnostic(
                 "compute-accelerator-types-read",
                 "compute",
             )
             diagnostics.append(diagnostic)
-            location_coverage.append(
+            unscanned_locations = ("global",) if zones is None else zones[zone_index:]
+            location_coverage.extend(
                 CatalogLocationCoverage(
                     source=CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
-                    location="global",
-                    expectation=LocationCoverageExpectation.EXPECTED,
+                    location=location,
+                    expectation=expectation,
                     state=LocationCoverageState.NOT_SCANNED,
                     diagnostics=(diagnostic,),
                 )
+                for location in unscanned_locations
             )
         read = ProviderRead(
             values=tuple(values),
@@ -563,7 +773,7 @@ class GoogleComputeMachineTypeReader:
 
     def __init__(
         self,
-        client: ComputeMachineTypesPageClient,
+        client: ComputeMachineTypesPageClient | ComputeMachineTypesZonalPageClient,
         policy: GoogleReadPolicy,
         *,
         page_size: int = 100,
@@ -579,7 +789,7 @@ class GoogleComputeMachineTypeReader:
         self._maximum_pages = maximum_pages
         self._now = now
 
-    async def read(  # noqa: C901 - preserves every scoped coverage outcome
+    async def read(  # noqa: C901, PLR0912, PLR0915 - preserve scoped outcomes
         self,
         request: ComputeMachineTypeReadRequest,
     ) -> CatalogRead[ComputeMachineType]:
@@ -588,6 +798,13 @@ class GoogleComputeMachineTypeReader:
             msg = "Compute catalog reader requires ComputeMachineTypeReadRequest"
             raise TypeError(msg)
         project = request.context.project.project_id
+        zones = request.zones
+        expectation = (
+            LocationCoverageExpectation.REQUESTED
+            if zones is not None
+            else LocationCoverageExpectation.EXPECTED
+        )
+        zone_index = 0
         token = ""
         attempted = 0
         completed = 0
@@ -596,26 +813,84 @@ class GoogleComputeMachineTypeReader:
         diagnostics: list[Diagnostic] = []
         location_coverage: list[CatalogLocationCoverage] = []
         while attempted < self._maximum_pages:
+            if zones is not None and zone_index >= len(zones):
+                break
+            zone = zones[zone_index] if zones is not None else None
             attempted += 1
-            result = await self._policy.call(
-                request.context,
-                provider="compute",
-                phase="compute-machine-types-read",
-                identity=f"compute-machine-types:{project}:{token}",
-                dispatch=lambda timeout, page_token=token: self._client.machine_types(
-                    project=project,
-                    max_results=self._page_size,
-                    page_token=page_token,
-                    return_partial_success=True,
-                    timeout_seconds=timeout,
-                ),
-            )
+            if zone is None:
+                if not isinstance(
+                    self._client,
+                    ComputeMachineTypesPageClient,
+                ):
+                    msg = "Compute machine client lacks aggregated list support"
+                    raise TypeError(msg)
+                result = await self._policy.call(
+                    request.context,
+                    provider="compute",
+                    phase="compute-machine-types-read",
+                    identity=f"compute-machine-types:{project}:{token}",
+                    dispatch=lambda timeout, page_token=token: (
+                        self._client.machine_types(
+                            project=project,
+                            max_results=self._page_size,
+                            page_token=page_token,
+                            return_partial_success=True,
+                            timeout_seconds=timeout,
+                        )
+                    ),
+                )
+            else:
+                if not isinstance(
+                    self._client,
+                    ComputeMachineTypesZonalPageClient,
+                ):
+                    msg = "Compute machine client lacks exact-zone list support"
+                    raise TypeError(msg)
+                result = await self._policy.call(
+                    request.context,
+                    provider="compute",
+                    phase="compute-machine-types-read",
+                    identity=f"compute-machine-types:{project}:{zone}:{token}",
+                    dispatch=lambda timeout, page_token=token, zone=zone: (
+                        self._client.machine_types_for_zone(
+                            project=project,
+                            zone=zone,
+                            max_results=self._page_size,
+                            page_token=page_token,
+                            timeout_seconds=timeout,
+                        )
+                    ),
+                )
             if result.diagnostic is not None:
                 diagnostics.append(result.diagnostic)
                 location_coverage.append(
-                    _coverage("global", LocationCoverageState.FAILED, result.diagnostic)
+                    _coverage(
+                        zone or "global",
+                        LocationCoverageState.FAILED,
+                        result.diagnostic,
+                        expectation=expectation,
+                    )
                 )
-                break
+                if zones is None:
+                    break
+                zone_index += 1
+                token = ""
+                if result.diagnostic.code.value in {
+                    "provider-read-cancelled",
+                    "provider-read-deadline-exceeded",
+                }:
+                    location_coverage.extend(
+                        _coverage(
+                            pending_zone,
+                            LocationCoverageState.NOT_SCANNED,
+                            result.diagnostic,
+                            expectation=expectation,
+                        )
+                        for pending_zone in zones[zone_index:]
+                    )
+                    zone_index = len(zones)
+                    break
+                continue
             page = result.value
             if page is None:
                 msg = "successful Compute catalog page call must contain a page"
@@ -628,6 +903,7 @@ class GoogleComputeMachineTypeReader:
                     values,
                     diagnostics,
                     location_coverage,
+                    expectation,
                 )
             for unreachable in page.unreachable_scopes:
                 diagnostic = _coverage_diagnostic(
@@ -639,35 +915,48 @@ class GoogleComputeMachineTypeReader:
                         _scope_location(unreachable),
                         LocationCoverageState.FAILED,
                         diagnostic,
+                        expectation=expectation,
                     )
                 )
             if page.warning_code is not None:
                 if page.warning_code == "NO_RESULTS_ON_PAGE":
                     location_coverage.append(
-                        _coverage("global", LocationCoverageState.EMPTY)
+                        _coverage(
+                            zone or "global",
+                            LocationCoverageState.EMPTY,
+                            expectation=expectation,
+                        )
                     )
                 else:
                     diagnostic = _coverage_diagnostic("compute-catalog-page-warning")
                     diagnostics.append(diagnostic)
                     location_coverage.append(
-                        _coverage("global", LocationCoverageState.FAILED, diagnostic)
+                        _coverage(
+                            zone or "global",
+                            LocationCoverageState.FAILED,
+                            diagnostic,
+                            expectation=expectation,
+                        )
                     )
             token = page.next_page_token
             if not token:
-                break
-        else:
-            cap = bool(token)
+                if zones is None:
+                    break
+                zone_index += 1
+        cap = bool(token) or (zones is not None and zone_index < len(zones))
         if cap:
             diagnostic = page_cap_diagnostic("compute-machine-types-read", "compute")
             diagnostics.append(diagnostic)
-            location_coverage.append(
+            unscanned_locations = ("global",) if zones is None else zones[zone_index:]
+            location_coverage.extend(
                 CatalogLocationCoverage(
                     source=CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
-                    location="global",
-                    expectation=LocationCoverageExpectation.EXPECTED,
+                    location=location,
+                    expectation=expectation,
                     state=LocationCoverageState.NOT_SCANNED,
                     diagnostics=(diagnostic,),
                 )
+                for location in unscanned_locations
             )
         read = ProviderRead(
             values=tuple(values),
@@ -678,12 +967,13 @@ class GoogleComputeMachineTypeReader:
         return CatalogRead(read, tuple(location_coverage))
 
 
-def _consume_accelerator_scope(
+def _consume_accelerator_scope(  # noqa: PLR0913 - explicit coverage evidence
     scoped: ComputeAcceleratorTypesScope,
     project: str,
     values: list[ComputeAcceleratorType],
     diagnostics: list[Diagnostic],
     coverage: list[CatalogLocationCoverage],
+    expectation: LocationCoverageExpectation,
 ) -> None:
     try:
         location = _scope_location(scoped.scope)
@@ -695,6 +985,7 @@ def _consume_accelerator_scope(
                 "global",
                 LocationCoverageState.FAILED,
                 diagnostic,
+                expectation=expectation,
             )
         )
         return
@@ -719,6 +1010,7 @@ def _consume_accelerator_scope(
                 location,
                 LocationCoverageState.FAILED,
                 diagnostic,
+                expectation=expectation,
             )
         )
     elif scope_failed:
@@ -731,6 +1023,7 @@ def _consume_accelerator_scope(
                 location,
                 LocationCoverageState.FAILED,
                 diagnostic,
+                expectation=expectation,
             )
         )
     else:
@@ -742,6 +1035,7 @@ def _consume_accelerator_scope(
                     if scoped.accelerator_types
                     else LocationCoverageState.EMPTY
                 ),
+                expectation=expectation,
             )
         )
 
@@ -788,11 +1082,13 @@ def _accelerator_coverage(
     location: str,
     state: LocationCoverageState,
     diagnostic: Diagnostic | None = None,
+    *,
+    expectation: LocationCoverageExpectation = LocationCoverageExpectation.EXPECTED,
 ) -> CatalogLocationCoverage:
     return CatalogLocationCoverage(
         source=CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
         location=location,
-        expectation=LocationCoverageExpectation.EXPECTED,
+        expectation=expectation,
         state=state,
         diagnostics=(diagnostic,) if diagnostic is not None else (),
     )
@@ -811,19 +1107,27 @@ def _accelerator_coverage_diagnostic(code: str) -> Diagnostic:
     )
 
 
-def _consume_scope(
+def _consume_scope(  # noqa: PLR0913 - explicit coverage evidence
     scoped: ComputeMachineTypesScope,
     project: str,
     values: list[ComputeMachineType],
     diagnostics: list[Diagnostic],
     coverage: list[CatalogLocationCoverage],
+    expectation: LocationCoverageExpectation,
 ) -> None:
     try:
         location = _scope_location(scoped.scope)
     except ValueError:
         diagnostic = schema_diagnostic("compute-machine-types-read", "compute")
         diagnostics.append(diagnostic)
-        coverage.append(_coverage("global", LocationCoverageState.FAILED, diagnostic))
+        coverage.append(
+            _coverage(
+                "global",
+                LocationCoverageState.FAILED,
+                diagnostic,
+                expectation=expectation,
+            )
+        )
         return
     scope_failed = False
     for item in scoped.machine_types:
@@ -836,11 +1140,25 @@ def _consume_scope(
     if scoped.warning_code is not None and scoped.warning_code != "NO_RESULTS_ON_PAGE":
         diagnostic = _coverage_diagnostic("compute-catalog-scope-warning")
         diagnostics.append(diagnostic)
-        coverage.append(_coverage(location, LocationCoverageState.FAILED, diagnostic))
+        coverage.append(
+            _coverage(
+                location,
+                LocationCoverageState.FAILED,
+                diagnostic,
+                expectation=expectation,
+            )
+        )
     elif scope_failed:
         diagnostic = _coverage_diagnostic("compute-catalog-scope-invalid")
         diagnostics.append(diagnostic)
-        coverage.append(_coverage(location, LocationCoverageState.FAILED, diagnostic))
+        coverage.append(
+            _coverage(
+                location,
+                LocationCoverageState.FAILED,
+                diagnostic,
+                expectation=expectation,
+            )
+        )
     else:
         coverage.append(
             _coverage(
@@ -850,6 +1168,7 @@ def _consume_scope(
                     if scoped.machine_types
                     else LocationCoverageState.EMPTY
                 ),
+                expectation=expectation,
             )
         )
 
@@ -947,9 +1266,7 @@ def _canonical_resource_zone(value: object, project: str) -> str:
     """Normalize the two official Compute zone identity representations."""
     if isinstance(value, str) and _is_canonical_zone(value):
         return value
-    prefix = (
-        f"https://www.googleapis.com/compute/v1/projects/{project}/zones/"
-    )
+    prefix = f"https://www.googleapis.com/compute/v1/projects/{project}/zones/"
     if not isinstance(value, str) or not value.startswith(prefix):
         msg = "Compute resource zone must be a canonical short or full identity"
         raise ValueError(msg)
@@ -977,11 +1294,13 @@ def _coverage(
     location: str,
     state: LocationCoverageState,
     diagnostic: Diagnostic | None = None,
+    *,
+    expectation: LocationCoverageExpectation = LocationCoverageExpectation.EXPECTED,
 ) -> CatalogLocationCoverage:
     return CatalogLocationCoverage(
         source=CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
         location=location,
-        expectation=LocationCoverageExpectation.EXPECTED,
+        expectation=expectation,
         state=state,
         diagnostics=(diagnostic,) if diagnostic is not None else (),
     )
