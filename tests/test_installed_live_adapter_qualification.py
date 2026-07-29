@@ -18,6 +18,19 @@ SCRIPT = (
 PROJECT = "private-qualification-project"
 EXPECTED_CALL_COUNT = 3
 QUOTA_LIST_INVOCATION = 2
+INSTALL_FAILURE_EXIT_CODE = 23
+INSTALL_FAILURE_ELAPSED_MS = 100
+SAFE_CHILD_ENVIRONMENT_KEYS = {
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "HOME",
+    "PATH",
+    "UV_TOOL_BIN_DIR",
+    "UV_TOOL_DIR",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+}
 
 
 def _module() -> dict[str, Any]:
@@ -100,7 +113,20 @@ def test_cli_installs_and_qualifies_exact_candidate_without_retaining_identity(
         runner=runner,
         environ={
             "QUALIFICATION_PROJECT": PROJECT,
+            "PATH": "/usr/local/bin:/usr/bin",
+            "HOME": "/private/home",
+            "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE": "/private/credential.json",
+            "CLOUDSDK_CORE_PROJECT": "credential-project",
+            "CLOUDSDK_PROJECT": "credential-project",
+            "GCLOUD_PROJECT": "credential-project",
+            "GCP_PROJECT": "credential-project",
             "GOOGLE_APPLICATION_CREDENTIALS": "/private/credential.json",
+            "GOOGLE_CLOUD_PROJECT": "credential-project",
+            "GOOGLE_GHA_CREDS_PATH": "/private/credential.json",
+            "GITHUB_TOKEN": "private-github-token",
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "private-oidc-token",
+            "ACTIONS_ID_TOKEN_REQUEST_URL": "https://private-oidc.invalid",
+            "UNRELATED_SECRET": "private-unrelated-secret",
         },
         monotonic=lambda: next(times),
     )
@@ -154,11 +180,14 @@ def test_cli_installs_and_qualifies_exact_candidate_without_retaining_identity(
         "--quiet",
     ]
     for _command, child_environment in calls:
+        assert set(child_environment) == SAFE_CHILD_ENVIRONMENT_KEYS
         assert "QUALIFICATION_PROJECT" not in child_environment
+        assert child_environment["PATH"] == "/usr/local/bin:/usr/bin"
         assert child_environment["GOOGLE_APPLICATION_CREDENTIALS"] == (
             "/private/credential.json"
         )
         for key in (
+            "HOME",
             "UV_TOOL_BIN_DIR",
             "UV_TOOL_DIR",
             "XDG_CACHE_HOME",
@@ -166,7 +195,7 @@ def test_cli_installs_and_qualifies_exact_candidate_without_retaining_identity(
             "XDG_DATA_HOME",
             "XDG_STATE_HOME",
         ):
-            assert child_environment[key].startswith(str(tmp_path.parent))
+            assert Path(child_environment[key]).is_relative_to(tmp_path)
 
     evidence = json.loads(output.read_text(encoding="utf-8"))
     assert [record["check"] for record in evidence] == [
@@ -198,6 +227,125 @@ def test_cli_installs_and_qualifies_exact_candidate_without_retaining_identity(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""
+
+
+def test_missing_project_blocks_with_one_sanitized_input_failure(
+    tmp_path: Path,
+) -> None:
+    """Missing qualification input fails before install with attributable evidence."""
+    main = cast("Any", _module()["main"])
+    wheel = tmp_path / "cqmgr-0.1.0-py3-none-any.whl"
+    wheel.write_bytes(b"immutable candidate")
+    output = tmp_path / "qualification.json"
+    calls: list[list[str]] = []
+
+    def runner(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del kwargs
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    exit_code = main(
+        [
+            str(wheel),
+            "--project-env",
+            "QUALIFICATION_PROJECT",
+            "--output",
+            str(output),
+        ],
+        runner=runner,
+        environ={},
+    )
+
+    assert exit_code == 1
+    assert calls == []
+    evidence = json.loads(output.read_text(encoding="utf-8"))
+    assert len(evidence) == 1
+    record = evidence[0]
+    assert set(record) == {
+        "check",
+        "digest",
+        "elapsed_ms",
+        "exit_code",
+        "outcome",
+        "schema",
+    }
+    assert record["check"] == "qualification-input"
+    assert record["elapsed_ms"] == 0
+    assert record["exit_code"] == 1
+    assert record["outcome"] == "unsuccessful"
+    assert record["schema"] == "not-applicable"
+    _assert_evidence_digest(record)
+    assert PROJECT not in output.read_text(encoding="utf-8")
+
+
+def test_candidate_install_failure_blocks_with_one_sanitized_record(
+    tmp_path: Path,
+) -> None:
+    """A failed immutable-candidate install emits no child-process details."""
+    main = cast("Any", _module()["main"])
+    wheel = tmp_path / "cqmgr-0.1.0-py3-none-any.whl"
+    wheel.write_bytes(b"immutable candidate")
+    output = tmp_path / "qualification.json"
+    calls: list[list[str]] = []
+
+    def runner(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del kwargs
+        calls.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            INSTALL_FAILURE_EXIT_CODE,
+            b"private install output",
+            b"private install diagnostic",
+        )
+
+    times = iter((1.0, 1.1))
+    exit_code = main(
+        [
+            str(wheel),
+            "--project-env",
+            "QUALIFICATION_PROJECT",
+            "--output",
+            str(output),
+        ],
+        runner=runner,
+        environ={
+            "QUALIFICATION_PROJECT": PROJECT,
+            "GOOGLE_APPLICATION_CREDENTIALS": "/private/credential.json",
+            "GITHUB_TOKEN": "private-github-token",
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "private-oidc-token",
+            "ACTIONS_ID_TOKEN_REQUEST_URL": "https://private-oidc.invalid",
+        },
+        monotonic=lambda: next(times),
+    )
+
+    assert exit_code == 1
+    assert len(calls) == 1
+    evidence = json.loads(output.read_text(encoding="utf-8"))
+    assert len(evidence) == 1
+    record = evidence[0]
+    assert set(record) == {
+        "check",
+        "digest",
+        "elapsed_ms",
+        "exit_code",
+        "outcome",
+        "schema",
+    }
+    assert record["check"] == "candidate-install"
+    assert record["elapsed_ms"] == INSTALL_FAILURE_ELAPSED_MS
+    assert record["exit_code"] == INSTALL_FAILURE_EXIT_CODE
+    assert record["outcome"] == "unsuccessful"
+    assert record["schema"] == "not-applicable"
+    _assert_evidence_digest(record)
+    retained = output.read_text(encoding="utf-8")
+    assert PROJECT not in retained
+    assert "private" not in retained
 
 
 def test_schema_or_outcome_failure_blocks_after_retaining_sanitized_evidence(

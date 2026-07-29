@@ -21,6 +21,10 @@ CHECK_TIMEOUT_SECONDS = 600.0
 TIMEOUT_EXIT_CODE = 124
 FAILED_EXECUTION_EXIT_CODE = 1
 EXPECTED_EVIDENCE_COUNT = 3
+ALLOWED_PARENT_ENVIRONMENT = (
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "PATH",
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -179,7 +183,7 @@ def main(
             arguments.output,
             [
                 _safe_record(
-                    check="candidate-install",
+                    check="qualification-input",
                     exit_code=FAILED_EXECUTION_EXIT_CODE,
                     elapsed_ms=0,
                     schema="not-applicable",
@@ -196,10 +200,15 @@ def main(
     ) as temporary:
         root = Path(temporary)
         tool_bin = root / "bin"
-        child_environment = dict(environ)
+        child_environment = {
+            key: value
+            for key in ALLOWED_PARENT_ENVIRONMENT
+            if (value := environ.get(key)) is not None
+        }
         child_environment.pop(arguments.project_env, None)
         child_environment.update(
             {
+                "HOME": str(root / "home"),
                 "UV_TOOL_BIN_DIR": str(tool_bin),
                 "UV_TOOL_DIR": str(root / "tools"),
                 "XDG_CACHE_HOME": str(root / "xdg-cache"),
