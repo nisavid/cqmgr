@@ -26,8 +26,9 @@ from cqmgr.adapters.google.compute_catalog import (
     GoogleComputeMachineTypeReader,
     OfficialComputeAcceleratorTypesPageClient,
     OfficialComputeMachineTypesPageClient,
+    _finalize_requested_coverage,
 )
-from cqmgr.adapters.google.read_policy import GoogleReadPolicy
+from cqmgr.adapters.google.read_policy import GoogleReadPolicy, schema_diagnostic
 from cqmgr.adapters.google.tpu_catalog import (
     GoogleTpuAcceleratorTypeReader,
     GoogleTpuLocationReader,
@@ -52,6 +53,8 @@ from cqmgr.application.ports.provider_reads import ProviderReadContext
 from cqmgr.domain.catalog import (
     CatalogEvidenceSource,
     CatalogLifecycle,
+    CatalogLocationCoverage,
+    LocationCoverageExpectation,
     LocationCoverageState,
 )
 from cqmgr.domain.identity import ADCIdentityEvidence, ADCQuotaProject, CredentialKind
@@ -100,10 +103,17 @@ class FakeComputePages:
     """Scripted Compute page client."""
 
     def __init__(
-        self, pages: Sequence[ComputeMachineTypesPage | BaseException]
+        self,
+        pages: Sequence[ComputeMachineTypesPage | BaseException],
+        *,
+        delayed_zones: frozenset[str] = frozenset(),
+        delay_aggregated: bool = False,
     ) -> None:
         self.pages = list(pages)
         self.calls: list[tuple[str, int, str, bool, float]] = []
+        self.zone_calls: list[tuple[str, str, int, str, float]] = []
+        self.delayed_zones = delayed_zones
+        self.delay_aggregated = delay_aggregated
 
     async def machine_types(
         self,
@@ -117,6 +127,29 @@ class FakeComputePages:
         self.calls.append(
             (project, max_results, page_token, return_partial_success, timeout_seconds)
         )
+        if self.delay_aggregated:
+            await asyncio.Event().wait()
+            raise AssertionError
+        page = self.pages.pop(0)
+        if isinstance(page, BaseException):
+            raise page
+        return page
+
+    async def machine_types_for_zone(
+        self,
+        *,
+        project: str,
+        zone: str,
+        max_results: int,
+        page_token: str,
+        timeout_seconds: float,
+    ) -> ComputeMachineTypesPage:
+        self.zone_calls.append(
+            (project, zone, max_results, page_token, timeout_seconds)
+        )
+        if zone in self.delayed_zones:
+            await asyncio.Event().wait()
+            raise AssertionError
         page = self.pages.pop(0)
         if isinstance(page, BaseException):
             raise page
@@ -127,10 +160,17 @@ class FakeComputeAcceleratorPages:
     """Scripted Compute accelerator-type page client."""
 
     def __init__(
-        self, pages: Sequence[ComputeAcceleratorTypesPage | BaseException]
+        self,
+        pages: Sequence[ComputeAcceleratorTypesPage | BaseException],
+        *,
+        delayed_zones: frozenset[str] = frozenset(),
+        delay_aggregated: bool = False,
     ) -> None:
         self.pages = list(pages)
         self.calls: list[tuple[str, int, str, bool, float]] = []
+        self.zone_calls: list[tuple[str, str, int, str, float]] = []
+        self.delayed_zones = delayed_zones
+        self.delay_aggregated = delay_aggregated
 
     async def accelerator_types(
         self,
@@ -150,6 +190,29 @@ class FakeComputeAcceleratorPages:
                 timeout_seconds,
             )
         )
+        if self.delay_aggregated:
+            await asyncio.Event().wait()
+            raise AssertionError
+        page = self.pages.pop(0)
+        if isinstance(page, BaseException):
+            raise page
+        return page
+
+    async def accelerator_types_for_zone(
+        self,
+        *,
+        project: str,
+        zone: str,
+        max_results: int,
+        page_token: str,
+        timeout_seconds: float,
+    ) -> ComputeAcceleratorTypesPage:
+        self.zone_calls.append(
+            (project, zone, max_results, page_token, timeout_seconds)
+        )
+        if zone in self.delayed_zones:
+            await asyncio.Event().wait()
+            raise AssertionError
         page = self.pages.pop(0)
         if isinstance(page, BaseException):
             raise page
@@ -213,7 +276,11 @@ def _json(name: str) -> Mapping[str, object]:
     return cast("Mapping[str, object]", json.loads((FIXTURES / name).read_text()))
 
 
-def _context(*, cancellation: CancellationToken | None = None) -> ProviderReadContext:
+def _context(
+    *,
+    cancellation: CancellationToken | None = None,
+    deadline: float | None = None,
+) -> ProviderReadContext:
     return ProviderReadContext(
         project=CanonicalProject(
             ResourceScope(ResourceScopeKind.PROJECT, "projects/123456789"),
@@ -224,7 +291,7 @@ def _context(*, cancellation: CancellationToken | None = None) -> ProviderReadCo
             credential_kind=CredentialKind.UNKNOWN,
             adc_quota_project=ADCQuotaProject("public-quota-project"),
         ),
-        deadline=time.monotonic() + 30,
+        deadline=deadline if deadline is not None else time.monotonic() + 30,
         cancellation=cancellation or CancellationToken(),
     )
 
@@ -430,6 +497,9 @@ def test_compute_accelerator_reader_preserves_identity_lifecycle_and_coverage() 
     assert {item.source for item in result.location_coverage} == {
         CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES
     }
+    assert "provider-schema-invalid" not in {
+        item.code.value for item in result.read.diagnostics
+    }
     assert not result.complete
     assert all(call[0] == "public-schema-project" for call in client.calls)
     assert all(call[3] is True for call in client.calls)
@@ -475,6 +545,9 @@ def test_compute_reader_preserves_scopes_lifecycle_accelerators_and_warnings() -
         LocationCoverageState.EMPTY,
         LocationCoverageState.FAILED,
     ]
+    assert "provider-schema-invalid" not in {
+        item.code.value for item in result.read.diagnostics
+    }
     assert not result.complete
     assert all(call[0] == "public-schema-project" for call in client.calls)
     assert all(call[3] is True for call in client.calls)
@@ -494,6 +567,249 @@ def test_compute_page_cap_retains_values_and_marks_read_incomplete() -> None:
     assert [item.name for item in result.values] == ["a3-highgpu-8g"]
     assert result.read.coverage.page_cap_reached
     assert not result.complete
+
+
+def test_compute_exact_zone_readers_never_request_unrelated_zones() -> None:
+    """An exact candidate dispatches only per-zone reads for both Compute sources."""
+    machine_page = replace(_compute_pages()[0], next_page_token="")
+    accelerator_page = replace(
+        _compute_accelerator_pages()[0],
+        next_page_token="",
+    )
+    delayed_zone = "us-east1-b"
+    machine_client = FakeComputePages(
+        (machine_page,),
+        delayed_zones=frozenset((delayed_zone,)),
+        delay_aggregated=True,
+    )
+    accelerator_client = FakeComputeAcceleratorPages(
+        (accelerator_page,),
+        delayed_zones=frozenset((delayed_zone,)),
+        delay_aggregated=True,
+    )
+    request_zones = ("us-central1-a",)
+
+    machine_result = asyncio.run(
+        asyncio.wait_for(
+            GoogleComputeMachineTypeReader(
+                machine_client,
+                _policy(),
+                now=lambda: NOW,
+            ).read(ComputeMachineTypeReadRequest(_context(), request_zones)),
+            timeout=0.25,
+        )
+    )
+    accelerator_result = asyncio.run(
+        asyncio.wait_for(
+            GoogleComputeAcceleratorTypeReader(
+                accelerator_client,
+                _policy(),
+                now=lambda: NOW,
+            ).read(ComputeAcceleratorTypeReadRequest(_context(), request_zones)),
+            timeout=0.25,
+        )
+    )
+
+    assert [item.name for item in machine_result.values] == ["a3-highgpu-8g"]
+    assert [item.name for item in accelerator_result.values] == ["nvidia-b200"]
+    assert machine_client.calls == []
+    assert accelerator_client.calls == []
+    assert [call[1] for call in machine_client.zone_calls] == ["us-central1-a"]
+    assert [call[1] for call in accelerator_client.zone_calls] == ["us-central1-a"]
+    assert delayed_zone not in {
+        call[1] for call in (*machine_client.zone_calls, *accelerator_client.zone_calls)
+    }
+    assert all(
+        item.expectation is LocationCoverageExpectation.REQUESTED
+        for item in (
+            *machine_result.location_coverage,
+            *accelerator_result.location_coverage,
+        )
+    )
+
+
+def test_compute_exact_zone_machine_pages_yield_one_success_coverage() -> None:
+    """One exhausted zone chain retains every machine under one coverage record."""
+    zone = "us-central1-a"
+
+    def page(name: str, next_page_token: str) -> ComputeMachineTypesPage:
+        return ComputeMachineTypesPage(
+            (
+                ComputeMachineTypesScope(
+                    f"zones/{zone}",
+                    (
+                        compute_v1.MachineType(
+                            name=name,
+                            zone=zone,
+                            self_link=(
+                                "https://www.googleapis.com/compute/v1/projects/"
+                                f"public-schema-project/zones/{zone}/"
+                                f"machineTypes/{name}"
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            next_page_token,
+        )
+
+    result = asyncio.run(
+        GoogleComputeMachineTypeReader(
+            FakeComputePages(
+                (
+                    page("a3-highgpu-8g", "public-next-page"),
+                    page("g2-standard-4", ""),
+                )
+            ),
+            _policy(),
+            now=lambda: NOW,
+        ).read(ComputeMachineTypeReadRequest(_context(), (zone,)))
+    )
+
+    assert [item.name for item in result.values] == [
+        "a3-highgpu-8g",
+        "g2-standard-4",
+    ]
+    assert [
+        (
+            item.source,
+            item.location,
+            item.expectation,
+            item.state,
+        )
+        for item in result.location_coverage
+    ] == [
+        (
+            CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+            zone,
+            LocationCoverageExpectation.REQUESTED,
+            LocationCoverageState.SUCCESS,
+        )
+    ]
+
+
+def test_compute_exact_zone_accelerator_pages_yield_one_success_coverage() -> None:
+    """One exhausted zone chain retains every accelerator under one coverage record."""
+    zone = "us-central1-a"
+
+    def page(name: str, next_page_token: str) -> ComputeAcceleratorTypesPage:
+        return ComputeAcceleratorTypesPage(
+            (
+                ComputeAcceleratorTypesScope(
+                    f"zones/{zone}",
+                    (
+                        compute_v1.AcceleratorType(
+                            name=name,
+                            zone=zone,
+                            self_link=(
+                                "https://www.googleapis.com/compute/v1/projects/"
+                                f"public-schema-project/zones/{zone}/"
+                                f"acceleratorTypes/{name}"
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            next_page_token,
+        )
+
+    result = asyncio.run(
+        GoogleComputeAcceleratorTypeReader(
+            FakeComputeAcceleratorPages(
+                (
+                    page("nvidia-b200", "public-next-page"),
+                    page("nvidia-h100-80gb", ""),
+                )
+            ),
+            _policy(),
+            now=lambda: NOW,
+        ).read(ComputeAcceleratorTypeReadRequest(_context(), (zone,)))
+    )
+
+    assert [item.name for item in result.values] == [
+        "nvidia-b200",
+        "nvidia-h100-80gb",
+    ]
+    assert [
+        (
+            item.source,
+            item.location,
+            item.expectation,
+            item.state,
+        )
+        for item in result.location_coverage
+    ] == [
+        (
+            CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+            zone,
+            LocationCoverageExpectation.REQUESTED,
+            LocationCoverageState.SUCCESS,
+        )
+    ]
+
+
+def test_compute_zonal_subcalls_share_remaining_deadline_and_diagnostics() -> None:
+    """Each zonal page gets remaining time and an expired zone keeps source/phase."""
+
+    def page(zone: str, name: str) -> ComputeMachineTypesPage:
+        return ComputeMachineTypesPage(
+            (
+                ComputeMachineTypesScope(
+                    f"zones/{zone}",
+                    (
+                        compute_v1.MachineType(
+                            name=name,
+                            zone=zone,
+                            self_link=(
+                                "https://www.googleapis.com/compute/v1/projects/"
+                                f"public-schema-project/zones/{zone}/"
+                                f"machineTypes/{name}"
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            "",
+        )
+
+    client = FakeComputePages(
+        (
+            page("us-central1-a", "a3-highgpu-8g"),
+            page("us-east1-b", "g2-standard-4"),
+        )
+    )
+    ticks = iter((0.0, 2.0, 4.0, 6.0, 10.0))
+    policy = GoogleReadPolicy(
+        RecordingBudget(),
+        NoJitter(),
+        timeout_seconds=20.0,
+        maximum_attempts=1,
+        monotonic=lambda: next(ticks),
+    )
+
+    result = asyncio.run(
+        GoogleComputeMachineTypeReader(client, policy, now=lambda: NOW).read(
+            ComputeMachineTypeReadRequest(
+                _context(deadline=10.0),
+                ("us-central1-a", "us-east1-b", "us-west1-c"),
+            )
+        )
+    )
+
+    assert [call[1] for call in client.zone_calls] == [
+        "us-central1-a",
+        "us-east1-b",
+    ]
+    assert [call[-1] for call in client.zone_calls] == [8.0, 4.0]
+    deadline = next(
+        item
+        for item in result.read.diagnostics
+        if item.code.value == "provider-read-deadline-exceeded"
+    )
+    assert deadline.source.value == "compute"
+    assert deadline.phase.value == "compute-machine-types-read"
+    assert result.location_coverage[-1].location == "us-west1-c"
+    assert result.location_coverage[-1].state is LocationCoverageState.FAILED
 
 
 def test_tpu_readers_keep_sources_and_zone_coverage_independent() -> None:
@@ -597,6 +913,87 @@ def test_invalid_compute_scope_is_explicit_failed_coverage(scope: str) -> None:
     assert not result.complete
 
 
+@pytest.mark.parametrize(
+    ("zone", "self_link"),
+    [
+        (
+            "https://compute.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-central1-a",
+            "https://www.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-central1-a/"
+            "machineTypes/a3-highgpu-8g",
+        ),
+        (
+            "https://www.googleapis.com/compute/v1/projects/other/zones/us-central1-a",
+            "https://www.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-central1-a/"
+            "machineTypes/a3-highgpu-8g",
+        ),
+        (
+            "https://www.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-east1-b",
+            "https://www.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-central1-a/"
+            "machineTypes/a3-highgpu-8g",
+        ),
+        (
+            "https://www.googleapis.com/compute/v1/projects/"
+            "public-schema-project/regions/us-central1",
+            "https://www.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-central1-a/"
+            "machineTypes/a3-highgpu-8g",
+        ),
+        (
+            "https://www.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-central1-a",
+            "https://compute.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-central1-a/"
+            "machineTypes/a3-highgpu-8g",
+        ),
+        (
+            "https://www.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-central1-a",
+            "https://www.googleapis.com/compute/v1/projects/"
+            "public-schema-project/zones/us-central1-a/"
+            "acceleratorTypes/a3-highgpu-8g",
+        ),
+    ],
+)
+def test_compute_reader_rejects_nonmatching_full_resource_identities(
+    zone: str,
+    self_link: str,
+) -> None:
+    """Full identities must match the API, project, zone, collection, and name."""
+    page = ComputeMachineTypesPage(
+        scopes=(
+            ComputeMachineTypesScope(
+                "zones/us-central1-a",
+                (
+                    compute_v1.MachineType(
+                        name="a3-highgpu-8g",
+                        zone=zone,
+                        self_link=self_link,
+                    ),
+                ),
+            ),
+        ),
+        next_page_token="",
+    )
+
+    result = asyncio.run(
+        GoogleComputeMachineTypeReader(
+            FakeComputePages((page,)), _policy(), now=lambda: NOW
+        ).read(ComputeMachineTypeReadRequest(_context()))
+    )
+
+    assert result.values == ()
+    assert result.location_coverage[0].state is LocationCoverageState.FAILED
+    assert [item.code.value for item in result.read.diagnostics] == [
+        "provider-schema-invalid",
+        "compute-catalog-scope-invalid",
+    ]
+
+
 def test_invalid_tpu_location_is_explicit_failed_coverage() -> None:
     """An untrusted TPU location ID leaves one visible source-coverage failure."""
     page = TpuLocationsPage(
@@ -631,6 +1028,82 @@ def test_tpu_requests_reject_noncanonical_zone(zone: str) -> None:
     """Per-zone reads reject ambiguous or noncanonical location inputs."""
     with pytest.raises(ValueError, match="zone"):
         TpuAcceleratorTypeReadRequest(_context(), zone)
+
+
+@pytest.mark.parametrize(
+    "zones",
+    [
+        (),
+        ("us-central1",),
+        ("US-CENTRAL1-A",),
+        ("us-central1-a", "us-central1-a"),
+    ],
+)
+def test_compute_requests_reject_invalid_explicit_zones(
+    zones: tuple[str, ...],
+) -> None:
+    """Explicit Compute catalog scope requires unique canonical zones."""
+    with pytest.raises(ValueError, match="zones"):
+        ComputeMachineTypeReadRequest(_context(), zones)
+    with pytest.raises(ValueError, match="zones"):
+        ComputeAcceleratorTypeReadRequest(_context(), zones)
+
+
+@pytest.mark.parametrize(
+    "request_type",
+    [ComputeMachineTypeReadRequest, ComputeAcceleratorTypeReadRequest],
+)
+def test_compute_requests_reject_an_empty_explicit_zone_set(
+    request_type: type[
+        ComputeMachineTypeReadRequest | ComputeAcceleratorTypeReadRequest
+    ],
+) -> None:
+    """An empty exact-zone selection is distinct from malformed zone identities."""
+    with pytest.raises(ValueError, match="zones must contain at least one location"):
+        request_type(_context(), ())
+
+
+def test_compute_requests_reject_mutable_explicit_zones() -> None:
+    """A mutable sequence cannot cross the immutable catalog request seam."""
+    with pytest.raises(TypeError, match="zones"):
+        ComputeMachineTypeReadRequest(
+            _context(),
+            cast("tuple[str, ...]", ["us-central1-a"]),
+        )
+
+
+def test_requested_coverage_preserves_unsupported_precedence_and_reason() -> None:
+    """Unsupported exact-zone evidence remains complete and keeps its reason."""
+    zone = "us-central1-a"
+    diagnostic = schema_diagnostic("compute-machine-types-read", "compute")
+
+    result = _finalize_requested_coverage(
+        [
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+                zone,
+                LocationCoverageExpectation.REQUESTED,
+                LocationCoverageState.EMPTY,
+            ),
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+                zone,
+                LocationCoverageExpectation.REQUESTED,
+                LocationCoverageState.UNSUPPORTED,
+                (diagnostic,),
+            ),
+        ]
+    )
+
+    assert result == (
+        CatalogLocationCoverage(
+            CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+            zone,
+            LocationCoverageExpectation.REQUESTED,
+            LocationCoverageState.UNSUPPORTED,
+            (diagnostic,),
+        ),
+    )
 
 
 def test_official_compute_wrapper_uses_partial_success_without_retry() -> None:
@@ -676,6 +1149,7 @@ def test_official_compute_wrapper_uses_partial_success_without_retry() -> None:
         cast("tuple[object, object, object]", client.call)[0],
     )
     assert request.return_partial_success
+    assert not request.filter
     assert request.page_token == "public-page"
     assert cast("tuple[object, object, object]", client.call)[1:] == (None, 2.5)
     assert result.next_page_token == "public-next"
@@ -733,6 +1207,96 @@ def test_official_compute_accelerator_wrapper_uses_aggregated_partial_success() 
     assert result.next_page_token == "public-next"
     assert result.warning_code == "NO_RESULTS_ON_PAGE"
     assert result.scopes[0].accelerator_types[0].name == "nvidia-b200"
+
+
+def test_official_compute_machine_wrapper_uses_exact_zonal_list() -> None:
+    """The generated machine client receives the exact requested zone."""
+    page = compute_v1.MachineTypeList(
+        items=(compute_v1.MachineType(name="a3-highgpu-8g"),),
+        next_page_token="public-next",
+    )
+
+    class Pager:
+        pages = iter((page,))
+
+    class Client:
+        def __init__(self) -> None:
+            self.call: tuple[object, object, object] | None = None
+
+        def list(self, *, request: object, retry: object, timeout: object) -> Pager:
+            self.call = (request, retry, timeout)
+            return Pager()
+
+    client = Client()
+    result = asyncio.run(
+        OfficialComputeMachineTypesPageClient(
+            cast("compute_v1.MachineTypesClient", client)
+        ).machine_types_for_zone(
+            project="public-project",
+            zone="us-central1-a",
+            max_results=OFFICIAL_PAGE_SIZE,
+            page_token="public-page",
+            timeout_seconds=2.5,
+        )
+    )
+
+    request = cast(
+        "compute_v1.ListMachineTypesRequest",
+        cast("tuple[object, object, object]", client.call)[0],
+    )
+    assert request.project == "public-project"
+    assert request.zone == "us-central1-a"
+    assert request.max_results == OFFICIAL_PAGE_SIZE
+    assert request.page_token == "public-page"
+    assert cast("tuple[object, object, object]", client.call)[1:] == (None, 2.5)
+    assert result.scopes[0].scope == "zones/us-central1-a"
+    assert result.scopes[0].machine_types[0].name == "a3-highgpu-8g"
+    assert result.next_page_token == "public-next"
+
+
+def test_official_compute_accelerator_wrapper_uses_exact_zonal_list() -> None:
+    """The generated accelerator client receives the exact requested zone."""
+    page = compute_v1.AcceleratorTypeList(
+        items=(compute_v1.AcceleratorType(name="nvidia-b200"),),
+        next_page_token="public-next",
+    )
+
+    class Pager:
+        pages = iter((page,))
+
+    class Client:
+        def __init__(self) -> None:
+            self.call: tuple[object, object, object] | None = None
+
+        def list(self, *, request: object, retry: object, timeout: object) -> Pager:
+            self.call = (request, retry, timeout)
+            return Pager()
+
+    client = Client()
+    result = asyncio.run(
+        OfficialComputeAcceleratorTypesPageClient(
+            cast("compute_v1.AcceleratorTypesClient", client)
+        ).accelerator_types_for_zone(
+            project="public-project",
+            zone="us-central1-a",
+            max_results=OFFICIAL_PAGE_SIZE,
+            page_token="public-page",
+            timeout_seconds=2.5,
+        )
+    )
+
+    request = cast(
+        "compute_v1.ListAcceleratorTypesRequest",
+        cast("tuple[object, object, object]", client.call)[0],
+    )
+    assert request.project == "public-project"
+    assert request.zone == "us-central1-a"
+    assert request.max_results == OFFICIAL_PAGE_SIZE
+    assert request.page_token == "public-page"
+    assert cast("tuple[object, object, object]", client.call)[1:] == (None, 2.5)
+    assert result.scopes[0].scope == "zones/us-central1-a"
+    assert result.scopes[0].accelerator_types[0].name == "nvidia-b200"
+    assert result.next_page_token == "public-next"
 
 
 def test_official_compute_wrapper_bounds_sync_dispatch_concurrency() -> None:

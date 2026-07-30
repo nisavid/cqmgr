@@ -142,6 +142,24 @@ def test_measure_uses_dedicated_tui_boundaries_not_pytest_process_time() -> None
     assert report["measurements"]["steady_refresh_seconds"] == steady_refresh
 
 
+def test_main_uses_the_qualification_run_count_by_default(tmp_path: Path) -> None:
+    """Default evidence generation cannot drift from qualification policy."""
+    module = runpy.run_path(str(SCRIPT))
+    main = typing.cast("typing.Any", module["main"])
+    captured_runs: list[int] = []
+
+    def measure(runs: int) -> dict[str, object]:
+        captured_runs.append(runs)
+        return {"schema": "test"}
+
+    main.__globals__["REQUIRED_BUDGET_COLD_START_RUNS"] = 6
+    main.__globals__["measure"] = measure
+
+    main(("--output", str(tmp_path / "report.json")))
+
+    assert captured_runs == [6]
+
+
 def test_memory_probe_records_portable_process_rss() -> None:
     """Resident memory is an OS process metric on every supported platform."""
     module = runpy.run_path(str(SCRIPT))
@@ -205,7 +223,7 @@ def test_performance_budgets_reject_non_finite_ceilings(value: float) -> None:
 
 
 def test_performance_budgets_accept_exact_thresholds() -> None:
-    """A measurement equal to every ceiling remains qualified."""
+    """A median equal to its ceiling qualifies despite one retained outlier."""
     module = runpy.run_path(str(SCRIPT))
     enforce = typing.cast("typing.Any", module["enforce_performance_budgets"])
     budgets = json.loads(BUDGETS.read_text(encoding="utf-8"))
@@ -214,9 +232,9 @@ def test_performance_budgets_accept_exact_thresholds() -> None:
         "environment": {"platform": "test", "python": "3.14"},
         "measurements": {
             "cold_start_seconds": {
-                "maximum": limits["cold_start_seconds"],
-                "median": 0.5,
-                "runs": 3,
+                "maximum": limits["cold_start_seconds"] * 4,
+                "median": limits["cold_start_seconds"],
+                "runs": 5,
             },
             "first_tui_render_seconds": limits["first_tui_render_seconds"],
             "peak_python_memory_bytes": limits["peak_python_memory_bytes"],
@@ -229,6 +247,60 @@ def test_performance_budgets_accept_exact_thresholds() -> None:
     assert enforce(baseline, budgets) == baseline
 
 
+@pytest.mark.parametrize(
+    ("cold_starts", "qualifies"),
+    [
+        ((0.5, 0.5, 0.5, 2.5, 2.5), True),
+        ((0.5, 0.5, 2.5, 2.5, 2.5), False),
+    ],
+)
+def test_performance_budgets_enforce_the_five_launch_boundary(
+    cold_starts: tuple[float, ...],
+    *,
+    qualifies: bool,
+) -> None:
+    """Two slow launches qualify, while three make the exact-five median fail."""
+    module = runpy.run_path(str(SCRIPT))
+    measurement_report = typing.cast("typing.Any", module["measurement_report"])
+    enforce = typing.cast("typing.Any", module["enforce_performance_budgets"])
+    budgets = json.loads(BUDGETS.read_text(encoding="utf-8"))
+    report = measurement_report(
+        cold_start_seconds=cold_starts,
+        resident_memory_bytes=1,
+        peak_python_memory_bytes=1,
+        first_tui_render_seconds=0.1,
+        steady_refresh_seconds=0.1,
+        platform_name="test",
+        python_version="3.14",
+    )
+
+    if qualifies:
+        assert enforce(report, budgets) == report
+    else:
+        with pytest.raises(ValueError, match="cold_start_seconds"):
+            enforce(report, budgets)
+
+
+@pytest.mark.parametrize("runs", [4, 7])
+def test_performance_budgets_require_exactly_five_cold_start_samples(
+    runs: int,
+) -> None:
+    """Qualification uses the exact five-run policy behind its median."""
+    module = runpy.run_path(str(SCRIPT))
+    enforce = typing.cast("typing.Any", module["enforce_performance_budgets"])
+    baseline = json.loads(BASELINES[0].read_text(encoding="utf-8"))
+    budgets = json.loads(BUDGETS.read_text(encoding="utf-8"))
+    measurements = typing.cast("dict[str, object]", baseline["measurements"])
+    measurements["cold_start_seconds"] = {
+        "maximum": 0.6,
+        "median": 0.5,
+        "runs": runs,
+    }
+
+    with pytest.raises(ValueError, match="exactly 5"):
+        enforce(baseline, budgets)
+
+
 def test_performance_budgets_report_every_exceeded_ceiling() -> None:
     """Qualification fails closed with every actionable regression named."""
     module = runpy.run_path(str(SCRIPT))
@@ -237,9 +309,9 @@ def test_performance_budgets_report_every_exceeded_ceiling() -> None:
     budgets = json.loads(BUDGETS.read_text(encoding="utf-8"))
     measurements = typing.cast("dict[str, object]", baseline["measurements"])
     measurements["cold_start_seconds"] = {
-        "maximum": 2.001,
-        "median": 0.5,
-        "runs": 3,
+        "maximum": 6.0,
+        "median": 2.001,
+        "runs": 5,
     }
     measurements["resident_memory_bytes"] = 128 * 1024 * 1024 + 1
 

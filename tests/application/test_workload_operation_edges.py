@@ -15,9 +15,14 @@ from cqmgr.application.operations.quotas import (
     QuotaInspectRequest,
     QuotaOperations,
     QuotaResolveRequest,
+    WorkloadChoiceRequest,
     WorkloadResolutionOperations,
 )
-from cqmgr.application.ports.catalog_reads import CatalogRead
+from cqmgr.application.ports.catalog_reads import (
+    CatalogRead,
+    ComputeAcceleratorTypeReadRequest,
+    ComputeMachineTypeReadRequest,
+)
 from cqmgr.application.ports.coordination import CancellationToken
 from cqmgr.application.ports.provider_reads import ProviderReadContext
 from cqmgr.domain.accelerator_overlay import (
@@ -27,6 +32,7 @@ from cqmgr.domain.accelerator_overlay import (
     CloudTpuSliceRequirement,
     ComputeInstanceRequirement,
     ProvisioningModel,
+    WorkloadKind,
     WorkloadLocationDisposition,
 )
 from cqmgr.domain.catalog import (
@@ -228,6 +234,53 @@ def _compute_accelerator_catalog_read() -> CatalogRead[ComputeAcceleratorType]:
                 "us-central1-a",
                 LocationCoverageExpectation.REQUESTED,
                 LocationCoverageState.SUCCESS,
+            ),
+        ),
+    )
+
+
+def _empty_compute_machine_catalog_read() -> CatalogRead[ComputeMachineType]:
+    """Return authoritative empty Compute machine evidence."""
+    return CatalogRead(
+        _complete(),
+        (
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+                "us-central1-a",
+                LocationCoverageExpectation.REQUESTED,
+                LocationCoverageState.EMPTY,
+            ),
+        ),
+    )
+
+
+def _incomplete_compute_accelerator_catalog_read(
+    diagnostic_code: str = "catalog-location-not-scanned",
+    *values: ComputeAcceleratorType,
+) -> CatalogRead[ComputeAcceleratorType]:
+    """Return incomplete Compute accelerator evidence with a public diagnostic."""
+    diagnostic = Diagnostic(
+        DiagnosticCode(diagnostic_code),
+        Severity.WARNING,
+        DiagnosticPhase("catalog-read"),
+        DiagnosticSource("compute-accelerator-types"),
+        RetryDisposition.AFTER_REFRESH,
+        RedactedText("The provider did not complete the accelerator catalog read."),
+    )
+    return CatalogRead(
+        ProviderRead(
+            values,
+            ProviderReadCoverage(1, 0),
+            NOW,
+            (diagnostic,),
+        ),
+        (
+            CatalogLocationCoverage(
+                CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+                "us-central1-a",
+                LocationCoverageExpectation.REQUESTED,
+                LocationCoverageState.NOT_SCANNED,
+                (diagnostic,),
             ),
         ),
     )
@@ -491,6 +544,290 @@ def test_resolve_classifies_wholly_unavailable_effective_evidence_as_operational
     assert result.data is None
     assert not result.completeness.is_complete
     assert not result.completeness.has_partial_data
+
+
+def test_resolve_compute_exact_zone_scopes_both_catalog_reads() -> None:
+    """One exact candidate reads only that zone through both Compute catalog ports."""
+    accelerator_reader = ScriptedCatalogReader((_compute_accelerator_catalog_read(),))
+    machine_reader = ScriptedCatalogReader((_gpu_catalog_read(),))
+    operations = WorkloadResolutionOperations(
+        ScriptedReader((_complete(),)),
+        ScriptedReader((_complete(),)),
+        accelerator_reader,
+        machine_reader,
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+
+    result = asyncio.run(
+        operations.resolve(QuotaResolveRequest(_context(), _gpu_requirement()))
+    )
+
+    assert result.data is not None
+    accelerator_request = accelerator_reader.calls[0]
+    machine_request = machine_reader.calls[0]
+    assert isinstance(accelerator_request, ComputeAcceleratorTypeReadRequest)
+    assert isinstance(machine_request, ComputeMachineTypeReadRequest)
+    assert accelerator_request.zones == ("us-central1-a",)
+    assert machine_request.zones == ("us-central1-a",)
+
+
+def test_read_catalog_compute_returns_typed_choices_without_quota_reads() -> None:
+    """Guided Compute choices retain typed relationships and exact-zone coverage."""
+    accelerator_reader = ScriptedCatalogReader((_compute_accelerator_catalog_read(),))
+    machine_reader = ScriptedCatalogReader((_gpu_catalog_read(),))
+    operations = WorkloadResolutionOperations(
+        ScriptedReader(()),
+        ScriptedReader(()),
+        accelerator_reader,
+        machine_reader,
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+
+    result = asyncio.run(
+        operations.read_catalog(
+            WorkloadChoiceRequest(
+                _context(),
+                WorkloadKind.COMPUTE_INSTANCE,
+                ("us-central1-a",),
+            )
+        )
+    )
+
+    assert result.outcome.exit_class is ExitClass.SUCCESS
+    assert result.completeness.is_complete
+    assert result.data.compute_machine_types == _gpu_catalog_read().values
+    assert (
+        result.data.compute_accelerator_types
+        == _compute_accelerator_catalog_read().values
+    )
+    accelerator_request = cast(
+        "ComputeAcceleratorTypeReadRequest", accelerator_reader.calls[0]
+    )
+    machine_request = cast("ComputeMachineTypeReadRequest", machine_reader.calls[0])
+    assert accelerator_request.zones == ("us-central1-a",)
+    assert machine_request.zones == ("us-central1-a",)
+
+
+@pytest.mark.parametrize("location", ["global", "a", "not-a-region"])
+def test_workload_choice_request_rejects_noncanonical_locations(
+    location: str,
+) -> None:
+    """Malformed scopes cannot widen a guided read to aggregated evidence."""
+    with pytest.raises(ValueError, match="canonical location IDs"):
+        WorkloadChoiceRequest(
+            _context(),
+            WorkloadKind.COMPUTE_INSTANCE,
+            (location,),
+        )
+
+
+@pytest.mark.parametrize("location", ["us-central1", "us-central1-a"])
+def test_workload_choice_request_accepts_canonical_locations(location: str) -> None:
+    """Guided reads retain canonical region and exact-zone scopes."""
+    request = WorkloadChoiceRequest(
+        _context(),
+        WorkloadKind.COMPUTE_INSTANCE,
+        (location,),
+    )
+
+    assert request.locations == (location,)
+
+
+def test_read_catalog_classifies_unavailable_evidence_as_operational_failure() -> None:
+    """A catalog read with no usable choices is unavailable and operational."""
+    operations = WorkloadResolutionOperations(
+        ScriptedReader(()),
+        ScriptedReader(()),
+        ScriptedCatalogReader((_incomplete_compute_accelerator_catalog_read(),)),
+        ScriptedCatalogReader((_empty_compute_machine_catalog_read(),)),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+
+    result = asyncio.run(
+        operations.read_catalog(
+            WorkloadChoiceRequest(
+                _context(),
+                WorkloadKind.COMPUTE_INSTANCE,
+                ("us-central1-a",),
+            )
+        )
+    )
+
+    assert result.outcome.exit_class is ExitClass.OPERATIONAL_FAILURE
+    assert result.outcome.code == StableSymbol("workload-catalog-read-incomplete")
+    assert not result.completeness.is_complete
+    assert not result.completeness.has_partial_data
+
+
+def test_read_catalog_retains_partial_choices_as_incomplete_evidence() -> None:
+    """Usable choices remain visible with incomplete-evidence classification."""
+    operations = WorkloadResolutionOperations(
+        ScriptedReader(()),
+        ScriptedReader(()),
+        ScriptedCatalogReader((_incomplete_compute_accelerator_catalog_read(),)),
+        ScriptedCatalogReader((_gpu_catalog_read(),)),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+
+    result = asyncio.run(
+        operations.read_catalog(
+            WorkloadChoiceRequest(
+                _context(),
+                WorkloadKind.COMPUTE_INSTANCE,
+                ("us-central1-a",),
+            )
+        )
+    )
+
+    assert result.outcome.exit_class is ExitClass.INCOMPLETE_EVIDENCE
+    assert result.outcome.code == StableSymbol("workload-catalog-read-incomplete")
+    assert result.completeness.has_partial_data
+    assert result.data.compute_machine_types == _gpu_catalog_read().values
+
+
+def test_read_catalog_preserves_provider_deadline_outcome() -> None:
+    """A stopped catalog read retains invocation-wide timeout semantics."""
+    operations = WorkloadResolutionOperations(
+        ScriptedReader(()),
+        ScriptedReader(()),
+        ScriptedCatalogReader(
+            (
+                _incomplete_compute_accelerator_catalog_read(
+                    "provider-read-deadline-exceeded"
+                ),
+            )
+        ),
+        ScriptedCatalogReader((_empty_compute_machine_catalog_read(),)),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+
+    result = asyncio.run(
+        operations.read_catalog(
+            WorkloadChoiceRequest(
+                _context(),
+                WorkloadKind.COMPUTE_INSTANCE,
+                ("us-central1-a",),
+            )
+        )
+    )
+
+    assert result.outcome.exit_class is ExitClass.TIMEOUT
+    assert result.outcome.code == StableSymbol("operation-deadline-exceeded")
+    assert not result.completeness.has_partial_data
+
+
+def test_read_catalog_preserves_provider_cancellation_outcome() -> None:
+    """A stopped catalog read retains invocation-wide interruption semantics."""
+    operations = WorkloadResolutionOperations(
+        ScriptedReader(()),
+        ScriptedReader(()),
+        ScriptedCatalogReader(
+            (_incomplete_compute_accelerator_catalog_read("provider-read-cancelled"),)
+        ),
+        ScriptedCatalogReader((_empty_compute_machine_catalog_read(),)),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+
+    result = asyncio.run(
+        operations.read_catalog(
+            WorkloadChoiceRequest(
+                _context(),
+                WorkloadKind.COMPUTE_INSTANCE,
+                ("us-central1-a",),
+            )
+        )
+    )
+
+    assert result.outcome.exit_class is ExitClass.INTERRUPTED
+    assert result.outcome.code == StableSymbol("operation-interrupted")
+    assert not result.completeness.has_partial_data
+
+
+def test_read_catalog_tpu_expands_returned_locations_and_preserves_relationships() -> (
+    None
+):
+    """Guided TPU choices remain related to the exact provider-returned zones."""
+    location_read, accelerator_read, runtime_read = _legacy_tpu_catalog_reads()
+    operations = WorkloadResolutionOperations(
+        ScriptedReader(()),
+        ScriptedReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader((location_read,)),
+        ScriptedCatalogReader((accelerator_read,)),
+        ScriptedCatalogReader((runtime_read,)),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+
+    result = asyncio.run(
+        operations.read_catalog(
+            WorkloadChoiceRequest(_context(), WorkloadKind.CLOUD_TPU_SLICE)
+        )
+    )
+
+    assert result.outcome.exit_class is ExitClass.SUCCESS
+    assert result.completeness.is_complete
+    assert result.data.tpu_locations == location_read.values
+    assert result.data.tpu_accelerator_types == accelerator_read.values
+    assert result.data.tpu_runtime_versions == runtime_read.values
+
+
+@pytest.mark.parametrize(
+    "locations",
+    [CandidateLocations(("us-central1",)), AllCompatibleLocations()],
+)
+def test_resolve_compute_nonzonal_candidates_retain_aggregated_catalog_reads(
+    locations: CandidateLocations | AllCompatibleLocations,
+) -> None:
+    """Regional and all-compatible resolution keep the aggregated Compute seam."""
+    accelerator_reader = ScriptedCatalogReader((_compute_accelerator_catalog_read(),))
+    machine_reader = ScriptedCatalogReader((_gpu_catalog_read(),))
+    operations = WorkloadResolutionOperations(
+        ScriptedReader((_complete(),)),
+        ScriptedReader((_complete(),)),
+        accelerator_reader,
+        machine_reader,
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        ScriptedCatalogReader(()),
+        MAINTAINED_ACCELERATOR_OVERLAY,
+        FixedClock(),
+    )
+    requirement = replace(_gpu_requirement(), locations=locations)
+
+    _ = asyncio.run(operations.resolve(QuotaResolveRequest(_context(), requirement)))
+
+    accelerator_request = accelerator_reader.calls[0]
+    machine_request = machine_reader.calls[0]
+    assert isinstance(accelerator_request, ComputeAcceleratorTypeReadRequest)
+    assert isinstance(machine_request, ComputeMachineTypeReadRequest)
+    assert accelerator_request.zones is None
+    assert machine_request.zones is None
 
 
 def test_resolve_all_compatible_accepts_an_authoritatively_empty_tpu_inventory() -> (

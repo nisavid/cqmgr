@@ -94,8 +94,26 @@ def _yaml_list_values(document: str, *, indent: int) -> set[str]:
     }
 
 
+def _yaml_mapping_keys(document: str, *, indent: int) -> set[str]:
+    """Return mapping keys declared at one indentation level."""
+    return {
+        line.strip()[:-1]
+        for line in document.splitlines()
+        if len(line) - len(line.lstrip()) == indent and line.strip().endswith(":")
+    }
+
+
 def _workflow_job(workflow: str, name: str) -> str:
     return _yaml_block(workflow, name, indent=2)
+
+
+def _workflow_job_mapping(workflow: str, name: str) -> dict[str, object]:
+    """Return one parsed workflow job mapping."""
+    workflow_value = yaml.safe_load(workflow)
+    assert isinstance(workflow_value, dict), "workflow"
+    document = cast("dict[object, object]", workflow_value)
+    jobs = _mapping(document.get("jobs"), "jobs")
+    return _mapping(jobs.get(name), f"job {name}")
 
 
 def _job_step(job: str, name: str) -> str:
@@ -266,13 +284,24 @@ def test_live_read_only_workflow_has_separate_identity_and_environment_gate() ->
     triggers = _yaml_block(workflow, "on", indent=0)
     canary = _workflow_job(workflow, "canary")
 
-    assert "workflow_call:" in triggers
+    assert _yaml_mapping_keys(triggers, indent=2) == {
+        "schedule",
+        "workflow_dispatch",
+    }
     assert "environment: live-read-only" in canary
     assert "id-token: write" in canary
     assert "google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093" in (
         canary
     )
     assert "scripts/live_read_only_canary.py" in canary
+    assert "timeout-minutes: 25" in canary
+    assert "--max-pages 50" in canary
+    assert "--max-requests 500" in canary
+    assert "--max-seconds 1200" in canary
+    assert "--max-locations 125" in canary
+    assert "--timeout 10" in canary
+    assert "--max-transient-retries 1" in canary
+    assert "--retry-backoff-seconds 1" in canary
     assert "GCP_PROJECT_ID" in canary
     assert "GCP_WORKLOAD_IDENTITY_PROVIDER" in canary
     assert "GCP_SERVICE_ACCOUNT" in canary
@@ -285,14 +314,84 @@ def test_live_read_only_workflow_has_separate_identity_and_environment_gate() ->
 def test_release_publication_requires_the_exact_commit_live_canary() -> None:
     """Publication cannot outpace the protected exact-commit provider evidence."""
     workflow = (WORKFLOWS / "release.yml").read_text()
+    standalone_workflow = (WORKFLOWS / "live-read-only.yml").read_text()
     live_read_only = _workflow_job(workflow, "live-read-only")
     publish = _workflow_job(workflow, "publish")
     publish_needs = _yaml_block(publish, "needs", indent=4)
 
     assert "needs: build" in live_read_only
-    assert "uses: ./.github/workflows/live-read-only.yml" in live_read_only
+    assert "environment: live-read-only" in live_read_only
+    assert "runs-on: ubuntu-22.04" in live_read_only
     assert "id-token: write" in live_read_only
+    assert "GCP_WORKLOAD_IDENTITY_PROVIDER" in live_read_only
+    assert "GCP_SERVICE_ACCOUNT" in live_read_only
+    assert "GCP_PROJECT_ID" in live_read_only
+    assert "scripts/live_read_only_canary.py" in live_read_only
+    assert "uses: ./.github/workflows/live-read-only.yml" not in live_read_only
+    assert "secrets: inherit" not in live_read_only
+    release_job = _workflow_job_mapping(workflow, "live-read-only")
+    standalone_job = _workflow_job_mapping(standalone_workflow, "canary")
+    assert release_job.get("permissions") == {
+        "contents": "read",
+        "id-token": "write",
+    }
+    assert "secrets" not in release_job
+    release_steps = release_job.get("steps")
+    assert isinstance(release_steps, list), "release live-read-only steps"
+    checkout_steps = [
+        _mapping(step, "release live-read-only step")
+        for step in release_steps
+        if isinstance(step, dict)
+        and str(cast("dict[object, object]", step).get("uses", "")).startswith(
+            "actions/checkout@"
+        )
+    ]
+    assert len(checkout_steps) == 1
+    checkout_inputs = _mapping(checkout_steps[0].get("with"), "checkout inputs")
+    assert checkout_inputs == {"persist-credentials": False}
+    assert "ref" not in checkout_inputs
+    for field in ("runs-on", "timeout-minutes", "environment", "permissions", "steps"):
+        assert release_job.get(field) == standalone_job.get(field), field
     assert "live-read-only" in _yaml_list_values(publish_needs, indent=6)
+
+
+def test_release_publication_qualifies_installed_live_read_adapters() -> None:
+    """Publication requires sanitized live evidence from the exact candidate wheel."""
+    workflow = (WORKFLOWS / "release.yml").read_text()
+    qualification = _workflow_job(workflow, "installed-live-adapters")
+    publish = _workflow_job(workflow, "publish")
+    publish_needs = _yaml_block(publish, "needs", indent=4)
+
+    assert "needs: build" in qualification
+    assert "environment: live-read-only" in qualification
+    assert "runs-on: ubuntu-22.04" in qualification
+    assert "id-token: write" in qualification
+    assert "GCP_WORKLOAD_IDENTITY_PROVIDER" in qualification
+    assert "GCP_SERVICE_ACCOUNT" in qualification
+    assert "GCP_PROJECT_ID" in qualification
+    assert "scripts/installed_live_adapter_qualification.py" in qualification
+    assert "--project-env GCP_PROJECT_ID" in qualification
+    assert (
+        "candidate/release/cqmgr-${{ needs.build.outputs.version }}-py3-none-any.whl"
+        in qualification
+    )
+    candidate = _job_step(qualification, "Download immutable release candidate")
+    assert "uses: actions/download-artifact@" in candidate
+    assert "name: release-candidate" in candidate
+    assert "path: candidate" in candidate
+
+    evidence = _job_step(
+        qualification,
+        "Upload sanitized installed-adapter evidence",
+    )
+    assert "if: always()" in evidence
+    assert "uses: actions/upload-artifact@" in evidence
+    assert "name: installed-live-adapter-evidence" in evidence
+    assert "path: installed-live-adapter-evidence.json" in evidence
+    assert "installed-live-adapters" in _yaml_list_values(
+        publish_needs,
+        indent=6,
+    )
 
 
 def test_release_performance_job_enforces_budgets_and_retains_failure_evidence() -> (

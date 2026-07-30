@@ -4,9 +4,6 @@ on:
   schedule:
     - cron: "41 8 * * 1"
   workflow_dispatch:
-  # The called job resolves secrets from its protected environment. GitHub does
-  # not support passing environment secrets through workflow_call.
-  workflow_call:
 
 concurrency:
   group: live-read-only
@@ -21,9 +18,9 @@ jobs:
     name: Bounded keyless provider reads
     # ubuntu-22.04 remains a supported stable GitHub-hosted runner label.
     runs-on: ubuntu-22.04
-    # The protected environment supplies all three GCP values for direct and
-    # reusable invocations; callers cannot override environment secrets.
-    timeout-minutes: 15
+    # The protected environment supplies all three GCP values directly to this
+    # job; workflow callers cannot inject or override them.
+    timeout-minutes: 25
     environment: live-read-only
     permissions:
       # Required to check out the exact repository revision.
@@ -59,11 +56,13 @@ jobs:
           uv run --locked --no-dev --no-sync
           python scripts/live_read_only_canary.py
           --project-env GCP_PROJECT_ID
-          --max-pages 20
-          --max-requests 100
-          --max-seconds 120
-          --max-locations 100
+          --max-pages 50
+          --max-requests 500
+          --max-seconds 1200
+          --max-locations 125
           --timeout 10
+          --max-transient-retries 1
+          --retry-backoff-seconds 1
           --output live-read-only-evidence.json
 
       - name: Upload sanitized evidence

@@ -26,6 +26,9 @@ from cqmgr.domain.catalog import (
     TpuRuntimeVersion,
     UnitConversionEvidence,
     WorkloadConsumer,
+    is_canonical_region,
+    is_canonical_region_or_zone,
+    is_canonical_zone,
 )
 from cqmgr.domain.quota_queries import QuotaQueryItem
 from cqmgr.domain.quotas import (
@@ -42,7 +45,6 @@ _REVIEW_DATE = date(2026, 7, 14)
 _COMPUTE_QUOTA_SOURCE = "https://docs.cloud.google.com/compute/resource-usage"
 _TPU_QUOTA_SOURCE = "https://docs.cloud.google.com/tpu/docs/quota"
 _MIN_DNS_LABELS = 2
-_LOCATION_CHARACTERS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
 
 
 class AmbiguousOverlayMatchError(ValueError):
@@ -117,7 +119,7 @@ class CandidateLocations:
         if (
             not isinstance(self.values, tuple)
             or not self.values
-            or any(not _is_canonical_region_or_zone(value) for value in self.values)
+            or any(not is_canonical_region_or_zone(value) for value in self.values)
         ):
             msg = "candidate locations must contain canonical regions or zones"
             raise ValueError(msg)
@@ -1415,7 +1417,7 @@ def _location_coverage(
         CatalogEvidenceSource.TPU_ACCELERATOR_TYPES,
         CatalogEvidenceSource.TPU_RUNTIME_VERSIONS,
     )
-    if _is_canonical_region(location):
+    if is_canonical_region(location):
         return tuple(
             item
             for item in catalog.coverage
@@ -1436,7 +1438,7 @@ def _compute_location_coverage(
     catalog: WorkloadCatalogEvidence,
     location: str,
 ) -> tuple[CatalogLocationCoverage, ...]:
-    if _is_canonical_region(location):
+    if is_canonical_region(location):
         return tuple(
             item
             for item in catalog.coverage
@@ -1518,7 +1520,7 @@ def _derive_workload_facts(  # noqa: C901
                 ResolutionFailureReason.MISSING_LOCATION_EVIDENCE,
                 "Compute accelerator evidence is internally inconsistent.",
             )
-        if _is_canonical_region(location):
+        if is_canonical_region(location):
             return _derive_compute_region_facts(
                 mappings,
                 requirement,
@@ -1526,7 +1528,7 @@ def _derive_workload_facts(  # noqa: C901
                 catalog,
             )
         return _derive_compute_zone_facts(mappings, requirement, location, catalog)
-    if _is_canonical_region(location):
+    if is_canonical_region(location):
         inventory_records = tuple(
             item
             for item in _location_coverage(requirement, location, catalog)
@@ -1748,13 +1750,13 @@ def _derive_compute_zone_facts(
 
 
 def _compute_quota_region(location: str) -> str:
-    if _is_canonical_region(location):
+    if is_canonical_region(location):
         return location
     return location.rsplit("-", maxsplit=1)[0]
 
 
 def _zone_belongs_to_region(location: str, region: str) -> bool:
-    return _is_canonical_zone(location) and location.startswith(f"{region}-")
+    return is_canonical_zone(location) and location.startswith(f"{region}-")
 
 
 def _unresolved_location(
@@ -2116,14 +2118,14 @@ def _require_location(value: object, field_name: str) -> None:
 
 def _require_canonical_zone(value: object, field_name: str) -> None:
     _require_location(value, field_name)
-    if not _is_canonical_zone(value):
+    if not is_canonical_zone(value):
         msg = f"{field_name} must be an exact canonical zone"
         raise ValueError(msg)
 
 
 def _require_canonical_region_or_zone(value: object, field_name: str) -> None:
     _require_location(value, field_name)
-    if not _is_canonical_region_or_zone(value):
+    if not is_canonical_region_or_zone(value):
         msg = f"{field_name} must be an exact canonical region or zone"
         raise ValueError(msg)
 
@@ -2160,32 +2162,6 @@ def _is_canonical_service_dns(service: object) -> bool:
         and all(character in allowed for character in label)
         for label in labels
     )
-
-
-def _is_canonical_zone(value: object) -> bool:
-    if not isinstance(value, str):
-        return False
-    region, separator, suffix = value.rpartition("-")
-    return (
-        separator == "-"
-        and _is_canonical_region(region)
-        and len(suffix) == 1
-        and suffix.isalpha()
-    )
-
-
-def _is_canonical_region(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and "-" in value
-        and all(value.split("-"))
-        and all(character in _LOCATION_CHARACTERS for character in value)
-        and value[-1:].isdigit()
-    )
-
-
-def _is_canonical_region_or_zone(value: object) -> bool:
-    return _is_canonical_region(value) or _is_canonical_zone(value)
 
 
 _B200_A4_REGIONAL = OverlayMapping(

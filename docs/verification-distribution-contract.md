@@ -394,10 +394,46 @@ The ordinary canary may perform only bounded:
 - Compute aggregated accelerator-type and machine-type lists; and
 - TPU location, accelerator-type, and runtime-version lists.
 
+A live release canary is bounded qualification evidence, not the hermetic
+exhaustive catalog. Its Compute machine-type read selects every provider row
+with an assigned accelerator configuration plus every machine type named by
+the release overlay. The canonical server filter is derived from the packaged
+overlay, sorted and deduplicated, and fails before transport if a name is
+invalid or the filter exceeds its fixed term or byte bound. Evidence binds that
+declared selection to the exact filter digest, overlay content digest, overlay
+term count, and partial-success setting without retaining the raw provider
+response. Runtime inventory remains unfiltered, and the hermetic release
+manifest remains the exhaustive release-relative provider evidence.
+
 A separate canary may call the documented read-only Spot capacity advice
 operation on a known-supported configuration. Its Preview lifecycle and `POST`
 transport are explicit. Both canaries use exact resource and quota projects,
 services, regions, page limits, retry limits, and wall-clock deadlines.
+The ordinary release canary caps each pageable source at 50 pages, the complete
+run at 500 requests and 1,200 seconds, each request at 10 seconds, and TPU
+fanout at 125 locations. A timeout, connection failure, HTTP `408`, HTTP `429`,
+or HTTP `5xx` response receives at most one retry after a one-second backoff
+under those same global bounds. Other HTTP failures and provider schema failures
+fail immediately. Sanitized source evidence records only the failure class and
+transient-retry count, never exception text, response bodies, resource names, or
+provider identifiers. Configuration fails before transport unless its request
+limit can cover at least one request for each of the 10 fixed sources plus two
+child requests for every allowed TPU location. Exceeding any runtime bound fails
+closed after retaining sanitized incomplete evidence.
+
+The installed-adapter release gate downloads the exact candidate wheel and
+installs it with `uv tool install --no-build --python 3.14` into ephemeral uv
+tool and XDG state. It runs the installed executable, rather than the source
+checkout, for one bounded Compute quota list and one exact Compute-instance
+resolution. The project identifier enters the orchestrator only through
+`GCP_PROJECT_ID`; the orchestrator constructs the resource scope in memory and
+passes it to each installed command. Child output remains in memory and must be
+an operation result with schema `cqmgr.operation-result/v1` and success exit
+class. Retained evidence contains only the check label, exit code, elapsed
+time, schema and outcome classifications, and a digest of those fields. Every
+failure path retains the same sanitized evidence shape without command
+arguments, provider payloads, resource scope, project identity, principal, or
+credential detail.
 
 The identity deliberately lacks quota-update, service-enablement, and resource
 provisioning permissions. The ordinary canary composition contains no create,
@@ -415,15 +451,20 @@ never enables an API, changes quota, creates capacity, or relies on ambient
 `gcloud` state.
 
 Scheduled canaries and the exact release commit's canaries are release gates.
-The release canary exhausts every page and every discovered supported Cloud TPU
-location required by its declared two-provider evidence set; any warning,
-unreachable scope, failed subsource, or unexhausted page is explicit coverage
-and prevents an exhaustive live claim. Live evidence retains only normalized
-source, coverage, lifecycle, shape, timing, method/path identity, safe digests,
-and pass/fail facts; no raw body, credential, principal email, quota contact,
-or private identifier is retained. Even complete canary evidence describes
-catalog visibility for the named project and observation time, never physical
-capacity or universal regional availability.
+The release canary exhausts every page matching each declared source selection
+and every discovered supported Cloud TPU location required by its declared
+two-provider evidence set. A complete filtered Compute machine-type source is
+complete only for the accelerator-relevant selection recorded in that evidence;
+it is not a complete-machine-inventory claim. Any partial-success warning other
+than an explicit `NO_RESULTS_ON_PAGE` empty-result warning, any unreachable
+scope, failed source, or unexhausted page is explicit coverage and prevents a
+complete live claim. A provider transport, HTTP, or schema failure also writes
+sanitized incomplete evidence before failing the gate. Live evidence retains
+only normalized source, coverage, lifecycle, shape, timing, method/path
+identity, safe digests, and pass/fail facts; no raw body, credential, principal
+email, quota contact, or private identifier is retained. Even complete canary
+evidence describes catalog visibility for the named project and observation
+time, never physical capacity or universal regional availability.
 
 Direct-user ADC receives hermetic `authorized_user` discovery, refresh,
 identity-scope, quota-project, failure, and redaction contracts on every
@@ -435,6 +476,8 @@ stored in CI.
 
 Implementation records cold start, resident and peak memory, first TUI render,
 and steady provider-refresh behavior on representative supported platforms.
+The cold-start budget applies to the median of exactly five isolated launches;
+the maximum remains retained evidence but does not fail qualification by itself.
 The first release cannot publish until reviewed budgets are recorded from that
 baseline. Later releases block material regressions against those budgets.
 This contract does not invent absolute limits before executable evidence

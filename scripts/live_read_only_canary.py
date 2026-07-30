@@ -5,25 +5,47 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from importlib.resources import files
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
+
+import requests
+
+from cqmgr.domain.accelerator_overlay import MAINTAINED_ACCELERATOR_OVERLAY
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
 CANARY_SCHEMA = "cqmgr.live-read-only-evidence/v1"
 PROJECT_PATTERN = re.compile(r"[a-z][a-z0-9-]{4,28}[a-z0-9]\Z")
+MACHINE_TYPE_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)+\Z")
+DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 SERVICES = ("compute.googleapis.com", "tpu.googleapis.com")
 MONITORING_METRICS = (
     "serviceruntime.googleapis.com/quota/allocation/usage",
     "serviceruntime.googleapis.com/quota/rate/net_usage",
 )
 MINIMUM_REQUEST_TIMEOUT_SECONDS = 0.1
+DEFAULT_MAX_PAGES = 50
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
+DEFAULT_MAX_REQUESTS = 500
+DEFAULT_MAX_SECONDS = 1200.0
+DEFAULT_MAX_LOCATIONS = 125
+DEFAULT_MAX_TRANSIENT_RETRIES = 1
+DEFAULT_RETRY_BACKOFF_SECONDS = 1.0
+MINIMUM_FIXED_SOURCE_REQUESTS = 10
+TPU_CHILD_REQUESTS_PER_LOCATION = 2
+TRANSIENT_HTTP_STATUS_CODES = frozenset({408, 429})
+HTTP_CLIENT_ERROR_MIN = 400
+HTTP_CLIENT_ERROR_MAX = 499
+HTTP_SERVER_ERROR_MIN = 500
+HTTP_SERVER_ERROR_MAX = 599
 ALLOWED_GET_PATHS = frozenset(
     {
         "/v3/projects/{project}",
@@ -36,6 +58,89 @@ ALLOWED_GET_PATHS = frozenset(
         "/v2/projects/{project}/locations/{location}/acceleratorTypes",
         "/v2/projects/{project}/locations/{location}/runtimeVersions",
     }
+)
+MAX_MACHINE_TYPE_FILTER_TERMS = 100
+MAX_MACHINE_TYPE_FILTER_BYTES = 8192
+MACHINE_TYPE_SELECTION_KIND = "accelerator-relevant-machine-types/v1"
+COMPUTE_RETURN_PARTIAL_SUCCESS = True
+
+
+def _machine_type_query(  # noqa: C901 - strict fail-closed overlay validation
+    payload: object,
+    *,
+    expected_content_digest: str,
+    expected_machine_types: frozenset[str],
+) -> tuple[str, dict[str, object]]:
+    """Build one canonical bounded query from public release-overlay names."""
+    if not isinstance(payload, dict):
+        msg = "accelerator overlay must be an object"
+        raise TypeError(msg)
+    overlay_digest = payload.get("content_digest")
+    if not isinstance(overlay_digest, str) or not DIGEST_PATTERN.fullmatch(
+        overlay_digest
+    ):
+        msg = "accelerator overlay content digest is invalid"
+        raise ValueError(msg)
+    if overlay_digest != expected_content_digest:
+        msg = "accelerator overlay content digest does not match the canonical overlay"
+        raise ValueError(msg)
+    mappings = payload.get("mappings")
+    if not isinstance(mappings, list):
+        msg = "accelerator overlay mappings must be a list"
+        raise TypeError(msg)
+    machine_types: set[str] = set()
+    for mapping in mappings:
+        if not isinstance(mapping, dict):
+            msg = "accelerator overlay mapping must be an object"
+            raise TypeError(msg)
+        values = mapping.get("machine_types")
+        if not isinstance(values, list):
+            msg = "accelerator overlay machine_types must be a list"
+            raise TypeError(msg)
+        for value in values:
+            if not isinstance(value, str) or not MACHINE_TYPE_PATTERN.fullmatch(value):
+                msg = "accelerator overlay contains an invalid machine type"
+                raise ValueError(msg)
+            machine_types.add(value)
+    if len(machine_types) > MAX_MACHINE_TYPE_FILTER_TERMS:
+        msg = "accelerator overlay contains too many machine types for the canary"
+        raise ValueError(msg)
+    if machine_types != expected_machine_types:
+        msg = "accelerator overlay machine types do not match the canonical overlay"
+        raise ValueError(msg)
+    filter_value = " OR ".join(
+        [
+            "(accelerators.guestAcceleratorType:*)",
+            *(f'(name = "{machine_type}")' for machine_type in sorted(machine_types)),
+        ]
+    )
+    if len(filter_value.encode()) > MAX_MACHINE_TYPE_FILTER_BYTES:
+        msg = "accelerator overlay machine-type filter is too large for the canary"
+        raise ValueError(msg)
+    selection: dict[str, object] = {
+        "filter_digest": "sha256:" + hashlib.sha256(filter_value.encode()).hexdigest(),
+        "kind": MACHINE_TYPE_SELECTION_KIND,
+        "overlay_content_digest": overlay_digest,
+        "overlay_machine_type_terms": len(machine_types),
+        "return_partial_success": COMPUTE_RETURN_PARTIAL_SUCCESS,
+    }
+    return filter_value, selection
+
+
+EXPECTED_OVERLAY_CONTENT_DIGEST = MAINTAINED_ACCELERATOR_OVERLAY.metadata.content_digest
+EXPECTED_OVERLAY_MACHINE_TYPES = frozenset(
+    machine_type
+    for mapping in MAINTAINED_ACCELERATOR_OVERLAY.mappings
+    for machine_type in mapping.machine_types
+)
+MACHINE_TYPE_FILTER, MACHINE_TYPE_SELECTION = _machine_type_query(
+    json.loads(
+        files("cqmgr.resources")
+        .joinpath("accelerator-overlay.json")
+        .read_text(encoding="utf-8")
+    ),
+    expected_content_digest=EXPECTED_OVERLAY_CONTENT_DIGEST,
+    expected_machine_types=EXPECTED_OVERLAY_MACHINE_TYPES,
 )
 
 
@@ -91,13 +196,42 @@ class RequestBudgetError(RuntimeError):
         self.reason = reason
 
 
+class SourceEvidenceError(RuntimeError):
+    """One source failure stopped canary fanout with sanitized evidence."""
+
+    def __init__(self, message: str, evidence: dict[str, object]) -> None:
+        """Retain only public path shape, counts, and safe aggregate evidence."""
+        super().__init__(message)
+        self.evidence = evidence
+
+
+class ProviderReadError(RuntimeError):
+    """One provider boundary failed after its allowed transient retries."""
+
+    def __init__(
+        self,
+        failure_class: str,
+        *,
+        transient_retries: int,
+        last_transient_failure_class: str | None,
+    ) -> None:
+        """Retain only safe classification and retry counts."""
+        super().__init__("provider read failed safely")
+        self.failure_class = failure_class
+        self.transient_retries = transient_retries
+        self.last_transient_failure_class = last_transient_failure_class
+
+
 @dataclass(slots=True)
 class RequestBudget:
     """Enforce one request and wall-clock budget across the complete canary."""
 
     max_requests: int
     max_seconds: float
+    max_transient_retries: int = DEFAULT_MAX_TRANSIENT_RETRIES
+    retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS
     monotonic: Callable[[], float] = time.monotonic
+    sleeper: Callable[[float], None] = time.sleep
     requests: int = field(init=False, default=0)
     _started: float = field(init=False)
 
@@ -108,6 +242,18 @@ class RequestBudget:
             raise ValueError(msg)
         if self.max_seconds <= 0:
             msg = "global wall-clock limit must be positive"
+            raise ValueError(msg)
+        if (
+            isinstance(self.max_transient_retries, bool)
+            or self.max_transient_retries < 0
+        ):
+            msg = "transient retry limit must be a non-negative integer"
+            raise ValueError(msg)
+        if not math.isfinite(self.retry_backoff_seconds):
+            msg = "retry backoff must be finite"
+            raise ValueError(msg)
+        if self.retry_backoff_seconds < 0:
+            msg = "retry backoff must be non-negative"
             raise ValueError(msg)
         self._started = self.monotonic()
 
@@ -144,6 +290,16 @@ class RequestBudget:
             raise RequestBudgetError(reason, msg)
         return round(elapsed * 1000)
 
+    def wait_before_retry(self) -> None:
+        """Apply one fixed bounded delay before a transient retry."""
+        remaining = self.max_seconds - (self.monotonic() - self._started)
+        if remaining - self.retry_backoff_seconds < MINIMUM_REQUEST_TIMEOUT_SECONDS:
+            msg = "canary cannot fit retry backoff within its wall-clock deadline"
+            reason = "wall-clock-deadline"
+            raise RequestBudgetError(reason, msg)
+        if self.retry_backoff_seconds:
+            self.sleeper(self.retry_backoff_seconds)
+
 
 def _canonical_json(value: object) -> bytes:
     return (
@@ -170,6 +326,85 @@ def _response_mapping(response: ResponseLike) -> dict[str, object]:
     return cast("dict[str, object]", payload)
 
 
+def _provider_failure(error: Exception) -> tuple[str, bool]:  # noqa: PLR0911
+    """Classify one provider boundary failure without retaining private detail."""
+    if isinstance(error, requests.Timeout):
+        return "transport-timeout", True
+    if isinstance(error, requests.ConnectionError):
+        return "transport-connectivity", True
+    if isinstance(error, requests.HTTPError):
+        status = getattr(error.response, "status_code", None)
+        if status in TRANSIENT_HTTP_STATUS_CODES:
+            return f"http-{status}", True
+        if (
+            isinstance(status, int)
+            and HTTP_SERVER_ERROR_MIN <= status <= HTTP_SERVER_ERROR_MAX
+        ):
+            return "http-5xx", True
+        if (
+            isinstance(status, int)
+            and HTTP_CLIENT_ERROR_MIN <= status <= HTTP_CLIENT_ERROR_MAX
+        ):
+            return "http-4xx", False
+        return "http-failure", False
+    if isinstance(error, (TypeError, ValueError)):
+        return "provider-schema-failure", False
+    return "provider-read-failure", False
+
+
+def _request_mapping(  # noqa: PLR0913 - explicit provider request boundary
+    session: SessionLike,
+    *,
+    method: str,
+    url: str,
+    params: Mapping[str, str],
+    timeout: float,
+    budget: RequestBudget,
+) -> tuple[dict[str, object], int, str | None]:
+    """Read one provider page with exactly bounded transient retries."""
+    transient_retries = 0
+    last_transient_failure_class: str | None = None
+    while True:
+        request_timeout = budget.claim_timeout(timeout)
+        try:
+            payload = _response_mapping(
+                session.request(
+                    method,
+                    url,
+                    params=dict(params),
+                    timeout=request_timeout,
+                )
+            )
+        except RequestBudgetError:
+            raise
+        except Exception as error:  # noqa: BLE001 - classify provider boundary
+            failure_class, transient = _provider_failure(error)
+            if transient and transient_retries < budget.max_transient_retries:
+                transient_retries += 1
+                last_transient_failure_class = failure_class
+                budget.wait_before_retry()
+                continue
+            raise ProviderReadError(
+                failure_class,
+                transient_retries=transient_retries,
+                last_transient_failure_class=last_transient_failure_class,
+            ) from None
+        return payload, transient_retries, last_transient_failure_class
+
+
+def _with_retry_evidence(
+    evidence: dict[str, object],
+    *,
+    transient_retries: int,
+    last_transient_failure_class: str | None,
+) -> dict[str, object]:
+    """Decorate explicit source evidence with safe retry provenance."""
+    decorated = {**evidence, "transient_retries": transient_retries}
+    if last_transient_failure_class is not None:
+        decorated["last_transient_failure_class"] = last_transient_failure_class
+    return decorated
+
+
 def _records(
     value: object,
     item_key: str,
@@ -185,17 +420,118 @@ def _records(
             records: list[object] = []
             for wrapper in value.values():
                 if not isinstance(wrapper, dict):
-                    continue
-                nested = wrapper.get(nested_key)
-                if isinstance(nested, list):
-                    records.extend(nested)
+                    msg = f"provider field {item_key!r} contains a non-object scope"
+                    raise TypeError(msg)
+                if nested_key not in wrapper:
+                    if "warning" in wrapper:
+                        continue
+                    msg = f"provider field {item_key!r} scope is missing {nested_key!r}"
+                    raise RuntimeError(msg)
+                nested = wrapper[nested_key]
+                if not isinstance(nested, list):
+                    msg = (
+                        f"provider field {item_key!r} nested value "
+                        f"{nested_key!r} is not a list"
+                    )
+                    raise TypeError(msg)
+                records.extend(nested)
             return tuple(records)
         return tuple(value.values())
     msg = f"provider field {item_key!r} is neither a list nor an object"
     raise RuntimeError(msg)
 
 
-def read_pages(  # noqa: PLR0913 - one explicit bounded request contract
+def _selection_evidence(
+    selection: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    """Accept only the exact public machine-selection evidence shape."""
+    if selection is None:
+        return None
+    expected_keys = {
+        "filter_digest",
+        "kind",
+        "overlay_content_digest",
+        "overlay_machine_type_terms",
+        "return_partial_success",
+    }
+    if set(selection) != expected_keys:
+        msg = "evidence selection has an unsupported shape"
+        raise ValueError(msg)
+    filter_digest = selection["filter_digest"]
+    overlay_digest = selection["overlay_content_digest"]
+    terms = selection["overlay_machine_type_terms"]
+    if (
+        selection["kind"] != MACHINE_TYPE_SELECTION_KIND
+        or not isinstance(filter_digest, str)
+        or not DIGEST_PATTERN.fullmatch(filter_digest)
+        or not isinstance(overlay_digest, str)
+        or not DIGEST_PATTERN.fullmatch(overlay_digest)
+        or not isinstance(terms, int)
+        or isinstance(terms, bool)
+        or not 0 <= terms <= MAX_MACHINE_TYPE_FILTER_TERMS
+        or selection["return_partial_success"] is not True
+    ):
+        msg = "evidence selection contains an invalid public value"
+        raise ValueError(msg)
+    return dict(selection)
+
+
+def _next_page_token(payload: Mapping[str, object]) -> str | None:
+    """Return one validated provider page cursor without retaining it."""
+    token = payload.get("nextPageToken")
+    if token in (None, ""):
+        return None
+    if not isinstance(token, str):
+        msg = "provider page token must be a string"
+        raise TypeError(msg)
+    return token
+
+
+def _warning_is_failure(value: object) -> bool:
+    """Classify one provider warning without retaining its text or scope."""
+    if value is None:
+        return False
+    if not isinstance(value, dict):
+        msg = "provider warning must be an object"
+        raise TypeError(msg)
+    code = value.get("code")
+    if not isinstance(code, str) or not code:
+        msg = "provider warning code must be a non-empty string"
+        raise TypeError(msg)
+    return code != "NO_RESULTS_ON_PAGE"
+
+
+def _coverage_failures(
+    payload: Mapping[str, object],
+    *,
+    item_key: str,
+    nested_key: str | None,
+) -> int:
+    """Count sanitized partial-success failures in one provider page."""
+    failures = int(_warning_is_failure(payload.get("warning")))
+    unreachables = payload.get("unreachables")
+    if unreachables is not None:
+        if not isinstance(unreachables, list):
+            msg = "provider unreachables must be a list"
+            raise TypeError(msg)
+        failures += len(unreachables)
+    if nested_key is None:
+        return failures
+    wrappers = payload.get(item_key)
+    if wrappers is None:
+        return failures
+    if not isinstance(wrappers, dict):
+        msg = "Compute aggregated items must be an object"
+        raise TypeError(msg)
+    for wrapper in wrappers.values():
+        if not isinstance(wrapper, dict):
+            msg = "Compute aggregated scope must be an object"
+            raise TypeError(msg)
+        failures += int(_warning_is_failure(wrapper.get("warning")))
+    return failures
+
+
+def read_pages(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit bounded source state
     session: SessionLike,
     *,
     method: str,
@@ -208,54 +544,159 @@ def read_pages(  # noqa: PLR0913 - one explicit bounded request contract
     budget: RequestBudget,
     nested_key: str | None = None,
     collect_records: bool = False,
+    selection: Mapping[str, object] | None = None,
 ) -> tuple[dict[str, object], tuple[object, ...]]:
     """Return evidence and only records explicitly requested by the caller."""
     require_allowlisted(method, path_template)
     if max_pages < 1:
         msg = "page limit must be positive"
         raise ValueError(msg)
+    public_selection = _selection_evidence(selection)
     request_params = dict(params)
     records: list[object] = []
     record_count = 0
     digests: list[str] = []
+    transient_retries = 0
+    last_transient_failure_class: str | None = None
     started = time.monotonic()
     for page in range(1, max_pages + 1):
-        response = session.request(
-            method,
-            url,
-            params=request_params,
-            timeout=budget.claim_timeout(timeout),
-        )
-        payload = _response_mapping(response)
-        page_records = _records(
-            payload.get(item_key),
-            item_key,
-            nested_key=nested_key,
-        )
+        try:
+            (
+                payload,
+                page_transient_retries,
+                page_last_transient_failure_class,
+            ) = _request_mapping(
+                session,
+                method=method,
+                url=url,
+                params=request_params,
+                timeout=timeout,
+                budget=budget,
+            )
+            transient_retries += page_transient_retries
+            if page_last_transient_failure_class is not None:
+                last_transient_failure_class = page_last_transient_failure_class
+            page_records = _records(
+                payload.get(item_key),
+                item_key,
+                nested_key=nested_key,
+            )
+            coverage_failures = _coverage_failures(
+                payload,
+                item_key=item_key,
+                nested_key=nested_key,
+            )
+            token = _next_page_token(payload)
+        except RequestBudgetError:
+            raise
+        except SourceEvidenceError:
+            raise
+        except ProviderReadError as error:
+            transient_retries += error.transient_retries
+            if error.last_transient_failure_class is not None:
+                last_transient_failure_class = error.last_transient_failure_class
+            evidence: dict[str, object] = _with_retry_evidence(
+                {
+                    "complete": False,
+                    "elapsed_ms": round((time.monotonic() - started) * 1000),
+                    "failure_class": error.failure_class,
+                    "method": method,
+                    "pages": page - 1,
+                    "path": path_template,
+                    "reason": "provider-read-failure",
+                    "records": record_count,
+                },
+                transient_retries=transient_retries,
+                last_transient_failure_class=last_transient_failure_class,
+            )
+            if public_selection is not None:
+                evidence["selection"] = public_selection
+            msg = f"provider source failed safely: {method} {path_template}"
+            raise SourceEvidenceError(msg, evidence) from None
+        except Exception as error:  # noqa: BLE001 - sanitize parsed provider data
+            failure_class, _transient = _provider_failure(error)
+            evidence = _with_retry_evidence(
+                {
+                    "complete": False,
+                    "elapsed_ms": round((time.monotonic() - started) * 1000),
+                    "failure_class": failure_class,
+                    "method": method,
+                    "pages": page - 1,
+                    "path": path_template,
+                    "reason": "provider-read-failure",
+                    "records": record_count,
+                },
+                transient_retries=transient_retries,
+                last_transient_failure_class=last_transient_failure_class,
+            )
+            if public_selection is not None:
+                evidence["selection"] = public_selection
+            msg = f"provider source failed safely: {method} {path_template}"
+            raise SourceEvidenceError(msg, evidence) from None
         record_count += len(page_records)
         if collect_records:
             records.extend(page_records)
         digests.append(hashlib.sha256(_canonical_json(payload)).hexdigest())
-        token = payload.get("nextPageToken")
-        if token in (None, ""):
+        if coverage_failures:
+            evidence = _with_retry_evidence(
+                {
+                    "complete": False,
+                    "coverage_failures": coverage_failures,
+                    "digest": "sha256:"
+                    + hashlib.sha256("".join(digests).encode()).hexdigest(),
+                    "elapsed_ms": round((time.monotonic() - started) * 1000),
+                    "method": method,
+                    "pages": page,
+                    "path": path_template,
+                    "reason": "coverage-incomplete",
+                    "records": record_count,
+                },
+                transient_retries=transient_retries,
+                last_transient_failure_class=last_transient_failure_class,
+            )
+            if public_selection is not None:
+                evidence["selection"] = public_selection
+            msg = f"provider source returned incomplete coverage: {path_template}"
+            raise SourceEvidenceError(msg, evidence)
+        if token is None:
             elapsed = time.monotonic() - started
-            evidence: dict[str, object] = {
-                "complete": True,
-                "digest": "sha256:"
-                + hashlib.sha256("".join(digests).encode()).hexdigest(),
-                "elapsed_ms": round(elapsed * 1000),
-                "method": method,
-                "pages": page,
-                "path": path_template,
-                "records": record_count,
-            }
+            evidence = _with_retry_evidence(
+                {
+                    "complete": True,
+                    "digest": "sha256:"
+                    + hashlib.sha256("".join(digests).encode()).hexdigest(),
+                    "elapsed_ms": round(elapsed * 1000),
+                    "method": method,
+                    "pages": page,
+                    "path": path_template,
+                    "records": record_count,
+                },
+                transient_retries=transient_retries,
+                last_transient_failure_class=last_transient_failure_class,
+            )
+            if public_selection is not None:
+                evidence["selection"] = public_selection
             return evidence, tuple(records)
-        if not isinstance(token, str):
-            msg = "provider page token must be a string"
-            raise TypeError(msg)
         request_params["pageToken"] = token
+    elapsed = time.monotonic() - started
+    evidence = _with_retry_evidence(
+        {
+            "complete": False,
+            "digest": "sha256:" + hashlib.sha256("".join(digests).encode()).hexdigest(),
+            "elapsed_ms": round(elapsed * 1000),
+            "method": method,
+            "pages": max_pages,
+            "path": path_template,
+            "reason": "page-limit",
+            "records": record_count,
+        },
+        transient_retries=transient_retries,
+        last_transient_failure_class=last_transient_failure_class,
+    )
+    if public_selection is not None:
+        evidence["selection"] = public_selection
     msg = f"provider source exceeded page limit {max_pages}: {path_template}"
-    raise RuntimeError(msg)
+    raise SourceEvidenceError(msg, evidence)
 
 
 def read_once(  # noqa: PLR0913 - one explicit bounded request contract
@@ -270,23 +711,51 @@ def read_once(  # noqa: PLR0913 - one explicit bounded request contract
     """Read one non-pageable source and retain only shape and digest evidence."""
     require_allowlisted("GET", path_template)
     started = time.monotonic()
-    payload = _response_mapping(
-        session.request(
-            "GET",
-            url,
-            params=dict(params),
-            timeout=budget.claim_timeout(timeout),
+    try:
+        (
+            payload,
+            transient_retries,
+            last_transient_failure_class,
+        ) = _request_mapping(
+            session,
+            method="GET",
+            url=url,
+            params=params,
+            timeout=timeout,
+            budget=budget,
         )
+    except RequestBudgetError:
+        raise
+    except ProviderReadError as error:
+        evidence: dict[str, object] = _with_retry_evidence(
+            {
+                "complete": False,
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+                "failure_class": error.failure_class,
+                "method": "GET",
+                "pages": 0,
+                "path": path_template,
+                "reason": "provider-read-failure",
+                "records": 0,
+            },
+            transient_retries=error.transient_retries,
+            last_transient_failure_class=error.last_transient_failure_class,
+        )
+        msg = f"provider source failed safely: GET {path_template}"
+        raise SourceEvidenceError(msg, evidence) from None
+    return _with_retry_evidence(
+        {
+            "complete": True,
+            "digest": "sha256:" + hashlib.sha256(_canonical_json(payload)).hexdigest(),
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+            "method": "GET",
+            "pages": 1,
+            "path": path_template,
+            "records": 1,
+        },
+        transient_retries=transient_retries,
+        last_transient_failure_class=last_transient_failure_class,
     )
-    return {
-        "complete": True,
-        "digest": "sha256:" + hashlib.sha256(_canonical_json(payload)).hexdigest(),
-        "elapsed_ms": round((time.monotonic() - started) * 1000),
-        "method": "GET",
-        "pages": 1,
-        "path": path_template,
-        "records": 1,
-    }
 
 
 def _location_ids(
@@ -311,8 +780,16 @@ def _location_ids(
             raise RuntimeError(msg)
         locations.add(location)
         if len(locations) > max_locations:
+            evidence: dict[str, object] = {
+                "complete": False,
+                "method": None,
+                "pages": 0,
+                "path": "/v2/projects/{project}/locations",
+                "reason": "location-limit",
+                "records": len(locations),
+            }
             msg = f"TPU location source exceeded location limit {max_locations}"
-            raise RuntimeError(msg)
+            raise SourceEvidenceError(msg, evidence)
     return tuple(sorted(locations))
 
 
@@ -403,6 +880,14 @@ def _run_canary_sources(  # noqa: PLR0913 - explicit bounded source composition
     compute_sources = ("acceleratorTypes", "machineTypes")
     for resource in compute_sources:
         path = f"/compute/v1/projects/{{project}}/aggregated/{resource}"
+        params = {
+            "maxResults": "500",
+            "returnPartialSuccess": str(COMPUTE_RETURN_PARTIAL_SUCCESS).lower(),
+        }
+        selection: Mapping[str, object] | None = None
+        if resource == "machineTypes":
+            params["filter"] = MACHINE_TYPE_FILTER
+            selection = MACHINE_TYPE_SELECTION
         evidence, _records_value = read_pages(
             quota_session,
             method="GET",
@@ -412,11 +897,12 @@ def _run_canary_sources(  # noqa: PLR0913 - explicit bounded source composition
                 f"aggregated/{resource}"
             ),
             item_key="items",
-            params={"maxResults": "500"},
+            params=params,
             max_pages=max_pages,
             timeout=timeout,
             nested_key=resource,
             budget=budget,
+            selection=selection,
         )
         sources.append(evidence)
     location_path = "/v2/projects/{project}/locations"
@@ -433,7 +919,29 @@ def _run_canary_sources(  # noqa: PLR0913 - explicit bounded source composition
         collect_records=True,
     )
     sources.append(location_evidence)
-    locations = _location_ids(location_records, max_locations=max_locations)
+    try:
+        locations = _location_ids(location_records, max_locations=max_locations)
+    except SourceEvidenceError:
+        raise
+    except (TypeError, ValueError, RuntimeError):
+        evidence = _with_retry_evidence(
+            {
+                "complete": False,
+                "failure_class": "provider-schema-failure",
+                "method": "GET",
+                "pages": location_evidence["pages"],
+                "path": location_path,
+                "reason": "provider-read-failure",
+                "records": location_evidence["records"],
+            },
+            transient_retries=cast("int", location_evidence["transient_retries"]),
+            last_transient_failure_class=cast(
+                "str | None",
+                location_evidence.get("last_transient_failure_class"),
+            ),
+        )
+        msg = f"provider source failed safely: GET {location_path}"
+        raise SourceEvidenceError(msg, evidence) from None
     state["tpu_locations"] = len(locations)
     for location in locations:
         for resource, item_key in (
@@ -505,6 +1013,34 @@ def _budget_failure_evidence(
     }
 
 
+def _source_failure_evidence(
+    error: SourceEvidenceError,
+    *,
+    budget: RequestBudget,
+    sources: list[dict[str, object]],
+    state: dict[str, int],
+) -> dict[str, object]:
+    """Retain sanitized partial evidence after one source fails closed."""
+    terminal = {
+        "elapsed_ms": budget.observed_elapsed_ms(),
+        **error.evidence,
+    }
+    return {
+        "claims": {
+            "physical_capacity": False,
+            "universal_availability": False,
+        },
+        "complete": False,
+        "failure": error.evidence["reason"],
+        "schema": CANARY_SCHEMA,
+        "services": list(SERVICES),
+        "sources": [*sources, terminal],
+        "tpu_locations": state["tpu_locations"],
+        "total_elapsed_ms": budget.observed_elapsed_ms(),
+        "total_requests": budget.requests,
+    }
+
+
 def run_canary(  # noqa: PLR0913 - explicit global and per-request bounds
     session: SessionLike,
     project: str,
@@ -514,6 +1050,8 @@ def run_canary(  # noqa: PLR0913 - explicit global and per-request bounds
     max_requests: int,
     max_seconds: float,
     max_locations: int,
+    max_transient_retries: int = DEFAULT_MAX_TRANSIENT_RETRIES,
+    retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
 ) -> dict[str, object]:
     """Run one bounded canary and retain budget-exhaustion evidence."""
     if not PROJECT_PATTERN.fullmatch(project):
@@ -525,9 +1063,23 @@ def run_canary(  # noqa: PLR0913 - explicit global and per-request bounds
     if max_locations < 1:
         msg = "TPU location limit must be positive"
         raise ValueError(msg)
+    minimum_requests = (
+        MINIMUM_FIXED_SOURCE_REQUESTS + TPU_CHILD_REQUESTS_PER_LOCATION * max_locations
+    )
+    if max_requests < minimum_requests:
+        msg = (
+            f"global request limit {max_requests} cannot cover "
+            f"at least one request for each of {MINIMUM_FIXED_SOURCE_REQUESTS} "
+            "fixed sources plus "
+            f"{TPU_CHILD_REQUESTS_PER_LOCATION} requests for each of "
+            f"{max_locations} TPU locations; minimum is {minimum_requests}"
+        )
+        raise ValueError(msg)
     budget = RequestBudget(
         max_requests=max_requests,
         max_seconds=max_seconds,
+        max_transient_retries=max_transient_retries,
+        retry_backoff_seconds=retry_backoff_seconds,
     )
     sources: list[dict[str, object]] = []
     state = {"tpu_locations": 0}
@@ -549,6 +1101,13 @@ def run_canary(  # noqa: PLR0913 - explicit global and per-request bounds
             sources=sources,
             state=state,
         )
+    except SourceEvidenceError as error:
+        return _source_failure_evidence(
+            error,
+            budget=budget,
+            sources=sources,
+            state=state,
+        )
 
 
 def _write_evidence(output: Path, evidence: dict[str, object]) -> None:
@@ -563,11 +1122,25 @@ def main(arguments: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project-env", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--max-pages", type=int, default=10)
-    parser.add_argument("--timeout", type=float, default=10.0)
-    parser.add_argument("--max-requests", type=int, default=100)
-    parser.add_argument("--max-seconds", type=float, default=120.0)
-    parser.add_argument("--max-locations", type=int, default=100)
+    parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    )
+    parser.add_argument("--max-requests", type=int, default=DEFAULT_MAX_REQUESTS)
+    parser.add_argument("--max-seconds", type=float, default=DEFAULT_MAX_SECONDS)
+    parser.add_argument("--max-locations", type=int, default=DEFAULT_MAX_LOCATIONS)
+    parser.add_argument(
+        "--max-transient-retries",
+        type=int,
+        default=DEFAULT_MAX_TRANSIENT_RETRIES,
+    )
+    parser.add_argument(
+        "--retry-backoff-seconds",
+        type=float,
+        default=DEFAULT_RETRY_BACKOFF_SECONDS,
+    )
     parsed = parser.parse_args(arguments)
     project = os.environ.get(parsed.project_env)
     if project is None:
@@ -588,6 +1161,8 @@ def main(arguments: Sequence[str] | None = None) -> None:
         max_requests=parsed.max_requests,
         max_seconds=parsed.max_seconds,
         max_locations=parsed.max_locations,
+        max_transient_retries=parsed.max_transient_retries,
+        retry_backoff_seconds=parsed.retry_backoff_seconds,
     )
     _write_evidence(parsed.output, evidence)
 

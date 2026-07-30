@@ -29,6 +29,7 @@ from cqmgr.application.operations.quotas import (
     QuotaBrowseRequest,
     QuotaInspectRequest,
     QuotaResolveRequest,
+    WorkloadChoiceRequest,
 )
 from cqmgr.application.ports.configuration import (
     ConfigurationRepositoryError,
@@ -49,6 +50,8 @@ from cqmgr.domain.accelerator_overlay import (
     ComputeInstanceRequirement,
     ProvisioningModel,
     ResolvedWorkloadRequirement,
+    WorkloadCatalogEvidence,
+    WorkloadKind,
 )
 from cqmgr.domain.diagnostics import (
     Diagnostic,
@@ -567,6 +570,31 @@ class ReadOnlyOperations:
         context, _ = prepared
         delegated = await self._workloads.resolve(
             QuotaResolveRequest(context, requirement)
+        )
+        return _with_provider_identity(delegated, context)
+
+    async def workload_catalog(
+        self,
+        kind: WorkloadKind,
+        *,
+        locations: tuple[str, ...] = (),
+        deadline: float,
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = _DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[WorkloadCatalogEvidence | ReadOnlyFailureData]:
+        """Read live provider choices through the shared workload catalog seam."""
+        prepared = await self._provider_context(
+            operation="quota.workload-catalog",
+            boundary="workload-catalog-read",
+            deadline=deadline,
+            cancellation=cancellation,
+            scope_input=scope_input,
+        )
+        if isinstance(prepared, OperationResult):
+            return prepared
+        context, _ = prepared
+        delegated = await self._workloads.read_catalog(
+            WorkloadChoiceRequest(context, kind, locations)
         )
         return _with_provider_identity(delegated, context)
 

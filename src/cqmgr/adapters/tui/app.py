@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast, override
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, Checkbox, DataTable, Footer, Input, Static
+from textual.suggester import Suggester
+from textual.widgets import Button, Checkbox, DataTable, Footer, Input, Select, Static
 
 from cqmgr.adapters.cli.copy_cli import (
     obtainability_all_compatible_copy_cli,
@@ -62,10 +63,14 @@ from cqmgr.application.operations.watch import WatchStartError
 from cqmgr.application.ports.coordination import CancellationToken
 from cqmgr.application.ports.secrets import SecretValue
 from cqmgr.domain.accelerator_overlay import (
+    CandidateLocations,
     CloudTpuSliceRequirement,
     ComputeInstanceRequirement,
     ProvisioningModel,
+    ResolutionFailureReason,
     ResolvedWorkloadRequirement,
+    WorkloadCatalogEvidence,
+    WorkloadKind,
     WorkloadLocationDisposition,
 )
 from cqmgr.domain.apply_records import (
@@ -73,6 +78,7 @@ from cqmgr.domain.apply_records import (
     UnknownDispatchResolution,
 )
 from cqmgr.domain.audit import AuditQuery
+from cqmgr.domain.diagnostics import RetryDisposition
 from cqmgr.domain.obtainability import (
     DistributionShape,
     GpuAttachment,
@@ -81,7 +87,12 @@ from cqmgr.domain.obtainability import (
     SpotMachineConfiguration,
 )
 from cqmgr.domain.plans import TargetStrategy
-from cqmgr.domain.quota_queries import QuotaQueryFilters, QuotaQueryItem
+from cqmgr.domain.quota_queries import (
+    ProviderSourceCoverage,
+    ProviderSourceCoverageState,
+    QuotaQueryFilters,
+    QuotaQueryItem,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -158,6 +169,17 @@ class ReadOnlyOperationsLike(Protocol):
         scope_input: ReadOnlyScopeInput = _DEFAULT_SCOPE_INPUT,
     ) -> OperationResult[Any]:
         """Resolve one workload-first requirement."""
+
+    async def workload_catalog(
+        self,
+        kind: WorkloadKind,
+        *,
+        locations: tuple[str, ...] = (),
+        deadline: float,
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = _DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[Any]:
+        """Read live typed choices for one workload kind."""
 
     async def compare_obtainability_prepared(
         self,
@@ -271,6 +293,71 @@ class ObtainabilityWorkflowState:
     pending_all_compatible: bool = False
     confirmed_fingerprint: ObtainabilityRequestFingerprint | None = None
     confirmed_candidate_ids: tuple[str, ...] = ()
+
+
+class ProviderReadSource(StrEnum):
+    """Allowlisted provider families rendered in active read progress."""
+
+    QUOTA = "quota providers"
+    WORKLOAD_CATALOG = "workload catalogs"
+    SPOT_ADVICE = "Spot advice providers"
+
+
+class ProviderReadPhase(StrEnum):
+    """Operator-facing phases shared by current and planned provider reads."""
+
+    QUOTA_INVENTORY = "quota inventory"
+    QUOTA_INSPECTION = "exact quota inspection"
+    WORKLOAD_RESOLUTION = "workload resolution"
+    CATALOG_CHOICES = "catalog choices"
+    OBTAINABILITY_EXPANSION = "obtainability candidate expansion"
+    OBTAINABILITY_ELIGIBILITY = "obtainability eligibility"
+    OBTAINABILITY_COMPARISON = "obtainability comparison"
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderReadProgress:
+    """One generation-bound read with a shared caller-controlled deadline."""
+
+    workspace: str
+    source: ProviderReadSource
+    phase: ProviderReadPhase
+    started_at: float
+    deadline: float
+    generation: int
+    cancellation: CancellationToken
+
+
+class TokenAwareCatalogSuggester(Suggester):
+    """Suggest one provider token while preserving prior comma/space tokens."""
+
+    def __init__(self) -> None:
+        """Start empty until typed provider evidence arrives."""
+        super().__init__(use_cache=False, case_sensitive=False)
+        self._values: tuple[str, ...] = ()
+
+    def replace(self, values: tuple[str, ...]) -> None:
+        """Replace suggestions with stable unique provider values."""
+        self._values = tuple(dict.fromkeys(values))
+
+    @override
+    async def get_suggestion(self, value: str) -> str | None:
+        """Complete only the current token, retaining the caller's prefix."""
+        boundary = max(value.rfind(","), value.rfind(" "))
+        prefix = value[: boundary + 1]
+        token = value[boundary + 1 :]
+        if not token:
+            return None
+        folded = token.casefold()
+        return next(
+            (
+                f"{prefix}{candidate}"
+                for candidate in self._values
+                if candidate.casefold().startswith(folded)
+                and candidate.casefold() != folded
+            ),
+            None,
+        )
 
 
 class LifecycleRoute(StrEnum):
@@ -415,6 +502,14 @@ class CloudQuotaManagerApp(App[None]):
         color: #cbd3da;
     }
 
+    #technical-details {
+        height: auto;
+        margin-top: 1;
+        padding: 1;
+        border-top: solid #67727b;
+        color: #b8c4cc;
+    }
+
     #copy-cli-preview {
         height: auto;
         max-height: 5;
@@ -519,8 +614,19 @@ class CloudQuotaManagerApp(App[None]):
         "obtainability-distribution",
         "obtainability-candidates",
     )
+    _CATALOG_INPUT_IDS = (
+        "workload-machine-type",
+        "workload-gpu-type",
+        "workload-accelerator-type",
+        "workload-topology",
+        "workload-runtime-version",
+        "workload-locations",
+        "obtainability-machine-type",
+        "obtainability-gpu-type",
+        "obtainability-candidates",
+    )
 
-    def __init__(  # noqa: PLR0913 - complete surface composition contract
+    def __init__(  # noqa: PLR0913, PLR0915 - complete surface composition contract
         self,
         read_only: ReadOnlyOperationsLike,
         audit: AuditOperationsLike,
@@ -557,6 +663,10 @@ class CloudQuotaManagerApp(App[None]):
         self.scope_input = scope_input
         self.scope_locked = scope_locked
         self._monotonic = monotonic
+        self._catalog_suggesters = {
+            input_id: TokenAwareCatalogSuggester()
+            for input_id in self._CATALOG_INPUT_IDS
+        }
         self.layout_mode = "medium"
         self.active_workspace = "quotas"
         self.current_query = ReadOnlyQuotaQuery()
@@ -567,9 +677,14 @@ class CloudQuotaManagerApp(App[None]):
         self._quota_items: dict[str, QuotaQueryItem] = {}
         self._detail_route = False
         self._workload_kind: str | None = None
+        self._workload_catalog: WorkloadCatalogEvidence | None = None
+        self._workload_catalog_complete: bool | None = None
+        self._obtainability_catalog: WorkloadCatalogEvidence | None = None
+        self._obtainability_catalog_complete: bool | None = None
         self._last_focus_id: str | None = None
         self._provider_worker: Worker[Any] | None = None
         self._cancellation: CancellationToken | None = None
+        self._provider_progress: ProviderReadProgress | None = None
         self._provider_generation = 0
         self._workspace_generation = 0
         self._audit_operation_generation = 0
@@ -603,9 +718,24 @@ class CloudQuotaManagerApp(App[None]):
             yield Button("Quotas", id="workspace-quotas")
             yield Button("Obtainability", id="workspace-obtainability")
             yield Button("Audit", id="workspace-audit")
+            yield Button(
+                "Cancel read",
+                id="cancel-provider-read",
+                disabled=True,
+            )
+            yield Button(
+                "Show technical details",
+                id="toggle-technical-details",
+            )
         yield Static(
             "READY — provider evidence not yet observed",
             id="status-line",
+            markup=False,
+        )
+        yield Static(
+            "Technical details are available after an operation.",
+            id="technical-details",
+            classes="hidden",
             markup=False,
         )
         with Horizontal(id="quota-workbench"):
@@ -618,8 +748,9 @@ class CloudQuotaManagerApp(App[None]):
                     placeholder="Filter quota ID, name, or dimensions",
                     id="filter-text",
                 )
-                yield Input(
-                    placeholder="Service: compute, tpu, or blank",
+                yield Select(
+                    (("Compute", "compute"), ("Cloud TPU", "tpu")),
+                    prompt="All services",
                     id="filter-service",
                 )
                 yield Button("Apply filters", id="apply-filters")
@@ -649,39 +780,72 @@ class CloudQuotaManagerApp(App[None]):
                     )
                     yield Input(
                         placeholder="Machine type",
+                        name="Machine type",
                         id="workload-machine-type",
+                        suggester=self._catalog_suggesters["workload-machine-type"],
                     )
                     yield Input(
                         placeholder="Optional attached GPU type",
+                        name="Attached GPU type",
                         id="workload-gpu-type",
+                        suggester=self._catalog_suggesters["workload-gpu-type"],
                     )
                     yield Input(
                         placeholder="Optional attached GPU count",
+                        name="Attached GPU count",
                         id="workload-gpu-count",
                     )
                     yield Input(
                         placeholder="Cloud TPU accelerator type",
+                        name="Cloud TPU accelerator type",
                         id="workload-accelerator-type",
+                        suggester=self._catalog_suggesters["workload-accelerator-type"],
                     )
                     yield Input(
                         placeholder="Cloud TPU topology",
+                        name="Cloud TPU topology",
                         id="workload-topology",
+                        suggester=self._catalog_suggesters["workload-topology"],
                     )
                     yield Input(
                         placeholder="Cloud TPU runtime version",
+                        name="Cloud TPU runtime version",
                         id="workload-runtime-version",
+                        suggester=self._catalog_suggesters["workload-runtime-version"],
                     )
                     yield Input(
                         placeholder="Instance or slice count",
+                        name="Instance or slice count",
                         id="workload-count",
                     )
-                    yield Input(
-                        placeholder="Provisioning model",
+                    yield Select(
+                        tuple(
+                            (
+                                model.value.replace("-", " ").title(),
+                                model.value,
+                            )
+                            for model in ProvisioningModel
+                        ),
+                        prompt="Provisioning model",
+                        name="Provisioning model",
                         id="workload-provisioning",
                     )
                     yield Input(
                         placeholder="Comma-separated candidates, or all",
+                        name="Candidate locations",
                         id="workload-locations",
+                        suggester=self._catalog_suggesters["workload-locations"],
+                    )
+                    yield Static(
+                        "CHOICES NOT READ — open a workload route to query "
+                        "the provider.",
+                        id="workload-choice-evidence",
+                        markup=False,
+                    )
+                    yield Checkbox(
+                        "Allow unverified manual entry",
+                        id="workload-manual-entry",
+                        disabled=True,
                     )
                     yield Button("Resolve workload", id="workload-submit")
                 yield Button("Back to quota ledger", id="detail-back")
@@ -823,31 +987,55 @@ class CloudQuotaManagerApp(App[None]):
                     markup=False,
                 )
                 yield Input(
-                    placeholder="Machine type",
+                    placeholder="Machine type, e.g. a3-highgpu-8g",
+                    name="Machine type",
                     id="obtainability-machine-type",
+                    suggester=self._catalog_suggesters["obtainability-machine-type"],
                 )
                 yield Input(
                     placeholder="Optional attached GPU type",
+                    name="Attached GPU type",
                     id="obtainability-gpu-type",
+                    suggester=self._catalog_suggesters["obtainability-gpu-type"],
                 )
                 yield Input(
                     placeholder="Optional attached GPU count",
+                    name="Attached GPU count",
                     id="obtainability-gpu-count",
                 )
                 yield Input(
                     placeholder="VM count",
+                    name="VM count",
                     id="obtainability-vm-count",
                 )
-                yield Input(
-                    placeholder="Distribution: any, any-single-zone, or balanced",
+                yield Select(
+                    (
+                        ("Any", "any"),
+                        ("Any single zone", "any-single-zone"),
+                        ("Balanced", "balanced"),
+                    ),
+                    prompt="Distribution",
+                    name="Distribution",
                     id="obtainability-distribution",
                 )
                 yield Input(
                     placeholder=(
-                        "Explicit candidates separated by spaces: "
-                        "REGION[=ZONE[,ZONE...]]"
+                        "Explicit candidates, e.g. us-central1=us-central1-a "
+                        "us-east4=us-east4-a"
                     ),
+                    name="Candidate regions and zones",
                     id="obtainability-candidates",
+                    suggester=self._catalog_suggesters["obtainability-candidates"],
+                )
+                yield Static(
+                    "CHOICES NOT READ — open Obtainability to query the provider.",
+                    id="obtainability-choice-evidence",
+                    markup=False,
+                )
+                yield Checkbox(
+                    "Allow unverified manual entry",
+                    id="obtainability-manual-entry",
+                    disabled=True,
                 )
                 yield Button(
                     "Compare explicit candidates",
@@ -860,6 +1048,7 @@ class CloudQuotaManagerApp(App[None]):
                 yield Button(
                     "Confirm inherited fields and candidate expansion",
                     id="obtainability-confirm",
+                    classes="hidden",
                 )
                 yield Static(
                     "Candidate expansion: explicit candidates only.",
@@ -917,6 +1106,11 @@ class CloudQuotaManagerApp(App[None]):
         audit_table.add_columns("Record", "Operation", "Outcome", "Occurred")
         self._set_layout(self.size.width)
         self._set_active_workspace("quotas")
+        self.set_interval(
+            0.25,
+            self._refresh_provider_progress,
+            name="provider-progress",
+        )
         self._start_quota_load(self.current_query)
 
     async def on_unmount(self) -> None:
@@ -956,17 +1150,40 @@ class CloudQuotaManagerApp(App[None]):
         if self.active_workspace != "quotas":
             return
         generation = self._claim_provider_view()
-        self._cancellation = CancellationToken()
+        cancellation = CancellationToken()
+        deadline = self._deadline()
+        self._cancellation = cancellation
+        self._begin_provider_progress(
+            workspace="quotas",
+            source=ProviderReadSource.QUOTA,
+            phase=ProviderReadPhase.QUOTA_INVENTORY,
+            generation=generation,
+            cancellation=cancellation,
+            deadline=deadline,
+        )
         self._provider_worker = self.run_worker(
-            self._load_quotas(query, self._cancellation, generation),
+            self._load_quotas(
+                query,
+                cancellation,
+                generation,
+                deadline,
+            ),
             group="quota-load",
             exclusive=True,
             exit_on_error=False,
         )
 
     def _claim_provider_view(self) -> int:
+        progress = self._provider_progress
         if self._cancellation is not None:
             self._cancellation.cancel()
+        if progress is not None:
+            self._restore_interrupted_catalog_choices(progress)
+        self._provider_progress = None
+        if self.is_mounted:
+            self.query_one("#cancel-provider-read", Button).disabled = True
+            if progress is not None:
+                self._set_status(f"CANCELLED — {progress.phase.value} read superseded")
         self._provider_generation += 1
         return self._provider_generation
 
@@ -983,36 +1200,159 @@ class CloudQuotaManagerApp(App[None]):
             generation
         )
 
+    def _begin_provider_progress(  # noqa: PLR0913 - complete progress contract
+        self,
+        *,
+        workspace: str,
+        source: ProviderReadSource,
+        phase: ProviderReadPhase,
+        generation: int,
+        cancellation: CancellationToken,
+        deadline: float,
+    ) -> None:
+        """Render one cancellable provider read without weakening its deadline."""
+        if not self._owns_provider_view(generation):
+            return
+        self._provider_progress = ProviderReadProgress(
+            workspace=workspace,
+            source=source,
+            phase=phase,
+            started_at=cast("float", self._monotonic()),
+            deadline=deadline,
+            generation=generation,
+            cancellation=cancellation,
+        )
+        self.query_one("#cancel-provider-read", Button).disabled = False
+        self._refresh_provider_progress()
+
+    def _advance_provider_progress(
+        self,
+        *,
+        source: ProviderReadSource,
+        phase: ProviderReadPhase,
+        generation: int,
+    ) -> None:
+        """Advance a shared-deadline read while preserving its original start."""
+        progress = self._provider_progress
+        if progress is None or progress.generation != generation:
+            return
+        self._provider_progress = replace(
+            progress,
+            source=source,
+            phase=phase,
+        )
+        self._refresh_provider_progress()
+
+    def _refresh_provider_progress(self) -> None:
+        """Tick elapsed time and stop a read once its visible deadline is reached."""
+        progress = self._provider_progress
+        if (
+            progress is None
+            or not self._owns_provider_view(progress.generation)
+            or self.active_workspace != progress.workspace
+        ):
+            return
+        now = cast("float", self._monotonic())
+        elapsed = max(0.0, now - progress.started_at)
+        remaining = max(0.0, progress.deadline - now)
+        if remaining <= 0:
+            progress.cancellation.cancel()
+            self._restore_interrupted_catalog_choices(progress)
+            self._provider_generation += 1
+            self._provider_progress = None
+            self.query_one("#cancel-provider-read", Button).disabled = True
+            self._set_status(
+                f"DEADLINE REACHED — {progress.phase.value} stopped after "
+                f"{elapsed:.1f}s"
+            )
+            return
+        self._set_status(
+            f"READING — {progress.source.value} / {progress.phase.value} · "
+            f"elapsed {elapsed:.1f}s · deadline in {remaining:.1f}s · "
+            "Cancel read available"
+        )
+
+    def _finish_provider_progress(self, generation: int) -> None:
+        """Clear active progress only for the generation that owns the view."""
+        progress = self._provider_progress
+        if progress is None or progress.generation != generation:
+            return
+        self._provider_progress = None
+        self.query_one("#cancel-provider-read", Button).disabled = True
+
+    def _set_provider_failure(
+        self,
+        generation: int,
+        *,
+        workspace: str,
+        status: str,
+    ) -> None:
+        """Render one worker failure only while its generation owns the workspace."""
+        if self._owns_provider_view(generation) and self.active_workspace == workspace:
+            self._finish_provider_progress(generation)
+            self._set_status(status)
+
+    def _restore_interrupted_catalog_choices(
+        self,
+        progress: ProviderReadProgress,
+    ) -> None:
+        """Turn an interrupted catalog read into explicit incomplete evidence."""
+        if (
+            progress.phase is ProviderReadPhase.CATALOG_CHOICES
+            and self.active_workspace == progress.workspace
+        ):
+            self._bind_catalog_evidence(
+                progress.workspace,
+                None,
+                complete=False,
+            )
+
+    def _cancel_provider_read(self) -> None:
+        """Stop the active read and invalidate every later worker repaint."""
+        progress = self._provider_progress
+        if progress is None or not self._owns_provider_view(progress.generation):
+            return
+        progress.cancellation.cancel()
+        self._restore_interrupted_catalog_choices(progress)
+        self._provider_generation += 1
+        self._provider_progress = None
+        self.query_one("#cancel-provider-read", Button).disabled = True
+        self._set_status(f"CANCELLED — {progress.phase.value} read stopped")
+
     async def _load_quotas(
         self,
         query: ReadOnlyQuotaQuery,
         cancellation: CancellationToken,
         generation: int,
+        deadline: float,
     ) -> None:
         if cancellation.cancelled or not self._owns_quota_view(generation):
             return
-        self._set_status("READING — querying required provider inventory")
         try:
             result = await self.read_only.browse(
                 query,
-                deadline=self._deadline(),
+                deadline=deadline,
                 cancellation=cancellation,
                 scope_input=self.scope_input,
             )
         except asyncio.CancelledError:
             if self._owns_quota_view(generation):
+                self._finish_provider_progress(generation)
                 self._set_status("CANCELLED — prior provider read superseded")
             raise
         except Exception:  # noqa: BLE001 - no typed result exists for worker failure
             if self._owns_quota_view(generation):
+                self._finish_provider_progress(generation)
                 self._set_status(
                     "ERROR — quota inventory unavailable; retry the read-only operation"
                 )
             return
         if cancellation.cancelled or not self._owns_quota_view(generation):
             if self._owns_quota_view(generation):
+                self._finish_provider_progress(generation)
                 self._set_status("CANCELLED — prior provider read superseded")
             return
+        self._finish_provider_progress(generation)
         self.last_result = result
         self._render_instrument(result)
         self._render_quota_result(result)
@@ -1030,19 +1370,19 @@ class CloudQuotaManagerApp(App[None]):
                 )
                 self._show_copy_cli(command)
             return
-        reason = (
-            data.reason
-            if isinstance(data, ReadOnlyFailureData)
-            else result.outcome.code.value
+        evidence_label = self._result_evidence_label(result)
+        messages = tuple(
+            dict.fromkeys(str(diagnostic.message) for diagnostic in result.diagnostics)
         )
-        diagnostic_text = "\n".join(
-            f"{diagnostic.severity.value.upper()} {diagnostic.code.value}: "
-            f"{diagnostic.message} (retry: {diagnostic.retry.value})"
-            for diagnostic in result.diagnostics
-        )
+        guidance = self._result_retry_guidance(result)
         self.query_one("#quota-detail", Static).update(
-            f"Quota inspector unavailable\nReason: {reason}\n"
-            f"{diagnostic_text + chr(10) if diagnostic_text else ''}"
+            f"Quota inspector unavailable\nProvider evidence: {evidence_label}\n"
+            + (
+                "\n".join(f"Notice: {message}" for message in messages) + "\n"
+                if messages
+                else ""
+            )
+            + f"Retry guidance: {guidance}\n"
             "No provider mutation was attempted."
         )
         self._set_status(self._result_status(result))
@@ -1082,17 +1422,21 @@ class CloudQuotaManagerApp(App[None]):
         lines = [
             "Provider coverage:",
             *(
-                f"{coverage.service}: {coverage.state.value} "
+                f"{self._provider_source_label(coverage.service)}: "
+                f"{self._coverage_label_for_result(coverage)} "
                 f"({coverage.pages_completed}/{coverage.pages_attempted} pages)"
                 for coverage in data.source_coverage
             ),
             f"Aggregate completeness: {aggregate}",
         ]
+        lines.extend(
+            self._coverage_blocked_capability(coverage)
+            for coverage in data.source_coverage
+            if coverage.state is not ProviderSourceCoverageState.COMPLETE
+        )
         if self.last_result is not None:
-            lines.extend(
-                f"{diagnostic.severity.value.upper()} "
-                f"{diagnostic.code.value}: {diagnostic.message}"
-                for diagnostic in self.last_result.diagnostics
+            lines.append(
+                "Retry guidance: " + self._result_retry_guidance(self.last_result)
             )
         self.query_one("#coverage-summary", Static).update("  ".join(lines))
 
@@ -1115,6 +1459,7 @@ class CloudQuotaManagerApp(App[None]):
             f"Resource scope: {scope} [{lock}]\n"
             f"Authenticated principal: {principal} · Evidence: {complete}"
         )
+        self._render_technical_details(result)
 
     def _offline_instrument_text(self) -> str:
         return (
@@ -1130,16 +1475,189 @@ class CloudQuotaManagerApp(App[None]):
     def _set_status(self, text: str) -> None:
         self.query_one("#status-line", Static).update(text)
 
+    def _select_text(self, selector: str) -> str:
+        """Return one fixed-domain Select value as parser-ready text."""
+        value = self.query_one(selector, Select).value
+        return "" if value is Select.NULL else str(value)
+
     @staticmethod
     def _result_status(result: OperationResult[Any]) -> str:
         if result.succeeded:
             return "COMPLETE — operation boundary reached"
+        label = CloudQuotaManagerApp._result_evidence_label(result).upper()
+        guidance = CloudQuotaManagerApp._result_retry_guidance(result)
+        if result.completeness.has_partial_data:
+            return (
+                f"USABLE BUT NON-EXHAUSTIVE ({label}) — "
+                f"Returned evidence may be inspected. {guidance}"
+            )
+        return f"{label} — {guidance}"
+
+    @staticmethod
+    def _provider_source_label(service: str) -> str:
+        """Return one stable human source label without exposing API spelling."""
+        return {
+            "compute.googleapis.com": "Compute quotas",
+            "tpu.googleapis.com": "Cloud TPU quotas",
+        }.get(service, "Provider quotas")
+
+    @classmethod
+    def _coverage_blocked_capability(
+        cls,
+        coverage: ProviderSourceCoverage,
+    ) -> str:
+        """State what remains usable and what one missing source blocks."""
+        source = cls._provider_source_label(coverage.service)
+        if coverage.state is ProviderSourceCoverageState.INTENTIONALLY_UNQUERIED:
+            return (
+                f"{source} was intentionally unqueried; exhaustive inventory "
+                f"conclusions and mutation gates that depend on {source} are blocked "
+                "for this view."
+            )
         return (
-            f"{result.outcome.code.value.upper()} — "
-            f"exit {int(result.outcome.exit_class)}; "
-            "evidence "
-            f"{'complete' if result.completeness.is_complete else 'incomplete'}"
+            f"{source}: returned rows remain inspectable; exhaustive inventory "
+            f"conclusions and mutation gates that depend on {source} are blocked."
         )
+
+    @staticmethod
+    def _coverage_label(
+        coverage: ProviderSourceCoverage,
+        diagnostics: tuple[Diagnostic, ...],
+    ) -> str:
+        """Classify one source from typed coverage plus diagnostic codes."""
+        if coverage.state is ProviderSourceCoverageState.COMPLETE:
+            return "complete"
+        if coverage.state is ProviderSourceCoverageState.INTENTIONALLY_UNQUERIED:
+            return "intentionally unqueried"
+        codes = {code.value for code in coverage.diagnostic_codes} | {
+            diagnostic.code.value for diagnostic in diagnostics
+        }
+        if any("timeout" in code or "deadline" in code for code in codes):
+            return "timed out"
+        if any(
+            marker in code
+            for code in codes
+            for marker in ("malformed", "schema", "decode", "invalid-response")
+        ):
+            return "malformed"
+        if (
+            coverage.page_cap_reached
+            or coverage.pages_completed > 0
+            or any("page-cap" in code or "incomplete" in code for code in codes)
+        ):
+            return "page-capped / incomplete"
+        return "unavailable"
+
+    def _coverage_label_for_result(
+        self,
+        coverage: ProviderSourceCoverage,
+    ) -> str:
+        diagnostics = self.last_result.diagnostics if self.last_result else ()
+        return self._coverage_label(
+            coverage,
+            self._coverage_diagnostics(coverage, diagnostics),
+        )
+
+    @staticmethod
+    def _coverage_diagnostics(
+        coverage: ProviderSourceCoverage,
+        diagnostics: tuple[Diagnostic, ...],
+    ) -> tuple[Diagnostic, ...]:
+        """Keep one source label from inheriting another source's failure."""
+        declared_codes = {code.value for code in coverage.diagnostic_codes}
+        if declared_codes:
+            return tuple(
+                diagnostic
+                for diagnostic in diagnostics
+                if diagnostic.code.value in declared_codes
+            )
+        service_token = "tpu" if coverage.service == "tpu.googleapis.com" else "compute"
+        return tuple(
+            diagnostic
+            for diagnostic in diagnostics
+            if service_token in diagnostic.source.value
+            or service_token in diagnostic.code.value
+        )
+
+    @staticmethod
+    def _retry_guidance(retry: RetryDisposition) -> str:
+        """Translate only the typed retry fact, including an honest unknown."""
+        return {
+            RetryDisposition.NEVER: "Do not retry",
+            RetryDisposition.AFTER_UPGRADE: "Upgrade cqmgr, then retry",
+            RetryDisposition.AFTER_REFRESH: "Refresh provider evidence, then retry",
+            RetryDisposition.AFTER_NEW_PREVIEW: ("Create a new Preview, then retry"),
+            RetryDisposition.AFTER_BACKOFF: "Wait, then retry",
+            RetryDisposition.UNKNOWN: "No retry guidance is available",
+        }[retry]
+
+    @staticmethod
+    def _result_retry_guidance(result: OperationResult[Any]) -> str:
+        guidance = tuple(
+            dict.fromkeys(
+                CloudQuotaManagerApp._retry_guidance(diagnostic.retry)
+                for diagnostic in result.diagnostics
+            )
+        )
+        return "; ".join(guidance) if guidance else "No retry guidance is available"
+
+    @staticmethod
+    def _result_evidence_label(result: OperationResult[Any]) -> str:
+        if result.completeness.is_complete:
+            return "complete"
+        codes = {diagnostic.code.value for diagnostic in result.diagnostics}
+        if any("timeout" in code or "deadline" in code for code in codes):
+            return "timed out"
+        if any(
+            marker in code
+            for code in codes
+            for marker in ("malformed", "schema", "decode", "invalid-response")
+        ):
+            return "malformed"
+        return (
+            "page-capped / incomplete"
+            if result.completeness.has_partial_data
+            else "unavailable"
+        )
+
+    def _render_technical_details(self, result: OperationResult[Any]) -> None:
+        """Refresh raw identifiers without changing the disclosure state."""
+        details = self.query_one("#technical-details", Static)
+        details.update(
+            "Technical details\n"
+            + "\n".join(
+                (
+                    *self._result_fact_lines(result),
+                    *self._result_data_fact_lines(result),
+                )
+            )
+        )
+
+    def _toggle_technical_details(self) -> None:
+        details = self.query_one("#technical-details", Static)
+        hidden = details.has_class("hidden")
+        details.set_class(not hidden, "hidden")
+        self.query_one("#toggle-technical-details", Button).label = (
+            "Hide technical details" if hidden else "Show technical details"
+        )
+
+    @staticmethod
+    def _result_data_fact_lines(
+        result: OperationResult[Any],
+    ) -> tuple[str, ...]:
+        """Retain machine-facing data reasons outside the primary result copy."""
+        data = result.data
+        if isinstance(data, (IncompleteQuotaInspectData, ReadOnlyFailureData)):
+            return (f"Detail reason: {data.reason}",)
+        if isinstance(data, QuotaInspectData) and data.reason is not None:
+            return (f"Detail reason: {data.reason}",)
+        if isinstance(data, ResolvedWorkloadRequirement):
+            return tuple(
+                f"Location {location.location} reason: {location.failure_reason.value}"
+                for location in data.locations
+                if location.failure_reason is not None
+            )
+        return ()
 
     def open_compose(
         self,
@@ -3078,10 +3596,7 @@ class CloudQuotaManagerApp(App[None]):
                         "vm-count="
                         + self.query_one("#obtainability-vm-count", Input).value
                         + " distribution="
-                        + self.query_one(
-                            "#obtainability-distribution",
-                            Input,
-                        ).value,
+                        + self._select_text("#obtainability-distribution"),
                         "obtainability-candidates="
                         + self.query_one("#obtainability-candidates", Input).value,
                         "obtainability-expansion="
@@ -3162,9 +3677,17 @@ class CloudQuotaManagerApp(App[None]):
 
     def action_workspace(self, workspace: str) -> None:
         """Switch among the three sibling workspaces without losing inspector state."""
-        if workspace == "obtainability" and self.active_workspace != "obtainability":
+        entering_obtainability = (
+            workspace == "obtainability" and self.active_workspace != "obtainability"
+        )
+        if entering_obtainability:
             self._prepare_standalone_obtainability()
         self._set_active_workspace(workspace)
+        if entering_obtainability and self.active_workspace == workspace:
+            self._start_catalog_load(
+                WorkloadKind.COMPUTE_INSTANCE,
+                workspace="obtainability",
+            )
 
     def _set_active_workspace(self, workspace: str) -> None:
         if (
@@ -3182,7 +3705,8 @@ class CloudQuotaManagerApp(App[None]):
         self._workspace_generation += 1
         workspace_generation = self._workspace_generation
         if workspace == "audit" or (
-            self.active_workspace == "quotas" and workspace != "quotas"
+            workspace != self.active_workspace
+            and self.active_workspace in {"quotas", "obtainability"}
         ):
             self._claim_provider_view()
         self.active_workspace = workspace
@@ -3286,6 +3810,8 @@ class CloudQuotaManagerApp(App[None]):
         button_id = event.button.id
         if button_id and button_id.startswith("workspace-"):
             self.action_workspace(button_id.removeprefix("workspace-"))
+        elif button_id == "cancel-provider-read":
+            self._cancel_provider_read()
         elif button_id == "apply-filters" and self.active_workspace == "quotas":
             self._apply_filters()
         elif button_id == "detail-back":
@@ -3351,6 +3877,8 @@ class CloudQuotaManagerApp(App[None]):
                 exclusive=True,
                 exit_on_error=False,
             )
+        elif button_id == "toggle-technical-details":
+            self._toggle_technical_details()
         elif button_id in {"copy-cli", "obtainability-copy"}:
             command = self.last_copied_cli
             if command is not None:
@@ -3379,57 +3907,79 @@ class CloudQuotaManagerApp(App[None]):
             and input_id.startswith("obtainability-")
             and self.active_workspace == "obtainability"
         ):
-            try:
-                current = self._decode_obtainability_form(
-                    all_compatible=self._active_obtainability_all_compatible,
-                )
-            except (TypeError, ValueError):
-                current = None
-            if (
-                current is not None
-                and current.fingerprint == self._active_obtainability_fingerprint
-                and self._active_obtainability_inputs.get(input_id) == event.value
-            ):
-                return
-            self._claim_provider_view()
-            self._active_obtainability_fingerprint = None
-            self._active_obtainability_all_compatible = (
-                current.all_compatible if current is not None else False
+            self._invalidate_obtainability_edit(input_id, event.value)
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        """Treat fixed-domain edits like provider-backed text edits."""
+        if (
+            event.select.id == "obtainability-distribution"
+            and self.active_workspace == "obtainability"
+        ):
+            self._invalidate_obtainability_edit(
+                event.select.id,
+                "" if event.value is Select.NULL else str(event.value),
             )
-            self._active_obtainability_inputs.clear()
-            entry_mode = self._obtainability_state.entry_mode
-            self._obtainability_state = replace(
-                self._obtainability_state,
-                pending_expansion=None,
-                pending_fingerprint=None,
-                pending_all_compatible=False,
-                confirmed_fingerprint=None,
-                confirmed_candidate_ids=(),
+
+    def _invalidate_obtainability_edit(self, input_id: str, value: str) -> None:
+        """Invalidate every provider-backed Obtainability artifact on edit."""
+        if (
+            self._active_obtainability_fingerprint is None
+            and self._active_obtainability_inputs.get(input_id) == value
+        ):
+            return
+        try:
+            current = self._decode_obtainability_form(
+                all_compatible=self._active_obtainability_all_compatible,
             )
-            self._copy_cli_by_workspace.pop("obtainability", None)
-            self.last_result = None
-            self.query_one("#instrument-bar", Static).update(
-                self._offline_instrument_text()
-            )
-            self.query_one("#obtainability-detail", Static).update(
+        except (TypeError, ValueError):
+            current = None
+        if (
+            current is not None
+            and current.fingerprint == self._active_obtainability_fingerprint
+            and self._active_obtainability_inputs.get(input_id) == value
+        ):
+            return
+        self._claim_provider_view()
+        self._active_obtainability_fingerprint = None
+        self._active_obtainability_all_compatible = (
+            current.all_compatible if current is not None else False
+        )
+        self._active_obtainability_inputs.clear()
+        entry_mode = self._obtainability_state.entry_mode
+        self._obtainability_state = replace(
+            self._obtainability_state,
+            pending_expansion=None,
+            pending_fingerprint=None,
+            pending_all_compatible=False,
+            confirmed_fingerprint=None,
+            confirmed_candidate_ids=(),
+        )
+        self._copy_cli_by_workspace.pop("obtainability", None)
+        self.last_result = None
+        self.query_one("#instrument-bar", Static).update(
+            self._offline_instrument_text()
+        )
+        self.query_one("#obtainability-detail", Static).update(
+            self._standalone_obtainability_prompt()
+            if entry_mode is ObtainabilityEntryMode.STANDALONE
+            else (
                 "Complete the fixed request and choose an explicit candidate mode.\n"
                 "Obtainability is Preview evidence, not capacity."
             )
-            self._sync_copy_cli_preview()
-            self._set_status(
-                "INPUT CHANGED — confirm the exact request before comparison"
-            )
-            if current is not None and entry_mode is ObtainabilityEntryMode.STANDALONE:
-                if current.all_compatible:
-                    self._show_obtainability_all_compatible_copy_cli(current)
-                elif current.candidates:
-                    self._show_obtainability_copy_cli(current.candidates)
+        )
+        self._sync_copy_cli_preview()
+        self._set_status("INPUT CHANGED — confirm the exact request before comparison")
+        if current is not None and entry_mode is ObtainabilityEntryMode.STANDALONE:
+            if current.all_compatible:
+                self._show_obtainability_all_compatible_copy_cli(current)
+            elif current.candidates:
+                self._show_obtainability_copy_cli(current.candidates)
 
     def _apply_filters(self) -> None:
         if self.active_workspace != "quotas":
             return
         text = self.query_one("#filter-text", Input).value.strip() or None
-        service_value = self.query_one("#filter-service", Input).value.strip()
+        service_value = self._select_text("#filter-service")
         try:
             filters = QuotaQueryFilters(
                 services=(service_value,) if service_value else (),
@@ -3440,6 +3990,238 @@ class CloudQuotaManagerApp(App[None]):
             return
         self.current_query = ReadOnlyQuotaQuery(filters=filters)
         self._start_quota_load(self.current_query)
+
+    def _start_catalog_load(self, kind: WorkloadKind, *, workspace: str) -> None:
+        """Start one generation-bound live choice read."""
+        generation = self._claim_provider_view()
+        cancellation = CancellationToken()
+        deadline = self._deadline()
+        self._cancellation = cancellation
+        if workspace == "quotas":
+            self._workload_catalog = None
+            self._workload_catalog_complete = None
+            evidence_selector = "#workload-choice-evidence"
+            manual_selector = "#workload-manual-entry"
+        else:
+            self._obtainability_catalog = None
+            self._obtainability_catalog_complete = None
+            evidence_selector = "#obtainability-choice-evidence"
+            manual_selector = "#obtainability-manual-entry"
+        self.query_one(evidence_selector, Static).update(
+            "READING CHOICES — live provider catalog evidence is in progress."
+        )
+        manual = self.query_one(manual_selector, Checkbox)
+        manual.value = False
+        manual.disabled = True
+        self._begin_provider_progress(
+            workspace=workspace,
+            source=ProviderReadSource.WORKLOAD_CATALOG,
+            phase=ProviderReadPhase.CATALOG_CHOICES,
+            generation=generation,
+            cancellation=cancellation,
+            deadline=deadline,
+        )
+        self._provider_worker = self.run_worker(
+            self._load_catalog(
+                kind,
+                workspace,
+                cancellation,
+                generation,
+                deadline,
+            ),
+            group=f"{workspace}-catalog-choices",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _load_catalog(
+        self,
+        kind: WorkloadKind,
+        workspace: str,
+        cancellation: CancellationToken,
+        generation: int,
+        deadline: float,
+    ) -> None:
+        """Read and bind typed choices only while this route owns the view."""
+        try:
+            result = await self.read_only.workload_catalog(
+                kind,
+                deadline=deadline,
+                cancellation=cancellation,
+                scope_input=self.scope_input,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - no typed result exists to render
+            if self._owns_catalog_view(kind, workspace, generation):
+                self._finish_provider_progress(generation)
+                self._bind_catalog_evidence(workspace, None, complete=False)
+                self._set_status(
+                    "CHOICES UNAVAILABLE — enable unverified manual entry or retry"
+                )
+            return
+        if cancellation.cancelled or not self._owns_catalog_view(
+            kind,
+            workspace,
+            generation,
+        ):
+            return
+        self._finish_provider_progress(generation)
+        catalog = (
+            result.data if isinstance(result.data, WorkloadCatalogEvidence) else None
+        )
+        complete = catalog is not None and result.completeness.is_complete
+        self._bind_catalog_evidence(workspace, catalog, complete=complete)
+        empty = (
+            complete
+            and catalog is not None
+            and not self._catalog_has_supported_choices(workspace, catalog)
+        )
+        self._set_status(
+            (
+                "NO SUPPORTED CHOICES — complete provider catalog returned "
+                "no choices for this workload"
+            )
+            if empty
+            else (
+                "GUIDED CHOICES READY — complete provider catalog verified"
+                if complete
+                else (
+                    "PARTIAL CHOICES — manual values require explicit unverified entry"
+                )
+            )
+        )
+
+    def _owns_catalog_view(
+        self,
+        kind: WorkloadKind,
+        workspace: str,
+        generation: int,
+    ) -> bool:
+        if (
+            not self._owns_provider_view(generation)
+            or self.active_workspace != workspace
+        ):
+            return False
+        return workspace != "quotas" or self._workload_kind == kind.value
+
+    def _bind_catalog_evidence(
+        self,
+        workspace: str,
+        catalog: WorkloadCatalogEvidence | None,
+        *,
+        complete: bool,
+    ) -> None:
+        """Bind suggestions and explicit manual-entry policy to one workspace."""
+        if workspace == "quotas":
+            self._workload_catalog = catalog
+            self._workload_catalog_complete = complete
+            evidence_selector = "#workload-choice-evidence"
+            manual_selector = "#workload-manual-entry"
+        else:
+            self._obtainability_catalog = catalog
+            self._obtainability_catalog_complete = complete
+            evidence_selector = "#obtainability-choice-evidence"
+            manual_selector = "#obtainability-manual-entry"
+        self._replace_catalog_suggestions(workspace, catalog)
+        manual = self.query_one(manual_selector, Checkbox)
+        manual.value = False
+        manual.disabled = complete
+        empty = (
+            complete
+            and catalog is not None
+            and not self._catalog_has_supported_choices(workspace, catalog)
+        )
+        self.query_one(evidence_selector, Static).update(
+            (
+                "NO SUPPORTED CHOICES — provider catalog coverage is complete "
+                "but returned no choices for this workload."
+            )
+            if empty
+            else (
+                (
+                    "VERIFIED CHOICES — provider catalog coverage is complete; "
+                    "unsupported combinations are blocked locally."
+                )
+                if complete
+                else (
+                    "PARTIAL CHOICES — catalog coverage is incomplete or unavailable. "
+                    "Manual values require explicit unverified entry."
+                )
+            )
+        )
+
+    def _catalog_has_supported_choices(
+        self,
+        workspace: str,
+        catalog: WorkloadCatalogEvidence,
+    ) -> bool:
+        """Distinguish complete empty evidence from a loading or partial state."""
+        if (
+            workspace == "obtainability"
+            or self._workload_kind == WorkloadKind.COMPUTE_INSTANCE.value
+        ):
+            return bool(catalog.compute_machine_types)
+        location_zones = {location.location_id for location in catalog.tpu_locations}
+        accelerator_zones = {
+            accelerator.zone
+            for accelerator in catalog.tpu_accelerator_types
+            if accelerator.configurations
+        }
+        runtime_zones = {runtime.zone for runtime in catalog.tpu_runtime_versions}
+        return bool(location_zones.intersection(accelerator_zones, runtime_zones))
+
+    def _replace_catalog_suggestions(
+        self,
+        workspace: str,
+        catalog: WorkloadCatalogEvidence | None,
+    ) -> None:
+        """Derive searchable values without exposing provider DTOs to widgets."""
+        catalog = catalog or WorkloadCatalogEvidence.empty()
+        compute_machines = tuple(value.name for value in catalog.compute_machine_types)
+        compute_accelerators = tuple(
+            value.name for value in catalog.compute_accelerator_types
+        )
+        compute_locations = tuple(
+            value.zone
+            for value in (
+                *catalog.compute_machine_types,
+                *catalog.compute_accelerator_types,
+            )
+        )
+        if workspace == "obtainability":
+            values_by_id = {
+                "obtainability-machine-type": compute_machines,
+                "obtainability-gpu-type": compute_accelerators,
+                "obtainability-candidates": tuple(
+                    f"{zone.rpartition('-')[0]}={zone}" for zone in compute_locations
+                ),
+            }
+        elif self._workload_kind == WorkloadKind.CLOUD_TPU_SLICE.value:
+            values_by_id = {
+                "workload-accelerator-type": tuple(
+                    value.accelerator_type for value in catalog.tpu_accelerator_types
+                ),
+                "workload-topology": tuple(
+                    configuration.topology
+                    for value in catalog.tpu_accelerator_types
+                    for configuration in value.configurations
+                ),
+                "workload-runtime-version": tuple(
+                    value.version for value in catalog.tpu_runtime_versions
+                ),
+                "workload-locations": tuple(
+                    value.location_id for value in catalog.tpu_locations
+                ),
+            }
+        else:
+            values_by_id = {
+                "workload-machine-type": compute_machines,
+                "workload-gpu-type": compute_accelerators,
+                "workload-locations": compute_locations,
+            }
+        for input_id, values in values_by_id.items():
+            self._catalog_suggesters[input_id].replace(values)
 
     def _open_workload_route(self, kind: str) -> None:
         """Open one typed workload form without losing inspector state."""
@@ -3468,6 +4250,7 @@ class CloudQuotaManagerApp(App[None]):
             if kind == "compute-instance"
             else self.query_one("#workload-accelerator-type", Input)
         ).focus()
+        self._start_catalog_load(WorkloadKind(kind), workspace="quotas")
 
     def _submit_workload(self) -> None:
         """Decode form primitives through the same public parser as Click."""
@@ -3497,10 +4280,7 @@ class CloudQuotaManagerApp(App[None]):
                         "#workload-count",
                         Input,
                     ).value.strip(),
-                    provisioning_model=self.query_one(
-                        "#workload-provisioning",
-                        Input,
-                    ).value.strip(),
+                    provisioning_model=self._select_text("#workload-provisioning"),
                     locations=locations,
                     all_compatible=all_compatible,
                     attached_accelerator_type=(
@@ -3530,34 +4310,215 @@ class CloudQuotaManagerApp(App[None]):
                         "#workload-count",
                         Input,
                     ).value.strip(),
-                    provisioning_model=self.query_one(
-                        "#workload-provisioning",
-                        Input,
-                    ).value.strip(),
+                    provisioning_model=self._select_text("#workload-provisioning"),
                     locations=locations,
                     all_compatible=all_compatible,
                 )
         except (TypeError, ValueError) as error:
             self._set_status(f"INVALID WORKLOAD — {error}")
             return
+        choice_error = self._validate_workload_choices(requirement)
+        if choice_error is not None:
+            self._set_status(f"INVALID WORKLOAD CHOICE — {choice_error}")
+            return
         generation = self._claim_provider_view()
+        cancellation = CancellationToken()
+        deadline = self._deadline()
+        self._cancellation = cancellation
         self.run_worker(
-            self.resolve_workload(requirement, generation),
+            self.resolve_workload(
+                requirement,
+                generation,
+                cancellation=cancellation,
+                deadline=deadline,
+            ),
             group="workload-resolve",
             exclusive=True,
             exit_on_error=False,
         )
 
+    def _validate_workload_choices(
+        self,
+        requirement: ComputeInstanceRequirement | CloudTpuSliceRequirement,
+    ) -> str | None:
+        """Enforce complete provider evidence or explicit unverified entry."""
+        if self._workload_catalog_complete is None:
+            return "catalog choices are still loading"
+        if not self._workload_catalog_complete:
+            manual = self.query_one("#workload-manual-entry", Checkbox)
+            if not manual.value:
+                return "enable unverified manual entry for incomplete catalog evidence"
+            self.query_one("#workload-choice-evidence", Static).update(
+                "UNVERIFIED MANUAL ENTRY — the provider catalog was incomplete; "
+                "resolution will verify the submitted values."
+            )
+            return None
+        catalog = self._workload_catalog
+        if catalog is None:
+            return "complete catalog evidence is unavailable"
+        if isinstance(requirement, ComputeInstanceRequirement):
+            return self._validate_compute_catalog_choice(requirement, catalog)
+        return self._validate_tpu_catalog_choice(requirement, catalog)
+
+    @staticmethod
+    def _location_matches(zone: str, candidate: str) -> bool:
+        """Match one exact zone or its canonical parent region."""
+        return zone == candidate or zone.startswith(f"{candidate}-")
+
+    def _validate_compute_catalog_choice(
+        self,
+        requirement: ComputeInstanceRequirement,
+        catalog: WorkloadCatalogEvidence,
+    ) -> str | None:
+        """Validate each selected Compute location against complete evidence."""
+        candidates: tuple[str | None, ...] = (
+            tuple(requirement.locations.values)
+            if isinstance(requirement.locations, CandidateLocations)
+            else (None,)
+        )
+        for candidate in candidates:
+            error = self._compute_catalog_choice_error(
+                catalog,
+                machine_type=requirement.machine_type,
+                accelerator_type=requirement.attached_accelerator_type,
+                accelerator_count=requirement.attached_accelerator_count,
+                candidate=candidate,
+            )
+            if error is not None:
+                return error
+        return None
+
+    def _compute_catalog_choice_error(
+        self,
+        catalog: WorkloadCatalogEvidence,
+        *,
+        machine_type: str,
+        accelerator_type: str | None,
+        accelerator_count: int | None,
+        candidate: str | None,
+    ) -> str | None:
+        """Validate one machine/attachment relationship in matching zones."""
+        machines = tuple(
+            machine
+            for machine in catalog.compute_machine_types
+            if machine.name == machine_type
+            and (candidate is None or self._location_matches(machine.zone, candidate))
+        )
+        location_suffix = "" if candidate is None else f" in {candidate}"
+        if not machines:
+            return f"{machine_type} is not available{location_suffix}"
+        if accelerator_type is None:
+            return None
+        compatible_zones = {
+            machine.zone
+            for machine in machines
+            if any(
+                attachment.accelerator_type == accelerator_type
+                and attachment.count == accelerator_count
+                for attachment in machine.guest_accelerators
+            )
+        }
+        if not compatible_zones:
+            return (
+                f"{accelerator_type} x{accelerator_count} is not a supported "
+                f"machine attachment for {machine_type}{location_suffix}"
+            )
+        if not any(
+            accelerator.name == accelerator_type
+            and accelerator.zone in compatible_zones
+            for accelerator in catalog.compute_accelerator_types
+        ):
+            return (
+                f"{accelerator_type} is not available with "
+                f"{machine_type}{location_suffix}"
+            )
+        return None
+
+    def _validate_tpu_catalog_choice(
+        self,
+        requirement: CloudTpuSliceRequirement,
+        catalog: WorkloadCatalogEvidence,
+    ) -> str | None:
+        """Validate TPU type/topology/runtime relationships in the same zone."""
+        candidates: tuple[str | None, ...] = (
+            tuple(requirement.locations.values)
+            if isinstance(requirement.locations, CandidateLocations)
+            else (None,)
+        )
+        inventory_zones = tuple(
+            location.location_id for location in catalog.tpu_locations
+        )
+        for candidate in candidates:
+            zones = tuple(
+                zone
+                for zone in inventory_zones
+                if candidate is None or self._location_matches(zone, candidate)
+            )
+            supported = any(
+                any(
+                    accelerator.zone == zone
+                    and accelerator.accelerator_type == requirement.accelerator_type
+                    and any(
+                        configuration.topology == requirement.topology
+                        for configuration in accelerator.configurations
+                    )
+                    for accelerator in catalog.tpu_accelerator_types
+                )
+                and any(
+                    runtime.zone == zone
+                    and runtime.version == requirement.runtime_version
+                    for runtime in catalog.tpu_runtime_versions
+                )
+                for zone in zones
+            )
+            if not supported:
+                return (
+                    "TPU accelerator, topology, and runtime are not available "
+                    "together" + ("" if candidate is None else f" in {candidate}")
+                )
+        return None
+
     def _prepare_standalone_obtainability(self) -> None:
         self._obtainability_state = ObtainabilityWorkflowState()
+        for selector in (
+            "#obtainability-machine-type",
+            "#obtainability-gpu-type",
+            "#obtainability-gpu-count",
+            "#obtainability-candidates",
+        ):
+            self.query_one(selector, Input).value = ""
+        self.query_one("#obtainability-vm-count", Input).value = "1"
+        self.query_one(
+            "#obtainability-distribution", Select
+        ).value = DistributionShape.ANY.value
         self.query_one("#obtainability-breadcrumb", Static).update(
             "Obtainability / Standalone\n"
             "Fix one exact Spot VM request. Candidate locations never expand silently."
         )
+        self.query_one("#obtainability-detail", Static).update(
+            self._standalone_obtainability_prompt()
+        )
         self.query_one("#obtainability-expansion", Static).update(
             "Candidate expansion: explicit candidates only."
         )
+        confirm = self.query_one("#obtainability-confirm", Button)
+        confirm.label = "Confirm inherited fields and candidate expansion"
+        confirm.add_class("hidden")
         self.query_one("#obtainability-return").add_class("hidden")
+        self._active_obtainability_fingerprint = None
+        self._active_obtainability_all_compatible = False
+        self._active_obtainability_inputs = self._obtainability_input_values()
+
+    @staticmethod
+    def _standalone_obtainability_prompt() -> str:
+        return (
+            "Complete the fixed request and choose an explicit candidate mode.\n"
+            "Example: one Spot a3-highgpu-8g VM using any-single-zone with "
+            "candidates us-central1=us-central1-a us-east4=us-east4-a. "
+            "Question: can this exact request be obtained across these explicit "
+            "candidates?\n"
+            "Obtainability is Preview evidence, not capacity."
+        )
 
     def _open_contextual_obtainability(self) -> None:
         resolved = self._resolved_compute
@@ -3585,7 +4546,7 @@ class CloudQuotaManagerApp(App[None]):
             requirement.instance_count
         )
         self.query_one(
-            "#obtainability-distribution", Input
+            "#obtainability-distribution", Select
         ).value = DistributionShape.ANY.value
         compatible = tuple(
             location.location
@@ -3651,7 +4612,15 @@ class CloudQuotaManagerApp(App[None]):
             + (", ".join(compatible) if compatible else "none proven compatible")
         )
         self.query_one("#obtainability-return").remove_class("hidden")
+        confirm = self.query_one("#obtainability-confirm", Button)
+        confirm.label = "Confirm inherited fields and candidate expansion"
+        confirm.remove_class("hidden")
         self._set_active_workspace("obtainability")
+        self._bind_catalog_evidence(
+            "obtainability",
+            self._workload_catalog,
+            complete=bool(self._workload_catalog_complete),
+        )
         self._set_status("CONFIRM INHERITED FIELDS — no advice query has started")
 
     @staticmethod
@@ -3716,7 +4685,13 @@ class CloudQuotaManagerApp(App[None]):
             self._show_obtainability_all_compatible_copy_cli(draft)
         else:
             self._show_obtainability_copy_cli(candidates)
-        self._set_status("CONFIRMED — inherited fields and candidate mode are explicit")
+        if state.entry_mode is ObtainabilityEntryMode.STANDALONE:
+            self.query_one("#obtainability-confirm").add_class("hidden")
+            self._set_status("CONFIRMED — candidate expansion is explicit")
+        else:
+            self._set_status(
+                "CONFIRMED — inherited fields and candidate mode are explicit"
+            )
 
     def _submit_obtainability(self) -> None:
         """Decode an explicit fixed request through the same parser as Click."""
@@ -3726,6 +4701,11 @@ class CloudQuotaManagerApp(App[None]):
             self._set_status(f"INVALID OBTAINABILITY REQUEST — {error}")
             return
         state = self._obtainability_state
+        if state.entry_mode is ObtainabilityEntryMode.STANDALONE:
+            choice_error = self._validate_obtainability_choices(draft)
+            if choice_error is not None:
+                self._set_status(f"INVALID OBTAINABILITY CHOICE — {choice_error}")
+                return
         if state.entry_mode is ObtainabilityEntryMode.CONTEXTUAL:
             if (
                 state.pending_expansion is None
@@ -3733,13 +4713,23 @@ class CloudQuotaManagerApp(App[None]):
             ):
                 generation = self._claim_provider_view()
                 cancellation = CancellationToken()
+                deadline = self._deadline()
                 self._cancellation = cancellation
                 self._mark_obtainability_submission(draft)
+                self._begin_provider_progress(
+                    workspace="obtainability",
+                    source=ProviderReadSource.WORKLOAD_CATALOG,
+                    phase=ProviderReadPhase.OBTAINABILITY_EXPANSION,
+                    generation=generation,
+                    cancellation=cancellation,
+                    deadline=deadline,
+                )
                 self.run_worker(
                     self._preview_contextual_obtainability(
                         draft,
                         cancellation,
                         generation,
+                        deadline,
                     ),
                     group="obtainability-expand",
                     exclusive=True,
@@ -3760,13 +4750,23 @@ class CloudQuotaManagerApp(App[None]):
                 return
             generation = self._claim_provider_view()
             cancellation = CancellationToken()
+            deadline = self._deadline()
             self._cancellation = cancellation
             self._mark_obtainability_submission(draft)
+            self._begin_provider_progress(
+                workspace="obtainability",
+                source=ProviderReadSource.SPOT_ADVICE,
+                phase=ProviderReadPhase.OBTAINABILITY_COMPARISON,
+                generation=generation,
+                cancellation=cancellation,
+                deadline=deadline,
+            )
             self.run_worker(
                 self._compare_obtainability_prepared(
                     state.pending_expansion,
                     cancellation,
                     generation,
+                    deadline,
                 ),
                 group="obtainability-compare",
                 exclusive=True,
@@ -3775,11 +4775,25 @@ class CloudQuotaManagerApp(App[None]):
             return
         generation = self._claim_provider_view()
         cancellation = CancellationToken()
+        deadline = self._deadline()
         self._cancellation = cancellation
         self._mark_obtainability_submission(draft)
         self._show_obtainability_copy_cli(draft.candidates)
+        self._begin_provider_progress(
+            workspace="obtainability",
+            source=ProviderReadSource.WORKLOAD_CATALOG,
+            phase=ProviderReadPhase.OBTAINABILITY_ELIGIBILITY,
+            generation=generation,
+            cancellation=cancellation,
+            deadline=deadline,
+        )
         self.run_worker(
-            self._compare_obtainability(draft, cancellation, generation),
+            self._compare_obtainability(
+                draft,
+                cancellation,
+                generation,
+                deadline,
+            ),
             group="obtainability-compare",
             exclusive=True,
             exit_on_error=False,
@@ -3797,6 +4811,11 @@ class CloudQuotaManagerApp(App[None]):
         except (TypeError, ValueError) as error:
             self._set_status(f"INVALID OBTAINABILITY REQUEST — {error}")
             return
+        if self._obtainability_state.entry_mode is ObtainabilityEntryMode.STANDALONE:
+            choice_error = self._validate_obtainability_choices(draft)
+            if choice_error is not None:
+                self._set_status(f"INVALID OBTAINABILITY CHOICE — {choice_error}")
+                return
         self._show_obtainability_all_compatible_copy_cli(draft)
         state = self._obtainability_state
         if (
@@ -3813,14 +4832,24 @@ class CloudQuotaManagerApp(App[None]):
             )
             generation = self._claim_provider_view()
             cancellation = CancellationToken()
+            deadline = self._deadline()
             self._cancellation = cancellation
             self._mark_obtainability_submission(draft)
+            self._begin_provider_progress(
+                workspace="obtainability",
+                source=ProviderReadSource.WORKLOAD_CATALOG,
+                phase=ProviderReadPhase.OBTAINABILITY_EXPANSION,
+                generation=generation,
+                cancellation=cancellation,
+                deadline=deadline,
+            )
             self.run_worker(
                 self._preview_obtainability_expansion(
                     requirement,
                     draft,
                     cancellation,
                     generation,
+                    deadline,
                 ),
                 group="obtainability-expand",
                 exclusive=True,
@@ -3834,29 +4863,91 @@ class CloudQuotaManagerApp(App[None]):
             state.confirmed_fingerprint != draft.fingerprint
             or state.confirmed_candidate_ids != confirmed_ids
         ):
+            confirm = self.query_one("#obtainability-confirm", Button)
+            confirm.label = "Confirm candidate expansion"
+            confirm.remove_class("hidden")
             self._set_status("CONFIRM CANDIDATE EXPANSION — no comparison has started")
             return
         generation = self._claim_provider_view()
         cancellation = CancellationToken()
+        deadline = self._deadline()
         self._cancellation = cancellation
         self._mark_obtainability_submission(draft)
+        self._begin_provider_progress(
+            workspace="obtainability",
+            source=ProviderReadSource.SPOT_ADVICE,
+            phase=ProviderReadPhase.OBTAINABILITY_COMPARISON,
+            generation=generation,
+            cancellation=cancellation,
+            deadline=deadline,
+        )
         self.run_worker(
             self._compare_obtainability_prepared(
                 state.pending_expansion,
                 cancellation,
                 generation,
+                deadline,
             ),
             group="obtainability-compare",
             exclusive=True,
             exit_on_error=False,
         )
 
+    def _validate_obtainability_choices(
+        self,
+        draft: ObtainabilityFormDraft,
+    ) -> str | None:
+        """Enforce complete Compute choices for standalone Spot inputs."""
+        if self._obtainability_catalog_complete is None:
+            return "catalog choices are still loading"
+        if not self._obtainability_catalog_complete:
+            manual = self.query_one("#obtainability-manual-entry", Checkbox)
+            if not manual.value:
+                return "enable unverified manual entry for incomplete catalog evidence"
+            self.query_one("#obtainability-choice-evidence", Static).update(
+                "UNVERIFIED MANUAL ENTRY — the provider catalog was incomplete; "
+                "eligibility resolution will verify the submitted values."
+            )
+            return None
+        catalog = self._obtainability_catalog
+        if catalog is None:
+            return "complete catalog evidence is unavailable"
+        candidates: tuple[str | None, ...] = (
+            tuple(
+                location
+                for candidate in draft.candidates
+                for location in (candidate.zones or (candidate.endpoint_region,))
+            )
+            if draft.candidates
+            else (None,)
+        )
+        for candidate in candidates:
+            gpu = draft.machine.gpu
+            error = self._compute_catalog_choice_error(
+                catalog,
+                machine_type=draft.machine.machine_type,
+                accelerator_type=(gpu.accelerator_type if gpu is not None else None),
+                accelerator_count=(gpu.count if gpu is not None else None),
+                candidate=candidate,
+            )
+            if error is not None:
+                return error
+        return None
+
     def _mark_obtainability_submission(self, draft: ObtainabilityFormDraft) -> None:
         """Keep already-submitted form events from superseding their own worker."""
         self._active_obtainability_fingerprint = draft.fingerprint
         self._active_obtainability_all_compatible = draft.all_compatible
-        self._active_obtainability_inputs = {
-            input_id: self.query_one(f"#{input_id}", Input).value
+        self._active_obtainability_inputs = self._obtainability_input_values()
+
+    def _obtainability_input_values(self) -> dict[str, str]:
+        """Snapshot every value whose edit invalidates provider-backed evidence."""
+        return {
+            input_id: (
+                self._select_text(f"#{input_id}")
+                if input_id == "obtainability-distribution"
+                else self.query_one(f"#{input_id}", Input).value
+            )
             for input_id in self._OBTAINABILITY_INPUT_IDS
         }
 
@@ -3879,10 +4970,7 @@ class CloudQuotaManagerApp(App[None]):
                 "#obtainability-vm-count",
                 Input,
             ).value.strip(),
-            distribution_shape=self.query_one(
-                "#obtainability-distribution",
-                Input,
-            ).value.strip(),
+            distribution_shape=self._select_text("#obtainability-distribution"),
         )
         candidate_text = self.query_one(
             "#obtainability-candidates",
@@ -3935,17 +5023,37 @@ class CloudQuotaManagerApp(App[None]):
         draft: ObtainabilityFormDraft,
         cancellation: CancellationToken,
         generation: int,
+        deadline: float,
     ) -> None:
-        result = await self.read_only.resolve(
-            requirement,
-            deadline=self._deadline(),
-            cancellation=cancellation,
-            scope_input=self.scope_input,
-        )
+        try:
+            result = await self.read_only.resolve(
+                requirement,
+                deadline=deadline,
+                cancellation=cancellation,
+                scope_input=self.scope_input,
+            )
+        except asyncio.CancelledError:
+            self._set_provider_failure(
+                generation,
+                workspace="obtainability",
+                status="CANCELLED — obtainability candidate expansion stopped",
+            )
+            raise
+        except Exception:  # noqa: BLE001 - no typed result exists to render
+            self._set_provider_failure(
+                generation,
+                workspace="obtainability",
+                status=(
+                    "ERROR — candidate expansion unavailable; retry the "
+                    "read-only operation"
+                ),
+            )
+            return
         if cancellation.cancelled or not self._owns_obtainability_view(generation):
             return
         data = result.data
         if not isinstance(data, ResolvedWorkloadRequirement):
+            self._finish_provider_progress(generation)
             self._set_status(
                 "EXPANSION UNAVAILABLE — compatible locations were not resolved"
             )
@@ -3959,6 +5067,7 @@ class CloudQuotaManagerApp(App[None]):
             )
             prepared = prepare_obtainability_comparison(data, candidates)
         except (TypeError, ValueError):
+            self._finish_provider_progress(generation)
             self._set_status(
                 "EXPANSION UNAVAILABLE — no cataloged Spot Compute candidates"
             )
@@ -3979,6 +5088,10 @@ class CloudQuotaManagerApp(App[None]):
             "Candidate expansion before comparison: "
             + (", ".join(compatible) or "none proven compatible")
         )
+        confirm = self.query_one("#obtainability-confirm", Button)
+        confirm.label = "Confirm candidate expansion"
+        confirm.remove_class("hidden")
+        self._finish_provider_progress(generation)
         self._set_status("CONFIRM CANDIDATE EXPANSION — no comparison has started")
 
     async def _preview_contextual_obtainability(
@@ -3986,6 +5099,7 @@ class CloudQuotaManagerApp(App[None]):
         draft: ObtainabilityFormDraft,
         cancellation: CancellationToken,
         generation: int,
+        deadline: float,
     ) -> None:
         """Prepare one edited contextual request before operator confirmation."""
         locations = tuple(
@@ -4000,16 +5114,34 @@ class CloudQuotaManagerApp(App[None]):
             locations=locations,
             all_compatible=False,
         )
-        self._set_status("READING — preparing edited inherited fields")
-        result = await self.read_only.resolve(
-            requirement,
-            deadline=self._deadline(),
-            cancellation=cancellation,
-            scope_input=self.scope_input,
-        )
+        try:
+            result = await self.read_only.resolve(
+                requirement,
+                deadline=deadline,
+                cancellation=cancellation,
+                scope_input=self.scope_input,
+            )
+        except asyncio.CancelledError:
+            self._set_provider_failure(
+                generation,
+                workspace="obtainability",
+                status="CANCELLED — obtainability preparation stopped",
+            )
+            raise
+        except Exception:  # noqa: BLE001 - no typed result exists to render
+            self._set_provider_failure(
+                generation,
+                workspace="obtainability",
+                status=(
+                    "ERROR — obtainability preparation unavailable; retry the "
+                    "read-only operation"
+                ),
+            )
+            return
         if cancellation.cancelled or not self._owns_obtainability_view(generation):
             return
         if not isinstance(result.data, ResolvedWorkloadRequirement):
+            self._finish_provider_progress(generation)
             self.last_result = result
             self._render_instrument(result)
             self._render_obtainability_result(result)
@@ -4020,6 +5152,7 @@ class CloudQuotaManagerApp(App[None]):
                 draft.candidates,
             )
         except (TypeError, ValueError):
+            self._finish_provider_progress(generation)
             self._set_status(
                 "PREPARATION UNAVAILABLE — exact candidates were not resolved"
             )
@@ -4032,6 +5165,7 @@ class CloudQuotaManagerApp(App[None]):
             confirmed_fingerprint=None,
             confirmed_candidate_ids=(),
         )
+        self._finish_provider_progress(generation)
         self._set_status("CONFIRM INHERITED FIELDS — no advice query has started")
 
     async def _compare_obtainability(
@@ -4039,6 +5173,7 @@ class CloudQuotaManagerApp(App[None]):
         draft: ObtainabilityFormDraft,
         cancellation: CancellationToken,
         generation: int,
+        deadline: float,
     ) -> None:
         if cancellation.cancelled or not self._owns_obtainability_view(generation):
             return
@@ -4054,38 +5189,60 @@ class CloudQuotaManagerApp(App[None]):
             locations=locations,
             all_compatible=False,
         )
-        self._set_status("READING — checking exact Spot Compute eligibility")
+        self._advance_provider_progress(
+            source=ProviderReadSource.WORKLOAD_CATALOG,
+            phase=ProviderReadPhase.OBTAINABILITY_ELIGIBILITY,
+            generation=generation,
+        )
         try:
             resolved_result = await self.read_only.resolve(
                 requirement,
-                deadline=self._deadline(),
+                deadline=deadline,
                 cancellation=cancellation,
                 scope_input=self.scope_input,
             )
         except asyncio.CancelledError:
+            self._set_provider_failure(
+                generation,
+                workspace="obtainability",
+                status="CANCELLED — obtainability comparison stopped",
+            )
             raise
         except Exception:  # noqa: BLE001 - no typed result exists for worker failure
-            if self._owns_obtainability_view(generation):
-                self._set_status(
+            self._set_provider_failure(
+                generation,
+                workspace="obtainability",
+                status=(
                     "ERROR — obtainability comparison unavailable; retry the "
                     "read-only operation"
-                )
+                ),
+            )
             return
         if cancellation.cancelled or not self._owns_obtainability_view(generation):
             return
         if not isinstance(resolved_result.data, ResolvedWorkloadRequirement):
+            self._finish_provider_progress(generation)
             self.last_result = resolved_result
             self._render_instrument(resolved_result)
             self._render_obtainability_result(resolved_result)
             return
-        prepared = prepare_obtainability_comparison(
-            resolved_result.data,
-            draft.candidates,
-        )
+        try:
+            prepared = prepare_obtainability_comparison(
+                resolved_result.data,
+                draft.candidates,
+            )
+        except (TypeError, ValueError):
+            self._set_provider_failure(
+                generation,
+                workspace="obtainability",
+                status=("PREPARATION UNAVAILABLE — exact candidates were not resolved"),
+            )
+            return
         await self._compare_obtainability_prepared(
             prepared,
             cancellation,
             generation,
+            deadline,
         )
 
     async def _compare_obtainability_prepared(
@@ -4093,19 +5250,43 @@ class CloudQuotaManagerApp(App[None]):
         prepared: PreparedObtainabilityComparison,
         cancellation: CancellationToken,
         generation: int,
+        deadline: float,
     ) -> None:
         """Compare the exact resolver-backed candidates already confirmed."""
         if cancellation.cancelled or not self._owns_obtainability_view(generation):
             return
-        self._set_status("READING — comparing exact Spot VM candidates")
-        result = await self.read_only.compare_obtainability_prepared(
-            prepared,
-            deadline=self._deadline(),
-            cancellation=cancellation,
-            scope_input=self.scope_input,
+        self._advance_provider_progress(
+            source=ProviderReadSource.SPOT_ADVICE,
+            phase=ProviderReadPhase.OBTAINABILITY_COMPARISON,
+            generation=generation,
         )
+        try:
+            result = await self.read_only.compare_obtainability_prepared(
+                prepared,
+                deadline=deadline,
+                cancellation=cancellation,
+                scope_input=self.scope_input,
+            )
+        except asyncio.CancelledError:
+            self._set_provider_failure(
+                generation,
+                workspace="obtainability",
+                status="CANCELLED — obtainability comparison stopped",
+            )
+            raise
+        except Exception:  # noqa: BLE001 - no typed result exists to render
+            self._set_provider_failure(
+                generation,
+                workspace="obtainability",
+                status=(
+                    "ERROR — obtainability comparison unavailable; retry the "
+                    "read-only operation"
+                ),
+            )
+            return
         if cancellation.cancelled or not self._owns_obtainability_view(generation):
             return
+        self._finish_provider_progress(generation)
         self.last_result = result
         self._render_instrument(result)
         self._render_obtainability_result(result)
@@ -4123,7 +5304,7 @@ class CloudQuotaManagerApp(App[None]):
         data = result.data
         lines = [
             "Obtainability comparison",
-            f"Outcome: {result.outcome.code.value}",
+            f"Evidence: {self._result_evidence_label(result)}",
             "Complete: " + ("yes" if result.completeness.is_complete else "no"),
             "Partial evidence retained: "
             + ("yes" if result.completeness.has_partial_data else "no"),
@@ -4133,10 +5314,11 @@ class CloudQuotaManagerApp(App[None]):
             for gap in result.completeness.gaps
         )
         lines.extend(
-            f"{diagnostic.severity.value.upper()} {diagnostic.code.value}: "
-            f"{diagnostic.message} (retry: {diagnostic.retry.value})"
+            f"{diagnostic.severity.value.upper()} notice: {diagnostic.message}"
             for diagnostic in result.diagnostics
         )
+        if result.diagnostics:
+            lines.append("Retry guidance: " + self._result_retry_guidance(result))
         if isinstance(data, ObtainabilityComparison):
             if data.resolver_provenance is not None:
                 provenance = data.resolver_provenance
@@ -4410,8 +5592,24 @@ class CloudQuotaManagerApp(App[None]):
         self.set_class(self._detail_route, "detail-route")
         self._last_focus_id = "quota-ledger"
         generation = self._claim_provider_view()
+        cancellation = CancellationToken()
+        deadline = self._deadline()
+        self._cancellation = cancellation
+        self._begin_provider_progress(
+            workspace="quotas",
+            source=ProviderReadSource.QUOTA,
+            phase=ProviderReadPhase.QUOTA_INSPECTION,
+            generation=generation,
+            cancellation=cancellation,
+            deadline=deadline,
+        )
         self.run_worker(
-            self._inspect_quota(selector, generation),
+            self._inspect_quota(
+                selector,
+                generation,
+                cancellation,
+                deadline,
+            ),
             group="quota-inspect",
             exclusive=True,
             exit_on_error=False,
@@ -4421,16 +5619,38 @@ class CloudQuotaManagerApp(App[None]):
         self,
         selector: QuotaInspectSelector,
         generation: int,
+        cancellation: CancellationToken,
+        deadline: float,
     ) -> None:
         if not self._owns_quota_view(generation):
             return
-        result = await self.read_only.inspect(
-            selector,
-            deadline=self._deadline(),
-            scope_input=self.scope_input,
-        )
-        if not self._owns_quota_view(generation):
+        try:
+            result = await self.read_only.inspect(
+                selector,
+                deadline=deadline,
+                cancellation=cancellation,
+                scope_input=self.scope_input,
+            )
+        except asyncio.CancelledError:
+            self._set_provider_failure(
+                generation,
+                workspace="quotas",
+                status="CANCELLED — exact quota inspection stopped",
+            )
+            raise
+        except Exception:  # noqa: BLE001 - no typed result exists to render
+            self._set_provider_failure(
+                generation,
+                workspace="quotas",
+                status=(
+                    "ERROR — quota inspection unavailable; retry the "
+                    "read-only operation"
+                ),
+            )
             return
+        if cancellation.cancelled or not self._owns_quota_view(generation):
+            return
+        self._finish_provider_progress(generation)
         self.last_result = result
         self._render_instrument(result)
         self._render_quota_detail(result)
@@ -4442,21 +5662,23 @@ class CloudQuotaManagerApp(App[None]):
         lines = [
             "Quota detail",
             f"Operation: {result.operation.value}",
-            f"Outcome: {result.outcome.code.value}",
+            f"Evidence: {self._result_evidence_label(result)}",
             "Complete: " + ("yes" if result.completeness.is_complete else "no"),
         ]
+        if not result.completeness.is_complete or result.diagnostics:
+            lines.append("Retry guidance: " + self._result_retry_guidance(result))
         if isinstance(data, QuotaInspectData):
             lines.extend(self._inspect_lines(data))
         elif isinstance(data, IncompleteQuotaInspectData):
             lines.extend(
                 (
                     f"Selector: {data.selector.service} / {data.selector.quota_id}",
-                    f"Reason: {data.reason}",
+                    "Evidence limitation: the exact quota inventory is incomplete.",
                     f"Retained matching slices: {len(data.matching_items)}",
                 )
             )
         elif isinstance(data, ReadOnlyFailureData):
-            lines.append(f"Reason: {data.reason}")
+            lines.append("Provider evidence is unavailable for this selector.")
         self.query_one("#quota-detail", Static).update("\n".join(lines))
         self.query_one("#quota-compose-request", Button).disabled = not (
             isinstance(data, QuotaInspectData)
@@ -4499,7 +5721,7 @@ class CloudQuotaManagerApp(App[None]):
                 )
             )
         if data.reason is not None:
-            lines.append(f"Reason: {data.reason}")
+            lines.append("Evidence limitation: exact quota evidence is incomplete.")
         return tuple(lines)
 
     async def _inspect_audit(
@@ -4570,15 +5792,49 @@ class CloudQuotaManagerApp(App[None]):
         self,
         requirement: ComputeInstanceRequirement | CloudTpuSliceRequirement,
         generation: int,
+        *,
+        cancellation: CancellationToken | None = None,
+        deadline: float | None = None,
     ) -> OperationResult[Any]:
         """Resolve one typed workload and retain its exact cross-surface result."""
-        result = await self.read_only.resolve(
-            requirement,
-            deadline=self._deadline(),
-            scope_input=self.scope_input,
+        cancellation = cancellation or CancellationToken()
+        deadline = self._deadline() if deadline is None else deadline
+        self._cancellation = cancellation
+        self._begin_provider_progress(
+            workspace="quotas",
+            source=ProviderReadSource.WORKLOAD_CATALOG,
+            phase=ProviderReadPhase.WORKLOAD_RESOLUTION,
+            generation=generation,
+            cancellation=cancellation,
+            deadline=deadline,
         )
-        if not self._owns_quota_view(generation):
+        try:
+            result = await self.read_only.resolve(
+                requirement,
+                deadline=deadline,
+                cancellation=cancellation,
+                scope_input=self.scope_input,
+            )
+        except asyncio.CancelledError:
+            self._set_provider_failure(
+                generation,
+                workspace="quotas",
+                status="CANCELLED — workload resolution stopped",
+            )
+            raise
+        except Exception:
+            self._set_provider_failure(
+                generation,
+                workspace="quotas",
+                status=(
+                    "ERROR — workload resolution unavailable; retry the "
+                    "read-only operation"
+                ),
+            )
+            raise
+        if cancellation.cancelled or not self._owns_quota_view(generation):
             return result
+        self._finish_provider_progress(generation)
         self.last_result = result
         self._render_instrument(result)
         self._render_workload_result(result)
@@ -4597,9 +5853,11 @@ class CloudQuotaManagerApp(App[None]):
         self._resolved_workload = None
         lines = [
             "Workload resolution",
-            f"Outcome: {result.outcome.code.value}",
+            f"Evidence: {self._result_evidence_label(result)}",
             "Complete: " + ("yes" if result.completeness.is_complete else "no"),
         ]
+        if not result.completeness.is_complete or result.diagnostics:
+            lines.append("Retry guidance: " + self._result_retry_guidance(result))
         if isinstance(result.data, ResolvedWorkloadRequirement):
             if (
                 result.completeness.is_complete
@@ -4628,7 +5886,10 @@ class CloudQuotaManagerApp(App[None]):
                     )
                 )
                 if location.failure_reason is not None:
-                    lines.append(f"Reason: {location.failure_reason.value}")
+                    lines.append(
+                        "Explanation: "
+                        + self._workload_failure_explanation(location.failure_reason)
+                    )
             requirement = result.data.requirement
             if (
                 isinstance(requirement, ComputeInstanceRequirement)
@@ -4641,6 +5902,32 @@ class CloudQuotaManagerApp(App[None]):
                 self._resolved_compute = result.data
                 self.query_one("#workload-obtainability").remove_class("hidden")
         elif isinstance(result.data, ReadOnlyFailureData):
-            lines.append(f"Reason: {result.data.reason}")
+            lines.append("Provider evidence is unavailable for this workload.")
         self.query_one("#quota-detail", Static).update("\n".join(lines))
         self._set_status(self._result_status(result))
+
+    @staticmethod
+    def _workload_failure_explanation(
+        reason: ResolutionFailureReason,
+    ) -> str:
+        """Translate stable resolution reasons into primary human guidance."""
+        return {
+            ResolutionFailureReason.AMBIGUOUS: (
+                "Provider evidence supports conflicting interpretations."
+            ),
+            ResolutionFailureReason.UNSUPPORTED_CONVERSION: (
+                "No supported quota conversion exists for this workload."
+            ),
+            ResolutionFailureReason.UNSUPPORTED_COMPATIBILITY: (
+                "Catalog evidence does not support this workload in this location."
+            ),
+            ResolutionFailureReason.PROVIDER_IDENTITY: (
+                "Provider identity evidence could not be verified."
+            ),
+            ResolutionFailureReason.MISSING_LOCATION_EVIDENCE: (
+                "Location evidence is incomplete."
+            ),
+            ResolutionFailureReason.INELIGIBLE: (
+                "This workload is not eligible in this location."
+            ),
+        }[reason]
