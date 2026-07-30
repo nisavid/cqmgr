@@ -48,6 +48,8 @@ from cqmgr.domain.accelerator_overlay import (
     QuotaConstraintRequirement,
     ResolvedWorkloadLocation,
     ResolvedWorkloadRequirement,
+    WorkloadCatalogEvidence,
+    WorkloadKind,
     WorkloadLocationDisposition,
 )
 from cqmgr.domain.catalog import (
@@ -306,15 +308,27 @@ class UnusedWorkloadOperations:
 class RecordingWorkloadOperations:
     """Record one typed workload-resolution request."""
 
-    def __init__(self, scripted: OperationResult[object]) -> None:
+    def __init__(
+        self,
+        scripted: OperationResult[object],
+        catalog_result: OperationResult[object] | None = None,
+    ) -> None:
         """Retain the scripted operation result."""
         self.scripted = scripted
+        self.catalog_result = catalog_result
         self.requests: list[object] = []
+        self.catalog_requests: list[object] = []
 
     async def resolve(self, request: object) -> OperationResult[object]:
         """Record and return one workload result."""
         self.requests.append(request)
         return self.scripted
+
+    async def read_catalog(self, request: object) -> OperationResult[object]:
+        """Record and return one workload-choice result."""
+        self.catalog_requests.append(request)
+        assert self.catalog_result is not None
+        return self.catalog_result
 
 
 class RecordingObtainabilityOperations:
@@ -1585,4 +1599,38 @@ def test_resolve_delegates_typed_requirement_with_the_same_bounded_context() -> 
     assert returned.identity_evidence == ProviderIdentityEvidence.from_adc(identity())
     request = workloads.requests[0]
     assert request.requirement is requirement  # type: ignore[attr-defined]
+    assert request.context.deadline == deadline  # type: ignore[attr-defined]
+
+
+def test_workload_catalog_delegates_kind_locations_and_bounded_context() -> None:
+    """Guided choices share scope, ADC, deadline, and cancellation policy."""
+    catalog = WorkloadCatalogEvidence.empty()
+    catalog_result = result(
+        "quota.workload-catalog",
+        catalog,
+        resource_scope=scope("123456789"),
+    )
+    workloads = RecordingWorkloadOperations(
+        result("quota.resolve", None),
+        catalog_result,
+    )
+    facade, _, _, _, _, _, _ = service(
+        selection=SelectionState(direct_resource_scope=scope("123456789")),
+        workloads=workloads,
+    )
+    deadline = 8.0
+
+    returned = asyncio.run(
+        facade.workload_catalog(
+            WorkloadKind.COMPUTE_INSTANCE,
+            locations=("us-central1-a",),
+            deadline=deadline,
+        )
+    )
+
+    assert returned.data is catalog
+    assert returned.identity_evidence == ProviderIdentityEvidence.from_adc(identity())
+    request = workloads.catalog_requests[0]
+    assert request.kind is WorkloadKind.COMPUTE_INSTANCE  # type: ignore[attr-defined]
+    assert request.locations == ("us-central1-a",)  # type: ignore[attr-defined]
     assert request.context.deadline == deadline  # type: ignore[attr-defined]

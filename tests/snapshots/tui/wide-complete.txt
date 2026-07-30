@@ -15,7 +15,7 @@ tpu.googleapis.com TPU-V6E-CHIPS us-central2
 discovered=yes cataloged=yes guided=no mutable=no
 copy-cli=cqmgr quota list --resource-scope projects/123456789 --limit 100 --output human
 status=COMPLETE — operation boundary reached
-coverage=Provider coverage:  compute.googleapis.com: complete (1/1 pages)  tpu.googleapis.com: complete (1/1 pages)  Aggregate completeness: complete
+coverage=Provider coverage:  Compute quotas: complete (1/1 pages)  Cloud TPU quotas: complete (1/1 pages)  Aggregate completeness: complete  Retry guidance: No retry guidance is available
 detail=Quota detail
 Select an exact effective quota slice.
 audit=Select a retained record to inspect its exact chain facts.

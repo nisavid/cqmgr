@@ -15,9 +15,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, override
 
+import pytest
 from click.testing import CliRunner
 from textual.filter import Monochrome, NoColor
-from textual.widgets import Button, Checkbox, DataTable, Input, Static
+from textual.widgets import Button, Checkbox, DataTable, Input, Select, Static
 
 import cqmgr.cli as cli_module
 from cqmgr.adapters.cli.lifecycle import (
@@ -25,7 +26,10 @@ from cqmgr.adapters.cli.lifecycle import (
     WatchCliInput,
 )
 from cqmgr.adapters.serialization.results import operation_result_mapping
-from cqmgr.adapters.tui.app import CloudQuotaManagerApp
+from cqmgr.adapters.tui.app import (
+    CloudQuotaManagerApp,
+    TokenAwareCatalogSuggester,
+)
 from cqmgr.application.operations.apply import (
     ApplyChildData,
     ApplyData,
@@ -54,6 +58,7 @@ from cqmgr.application.operations.plans import (
 )
 from cqmgr.application.operations.quotas import QuotaBrowseData, QuotaInspectData
 from cqmgr.application.operations.read_only import (
+    IncompleteQuotaInspectData,
     QuotaInspectSelector,
     ReadOnlyFailureData,
     ReadOnlyQuotaQuery,
@@ -72,6 +77,8 @@ from cqmgr.domain.accelerator_overlay import (
     ResolutionFailureReason,
     ResolvedWorkloadLocation,
     ResolvedWorkloadRequirement,
+    WorkloadCatalogEvidence,
+    WorkloadKind,
     WorkloadLocationDisposition,
 )
 from cqmgr.domain.apply_records import (
@@ -87,10 +94,21 @@ from cqmgr.domain.audit import (
     AuditVerification,
 )
 from cqmgr.domain.catalog import (
+    AcceleratorAttachment,
     AcceleratorConstraintSet,
     AcceleratorId,
+    CatalogEvidenceSource,
+    CatalogLocationCoverage,
     CatalogPredicates,
+    ComputeAcceleratorType,
+    ComputeMachineType,
+    LocationCoverageExpectation,
+    LocationCoverageState,
     ManagementPlane,
+    TpuAcceleratorConfig,
+    TpuAcceleratorType,
+    TpuLocation,
+    TpuRuntimeVersion,
     UnitConversionEvidence,
     WorkloadConsumer,
 )
@@ -174,8 +192,6 @@ from cqmgr.domain.watch import (
 )
 
 if TYPE_CHECKING:
-    import pytest
-
     from cqmgr.application.operations.obtainability import (
         PreparedObtainabilityComparison,
     )
@@ -189,12 +205,25 @@ KEY = SecretValue(b"k" * 32)
 DEFAULT_SCOPE_INPUT = ReadOnlyScopeInput()
 
 
+class ManualMonotonic:
+    """Advance injected UI time without delaying the test process."""
+
+    def __init__(self, initial: float) -> None:
+        self.value = initial
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
 def _static(app: CloudQuotaManagerApp, selector: str) -> Static:
     return app.query_one(selector, Static)
 
 
-def _input(app: CloudQuotaManagerApp, selector: str) -> Input:
-    return app.query_one(selector, Input)
+def _input(app: CloudQuotaManagerApp, selector: str) -> Any:
+    return app.query_one(selector)
 
 
 def _table(app: CloudQuotaManagerApp, selector: str) -> DataTable[object]:
@@ -344,6 +373,120 @@ PARTIAL_DIAGNOSTIC = Diagnostic(
         "Cloud TPU location evidence is incomplete; refresh the inventory."
     ),
 )
+
+
+def _workload_catalog_result(
+    *,
+    complete: bool = True,
+) -> OperationResult[WorkloadCatalogEvidence]:
+    """Return live choice evidence spanning the public TUI examples."""
+    zones = (
+        "us-central1-a",
+        "us-central1-b",
+        "us-east1-b",
+        "us-east1-c",
+    )
+    machines = tuple(
+        ComputeMachineType(machine, zone, attachments, None)
+        for zone in zones
+        for machine, attachments in (
+            (
+                "a3-highgpu-8g",
+                (AcceleratorAttachment("nvidia-h100-80gb", 8),),
+            ),
+            ("n1-standard-16", ()),
+        )
+    )
+    accelerators = tuple(
+        ComputeAcceleratorType(accelerator, zone, None)
+        for zone in zones
+        for accelerator in ("nvidia-h100-80gb", "nvidia-tesla-t4")
+    )
+    tpu_locations = tuple(
+        TpuLocation(f"projects/123456789/locations/{zone}", zone) for zone in zones
+    )
+    tpu_accelerators = tuple(
+        TpuAcceleratorType(
+            f"projects/123456789/locations/{zone}/acceleratorTypes/v6e-8",
+            zone,
+            "v6e-8",
+            (TpuAcceleratorConfig("V6E", "2x4"),),
+        )
+        for zone in zones
+    )
+    runtimes = tuple(
+        TpuRuntimeVersion(
+            f"projects/123456789/locations/{zone}/runtimeVersions/{version}",
+            zone,
+            version,
+        )
+        for zone in zones
+        for version in ("tpu-vm-base", "v2-alpha-tpuv6e")
+    )
+    coverage = tuple(
+        CatalogLocationCoverage(
+            source,
+            zone,
+            LocationCoverageExpectation.EXPECTED,
+            (
+                LocationCoverageState.NOT_SCANNED
+                if not complete
+                and source is CatalogEvidenceSource.COMPUTE_MACHINE_TYPES
+                and zone == "us-east1-b"
+                else LocationCoverageState.SUCCESS
+            ),
+            (
+                (PARTIAL_DIAGNOSTIC,)
+                if not complete
+                and source is CatalogEvidenceSource.COMPUTE_MACHINE_TYPES
+                and zone == "us-east1-b"
+                else ()
+            ),
+        )
+        for source in (
+            CatalogEvidenceSource.COMPUTE_MACHINE_TYPES,
+            CatalogEvidenceSource.COMPUTE_ACCELERATOR_TYPES,
+            CatalogEvidenceSource.TPU_LOCATIONS,
+            CatalogEvidenceSource.TPU_ACCELERATOR_TYPES,
+            CatalogEvidenceSource.TPU_RUNTIME_VERSIONS,
+        )
+        for zone in zones
+    )
+    catalog = WorkloadCatalogEvidence(
+        machines,
+        tpu_locations,
+        tpu_accelerators,
+        runtimes,
+        coverage,
+        accelerators,
+    )
+    return OperationResult(
+        operation=OperationName("quota.workload-catalog"),
+        resource_scope=SCOPE,
+        boundary=OperationBoundary(StableSymbol("workload-catalog-read"), complete),
+        outcome=Outcome(
+            StableSymbol(
+                "workload-catalog-read"
+                if complete
+                else "workload-catalog-read-incomplete"
+            ),
+            ExitClass.SUCCESS if complete else ExitClass.INCOMPLETE_EVIDENCE,
+        ),
+        completeness=(
+            Completeness.complete()
+            if complete
+            else Completeness.incomplete(
+                EvidenceGap(
+                    StableSymbol("compute-machine-types"),
+                    StableSymbol("missing-location-evidence"),
+                )
+            )
+        ),
+        started_at=NOW,
+        finished_at=NOW,
+        data=catalog,
+        diagnostics=() if complete else (PARTIAL_DIAGNOSTIC,),
+    )
 
 
 def _failure_result() -> OperationResult[ReadOnlyFailureData]:
@@ -756,6 +899,8 @@ class ScriptedReadOnlyOperations:
         self.resolve_calls: list[
             tuple[ComputeInstanceRequirement | CloudTpuSliceRequirement, dict[str, Any]]
         ] = []
+        self.catalog_result = _workload_catalog_result()
+        self.catalog_calls: list[tuple[WorkloadKind, dict[str, Any]]] = []
         self.obtainability_result = _obtainability_result()
         self.obtainability_calls: list[
             tuple[tuple[ObtainabilityCandidate, ...], dict[str, Any]]
@@ -858,6 +1003,29 @@ class ScriptedReadOnlyOperations:
             finished_at=NOW,
             data=ResolvedWorkloadRequirement(requirement, locations, exhaustive),
         )
+
+    async def workload_catalog(
+        self,
+        kind: WorkloadKind,
+        *,
+        locations: tuple[str, ...] = (),
+        deadline: float,
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[WorkloadCatalogEvidence]:
+        """Return scripted typed catalog evidence for guided TUI controls."""
+        self.catalog_calls.append(
+            (
+                kind,
+                {
+                    "locations": locations,
+                    "deadline": deadline,
+                    "cancellation": cancellation,
+                    "scope_input": scope_input,
+                },
+            )
+        )
+        return self.catalog_result
 
     async def compare_obtainability(
         self,
@@ -1109,6 +1277,36 @@ class FailedReadOnlyOperations(ScriptedReadOnlyOperations):
         raise RuntimeError(msg)
 
 
+class FailedProviderDetailOperations(ScriptedReadOnlyOperations):
+    """Raise before exact inspection or workload resolution returns evidence."""
+
+    @override
+    async def inspect(
+        self,
+        selector: QuotaInspectSelector,
+        *,
+        deadline: float,
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[QuotaInspectData]:
+        del selector, deadline, cancellation, scope_input
+        msg = "simulated exact provider read failure"
+        raise RuntimeError(msg)
+
+    @override
+    async def resolve(
+        self,
+        requirement: ComputeInstanceRequirement | CloudTpuSliceRequirement,
+        *,
+        deadline: float,
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[ResolvedWorkloadRequirement]:
+        del requirement, deadline, cancellation, scope_input
+        msg = "simulated workload resolution failure"
+        raise RuntimeError(msg)
+
+
 class BrowseInspectRaceOperations(ScriptedReadOnlyOperations):
     """Delay a refresh past a completed exact-slice inspection."""
 
@@ -1191,6 +1389,34 @@ class DelayedQuotaInspectOperations(ScriptedReadOnlyOperations):
         return result
 
 
+class DelayedCatalogOperations(ScriptedReadOnlyOperations):
+    """Hold one choice read to expose progress and stale repaint protection."""
+
+    def __init__(self) -> None:
+        super().__init__(_browse_result())
+        self.catalog_started = asyncio.Event()
+        self.release_catalog = asyncio.Event()
+        self.catalog_returned = asyncio.Event()
+        self.catalog_cancellation: CancellationToken | None = None
+
+    @override
+    async def workload_catalog(
+        self,
+        kind: WorkloadKind,
+        *,
+        locations: tuple[str, ...] = (),
+        deadline: float,
+        cancellation: CancellationToken | None = None,
+        scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
+    ) -> OperationResult[WorkloadCatalogEvidence]:
+        del kind, locations, deadline, scope_input
+        self.catalog_cancellation = cancellation
+        self.catalog_started.set()
+        await self.release_catalog.wait()
+        self.catalog_returned.set()
+        return self.catalog_result
+
+
 class DelayedObtainabilityOperations(ScriptedReadOnlyOperations):
     """Delay one advice comparison until the user has left Obtainability."""
 
@@ -1199,6 +1425,7 @@ class DelayedObtainabilityOperations(ScriptedReadOnlyOperations):
         self.compare_started = asyncio.Event()
         self.release_compare = asyncio.Event()
         self.compare_returned = asyncio.Event()
+        self.compare_cancellation: CancellationToken | None = None
 
     @override
     async def compare_obtainability_prepared(
@@ -1209,6 +1436,7 @@ class DelayedObtainabilityOperations(ScriptedReadOnlyOperations):
         cancellation: CancellationToken | None = None,
         scope_input: ReadOnlyScopeInput = DEFAULT_SCOPE_INPUT,
     ) -> OperationResult[ObtainabilityComparison]:
+        self.compare_cancellation = cancellation
         self.compare_started.set()
         await self.release_compare.wait()
         result = await super().compare_obtainability_prepared(
@@ -3621,9 +3849,9 @@ def test_workload_routes_decode_both_shapes_and_preserve_canonical_copy_cli() ->
             await pilot.pause()
 
             await pilot.click("#resolve-compute")
-            _input(app, "#workload-machine-type").value = "n1-standard-16"
-            _input(app, "#workload-gpu-type").value = "nvidia-tesla-t4"
-            _input(app, "#workload-gpu-count").value = "2"
+            _input(app, "#workload-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#workload-gpu-type").value = "nvidia-h100-80gb"
+            _input(app, "#workload-gpu-count").value = "8"
             _input(app, "#workload-count").value = "2"
             _input(app, "#workload-provisioning").value = "spot"
             _input(app, "#workload-locations").value = "us-central1-a, us-east1-b"
@@ -3632,10 +3860,10 @@ def test_workload_routes_decode_both_shapes_and_preserve_canonical_copy_cli() ->
 
             compute, compute_options = operations.resolve_calls[0]
             assert isinstance(compute, ComputeInstanceRequirement)
-            assert compute.machine_type == "n1-standard-16"
+            assert compute.machine_type == "a3-highgpu-8g"
             assert compute.instance_count == 2
-            assert compute.attached_accelerator_type == "nvidia-tesla-t4"
-            assert compute.attached_accelerator_count == 2
+            assert compute.attached_accelerator_type == "nvidia-h100-80gb"
+            assert compute.attached_accelerator_count == 8
             assert isinstance(compute.locations, CandidateLocations)
             assert compute.locations.values == ("us-central1-a", "us-east1-b")
             assert compute_options["scope_input"] == ReadOnlyScopeInput()
@@ -3643,18 +3871,19 @@ def test_workload_routes_decode_both_shapes_and_preserve_canonical_copy_cli() ->
             assert app.last_copied_cli.startswith(
                 "cqmgr quota resolve compute-instance "
             )
-            assert "--attached-accelerator-type nvidia-tesla-t4" in (
+            assert "--attached-accelerator-type nvidia-h100-80gb" in (
                 app.last_copied_cli
             )
-            assert "--attached-accelerator-count 2" in app.last_copied_cli
+            assert "--attached-accelerator-count 8" in app.last_copied_cli
             assert "Location: us-central1-a" in str(
                 _static(app, "#quota-detail").content
             )
             assert "Disposition: incompatible" in str(
                 _static(app, "#quota-detail").content
             )
-            assert "Reason: unsupported-compatibility" in str(
-                _static(app, "#quota-detail").content
+            assert (
+                "Catalog evidence does not support this workload in this location."
+                in str(_static(app, "#quota-detail").content)
             )
 
             await pilot.click("#resolve-tpu")
@@ -3678,6 +3907,539 @@ def test_workload_routes_decode_both_shapes_and_preserve_canonical_copy_cli() ->
                 "cqmgr quota resolve cloud-tpu-slice "
             )
             assert "--all-compatible-locations" in app.last_copied_cli
+
+    asyncio.run(scenario())
+
+
+def test_guided_workload_controls_use_fixed_selects_and_live_catalog_choices() -> None:
+    """Fixed domains are selects while provider choices retain typed evidence."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 70)) as pilot:
+            await pilot.pause()
+            assert isinstance(app.query_one("#filter-service"), Select)
+            provisioning = app.query_one("#workload-provisioning", Select)
+            assert isinstance(app.query_one("#obtainability-distribution"), Select)
+            assert provisioning.name == "Provisioning model"
+
+            await pilot.click("#resolve-compute")
+            await pilot.pause()
+
+            assert operations.catalog_calls[0][0] is WorkloadKind.COMPUTE_INSTANCE
+            assert "VERIFIED CHOICES" in str(
+                _static(app, "#workload-choice-evidence").content
+            )
+            machine = _input(app, "#workload-machine-type")
+            assert machine.name == "Machine type"
+            assert machine.has_focus
+            await pilot.press("tab")
+            assert _input(app, "#workload-gpu-type").has_focus
+            await pilot.press("tab")
+            assert _input(app, "#workload-gpu-count").has_focus
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "model",
+    [ProvisioningModel.FLEX_START, ProvisioningModel.RESERVATION_BOUND],
+)
+def test_workload_provisioning_select_preserves_every_typed_model(
+    model: ProvisioningModel,
+) -> None:
+    """The TUI fixed domain reaches the same parser values as the CLI."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 70)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-compute")
+            await pilot.pause()
+            _input(app, "#workload-machine-type").value = "n1-standard-16"
+            _input(app, "#workload-count").value = "1"
+            _input(app, "#workload-provisioning").value = model.value
+            _input(app, "#workload-locations").value = "us-central1-a"
+            _button(app, "#workload-submit").press()
+            await pilot.pause()
+
+            requirement, _ = operations.resolve_calls[0]
+            assert requirement.provisioning_model is model
+
+    asyncio.run(scenario())
+
+
+def test_catalog_autocomplete_replaces_only_the_active_token() -> None:
+    """Searchable provider choices preserve prior comma- and space-delimited input."""
+    suggester = TokenAwareCatalogSuggester()
+    suggester.replace(("us-central1-a", "us-east1-b"))
+
+    assert (
+        asyncio.run(suggester.get_suggestion("us-central1-a,us-e"))
+        == "us-central1-a,us-east1-b"
+    )
+    assert (
+        asyncio.run(suggester.get_suggestion("us-central1-a us-e"))
+        == "us-central1-a us-east1-b"
+    )
+
+
+def test_catalog_autocomplete_never_reuses_a_replaced_catalog_result() -> None:
+    """The same typed prefix reflects the latest provider catalog."""
+
+    class SuggestionRecorder:
+        def __init__(self) -> None:
+            self.suggestions: list[str] = []
+
+        def post_message(self, message: Any) -> None:
+            self.suggestions.append(message.suggestion)
+
+    async def scenario() -> None:
+        suggester = TokenAwareCatalogSuggester()
+        recorder: Any = SuggestionRecorder()
+        suggester.replace(("us-east1-b",))
+        await suggester._get_suggestion(  # type: ignore[arg-type]  # noqa: SLF001
+            recorder,
+            "us-e",
+        )
+        suggester.replace(("us-east4-a",))
+        await suggester._get_suggestion(  # type: ignore[arg-type]  # noqa: SLF001
+            recorder,
+            "us-e",
+        )
+
+        assert recorder.suggestions == ["us-east1-b", "us-east4-a"]
+
+    asyncio.run(scenario())
+
+
+def test_catalog_choice_progress_is_visible_cancellable_and_generation_bound() -> None:
+    """A stopped catalog worker restores manual entry and cannot repaint it."""
+
+    async def scenario() -> None:
+        operations = DelayedCatalogOperations()
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 70)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-compute")
+            await operations.catalog_started.wait()
+            await pilot.pause()
+
+            assert "workload catalogs / catalog choices" in str(
+                _static(app, "#status-line").content
+            )
+            _button(app, "#cancel-provider-read").press()
+            await pilot.pause()
+            assert operations.catalog_cancellation is not None
+            assert operations.catalog_cancellation.cancelled
+
+            cancelled_evidence = str(_static(app, "#workload-choice-evidence").content)
+            assert "PARTIAL CHOICES" in cancelled_evidence
+            manual = app.query_one("#workload-manual-entry", Checkbox)
+            assert not manual.disabled
+            operations.release_catalog.set()
+            await operations.catalog_returned.wait()
+            await pilot.pause()
+
+            assert (
+                str(_static(app, "#workload-choice-evidence").content)
+                == cancelled_evidence
+            )
+            assert "CANCELLED — catalog choices read stopped" in str(
+                _static(app, "#status-line").content
+            )
+
+            _input(app, "#workload-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#workload-gpu-type").value = "nvidia-h100-80gb"
+            _input(app, "#workload-gpu-count").value = "8"
+            _input(app, "#workload-count").value = "1"
+            _input(app, "#workload-provisioning").value = "standard"
+            _input(app, "#workload-locations").value = "us-central1-a"
+            manual.value = True
+            _button(app, "#workload-submit").press()
+            await pilot.pause()
+
+            assert len(operations.resolve_calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_catalog_cancellation_restores_obtainability_manual_entry() -> None:
+    """Cancellation restores the escape hatch in the affected workspace."""
+
+    async def scenario() -> None:
+        operations = DelayedCatalogOperations()
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(100, 36)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            await operations.catalog_started.wait()
+            assert app.active_workspace == "obtainability"
+            assert app._provider_progress is not None  # noqa: SLF001
+            assert app._provider_progress.workspace == "obtainability"  # noqa: SLF001
+            assert not _button(app, "#cancel-provider-read").disabled
+            _button(app, "#cancel-provider-read").press()
+            await pilot.pause()
+            assert operations.catalog_cancellation is not None
+            assert operations.catalog_cancellation.cancelled
+
+            evidence = str(_static(app, "#obtainability-choice-evidence").content)
+            manual = app.query_one("#obtainability-manual-entry", Checkbox)
+            assert "PARTIAL CHOICES" in evidence
+            assert not manual.disabled
+
+            operations.release_catalog.set()
+            await operations.catalog_returned.wait()
+            await pilot.pause()
+            assert (
+                str(_static(app, "#obtainability-choice-evidence").content) == evidence
+            )
+
+    asyncio.run(scenario())
+
+
+def test_catalog_supersession_by_form_edit_restores_manual_entry() -> None:
+    """Editing during a catalog read replaces loading state with incomplete evidence."""
+
+    async def scenario() -> None:
+        operations = DelayedCatalogOperations()
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(100, 36)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            await operations.catalog_started.wait()
+            _input(app, "#obtainability-machine-type").value = "a3-highgpu-8g"
+            await pilot.pause()
+
+            assert operations.catalog_cancellation is not None
+            assert operations.catalog_cancellation.cancelled
+            assert app._provider_progress is None  # noqa: SLF001
+            evidence = str(_static(app, "#obtainability-choice-evidence").content)
+            manual = app.query_one("#obtainability-manual-entry", Checkbox)
+            assert "PARTIAL CHOICES" in evidence
+            assert not manual.disabled
+
+            operations.release_catalog.set()
+            await operations.catalog_returned.wait()
+            await pilot.pause()
+            assert (
+                str(_static(app, "#obtainability-choice-evidence").content) == evidence
+            )
+
+    asyncio.run(scenario())
+
+
+def test_catalog_deadline_restores_manual_entry_without_stale_repaint() -> None:
+    """A catalog deadline leaves the form usable through explicit manual entry."""
+
+    async def scenario() -> None:
+        clock = ManualMonotonic(300.0)
+        operations = DelayedCatalogOperations()
+        app = CloudQuotaManagerApp(
+            operations,
+            ScriptedAuditOperations(),
+            monotonic=clock,
+        )
+
+        async with app.run_test(size=(140, 70)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-compute")
+            await operations.catalog_started.wait()
+            clock.advance(60.1)
+            app._refresh_provider_progress()  # noqa: SLF001
+            await pilot.pause()
+
+            assert operations.catalog_cancellation is not None
+            assert operations.catalog_cancellation.cancelled
+            evidence = str(_static(app, "#workload-choice-evidence").content)
+            manual = app.query_one("#workload-manual-entry", Checkbox)
+            assert "PARTIAL CHOICES" in evidence
+            assert not manual.disabled
+            assert (
+                str(_static(app, "#status-line").content)
+                == "DEADLINE REACHED — catalog choices stopped after 60.1s"
+            )
+
+            operations.release_catalog.set()
+            await operations.catalog_returned.wait()
+            await pilot.pause()
+            assert str(_static(app, "#workload-choice-evidence").content) == evidence
+
+    asyncio.run(scenario())
+
+
+def test_complete_catalog_rejects_an_invalid_workload_combination_locally() -> None:
+    """Complete choice evidence prevents unsupported provider values from dispatch."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 70)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-compute")
+            await pilot.pause()
+            _input(app, "#workload-machine-type").value = "unknown-machine"
+            _input(app, "#workload-count").value = "1"
+            _input(app, "#workload-provisioning").value = "standard"
+            _input(app, "#workload-locations").value = "us-central1-a"
+            _button(app, "#workload-submit").press()
+            await pilot.pause()
+
+            assert operations.resolve_calls == []
+            assert "INVALID WORKLOAD CHOICE" in str(
+                _static(app, "#status-line").content
+            )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("accelerator_type", "accelerator_count"),
+    [("nvidia-h100-80gb", "2"), ("nvidia-tesla-t4", "8")],
+)
+def test_complete_catalog_rejects_machine_gpu_relationship_mismatches_locally(
+    accelerator_type: str,
+    accelerator_count: str,
+) -> None:
+    """Separate same-zone declarations do not prove machine attachment support."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 70)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-compute")
+            await pilot.pause()
+            _input(app, "#workload-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#workload-gpu-type").value = accelerator_type
+            _input(app, "#workload-gpu-count").value = accelerator_count
+            _input(app, "#workload-count").value = "1"
+            _input(app, "#workload-provisioning").value = "standard"
+            _input(app, "#workload-locations").value = "us-central1-a"
+            _button(app, "#workload-submit").press()
+            await pilot.pause()
+
+            assert operations.resolve_calls == []
+            status = str(_static(app, "#status-line").content)
+            assert "INVALID WORKLOAD CHOICE" in status
+            assert "machine attachment" in status.casefold()
+
+    asyncio.run(scenario())
+
+
+def test_complete_empty_catalog_is_explicit_and_remains_fail_closed() -> None:
+    """Exhausted provider evidence can prove that no supported choices exist."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        operations.catalog_result = replace(
+            operations.catalog_result,
+            data=WorkloadCatalogEvidence.empty(),
+        )
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 70)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-compute")
+            await pilot.pause()
+
+            evidence = str(_static(app, "#workload-choice-evidence").content)
+            assert "NO SUPPORTED CHOICES" in evidence
+            assert "complete" in evidence.casefold()
+            assert app.query_one("#workload-manual-entry", Checkbox).disabled
+            assert "NO SUPPORTED CHOICES" in str(_static(app, "#status-line").content)
+
+    asyncio.run(scenario())
+
+
+def test_complete_compute_catalog_without_machine_choices_is_explicitly_empty() -> None:
+    """Accelerator evidence alone cannot form a selectable Compute workload."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        operations.catalog_result = replace(
+            operations.catalog_result,
+            data=replace(
+                operations.catalog_result.data,
+                compute_machine_types=(),
+            ),
+        )
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 70)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-compute")
+            await pilot.pause()
+
+            evidence = str(_static(app, "#workload-choice-evidence").content)
+            status = str(_static(app, "#status-line").content)
+            assert "NO SUPPORTED CHOICES" in evidence
+            assert "VERIFIED CHOICES" not in evidence
+            assert "NO SUPPORTED CHOICES" in status
+            assert "GUIDED CHOICES READY" not in status
+
+    asyncio.run(scenario())
+
+
+def test_complete_tpu_catalog_without_a_colocated_choice_is_explicitly_empty() -> None:
+    """Separate TPU fields cannot form a selectable workload across zones."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        operations.catalog_result = replace(
+            operations.catalog_result,
+            data=replace(
+                operations.catalog_result.data,
+                tpu_locations=(
+                    TpuLocation(
+                        "projects/123456789/locations/us-central1-a",
+                        "us-central1-a",
+                    ),
+                ),
+                tpu_accelerator_types=(
+                    TpuAcceleratorType(
+                        (
+                            "projects/123456789/locations/us-central1-a/"
+                            "acceleratorTypes/v6e-8"
+                        ),
+                        "us-central1-a",
+                        "v6e-8",
+                        (TpuAcceleratorConfig("V6E", "2x4"),),
+                    ),
+                ),
+                tpu_runtime_versions=(
+                    TpuRuntimeVersion(
+                        (
+                            "projects/123456789/locations/us-central1-b/"
+                            "runtimeVersions/tpu-vm-base"
+                        ),
+                        "us-central1-b",
+                        "tpu-vm-base",
+                    ),
+                ),
+            ),
+        )
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 70)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-tpu")
+            await pilot.pause()
+
+            evidence = str(_static(app, "#workload-choice-evidence").content)
+            status = str(_static(app, "#status-line").content)
+            assert "NO SUPPORTED CHOICES" in evidence
+            assert "VERIFIED CHOICES" not in evidence
+            assert "NO SUPPORTED CHOICES" in status
+            assert "GUIDED CHOICES READY" not in status
+
+    asyncio.run(scenario())
+
+
+def test_incomplete_catalog_requires_explicit_unverified_manual_entry() -> None:
+    """Partial choice evidence permits manual input only through its escape hatch."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        operations.catalog_result = _workload_catalog_result(complete=False)
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 70)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-compute")
+            await pilot.pause()
+            _input(app, "#workload-machine-type").value = "manual-machine"
+            _input(app, "#workload-count").value = "1"
+            _input(app, "#workload-provisioning").value = "standard"
+            _input(app, "#workload-locations").value = "us-central1-a"
+
+            _button(app, "#workload-submit").press()
+            await pilot.pause()
+            assert operations.resolve_calls == []
+
+            app.query_one("#workload-manual-entry", Checkbox).value = True
+            _button(app, "#workload-submit").press()
+            await pilot.pause()
+
+            assert len(operations.resolve_calls) == 1
+            assert "UNVERIFIED MANUAL ENTRY" in str(
+                _static(app, "#workload-choice-evidence").content
+            )
+
+    asyncio.run(scenario())
+
+
+def test_standalone_obtainability_opens_with_safe_defaults_and_exact_example() -> None:
+    """Standalone entry needs no inherited confirmation and defaults conservatively."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 48)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            await pilot.pause()
+
+            assert _input(app, "#obtainability-vm-count").value == "1"
+            assert _input(app, "#obtainability-distribution").value == "any"
+            assert _input(app, "#obtainability-candidates").value == ""
+            assert _button(app, "#obtainability-confirm").has_class("hidden")
+            assert (
+                "a3-highgpu-8g"
+                in _input(
+                    app,
+                    "#obtainability-machine-type",
+                ).placeholder
+            )
+            assert (
+                "us-central1=us-central1-a us-east4=us-east4-a"
+                in _input(app, "#obtainability-candidates").placeholder
+            )
+            example = str(_static(app, "#obtainability-detail").content)
+            assert (
+                "one Spot a3-highgpu-8g VM using any-single-zone with candidates "
+                "us-central1=us-central1-a us-east4=us-east4-a"
+            ) in example
+            assert (
+                "explicit candidates only"
+                in str(_static(app, "#obtainability-expansion").content).casefold()
+            )
+
+    asyncio.run(scenario())
+
+
+def test_complete_catalog_rejects_invalid_obtainability_gpu_count_locally() -> None:
+    """Standalone comparison cannot bypass a complete machine attachment fact."""
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 48)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            await pilot.pause()
+            _input(app, "#obtainability-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#obtainability-gpu-type").value = "nvidia-h100-80gb"
+            _input(app, "#obtainability-gpu-count").value = "2"
+            _input(app, "#obtainability-candidates").value = "us-central1=us-central1-a"
+            _button(app, "#obtainability-compare").press()
+            await pilot.pause()
+
+            assert operations.obtainability_prepared_calls == []
+            status = str(_static(app, "#status-line").content)
+            assert "INVALID OBTAINABILITY CHOICE" in status
+            assert "machine attachment" in status.casefold()
 
     asyncio.run(scenario())
 
@@ -3795,9 +4557,9 @@ def test_fully_specified_obtainability_exposes_copy_cli_before_provider_result()
         async with app.run_test(size=(140, 42)) as pilot:
             await pilot.pause()
             await pilot.click("#workspace-obtainability")
-            _input(app, "#obtainability-machine-type").value = "n1-standard-16"
-            _input(app, "#obtainability-gpu-type").value = "nvidia-tesla-t4"
-            _input(app, "#obtainability-gpu-count").value = "2"
+            _input(app, "#obtainability-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#obtainability-gpu-type").value = "nvidia-h100-80gb"
+            _input(app, "#obtainability-gpu-count").value = "8"
             _input(app, "#obtainability-vm-count").value = "2"
             _input(app, "#obtainability-distribution").value = "any-single-zone"
             _input(app, "#obtainability-candidates").value = "us-central1=us-central1-a"
@@ -3807,7 +4569,7 @@ def test_fully_specified_obtainability_exposes_copy_cli_before_provider_result()
             assert command is not None
             assert command.startswith("cqmgr obtainability compare ")
             assert "--resource-scope projects/123456789" in command
-            assert "--gpu-type nvidia-tesla-t4" in command
+            assert "--gpu-type nvidia-h100-80gb" in command
             assert "--candidate us-central1=us-central1-a" in command
             assert app.last_result is None
 
@@ -3815,8 +4577,8 @@ def test_fully_specified_obtainability_exposes_copy_cli_before_provider_result()
             await asyncio.wait_for(operations.compare_started.wait(), timeout=3)
             requirement, _options = operations.resolve_calls[-1]
             assert isinstance(requirement, ComputeInstanceRequirement)
-            assert requirement.attached_accelerator_type == "nvidia-tesla-t4"
-            assert requirement.attached_accelerator_count == 2
+            assert requirement.attached_accelerator_type == "nvidia-h100-80gb"
+            assert requirement.attached_accelerator_count == 8
             assert app.last_copied_cli == command
 
             operations.release_compare.set()
@@ -3879,12 +4641,12 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields(  # 
 
     async def scenario() -> None:  # noqa: PLR0915
         requirement = ComputeInstanceRequirement(
-            "n1-standard-16",
+            "a3-highgpu-8g",
             2,
             ProvisioningModel.SPOT,
             CandidateLocations(("us-central1-a",)),
-            attached_accelerator_type="nvidia-tesla-t4",
-            attached_accelerator_count=2,
+            attached_accelerator_type="nvidia-h100-80gb",
+            attached_accelerator_count=8,
         )
         operations = ScriptedReadOnlyOperations(_browse_result())
         operations.resolve_result = _resolved_compute_result(
@@ -3896,9 +4658,9 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields(  # 
         async with app.run_test(size=(140, 42)) as pilot:
             await pilot.pause()
             await pilot.click("#resolve-compute")
-            _input(app, "#workload-machine-type").value = "n1-standard-16"
-            _input(app, "#workload-gpu-type").value = "nvidia-tesla-t4"
-            _input(app, "#workload-gpu-count").value = "2"
+            _input(app, "#workload-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#workload-gpu-type").value = "nvidia-h100-80gb"
+            _input(app, "#workload-gpu-count").value = "8"
             _input(app, "#workload-count").value = "2"
             _input(app, "#workload-provisioning").value = "spot"
             _input(app, "#workload-locations").value = "us-central1-a"
@@ -3908,9 +4670,9 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields(  # 
             _button(app, "#workload-obtainability").press()
             await pilot.pause()
             assert app.active_workspace == "obtainability"
-            assert _input(app, "#obtainability-machine-type").value == "n1-standard-16"
-            assert _input(app, "#obtainability-gpu-type").value == "nvidia-tesla-t4"
-            assert _input(app, "#obtainability-gpu-count").value == "2"
+            assert _input(app, "#obtainability-machine-type").value == "a3-highgpu-8g"
+            assert _input(app, "#obtainability-gpu-type").value == "nvidia-h100-80gb"
+            assert _input(app, "#obtainability-gpu-count").value == "8"
             assert _input(app, "#obtainability-vm-count").value == "2"
             assert (
                 _input(app, "#obtainability-candidates").value
@@ -3937,8 +4699,8 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields(  # 
             await pilot.pause()
             assert app.last_copied_cli is not None
             assert "--candidate us-central1=us-central1-a" in app.last_copied_cli
-            assert "--gpu-type nvidia-tesla-t4" in app.last_copied_cli
-            assert "--gpu-count 2" in app.last_copied_cli
+            assert "--gpu-type nvidia-h100-80gb" in app.last_copied_cli
+            assert "--gpu-count 8" in app.last_copied_cli
             assert "Inherited from Quotas / Resolve / Compute instance" in str(
                 _static(app, "#obtainability-breadcrumb").content
             )
@@ -3952,8 +4714,8 @@ def test_contextual_obtainability_requires_confirmation_of_inherited_fields(  # 
             candidates = prepared.candidates
             assert candidates[0].zones == ("us-central1-a",)
             assert candidates[0].machine.gpu == GpuAttachment(
-                "nvidia-tesla-t4",
-                2,
+                "nvidia-h100-80gb",
+                8,
             )
             assert "Return context: Quotas / Resolve / Compute instance" in str(
                 _static(app, "#obtainability-detail").content
@@ -4116,7 +4878,7 @@ def test_obtainability_snapshot_preserves_incomplete_evidence_ties_and_n1_limits
                 snapshot
             )
             assert (
-                "WARNING capacity-history-incomplete: One candidate history source "
+                "WARNING notice: One candidate history source "
                 "is incomplete; ranking is partial."
             ) in snapshot
             assert (
@@ -4236,14 +4998,18 @@ def test_deferred_workload_worker_cannot_reclaim_ownership_after_leaving_quotas(
 
         async with app.run_test(size=(140, 40)) as pilot:
             await pilot.pause()
+            await pilot.click("#resolve-compute")
+            await pilot.pause()
             scheduled: list[Any] = []
+            run_worker = app.run_worker
 
-            def defer_worker(work: Any, **options: Any) -> None:
-                del options
-                scheduled.append(work)
+            def defer_worker(work: Any, **options: Any) -> Any:
+                if options.get("group") == "workload-resolve":
+                    scheduled.append(work)
+                    return None
+                return run_worker(work, **options)
 
             monkeypatch.setattr(app, "run_worker", defer_worker)
-            await pilot.click("#resolve-compute")
             _input(app, "#workload-machine-type").value = "a3-highgpu-8g"
             _input(app, "#workload-count").value = "1"
             _input(app, "#workload-provisioning").value = "spot"
@@ -4483,13 +5249,17 @@ def test_partial_failure_and_superseded_reads_remain_explicit_and_safe() -> None
             assert app.last_result is partial
             assert _table(app, "#quota-ledger").row_count == 3
             coverage = str(_static(app, "#coverage-summary").content)
-            assert "tpu.googleapis.com: incomplete" in coverage
+            assert "Cloud TPU quotas: page-capped / incomplete" in coverage
             assert "Aggregate completeness: incomplete" in coverage
-            assert "tpu-location-page-failed" in coverage
-            assert "Cloud TPU location evidence is incomplete" in coverage
-            assert "PROVIDER-SOURCE-INCOMPLETE" in str(
-                _static(app, "#status-line").content
+            assert "Refresh provider evidence, then retry" in coverage
+            assert "returned rows remain inspectable" in coverage
+            assert (
+                "mutation gates that depend on Cloud TPU quotas are blocked" in coverage
             )
+            assert "tpu-location-page-failed" not in coverage
+            status = str(_static(app, "#status-line").content)
+            assert "USABLE BUT NON-EXHAUSTIVE" in status
+            assert "PAGE-CAPPED / INCOMPLETE" in status
 
     async def failure_scenario() -> None:
         typed_failure = _failure_result()
@@ -4501,9 +5271,9 @@ def test_partial_failure_and_superseded_reads_remain_explicit_and_safe() -> None
             await pilot.pause()
             assert typed_app.last_result is typed_failure
             detail = str(_static(typed_app, "#quota-detail").content)
-            assert "Reason: provider-read-failed" in detail
-            assert "provider-read-failed" in detail
-            assert "retry after backoff" in detail
+            assert "Provider evidence: unavailable" in detail
+            assert "provider-read-failed" not in detail
+            assert "Wait, then retry" in detail
 
         app = CloudQuotaManagerApp(
             FailedReadOnlyOperations(_browse_result()),
@@ -4535,6 +5305,478 @@ def test_partial_failure_and_superseded_reads_remain_explicit_and_safe() -> None
     asyncio.run(partial_scenario())
     asyncio.run(failure_scenario())
     asyncio.run(cancellation_scenario())
+
+
+def test_incomplete_inspect_and_resolution_keep_raw_ids_in_technical_details() -> None:
+    """All provider-backed incomplete primary details use human evidence language."""
+
+    async def inspect_scenario() -> None:
+        selector = QuotaInspectSelector(
+            ITEMS[0].identity.service,
+            ITEMS[0].identity.quota_id,
+            ITEMS[0].location or "global",
+            ITEMS[0].identity.dimensions,
+        )
+        incomplete = OperationResult(
+            operation=OperationName("quota.inspect"),
+            resource_scope=SCOPE,
+            boundary=OperationBoundary(
+                StableSymbol("exact-slice-inspected"),
+                reached=False,
+            ),
+            outcome=Outcome(
+                StableSymbol("provider-source-incomplete"),
+                ExitClass.INCOMPLETE_EVIDENCE,
+            ),
+            completeness=Completeness.incomplete(
+                EvidenceGap(
+                    StableSymbol("tpu-quota-inventory"),
+                    StableSymbol("provider-source-incomplete"),
+                )
+            ),
+            started_at=NOW,
+            finished_at=NOW,
+            data=IncompleteQuotaInspectData(
+                selector,
+                (ITEMS[0],),
+                _browse_result(complete=False).data.source_coverage,
+                "provider-source-incomplete",
+            ),
+            diagnostics=(PARTIAL_DIAGNOSTIC,),
+        )
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        operations.inspect_result = incomplete  # type: ignore[assignment]
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app._render_instrument(incomplete)  # noqa: SLF001
+            app._render_quota_detail(incomplete)  # noqa: SLF001
+            detail = str(_static(app, "#quota-detail").content)
+            technical = str(_static(app, "#technical-details").content)
+            assert "Evidence: page-capped / incomplete" in detail
+            assert "provider-source-incomplete" not in detail
+            assert "Refresh provider evidence, then retry" in detail
+            assert "Outcome: provider-source-incomplete" in technical
+            assert "Detail reason: provider-source-incomplete" in technical
+
+    async def resolution_scenario() -> None:
+        requirement = ComputeInstanceRequirement(
+            "n1-standard-16",
+            1,
+            ProvisioningModel.STANDARD,
+            CandidateLocations(("us-central1-a",)),
+        )
+        incomplete = OperationResult(
+            operation=OperationName("quota.resolve"),
+            resource_scope=SCOPE,
+            boundary=OperationBoundary(
+                StableSymbol("workload-resolved"),
+                reached=False,
+            ),
+            outcome=Outcome(
+                StableSymbol("workload-resolved-incomplete"),
+                ExitClass.INCOMPLETE_EVIDENCE,
+            ),
+            completeness=Completeness.incomplete(
+                EvidenceGap(
+                    StableSymbol("compute-catalog"),
+                    StableSymbol("missing-location-evidence"),
+                )
+            ),
+            started_at=NOW,
+            finished_at=NOW,
+            data=ResolvedWorkloadRequirement(
+                requirement,
+                (
+                    ResolvedWorkloadLocation(
+                        location="us-central1-a",
+                        disposition=WorkloadLocationDisposition.INCOMPLETE,
+                        accelerator_id=None,
+                        owning_service=None,
+                        management_plane=None,
+                        supported_consumers=(),
+                        quota_pool=None,
+                        deployable_accelerator_quantity=None,
+                        constraint_set=None,
+                        constraint_requirements=(),
+                        coverage=(),
+                        failure_reason=(
+                            ResolutionFailureReason.MISSING_LOCATION_EVIDENCE
+                        ),
+                    ),
+                ),
+                None,
+            ),
+            diagnostics=(PARTIAL_DIAGNOSTIC,),
+        )
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        operations.resolve_result = incomplete
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app._render_instrument(incomplete)  # noqa: SLF001
+            app._render_workload_result(incomplete)  # noqa: SLF001
+            detail = str(_static(app, "#quota-detail").content)
+            technical = str(_static(app, "#technical-details").content)
+            assert "Evidence: page-capped / incomplete" in detail
+            assert "workload-resolved-incomplete" not in detail
+            assert "missing-location-evidence" not in detail
+            assert "Location evidence is incomplete." in detail
+            assert "Refresh provider evidence, then retry" in detail
+            assert "Outcome: workload-resolved-incomplete" in technical
+            assert (
+                "Location us-central1-a reason: missing-location-evidence" in technical
+            )
+
+    asyncio.run(inspect_scenario())
+    asyncio.run(resolution_scenario())
+
+
+@pytest.mark.parametrize(
+    ("coverage", "diagnostics", "expected"),
+    [
+        (
+            ProviderSourceCoverage.complete(
+                "compute.googleapis.com",
+                pages_attempted=1,
+                pages_completed=1,
+                observed_at=NOW,
+            ),
+            (),
+            "complete",
+        ),
+        (
+            ProviderSourceCoverage.intentionally_unqueried("compute.googleapis.com"),
+            (),
+            "intentionally unqueried",
+        ),
+        (
+            ProviderSourceCoverage.incomplete(
+                "compute.googleapis.com",
+                pages_attempted=2,
+                pages_completed=1,
+                observed_at=NOW,
+                page_cap_reached=True,
+            ),
+            (),
+            "page-capped / incomplete",
+        ),
+        (
+            ProviderSourceCoverage.incomplete(
+                "compute.googleapis.com",
+                pages_attempted=1,
+                pages_completed=0,
+                observed_at=NOW,
+                diagnostic_codes=(DiagnosticCode("provider-read-timeout"),),
+            ),
+            (
+                replace(
+                    PARTIAL_DIAGNOSTIC,
+                    code=DiagnosticCode("provider-read-timeout"),
+                ),
+            ),
+            "timed out",
+        ),
+        (
+            ProviderSourceCoverage.incomplete(
+                "compute.googleapis.com",
+                pages_attempted=1,
+                pages_completed=0,
+                observed_at=NOW,
+                diagnostic_codes=(DiagnosticCode("provider-schema-malformed"),),
+            ),
+            (
+                replace(
+                    PARTIAL_DIAGNOSTIC,
+                    code=DiagnosticCode("provider-schema-malformed"),
+                ),
+            ),
+            "malformed",
+        ),
+        (
+            ProviderSourceCoverage.incomplete(
+                "compute.googleapis.com",
+                pages_attempted=1,
+                pages_completed=0,
+                observed_at=NOW,
+                diagnostic_codes=(DiagnosticCode("provider-unavailable"),),
+            ),
+            (
+                replace(
+                    PARTIAL_DIAGNOSTIC,
+                    code=DiagnosticCode("provider-unavailable"),
+                ),
+            ),
+            "unavailable",
+        ),
+    ],
+)
+def test_coverage_labels_combine_typed_state_and_diagnostics(
+    coverage: ProviderSourceCoverage,
+    diagnostics: tuple[Diagnostic, ...],
+    expected: str,
+) -> None:
+    """Primary source labels distinguish every settled incomplete state."""
+    assert CloudQuotaManagerApp._coverage_label(coverage, diagnostics) == expected  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("retry", "expected"),
+    [
+        (RetryDisposition.NEVER, "Do not retry"),
+        (RetryDisposition.AFTER_UPGRADE, "Upgrade cqmgr, then retry"),
+        (RetryDisposition.AFTER_REFRESH, "Refresh provider evidence, then retry"),
+        (RetryDisposition.AFTER_NEW_PREVIEW, "Create a new Preview, then retry"),
+        (RetryDisposition.AFTER_BACKOFF, "Wait, then retry"),
+        (RetryDisposition.UNKNOWN, "No retry guidance is available"),
+    ],
+)
+def test_retry_guidance_never_guesses_for_unknown(
+    retry: RetryDisposition,
+    expected: str,
+) -> None:
+    """Every typed retry disposition maps directly; unknown adds no advice."""
+    assert CloudQuotaManagerApp._retry_guidance(retry) == expected  # noqa: SLF001
+
+
+def test_failure_primary_copy_is_human_and_raw_ids_stay_in_technical_details() -> None:
+    """Raw outcome, exit, and diagnostic identifiers stay in a secondary view."""
+
+    async def scenario() -> None:
+        failure = _failure_result()
+        app = CloudQuotaManagerApp(
+            ScriptedReadOnlyOperations(failure),  # type: ignore[arg-type]
+            ScriptedAuditOperations(),
+        )
+
+        async with app.run_test(size=(110, 40)) as pilot:
+            await pilot.pause()
+            status = str(_static(app, "#status-line").content)
+            detail = str(_static(app, "#quota-detail").content)
+            technical = _static(app, "#technical-details")
+
+            assert "UNAVAILABLE" in status
+            assert "provider-read-failed" not in status
+            assert "exit 9" not in status
+            assert "Wait, then retry" in detail
+            assert "provider-read-failed" not in detail
+            assert technical.has_class("hidden")
+            assert "Outcome: provider-read-failed" in str(technical.content)
+            assert "Exit class: 9" in str(technical.content)
+
+            _button(app, "#toggle-technical-details").press()
+            await pilot.pause()
+            assert not technical.has_class("hidden")
+            assert (
+                str(_button(app, "#toggle-technical-details").label)
+                == "Hide technical details"
+            )
+
+            app.action_refresh()
+            await pilot.pause()
+            assert not technical.has_class("hidden")
+            assert (
+                str(_button(app, "#toggle-technical-details").label)
+                == "Hide technical details"
+            )
+
+    asyncio.run(scenario())
+
+
+def test_exact_provider_failures_clear_progress_and_restore_retry_status() -> None:
+    """Failed detail workers cannot leave cancellation controls active."""
+
+    async def inspect_scenario() -> None:
+        operations = FailedProviderDetailOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            app._select_quota(operations.result.data.items[0])  # noqa: SLF001
+            await pilot.pause()
+
+            assert app._provider_progress is None  # noqa: SLF001
+            assert _button(app, "#cancel-provider-read").disabled
+            assert (
+                str(_static(app, "#status-line").content)
+                == "ERROR — quota inspection unavailable; retry the read-only operation"
+            )
+
+    async def resolution_scenario() -> None:
+        operations = FailedProviderDetailOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await pilot.click("#resolve-compute")
+            await pilot.pause()
+            _input(app, "#workload-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#workload-gpu-type").value = "nvidia-h100-80gb"
+            _input(app, "#workload-gpu-count").value = "8"
+            _input(app, "#workload-count").value = "1"
+            _input(app, "#workload-provisioning").value = "standard"
+            _input(app, "#workload-locations").value = "us-central1-a"
+            _button(app, "#workload-submit").press()
+            await pilot.pause()
+
+            assert app._provider_progress is None  # noqa: SLF001
+            assert _button(app, "#cancel-provider-read").disabled
+            assert (
+                str(_static(app, "#status-line").content)
+                == "ERROR — workload resolution unavailable; retry the "
+                "read-only operation"
+            )
+
+    asyncio.run(inspect_scenario())
+    asyncio.run(resolution_scenario())
+
+
+def test_invalid_obtainability_preparation_clears_provider_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rejected resolved candidates return control without waiting for a deadline."""
+
+    def reject_preparation(*_args: Any, **_kwargs: Any) -> Any:
+        msg = "simulated invalid prepared comparison"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(
+        "cqmgr.adapters.tui.app.prepare_obtainability_comparison",
+        reject_preparation,
+    )
+
+    async def scenario() -> None:
+        operations = ScriptedReadOnlyOperations(_browse_result())
+        app = CloudQuotaManagerApp(operations, ScriptedAuditOperations())
+
+        async with app.run_test(size=(100, 36)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            await pilot.pause()
+            _input(app, "#obtainability-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#obtainability-gpu-type").value = "nvidia-h100-80gb"
+            _input(app, "#obtainability-gpu-count").value = "8"
+            _input(app, "#obtainability-vm-count").value = "1"
+            _input(app, "#obtainability-distribution").value = "any"
+            _input(
+                app,
+                "#obtainability-candidates",
+            ).value = "us-central1=us-central1-a"
+            _button(app, "#obtainability-compare").press()
+            await pilot.pause()
+
+            assert app._provider_progress is None  # noqa: SLF001
+            assert _button(app, "#cancel-provider-read").disabled
+            assert (
+                str(_static(app, "#status-line").content)
+                == "PREPARATION UNAVAILABLE — exact candidates were not resolved"
+            )
+
+    asyncio.run(scenario())
+
+
+def test_quota_progress_exposes_elapsed_deadline_and_explicit_cancellation() -> None:
+    """A slow quota read stays visibly active and can be cancelled from the UI."""
+
+    async def scenario() -> None:
+        clock = ManualMonotonic(100.0)
+        operations = SupersededReadOnlyOperations()
+        app = CloudQuotaManagerApp(
+            operations,
+            ScriptedAuditOperations(),
+            monotonic=clock,
+        )
+
+        async with app.run_test(size=(100, 32)) as pilot:
+            await operations.first_started.wait()
+            await pilot.pause()
+
+            status = str(_static(app, "#status-line").content)
+            assert "READING — quota providers / quota inventory" in status
+            assert "elapsed 0.0s" in status
+            assert "deadline in 60.0s" in status
+            assert "Cancel read available" in status
+            assert not _button(app, "#cancel-provider-read").disabled
+
+            clock.advance(12.5)
+            app._refresh_provider_progress()  # noqa: SLF001
+            await pilot.pause()
+
+            status = str(_static(app, "#status-line").content)
+            assert "elapsed 12.5s" in status
+            assert "deadline in 47.5s" in status
+
+            _button(app, "#cancel-provider-read").press()
+            await pilot.pause()
+
+            assert operations.tokens[0].cancelled
+            assert _button(app, "#cancel-provider-read").disabled
+            assert (
+                str(_static(app, "#status-line").content)
+                == "CANCELLED — quota inventory read stopped"
+            )
+
+    asyncio.run(scenario())
+
+
+def test_obtainability_progress_reaches_deadline_without_stale_repaint() -> None:
+    """One shared deadline replaces active advice progress deterministically."""
+
+    async def scenario() -> None:
+        clock = ManualMonotonic(200.0)
+        operations = DelayedObtainabilityOperations()
+        app = CloudQuotaManagerApp(
+            operations,
+            ScriptedAuditOperations(),
+            monotonic=clock,
+        )
+
+        async with app.run_test(size=(100, 36)) as pilot:
+            await pilot.pause()
+            await pilot.click("#workspace-obtainability")
+            _input(app, "#obtainability-machine-type").value = "a3-highgpu-8g"
+            _input(app, "#obtainability-vm-count").value = "2"
+            _input(app, "#obtainability-distribution").value = "balanced"
+            _input(
+                app, "#obtainability-candidates"
+            ).value = "us-central1=us-central1-a,us-central1-b"
+            _button(app, "#obtainability-compare").press()
+            await operations.compare_started.wait()
+            await pilot.pause()
+            active_result = app.last_result
+
+            status = str(_static(app, "#status-line").content)
+            assert "READING — Spot advice providers / obtainability comparison" in (
+                status
+            )
+            assert "elapsed 0.0s" in status
+            assert "deadline in 60.0s" in status
+
+            clock.advance(60.1)
+            app._refresh_provider_progress()  # noqa: SLF001
+            await pilot.pause()
+
+            assert operations.compare_cancellation is not None
+            assert operations.compare_cancellation.cancelled
+            assert _button(app, "#cancel-provider-read").disabled
+            assert (
+                str(_static(app, "#status-line").content)
+                == "DEADLINE REACHED — obtainability comparison stopped after 60.1s"
+            )
+
+            operations.release_compare.set()
+            await operations.compare_returned.wait()
+            await pilot.pause()
+
+            assert app.last_result is active_result
+            assert (
+                str(_static(app, "#status-line").content)
+                == "DEADLINE REACHED — obtainability comparison stopped after 60.1s"
+            )
+
+    asyncio.run(scenario())
 
 
 def test_completed_inspection_owns_result_and_copy_cli_over_older_refresh() -> None:
