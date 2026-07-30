@@ -201,10 +201,10 @@ def test_release_workflow_builds_once_and_cannot_publish_a_manual_run() -> None:
     assert "environment: pypi" in publish
     assert "id-token: write" in publish
     assert "attestations: write" in publish
-    assert "pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247" in (
+    assert "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33" in (
         publish
     )
-    assert "actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6" in publish
+    assert "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d" in publish
     assert "PYPI_TOKEN" not in workflow
     assert "password:" not in workflow
     assert "scripts/publication_preflight.py pypi" in publish
