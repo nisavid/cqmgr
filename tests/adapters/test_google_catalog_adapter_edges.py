@@ -89,20 +89,71 @@ class NoJitter:
         OfficialComputeMachineTypesPageClient,
     ],
 )
-def test_official_compute_page_clients_close_owned_transport(
+def test_official_compute_page_clients_close_before_use_without_construction(
     wrapper: type[
         OfficialComputeAcceleratorTypesPageClient
         | OfficialComputeMachineTypesPageClient
     ],
 ) -> None:
-    """Every sync Compute wrapper exposes its generated transport shutdown."""
+    """Closing an unused Compute wrapper never constructs its generated client."""
+    constructed: list[object] = []
+
+    def factory() -> object:
+        client = SimpleNamespace(
+            transport=SimpleNamespace(close=lambda: constructed.append("closed"))
+        )
+        constructed.append(client)
+        return client
+
+    page_client = wrapper(factory)  # type: ignore[arg-type]
+    asyncio.run(page_client.close())
+    asyncio.run(page_client.close())
+
+    assert constructed == []
+
+
+@pytest.mark.parametrize(
+    ("wrapper", "read_method"),
+    [
+        (OfficialComputeAcceleratorTypesPageClient, "accelerator_types"),
+        (OfficialComputeMachineTypesPageClient, "machine_types"),
+    ],
+)
+def test_official_compute_page_clients_close_owned_transport(
+    wrapper: type[
+        OfficialComputeAcceleratorTypesPageClient
+        | OfficialComputeMachineTypesPageClient
+    ],
+    read_method: str,
+) -> None:
+    """Every used Compute wrapper shuts down its generated transport once."""
     closed: list[bool] = []
+    response = SimpleNamespace(
+        items={},
+        next_page_token="",
+        unreachables=(),
+        warning=None,
+    )
     client = SimpleNamespace(
-        transport=SimpleNamespace(close=lambda: closed.append(True))
+        transport=SimpleNamespace(close=lambda: closed.append(True)),
+        aggregated_list=lambda **_: SimpleNamespace(pages=iter((response,))),
     )
 
-    page_client = wrapper(client)  # type: ignore[arg-type]
-    asyncio.run(page_client.close())
+    page_client = wrapper(lambda: client)  # type: ignore[arg-type,return-value]
+
+    async def exercise() -> None:
+        read = getattr(page_client, read_method)
+        _ = await read(
+            project="fixture-project",
+            max_results=1,
+            page_token="",
+            return_partial_success=True,
+            timeout_seconds=1.0,
+        )
+        await page_client.close()
+        await page_client.close()
+
+    asyncio.run(exercise())
 
     assert closed == [True]
 
@@ -134,7 +185,7 @@ def test_compute_close_defers_transport_without_waiting_for_cancelled_worker() -
 
     async def exercise() -> None:
         page_client = OfficialComputeMachineTypesPageClient(
-            BlockingGeneratedClient(),  # type: ignore[arg-type]
+            BlockingGeneratedClient,  # type: ignore[arg-type]
         )
         read_task = asyncio.create_task(
             page_client.machine_types(
@@ -180,6 +231,17 @@ class ComputePages:
             raise value
         return value
 
+    async def machine_types_for_zone(
+        self,
+        **kwargs: object,
+    ) -> ComputeMachineTypesPage:
+        del kwargs
+        self.calls += 1
+        value = self.pages.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
 
 class ComputeAcceleratorPages:
     """Script materialized Compute accelerator-type pages."""
@@ -192,6 +254,17 @@ class ComputeAcceleratorPages:
         self.calls = 0
 
     async def accelerator_types(self, **kwargs: object) -> ComputeAcceleratorTypesPage:
+        del kwargs
+        self.calls += 1
+        value = self.pages.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    async def accelerator_types_for_zone(
+        self,
+        **kwargs: object,
+    ) -> ComputeAcceleratorTypesPage:
         del kwargs
         self.calls += 1
         value = self.pages.pop(0)

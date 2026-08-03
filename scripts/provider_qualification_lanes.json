@@ -1,0 +1,13 @@
+{
+  "lanes": {
+    "google": {
+      "path_prefixes": [
+        "src/cqmgr/adapters/google/",
+        "tests/adapters/test_compute_",
+        "tests/adapters/test_google",
+        "tests/google/"
+      ]
+    }
+  },
+  "schema": "cqmgr.provider-qualification-lanes/v1"
+}

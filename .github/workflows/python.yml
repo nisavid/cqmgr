@@ -17,6 +17,227 @@ permissions:
   contents: read
 
 jobs:
+  classify-provider-lanes:
+    name: Classify affected provider lanes
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      lanes: ${{ steps.classify.outputs.lanes }}
+    steps:
+      - name: Checkout exact candidate source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Classify affected provider lanes
+        id: classify
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            test -n "${BASE_SHA}"
+            test -n "${HEAD_SHA}"
+            test "$(git rev-parse HEAD)" = "${HEAD_SHA}"
+            git diff --name-only -z "${BASE_SHA}" "${HEAD_SHA}" |
+              python -c 'import json, sys; raw = sys.stdin.buffer.read(); parts = raw.split(b"\0"); assert parts[-1] == b""; json.dump([part.decode("utf-8") for part in parts[:-1]], sys.stdout, separators=(",", ":"))' \
+              > affected-paths.json
+            python scripts/affected_qualification_lanes.py \
+              --registry scripts/provider_qualification_lanes.json \
+              < affected-paths.json > affected-lanes.json
+          else
+            printf '[]\n' > affected-lanes.json
+          fi
+          LANES="$(cat affected-lanes.json)"
+          test -n "${LANES}"
+          echo "lanes=${LANES}" >> "${GITHUB_OUTPUT}"
+
+  protected-live-not-applicable:
+    name: Protected live explicitly not applicable
+    needs: classify-provider-lanes
+    if: needs.classify-provider-lanes.outputs.lanes == '[]'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Verify non-applicability proof
+        env:
+          LANES: ${{ needs.classify-provider-lanes.outputs.lanes }}
+        run: test "${LANES}" = '[]'
+
+  pull-request-candidate:
+    name: Exact pull-request candidate
+    needs: classify-provider-lanes
+    if: >-
+      github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && contains(fromJSON(needs.classify-provider-lanes.outputs.lanes), 'google')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+    steps:
+      - name: Checkout exact pull-request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.11.30
+          python-version: "3.14"
+          enable-cache: false
+
+      - name: Synchronize locked environment
+        run: uv sync --locked --python 3.14
+
+      - name: Bind non-publishable candidate identity
+        id: identity
+        shell: bash
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${HEAD_SHA}"
+          VERSION="$(uv run --locked --no-sync python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test -n "${VERSION}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          uv run --locked --no-sync python scripts/release_qualification.py \
+            pull-request-identity \
+            --repository "${GITHUB_REPOSITORY}" \
+            --pull-request "${PR_NUMBER}" \
+            --head-commit "${HEAD_SHA}" \
+            --output pull-request-identity.json
+
+      - name: Build source distribution
+        run: uv build --no-sources --sdist --out-dir dist
+
+      - name: Build sole wheel from source distribution
+        env:
+          VERSION: ${{ steps.identity.outputs.version }}
+        run: >-
+          uv build --no-sources --wheel --out-dir dist
+          "dist/cqmgr-${VERSION}.tar.gz"
+
+      - name: Verify exact distributions
+        run: uv run --locked --no-sync python scripts/verify_distribution.py dist
+
+      - name: Export locked runtime resolution
+        run: >-
+          uv export --locked --no-dev --no-emit-project
+          --format requirements-txt --output-file candidate-requirements.txt
+
+      - name: Prepare immutable candidate bundle
+        run: >-
+          uv run --locked --no-sync python scripts/release_qualification.py prepare
+          --dist dist
+          --identity pull-request-identity.json
+          --requirements candidate-requirements.txt
+          --output release
+          --qualification
+
+      - name: Verify candidate identity and bytes
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: >-
+          uv run --locked --no-sync python scripts/release_qualification.py
+          verify-pull-request
+          --release release
+          --identity pull-request-identity.json
+          --repository "${GITHUB_REPOSITORY}"
+          --pull-request "${PR_NUMBER}"
+          --head-commit "${HEAD_SHA}"
+
+      - name: Upload immutable pull-request candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pull-request-candidate
+          path: |
+            release/*
+            pull-request-identity.json
+          if-no-files-found: error
+          retention-days: 7
+
+  google-protected-live:
+    name: Google protected installed qualification
+    needs:
+      - classify-provider-lanes
+      - pull-request-candidate
+    if: >-
+      github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && contains(fromJSON(needs.classify-provider-lanes.outputs.lanes), 'google')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    environment: live-read-only
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout exact pull-request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.11.30
+          python-version: "3.14"
+          enable-cache: false
+
+      - name: Synchronize locked environment
+        run: uv sync --locked --python 3.14
+
+      - name: Download immutable pull-request candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pull-request-candidate
+          path: candidate
+
+      - name: Independently verify candidate identity and bytes
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: >-
+          uv run --locked --no-sync python scripts/release_qualification.py
+          verify-pull-request
+          --release candidate/release
+          --identity candidate/pull-request-identity.json
+          --repository "${GITHUB_REPOSITORY}"
+          --pull-request "${PR_NUMBER}"
+          --head-commit "${HEAD_SHA}"
+
+      - name: Authenticate read-only Google identity
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Qualify installed Compute adapters
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        run: >-
+          uv run --locked --no-sync python
+          scripts/installed_live_adapter_qualification.py
+          "candidate/release/cqmgr-${{ needs.pull-request-candidate.outputs.version }}-py3-none-any.whl"
+          --project-env GCP_PROJECT_ID
+          --output installed-live-adapter-evidence.json
+
+      - name: Upload sanitized installed-adapter evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pull-request-installed-live-adapter-evidence
+          path: installed-live-adapter-evidence.json
+          if-no-files-found: warn
+          retention-days: 14
+
   performance:
     uses: ./.github/workflows/performance.yml
     permissions:
@@ -183,3 +404,52 @@ jobs:
             uv run --python 3.14 python scripts/smoke_tool_install.py \
               dist --python 3.14 --native-keyring-round-trip
           '
+
+  python-qualification:
+    name: Python qualification
+    needs:
+      - classify-provider-lanes
+      - google-protected-live
+      - package-smoke
+      - performance
+      - protected-live-not-applicable
+      - pull-request-candidate
+      - quality
+      - tests
+    if: always()
+    permissions: {}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Require complete Python qualification
+        shell: bash
+        env:
+          CLASSIFIER_RESULT: ${{ needs.classify-provider-lanes.result }}
+          GOOGLE_LIVE_RESULT: ${{ needs.google-protected-live.result }}
+          LANES: ${{ needs.classify-provider-lanes.outputs.lanes }}
+          NON_APPLICABLE_RESULT: ${{ needs.protected-live-not-applicable.result }}
+          PACKAGE_SMOKE_RESULT: ${{ needs.package-smoke.result }}
+          PERFORMANCE_RESULT: ${{ needs.performance.result }}
+          PULL_REQUEST_CANDIDATE_RESULT: ${{ needs.pull-request-candidate.result }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          TESTS_RESULT: ${{ needs.tests.result }}
+        run: |
+          set -euo pipefail
+          test "${CLASSIFIER_RESULT}" = "success"
+          test "${QUALITY_RESULT}" = "success"
+          test "${TESTS_RESULT}" = "success"
+          test "${PACKAGE_SMOKE_RESULT}" = "success"
+          test "${PERFORMANCE_RESULT}" = "success"
+
+          if [[ "${LANES}" == '[]' ]]; then
+            test "${NON_APPLICABLE_RESULT}" = "success"
+            test "${PULL_REQUEST_CANDIDATE_RESULT}" = "skipped"
+            test "${GOOGLE_LIVE_RESULT}" = "skipped"
+          elif [[ "${LANES}" == '["google"]' ]]; then
+            test "${NON_APPLICABLE_RESULT}" = "skipped"
+            test "${PULL_REQUEST_CANDIDATE_RESULT}" = "success"
+            test "${GOOGLE_LIVE_RESULT}" = "success"
+          else
+            echo "unsupported protected qualification lane set" >&2
+            exit 1
+          fi

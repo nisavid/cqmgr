@@ -417,6 +417,151 @@ def test_release_performance_job_enforces_budgets_and_retains_failure_evidence()
     assert "if: always()" in upload
 
 
+def test_python_workflow_classifies_provider_lanes_fail_closed() -> None:
+    """Only an explicit affected-path proof can declare protected live inapplicable."""
+    workflow = (WORKFLOWS / "python.yml").read_text()
+    classifier = _workflow_job_mapping(workflow, "classify-provider-lanes")
+    classifier_text = _workflow_job(workflow, "classify-provider-lanes")
+    classify = _job_step(classifier_text, "Classify affected provider lanes")
+    non_applicable = _workflow_job_mapping(
+        workflow,
+        "protected-live-not-applicable",
+    )
+
+    assert classifier.get("outputs") == {
+        "lanes": "${{ steps.classify.outputs.lanes }}",
+    }
+    steps = classifier.get("steps")
+    assert isinstance(steps, list), "classifier steps"
+    checkout = next(
+        _mapping(step, "classifier checkout")
+        for step in steps
+        if isinstance(step, dict)
+        and str(cast("dict[object, object]", step).get("uses", "")).startswith(
+            "actions/checkout@"
+        )
+    )
+    assert _mapping(checkout.get("with"), "classifier checkout inputs") == {
+        "fetch-depth": 0,
+        "persist-credentials": False,
+        "ref": "${{ github.event.pull_request.head.sha || github.sha }}",
+    }
+    assert "git diff --name-only -z" in classify
+    assert "scripts/affected_qualification_lanes.py" in classify
+    assert "continue-on-error" not in classify
+    assert non_applicable.get("needs") == "classify-provider-lanes"
+    assert non_applicable.get("if") == (
+        "needs.classify-provider-lanes.outputs.lanes == '[]'"
+    )
+    assert "permissions" not in non_applicable
+
+
+def test_python_workflow_qualifies_same_repo_exact_head_candidate_live() -> None:
+    """Affected trusted PRs install and exercise independently verified head bytes."""
+    workflow = (WORKFLOWS / "python.yml").read_text()
+    candidate = _workflow_job_mapping(workflow, "pull-request-candidate")
+    candidate_text = _workflow_job(workflow, "pull-request-candidate")
+    live = _workflow_job_mapping(workflow, "google-protected-live")
+    live_text = _workflow_job(workflow, "google-protected-live")
+    expected_condition = (
+        "github.event_name == 'pull_request' && "
+        "github.event.pull_request.head.repo.full_name == github.repository && "
+        "contains(fromJSON(needs.classify-provider-lanes.outputs.lanes), 'google')"
+    )
+
+    assert candidate.get("needs") == "classify-provider-lanes"
+    assert candidate.get("if") == expected_condition
+    candidate_checkout = _job_step(candidate_text, "Checkout exact pull-request head")
+    assert "ref: ${{ github.event.pull_request.head.sha }}" in candidate_checkout
+    assert "persist-credentials: false" in candidate_checkout
+    assert "version: 0.11.30" in _job_step(
+        candidate_text,
+        "Install uv and Python",
+    )
+    assert "pull-request-identity" in _job_step(
+        candidate_text,
+        "Bind non-publishable candidate identity",
+    )
+    assert "--sdist" in _job_step(candidate_text, "Build source distribution")
+    wheel = _job_step(candidate_text, "Build sole wheel from source distribution")
+    assert "--wheel" in wheel
+    assert '"dist/cqmgr-${VERSION}.tar.gz"' in wheel
+    prepare = _job_step(candidate_text, "Prepare immutable candidate bundle")
+    assert "scripts/release_qualification.py prepare" in prepare
+    assert "--qualification" in prepare
+    assert "verify-pull-request" in _job_step(
+        candidate_text,
+        "Verify candidate identity and bytes",
+    )
+
+    assert live.get("needs") == [
+        "classify-provider-lanes",
+        "pull-request-candidate",
+    ]
+    assert live.get("if") == expected_condition
+    assert live.get("environment") == "live-read-only"
+    assert live.get("permissions") == {
+        "contents": "read",
+        "id-token": "write",
+    }
+    live_checkout = _job_step(live_text, "Checkout exact pull-request head")
+    assert "ref: ${{ github.event.pull_request.head.sha }}" in live_checkout
+    assert "persist-credentials: false" in live_checkout
+    assert "verify-pull-request" in _job_step(
+        live_text,
+        "Independently verify candidate identity and bytes",
+    )
+    authentication = _job_step(live_text, "Authenticate read-only Google identity")
+    assert "google-github-actions/auth@" in authentication
+    qualify = _job_step(live_text, "Qualify installed Compute adapters")
+    assert "scripts/installed_live_adapter_qualification.py" in qualify
+    assert "--project-env GCP_PROJECT_ID" in qualify
+    assert "candidate/release/cqmgr-" in qualify
+
+
+def test_python_qualification_is_one_fixed_fail_closed_aggregate() -> None:
+    """The required status represents every hermetic and applicable live gate."""
+    workflow = (WORKFLOWS / "python.yml").read_text()
+    aggregate = _workflow_job_mapping(workflow, "python-qualification")
+    aggregate_text = _workflow_job(workflow, "python-qualification")
+    expected_needs = {
+        "classify-provider-lanes",
+        "google-protected-live",
+        "package-smoke",
+        "performance",
+        "protected-live-not-applicable",
+        "pull-request-candidate",
+        "quality",
+        "tests",
+    }
+
+    assert aggregate.get("name") == "Python qualification"
+    assert aggregate.get("if") == "always()"
+    needs = aggregate.get("needs")
+    assert isinstance(needs, list), "aggregate needs"
+    assert set(needs) == expected_needs
+    assert aggregate.get("permissions") == {}
+    assert "environment" not in aggregate
+    verify = _job_step(aggregate_text, "Require complete Python qualification")
+    for result in (
+        "CLASSIFIER_RESULT",
+        "GOOGLE_LIVE_RESULT",
+        "NON_APPLICABLE_RESULT",
+        "PACKAGE_SMOKE_RESULT",
+        "PERFORMANCE_RESULT",
+        "PULL_REQUEST_CANDIDATE_RESULT",
+        "QUALITY_RESULT",
+        "TESTS_RESULT",
+    ):
+        assert result in verify
+    assert "\"${LANES}\" == '[]'" in verify
+    assert '"${LANES}" == \'["google"]\'' in verify
+    assert '"${GOOGLE_LIVE_RESULT}" = "success"' in verify
+    assert '"${NON_APPLICABLE_RESULT}" = "success"' in verify
+    assert '"${PULL_REQUEST_CANDIDATE_RESULT}" = "success"' in verify
+    assert "exit 1" in verify
+
+
 def test_dependency_review_accepts_the_reviewed_python_license_expression() -> None:
     """Compound dependency metadata may use SPDX Python-2.0."""
     workflow = (WORKFLOWS / "dependency-review.yml").read_text()

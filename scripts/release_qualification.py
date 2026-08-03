@@ -28,6 +28,13 @@ RELEASE_IDENTITY_FIELDS = {
     "tag",
     "version",
 }
+PULL_REQUEST_CANDIDATE_IDENTITY_FIELDS = {
+    "commit",
+    "mode",
+    "pull_request",
+    "repository",
+    "version",
+}
 
 
 def _project_version(project_path: Path) -> str:
@@ -106,6 +113,36 @@ def release_identity(  # noqa: PLR0913 - independent identity facts must agree
     }
 
 
+def pull_request_candidate_identity(
+    project_path: Path,
+    *,
+    repository: str,
+    pull_request_number: int,
+    head_sha: str,
+) -> dict[str, str]:
+    """Bind a non-publishable pull-request candidate to its exact head."""
+    if repository != CANONICAL_REPOSITORY:
+        msg = f"candidate must target the canonical repository {CANONICAL_REPOSITORY}"
+        raise ValueError(msg)
+    if (
+        isinstance(pull_request_number, bool)
+        or not isinstance(pull_request_number, int)
+        or pull_request_number < 1
+    ):
+        msg = "candidate pull-request number must be a positive integer"
+        raise ValueError(msg)
+    if not COMMIT_PATTERN.fullmatch(head_sha):
+        msg = "candidate identity requires one lowercase full head commit SHA"
+        raise ValueError(msg)
+    return {
+        "commit": head_sha,
+        "mode": "pull-request",
+        "pull_request": str(pull_request_number),
+        "repository": repository,
+        "version": _project_version(project_path),
+    }
+
+
 def _requirements_components(requirements: str) -> list[dict[str, str]]:
     components: dict[str, str] = {}
     for raw_line in requirements.splitlines():
@@ -166,16 +203,73 @@ def _distribution_names(version: str) -> tuple[str, str]:
     )
 
 
+def _validate_bundle_identity(
+    identity: Mapping[str, str],
+    *,
+    qualification: bool,
+) -> None:
+    mode = identity.get("mode")
+    if mode == "pull-request":
+        _validate_pull_request_bundle_identity(
+            identity,
+            qualification=qualification,
+        )
+    elif mode in {"dry-run", "release"}:
+        _validate_release_bundle_identity(identity)
+    else:
+        msg = "candidate identity has an unsupported mode"
+        raise ValueError(msg)
+    if identity.get("repository") != CANONICAL_REPOSITORY:
+        msg = "candidate identity does not name the canonical repository"
+        raise ValueError(msg)
+    if not COMMIT_PATTERN.fullmatch(identity.get("commit", "")):
+        msg = "candidate identity requires one lowercase full commit SHA"
+        raise ValueError(msg)
+    if not identity.get("version"):
+        msg = "candidate identity requires one version"
+        raise ValueError(msg)
+
+
+def _validate_pull_request_bundle_identity(
+    identity: Mapping[str, str],
+    *,
+    qualification: bool,
+) -> None:
+    if not qualification:
+        msg = "pull-request candidate identity is non-publishable"
+        raise ValueError(msg)
+    if set(identity) != PULL_REQUEST_CANDIDATE_IDENTITY_FIELDS:
+        msg = "pull-request candidate identity has unexpected fields"
+        raise ValueError(msg)
+    pull_request = identity.get("pull_request", "")
+    if (
+        not pull_request.isdecimal()
+        or pull_request.startswith("0")
+        or int(pull_request) < 1
+    ):
+        msg = "pull-request candidate identity has an invalid number"
+        raise ValueError(msg)
+
+
+def _validate_release_bundle_identity(identity: Mapping[str, str]) -> None:
+    if set(identity) != RELEASE_IDENTITY_FIELDS:
+        msg = "release identity has unexpected fields"
+        raise ValueError(msg)
+    if identity.get("tag") != f"v{identity.get('version', '')}":
+        msg = "release identity tag and version disagree"
+        raise ValueError(msg)
+
+
 def prepare_release_bundle(
     dist_dir: Path,
     output_dir: Path,
     identity: Mapping[str, str],
     requirements: str,
+    *,
+    qualification: bool = False,
 ) -> dict[str, object]:
     """Copy tested distributions once and produce release evidence around them."""
-    if identity.get("repository") != CANONICAL_REPOSITORY:
-        msg = "release identity does not name the canonical repository"
-        raise ValueError(msg)
+    _validate_bundle_identity(identity, qualification=qualification)
     version = identity["version"]
     distribution_names = _distribution_names(version)
     actual_distributions = tuple(
@@ -220,9 +314,12 @@ def prepare_release_bundle(
             "spec_version": "1.6",
         },
         "schema": RELEASE_MANIFEST_SCHEMA,
-        "tag": identity["tag"],
         "version": version,
     }
+    if identity["mode"] == "pull-request":
+        manifest["pull_request"] = identity["pull_request"]
+    else:
+        manifest["tag"] = identity["tag"]
     manifest_path = output_dir / "release-manifest.json"
     manifest_path.write_bytes(_canonical_json(manifest))
     checksum_names = (*distribution_names, sbom_name, manifest_path.name)
@@ -259,11 +356,14 @@ def _checksum_mapping(checksums_path: Path) -> dict[str, str]:
     return checksums
 
 
-def verify_release_bundle(  # noqa: C901 - one fail-closed bundle audit
+def verify_release_bundle(  # noqa: C901, PLR0912, PLR0915 - fail-closed bundle audit
     release_dir: Path,
     identity: Mapping[str, str],
+    *,
+    qualification: bool = False,
 ) -> dict[str, object]:
     """Verify exact assets, hashes, and identity without trusting job state."""
+    _validate_bundle_identity(identity, qualification=qualification)
     version = identity["version"]
     sbom_name = SBOM_FILENAME_TEMPLATE.format(version=version)
     expected_hashed = {
@@ -294,9 +394,17 @@ def verify_release_bundle(  # noqa: C901 - one fail-closed bundle audit
     expected_identity = {
         "commit": identity["commit"],
         "repository": identity["repository"],
-        "tag": identity["tag"],
         "version": version,
     }
+    if identity["mode"] == "pull-request":
+        expected_identity["pull_request"] = identity["pull_request"]
+        expected_specific_fields = {"pull_request"}
+    else:
+        expected_identity["tag"] = identity["tag"]
+        expected_specific_fields = {"tag"}
+    if set(manifest).intersection({"pull_request", "tag"}) != expected_specific_fields:
+        msg = "release manifest has conflicting identity fields"
+        raise ValueError(msg)
     if any(manifest.get(key) != value for key, value in expected_identity.items()):
         msg = "release manifest identity does not match the qualified identity"
         raise ValueError(msg)
@@ -332,6 +440,28 @@ def verify_release_bundle(  # noqa: C901 - one fail-closed bundle audit
     return manifest
 
 
+def verify_pull_request_candidate(  # noqa: PLR0913 - independent event facts
+    release_dir: Path,
+    identity: Mapping[str, str],
+    project_path: Path,
+    *,
+    repository: str,
+    pull_request_number: int,
+    head_sha: str,
+) -> dict[str, object]:
+    """Independently bind candidate bytes to the consuming PR event."""
+    expected_identity = pull_request_candidate_identity(
+        project_path,
+        repository=repository,
+        pull_request_number=pull_request_number,
+        head_sha=head_sha,
+    )
+    if dict(identity) != expected_identity:
+        msg = "pull-request candidate does not match the consuming event identity"
+        raise ValueError(msg)
+    return verify_release_bundle(release_dir, identity, qualification=True)
+
+
 def _write_json(path: Path | None, value: object) -> None:
     encoded = _canonical_json(value)
     if path is None:
@@ -353,16 +483,29 @@ def _identity_command(arguments: argparse.Namespace) -> None:
     _write_json(arguments.output, identity)
 
 
+def _pull_request_identity_command(arguments: argparse.Namespace) -> None:
+    identity = pull_request_candidate_identity(
+        arguments.project,
+        repository=arguments.repository,
+        pull_request_number=arguments.pull_request,
+        head_sha=arguments.head_commit,
+    )
+    _write_json(arguments.output, identity)
+
+
 def _load_identity(path: Path) -> dict[str, str]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if (
         not isinstance(value, dict)
-        or set(value) != RELEASE_IDENTITY_FIELDS
+        or set(value)
+        not in (RELEASE_IDENTITY_FIELDS, PULL_REQUEST_CANDIDATE_IDENTITY_FIELDS)
         or any(not isinstance(item, str) or not item for item in value.values())
     ):
         msg = "release identity must contain the exact required fields as strings"
         raise ValueError(msg)
-    return value
+    identity = value
+    _validate_bundle_identity(identity, qualification=True)
+    return identity
 
 
 def _prepare_command(arguments: argparse.Namespace) -> None:
@@ -372,12 +515,25 @@ def _prepare_command(arguments: argparse.Namespace) -> None:
         arguments.output,
         identity,
         arguments.requirements.read_text(encoding="utf-8"),
+        qualification=arguments.qualification,
     )
 
 
 def _verify_command(arguments: argparse.Namespace) -> None:
     identity = _load_identity(arguments.identity)
     verify_release_bundle(arguments.release, identity)
+
+
+def _verify_pull_request_command(arguments: argparse.Namespace) -> None:
+    identity = _load_identity(arguments.identity)
+    verify_pull_request_candidate(
+        arguments.release,
+        identity,
+        arguments.project,
+        repository=arguments.repository,
+        pull_request_number=arguments.pull_request,
+        head_sha=arguments.head_commit,
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -393,16 +549,40 @@ def _parser() -> argparse.ArgumentParser:
     identity.add_argument("--dry-run", action="store_true")
     identity.add_argument("--output", type=Path)
     identity.set_defaults(handler=_identity_command)
+    pull_request_identity = subparsers.add_parser("pull-request-identity")
+    pull_request_identity.add_argument(
+        "--project",
+        type=Path,
+        default=Path("pyproject.toml"),
+    )
+    pull_request_identity.add_argument("--repository", required=True)
+    pull_request_identity.add_argument("--pull-request", type=int, required=True)
+    pull_request_identity.add_argument("--head-commit", required=True)
+    pull_request_identity.add_argument("--output", type=Path)
+    pull_request_identity.set_defaults(handler=_pull_request_identity_command)
     prepare = subparsers.add_parser("prepare")
     prepare.add_argument("--dist", type=Path, required=True)
     prepare.add_argument("--identity", type=Path, required=True)
     prepare.add_argument("--requirements", type=Path, required=True)
     prepare.add_argument("--output", type=Path, required=True)
+    prepare.add_argument("--qualification", action="store_true")
     prepare.set_defaults(handler=_prepare_command)
     verify = subparsers.add_parser("verify")
     verify.add_argument("--release", type=Path, required=True)
     verify.add_argument("--identity", type=Path, required=True)
     verify.set_defaults(handler=_verify_command)
+    verify_pull_request = subparsers.add_parser("verify-pull-request")
+    verify_pull_request.add_argument("--release", type=Path, required=True)
+    verify_pull_request.add_argument("--identity", type=Path, required=True)
+    verify_pull_request.add_argument(
+        "--project",
+        type=Path,
+        default=Path("pyproject.toml"),
+    )
+    verify_pull_request.add_argument("--repository", required=True)
+    verify_pull_request.add_argument("--pull-request", type=int, required=True)
+    verify_pull_request.add_argument("--head-commit", required=True)
+    verify_pull_request.set_defaults(handler=_verify_pull_request_command)
     return parser
 
 
