@@ -447,7 +447,16 @@ def test_python_workflow_classifies_provider_lanes_fail_closed() -> None:
         "persist-credentials": False,
         "ref": "${{ github.event.pull_request.head.sha }}",
     }
+    assert "version: 0.11.30" in _job_step(
+        classifier_text,
+        "Install uv and Python",
+    )
     assert "git diff --merge-base --name-only -z" in classify
+    assert "uv run --no-project --python 3.14 python -c" in classify
+    assert (
+        "uv run --no-project --python 3.14 python "
+        "scripts/affected_qualification_lanes.py"
+    ) in classify
     assert "scripts/affected_qualification_lanes.py" in classify
     assert "printf '[]" not in classify
     assert "continue-on-error" not in classify
@@ -489,7 +498,11 @@ def test_python_workflow_qualifies_same_repo_exact_head_candidate_live() -> None
     assert "--sdist" in _job_step(candidate_text, "Build source distribution")
     wheel = _job_step(candidate_text, "Build sole wheel from source distribution")
     assert "--wheel" in wheel
-    assert '"dist/cqmgr-${VERSION}.tar.gz"' in wheel
+    assert "sdists=(dist/cqmgr-*.tar.gz)" in wheel
+    assert 'test "${#sdists[@]}" -eq 1' in wheel
+    assert '"${sdists[0]}"' in wheel
+    assert "wheels=(dist/cqmgr-*.whl)" in wheel
+    assert 'test "${#wheels[@]}" -eq 1' in wheel
     prepare = _job_step(candidate_text, "Prepare immutable candidate bundle")
     assert "scripts/release_qualification.py prepare" in prepare
     assert "--qualification" in prepare
@@ -520,9 +533,9 @@ def test_python_workflow_qualifies_same_repo_exact_head_candidate_live() -> None
     qualify = _job_step(live_text, "Qualify installed Compute adapters")
     assert "scripts/installed_live_adapter_qualification.py" in qualify
     assert "--project-env GCP_PROJECT_ID" in qualify
-    assert '"candidate/release/cqmgr-${CANDIDATE_VERSION}-py3-none-any.whl"' in (
-        qualify
-    )
+    assert "wheels=(candidate/release/cqmgr-*.whl)" in qualify
+    assert 'test "${#wheels[@]}" -eq 1' in qualify
+    assert '"${wheels[0]}"' in qualify
     live_steps = live.get("steps")
     assert isinstance(live_steps, list), "live steps"
     qualify_mapping = next(
@@ -533,7 +546,6 @@ def test_python_workflow_qualifies_same_repo_exact_head_candidate_live() -> None
         == "Qualify installed Compute adapters"
     )
     assert _mapping(qualify_mapping.get("env"), "qualification environment") == {
-        "CANDIDATE_VERSION": "${{ needs.pull-request-candidate.outputs.version }}",
         "GCP_PROJECT_ID": "${{ secrets.GCP_PROJECT_ID }}",
     }
 
@@ -562,6 +574,11 @@ def test_python_qualification_is_one_fixed_fail_closed_aggregate() -> None:
     assert aggregate.get("permissions") == {}
     assert "environment" not in aggregate
     verify = _job_step(aggregate_text, "Require complete Python qualification")
+    assert (
+        "SAME_REPOSITORY: "
+        "${{ github.event.pull_request.head.repo.full_name == github.repository }}"
+    ) in aggregate_text
+    assert 'test "${SAME_REPOSITORY}" = "true"' in verify
     for result in (
         "CLASSIFIER_RESULT",
         "GOOGLE_LIVE_RESULT",

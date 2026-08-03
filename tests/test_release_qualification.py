@@ -135,6 +135,7 @@ def test_pull_request_bundle_is_verifiable_only_for_qualification(
 def test_pull_request_bundle_cannot_claim_a_release_tag(tmp_path: Path) -> None:
     """Qualification rejects candidate evidence that also pretends to be a release."""
     module = _module()
+    canonical_json = cast("Any", module["_canonical_json"])
     candidate_identity = cast("Any", module["pull_request_candidate_identity"])
     prepare_release_bundle = cast("Any", module["prepare_release_bundle"])
     verify_release_bundle = cast("Any", module["verify_release_bundle"])
@@ -159,12 +160,7 @@ def test_pull_request_bundle_cannot_claim_a_release_tag(tmp_path: Path) -> None:
     manifest_path = output / "release-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["tag"] = "v0.1.0"
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
-        + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
+    manifest_path.write_bytes(canonical_json(manifest))
     checksums_path = output / "SHA256SUMS"
     checksums_path.write_text(
         "\n".join(

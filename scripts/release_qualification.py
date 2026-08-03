@@ -501,7 +501,10 @@ def _load_identity(path: Path) -> dict[str, str]:
         not in (RELEASE_IDENTITY_FIELDS, PULL_REQUEST_CANDIDATE_IDENTITY_FIELDS)
         or any(not isinstance(item, str) or not item for item in value.values())
     ):
-        msg = "release identity must contain the exact required fields as strings"
+        msg = (
+            "release or pull-request candidate identity must contain its exact "
+            "required fields as strings"
+        )
         raise ValueError(msg)
     identity = value
     _validate_bundle_identity(identity, qualification=True)
