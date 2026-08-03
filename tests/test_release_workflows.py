@@ -431,6 +431,7 @@ def test_python_workflow_classifies_provider_lanes_fail_closed() -> None:
     assert classifier.get("outputs") == {
         "lanes": "${{ steps.classify.outputs.lanes }}",
     }
+    assert classifier.get("if") == "github.event_name == 'pull_request'"
     steps = classifier.get("steps")
     assert isinstance(steps, list), "classifier steps"
     checkout = next(
@@ -444,10 +445,11 @@ def test_python_workflow_classifies_provider_lanes_fail_closed() -> None:
     assert _mapping(checkout.get("with"), "classifier checkout inputs") == {
         "fetch-depth": 0,
         "persist-credentials": False,
-        "ref": "${{ github.event.pull_request.head.sha || github.sha }}",
+        "ref": "${{ github.event.pull_request.head.sha }}",
     }
-    assert "git diff --name-only -z" in classify
+    assert "git diff --merge-base --name-only -z" in classify
     assert "scripts/affected_qualification_lanes.py" in classify
+    assert "printf '[]" not in classify
     assert "continue-on-error" not in classify
     assert non_applicable.get("needs") == "classify-provider-lanes"
     assert non_applicable.get("if") == (
@@ -478,10 +480,12 @@ def test_python_workflow_qualifies_same_repo_exact_head_candidate_live() -> None
         candidate_text,
         "Install uv and Python",
     )
-    assert "pull-request-identity" in _job_step(
+    identity = _job_step(
         candidate_text,
         "Bind non-publishable candidate identity",
     )
+    assert "pull-request-identity" in identity
+    assert "^[0-9A-Za-z][0-9A-Za-z._+-]*$" in identity
     assert "--sdist" in _job_step(candidate_text, "Build source distribution")
     wheel = _job_step(candidate_text, "Build sole wheel from source distribution")
     assert "--wheel" in wheel
@@ -516,7 +520,22 @@ def test_python_workflow_qualifies_same_repo_exact_head_candidate_live() -> None
     qualify = _job_step(live_text, "Qualify installed Compute adapters")
     assert "scripts/installed_live_adapter_qualification.py" in qualify
     assert "--project-env GCP_PROJECT_ID" in qualify
-    assert "candidate/release/cqmgr-" in qualify
+    assert '"candidate/release/cqmgr-${CANDIDATE_VERSION}-py3-none-any.whl"' in (
+        qualify
+    )
+    live_steps = live.get("steps")
+    assert isinstance(live_steps, list), "live steps"
+    qualify_mapping = next(
+        _mapping(step, "qualify installed Compute adapters")
+        for step in live_steps
+        if isinstance(step, dict)
+        and cast("dict[object, object]", step).get("name")
+        == "Qualify installed Compute adapters"
+    )
+    assert _mapping(qualify_mapping.get("env"), "qualification environment") == {
+        "CANDIDATE_VERSION": "${{ needs.pull-request-candidate.outputs.version }}",
+        "GCP_PROJECT_ID": "${{ secrets.GCP_PROJECT_ID }}",
+    }
 
 
 def test_python_qualification_is_one_fixed_fail_closed_aggregate() -> None:
@@ -536,7 +555,7 @@ def test_python_qualification_is_one_fixed_fail_closed_aggregate() -> None:
     }
 
     assert aggregate.get("name") == "Python qualification"
-    assert aggregate.get("if") == "always()"
+    assert aggregate.get("if") == "github.event_name == 'pull_request' && always()"
     needs = aggregate.get("needs")
     assert isinstance(needs, list), "aggregate needs"
     assert set(needs) == expected_needs
@@ -559,6 +578,14 @@ def test_python_qualification_is_one_fixed_fail_closed_aggregate() -> None:
     assert '"${GOOGLE_LIVE_RESULT}" = "success"' in verify
     assert '"${NON_APPLICABLE_RESULT}" = "success"' in verify
     assert '"${PULL_REQUEST_CANDIDATE_RESULT}" = "success"' in verify
+    for result in (
+        "CLASSIFIER_RESULT",
+        "PACKAGE_SMOKE_RESULT",
+        "PERFORMANCE_RESULT",
+        "QUALITY_RESULT",
+        "TESTS_RESULT",
+    ):
+        assert f'"${{{result}}}" = "success"' in verify
     assert "exit 1" in verify
 
 

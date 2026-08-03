@@ -79,6 +79,8 @@ def test_shared_qualification_paths_select_every_registered_lane(
             "src/cqmgr/adapters/serialization/results.py",
             "scripts/installed_live_adapter_qualification.py",
             ".github/workflows/python.yml",
+            "tests/adapters/test_lifecycle_cli.py",
+            "tests/application/test_quota_operations.py",
             "tests/test_google_read_only_bootstrap.py",
             "tests/test_release_workflows.py",
         ],
@@ -119,6 +121,9 @@ def test_unknown_path_fails_closed() -> None:
         "not-json",
         "{}",
         "[]",
+        '["/src/cqmgr/adapters/google/compute_catalog.py"]',
+        '["src\\\\cqmgr\\\\adapters\\\\google\\\\compute_catalog.py"]',
+        '["src/cqmgr/adapters/google/compute_catalog.py\\u001f"]',
         '["src/cqmgr/adapters/google/../unclassified.py"]',
     ],
 )
@@ -146,3 +151,57 @@ def test_missing_or_malformed_registry_fails_closed(tmp_path: Path) -> None:
     assert missing.returncode != 0
     assert malformed.returncode != 0
     assert missing.stdout == malformed.stdout == ""
+
+
+@pytest.mark.parametrize(
+    "registry_value",
+    [
+        {
+            "lanes": {"Google": {"path_prefixes": ["providers/google/"]}},
+            "schema": "cqmgr.provider-qualification-lanes/v1",
+        },
+        {
+            "lanes": {"google": []},
+            "schema": "cqmgr.provider-qualification-lanes/v1",
+        },
+        {
+            "lanes": {"google": {}},
+            "schema": "cqmgr.provider-qualification-lanes/v1",
+        },
+        {
+            "lanes": {"google": {"path_prefixes": []}},
+            "schema": "cqmgr.provider-qualification-lanes/v1",
+        },
+        {
+            "lanes": {"google": {"path_prefixes": [""]}},
+            "schema": "cqmgr.provider-qualification-lanes/v1",
+        },
+    ],
+)
+def test_malformed_lane_registry_entries_fail_closed(
+    tmp_path: Path,
+    registry_value: object,
+) -> None:
+    """Every malformed lane or prefix shape blocks classification."""
+    registry = tmp_path / "malformed-lane.json"
+    registry.write_text(
+        json.dumps(registry_value),
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    result = _classify(
+        ["src/cqmgr/adapters/google/compute_catalog.py"],
+        registry=registry,
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+
+
+def test_shared_test_classification_uses_exact_repository_paths() -> None:
+    """A merely similar test name remains unknown instead of selecting live."""
+    result = _classify(["tests/test_bootstrap_fixtures.py"])
+
+    assert result.returncode != 0
+    assert result.stdout == ""

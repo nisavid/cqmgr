@@ -19,6 +19,7 @@ permissions:
 jobs:
   classify-provider-lanes:
     name: Classify affected provider lanes
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     outputs:
@@ -29,30 +30,25 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Classify affected provider lanes
         id: classify
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          EVENT_NAME: ${{ github.event_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
-            test -n "${BASE_SHA}"
-            test -n "${HEAD_SHA}"
-            test "$(git rev-parse HEAD)" = "${HEAD_SHA}"
-            git diff --name-only -z "${BASE_SHA}" "${HEAD_SHA}" |
-              python -c 'import json, sys; raw = sys.stdin.buffer.read(); parts = raw.split(b"\0"); assert parts[-1] == b""; json.dump([part.decode("utf-8") for part in parts[:-1]], sys.stdout, separators=(",", ":"))' \
-              > affected-paths.json
-            python scripts/affected_qualification_lanes.py \
-              --registry scripts/provider_qualification_lanes.json \
-              < affected-paths.json > affected-lanes.json
-          else
-            printf '[]\n' > affected-lanes.json
-          fi
+          test -n "${BASE_SHA}"
+          test -n "${HEAD_SHA}"
+          test "$(git rev-parse HEAD)" = "${HEAD_SHA}"
+          git diff --merge-base --name-only -z "${BASE_SHA}" "${HEAD_SHA}" |
+            python -c 'import json, sys; raw = sys.stdin.buffer.read(); parts = raw.split(b"\0"); assert parts[-1] == b""; json.dump([part.decode("utf-8") for part in parts[:-1]], sys.stdout, separators=(",", ":"))' \
+            > affected-paths.json
+          python scripts/affected_qualification_lanes.py \
+            --registry scripts/provider_qualification_lanes.json \
+            < affected-paths.json > affected-lanes.json
           LANES="$(cat affected-lanes.json)"
           test -n "${LANES}"
           echo "lanes=${LANES}" >> "${GITHUB_OUTPUT}"
@@ -105,7 +101,7 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${HEAD_SHA}"
           VERSION="$(uv run --locked --no-sync python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-          test -n "${VERSION}"
+          [[ "${VERSION}" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           uv run --locked --no-sync python scripts/release_qualification.py \
             pull-request-identity \
@@ -176,6 +172,7 @@ jobs:
     environment: live-read-only
     permissions:
       contents: read
+      # Required to mint the OIDC token for Google workload identity federation.
       id-token: write
     steps:
       - name: Checkout exact pull-request head
@@ -220,14 +217,17 @@ jobs:
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
       - name: Qualify installed Compute adapters
+        shell: bash
         env:
+          CANDIDATE_VERSION: ${{ needs.pull-request-candidate.outputs.version }}
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-        run: >-
-          uv run --locked --no-sync python
-          scripts/installed_live_adapter_qualification.py
-          "candidate/release/cqmgr-${{ needs.pull-request-candidate.outputs.version }}-py3-none-any.whl"
-          --project-env GCP_PROJECT_ID
-          --output installed-live-adapter-evidence.json
+        run: |
+          set -euo pipefail
+          uv run --locked --no-sync python \
+            scripts/installed_live_adapter_qualification.py \
+            "candidate/release/cqmgr-${CANDIDATE_VERSION}-py3-none-any.whl" \
+            --project-env GCP_PROJECT_ID \
+            --output installed-live-adapter-evidence.json
 
       - name: Upload sanitized installed-adapter evidence
         if: always()
@@ -416,7 +416,7 @@ jobs:
       - pull-request-candidate
       - quality
       - tests
-    if: always()
+    if: github.event_name == 'pull_request' && always()
     permissions: {}
     runs-on: ubuntu-22.04
     timeout-minutes: 5

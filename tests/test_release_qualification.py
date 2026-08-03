@@ -265,6 +265,20 @@ def test_pull_request_cli_prepares_and_independently_verifies_candidate(
             str(identity),
         ]
     )
+    with pytest.raises(ValueError, match="non-publishable"):
+        main(
+            [
+                "prepare",
+                "--dist",
+                str(dist),
+                "--identity",
+                str(identity),
+                "--requirements",
+                str(requirements),
+                "--output",
+                str(tmp_path / "rejected-candidate"),
+            ]
+        )
     main(
         [
             "prepare",

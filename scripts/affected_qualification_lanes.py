@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
+    from typing import TextIO
 
 REGISTRY_SCHEMA = "cqmgr.provider-qualification-lanes/v1"
 LANE_PATTERN = re.compile(r"[a-z][a-z0-9-]*\Z")
@@ -36,6 +37,29 @@ SHARED_PREFIXES = (
     ".github/workflows/",
     "src/cqmgr/adapters/serialization/",
 )
+SHARED_TEST_PATHS = {
+    "tests/adapters/test_operation_result_serialization.py",
+    "tests/adapters/test_quota_snapshot_serialization.py",
+    "tests/adapters/test_lifecycle_cli.py",
+    "tests/adapters/test_watch_resume_serialization.py",
+    "tests/adapters/test_workload_result_serialization.py",
+    "tests/application/test_invocation.py",
+    "tests/application/test_quota_operations.py",
+    "tests/application/test_read_only_operations.py",
+    "tests/application/test_workload_operation_edges.py",
+    "tests/test_affected_qualification_lanes.py",
+    "tests/test_google_read_only_bootstrap.py",
+    "tests/test_installed_live_adapter_qualification.py",
+    "tests/test_lifecycle_cross_surface.py",
+    "tests/test_lifecycle_runtime_bootstrap.py",
+    "tests/test_mutation_qualification.py",
+    "tests/test_performance_qualification.py",
+    "tests/test_read_only_bootstrap.py",
+    "tests/test_read_only_cli.py",
+    "tests/test_release_qualification.py",
+    "tests/test_release_workflows.py",
+}
+SHARED_TEST_PREFIXES = ("tests/serialization/",)
 PROVED_UNRELATED_PATHS = {
     ".editorconfig",
     ".gitignore",
@@ -79,8 +103,8 @@ def _load_registry(path: Path) -> dict[str, tuple[str, ...]]:
     return lanes
 
 
-def _input_paths(stream: object) -> tuple[str, ...]:
-    value = json.load(stream)  # type: ignore[arg-type]
+def _input_paths(stream: TextIO) -> tuple[str, ...]:
+    value = json.load(stream)
     if (
         not isinstance(value, list)
         or not value
@@ -134,23 +158,7 @@ def _is_shared_path(path: str) -> bool:
     if path.startswith("scripts/"):
         return "qualification" in name or name == "provider_qualification_lanes.json"
     if path.startswith("tests/"):
-        return any(
-            marker in name
-            for marker in (
-                "bootstrap",
-                "invocation",
-                "qualification",
-                "release_workflows",
-                "serialization",
-            )
-        ) or name in {
-            "test_lifecycle_cli.py",
-            "test_lifecycle_cross_surface.py",
-            "test_quota_operations.py",
-            "test_read_only_cli.py",
-            "test_read_only_operations.py",
-            "test_workload_operation_edges.py",
-        }
+        return path in SHARED_TEST_PATHS or path.startswith(SHARED_TEST_PREFIXES)
     return False
 
 
