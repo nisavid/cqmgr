@@ -38,9 +38,32 @@ MANIFEST_SCHEMA = "cqmgr.release-manifest/v1"
 ASCII_CONTROL_LIMIT = 32
 ASCII_DELETE = 127
 EXPECTED_DISTRIBUTION_COUNT = 2
+MAX_HASHED_FILE_BYTES = 128 * 1024 * 1024
+MAX_METADATA_FILE_BYTES = 1024 * 1024
+
+
+def _require_bounded_file(
+    path: Path,
+    *,
+    kind: str,
+    maximum_bytes: int,
+) -> int:
+    if path.is_symlink() or not path.is_file():
+        msg = f"candidate {kind} must be one direct regular file"
+        raise ValueError(msg)
+    size = path.stat().st_size
+    if size > maximum_bytes:
+        msg = f"candidate {kind} file size exceeds the trusted maximum"
+        raise ValueError(msg)
+    return size
 
 
 def _object(path: Path) -> dict[str, object]:
+    _require_bounded_file(
+        path,
+        kind="JSON metadata",
+        maximum_bytes=MAX_METADATA_FILE_BYTES,
+    )
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         msg = f"{path.name} must contain one string-keyed object"
@@ -49,6 +72,11 @@ def _object(path: Path) -> dict[str, object]:
 
 
 def _sha256(path: Path) -> str:
+    _require_bounded_file(
+        path,
+        kind="hashed asset",
+        maximum_bytes=MAX_HASHED_FILE_BYTES,
+    )
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -165,6 +193,11 @@ def _distribution_assets(
 
 
 def _checksum_mapping(path: Path) -> dict[str, str]:
+    _require_bounded_file(
+        path,
+        kind="checksum metadata",
+        maximum_bytes=MAX_METADATA_FILE_BYTES,
+    )
     text = path.read_text(encoding="utf-8")
     if not text.endswith("\n") or "\r" in text:
         msg = "candidate checksum file is not canonical"
@@ -221,6 +254,7 @@ def verify_candidate(  # noqa: C901, PLR0912, PLR0915 - one fail-closed audit
         msg = "candidate manifest must be one direct regular file"
         raise ValueError(msg)
     manifest = _object(manifest_path)
+    publication = manifest.get("publication")
     if (
         set(manifest) != MANIFEST_FIELDS
         or manifest.get("schema") != MANIFEST_SCHEMA
@@ -228,7 +262,10 @@ def verify_candidate(  # noqa: C901, PLR0912, PLR0915 - one fail-closed audit
         or manifest.get("pull_request") != identity["pull_request"]
         or manifest.get("repository") != identity["repository"]
         or manifest.get("version") != identity["version"]
-        or manifest.get("publication") != {"authorized": False, "requested": False}
+        or not isinstance(publication, dict)
+        or set(publication) != {"authorized", "requested"}
+        or publication["authorized"] is not False
+        or publication["requested"] is not False
     ):
         msg = "candidate manifest identity is invalid"
         raise ValueError(msg)
