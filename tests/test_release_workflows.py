@@ -12,6 +12,10 @@ ROOT = Path(__file__).parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 SHA_PIN = re.compile(r"[^@\s]+@[0-9a-f]{40}\Z")
 LIVE_TIMEOUT_MINUTES = 25
+SAME_REPO_PULL_REQUEST_GUARD = (
+    "github.event_name == 'pull_request' && "
+    "github.event.pull_request.head.repo.full_name == github.repository"
+)
 
 
 def _mapping(value: object, context: str) -> dict[str, object]:
@@ -321,10 +325,7 @@ def test_trusted_live_workflow_binds_same_repo_head_and_same_run_candidate() -> 
     trust_text = _workflow_job(workflow, "trust-caller")
     qualify = _workflow_job_mapping(workflow, "qualify-candidate")
     qualify_text = _workflow_job(workflow, "qualify-candidate")
-    expected_guard = (
-        "github.event_name == 'pull_request' && "
-        "github.event.pull_request.head.repo.full_name == github.repository"
-    )
+    expected_guard = SAME_REPO_PULL_REQUEST_GUARD
 
     assert _yaml_mapping_keys(triggers, indent=2) == {"workflow_call"}
     assert _yaml_mapping_keys(inputs, indent=6) == {
@@ -383,10 +384,7 @@ def test_trusted_live_workflow_uses_only_protected_installed_compute_reads() -> 
     workflow = (WORKFLOWS / "trusted-live-read-only.yml").read_text()
     qualify = _workflow_job_mapping(workflow, "qualify-candidate")
     qualify_text = _workflow_job(workflow, "qualify-candidate")
-    expected_guard = (
-        "github.event_name == 'pull_request' && "
-        "github.event.pull_request.head.repo.full_name == github.repository"
-    )
+    expected_guard = SAME_REPO_PULL_REQUEST_GUARD
 
     assert qualify.get("if") == expected_guard
     assert qualify.get("environment") == "live-read-only"

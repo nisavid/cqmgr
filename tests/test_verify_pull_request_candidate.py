@@ -19,6 +19,8 @@ SCRIPT = Path(__file__).parents[1] / "scripts" / "verify_pull_request_candidate.
 REPOSITORY = "nisavid/cqmgr"
 HEAD_SHA = "a" * 40
 PULL_REQUEST = "105"
+MAX_HASHED_FILE_BYTES = 128 * 1024 * 1024
+MAX_METADATA_FILE_BYTES = 1024 * 1024
 
 
 def _verify_candidate() -> Callable[..., Path]:
@@ -145,6 +147,25 @@ def test_verify_candidate_rejects_assets_named_for_another_version(
         )
 
 
+def test_verify_candidate_rejects_non_boolean_publication_state(
+    tmp_path: Path,
+) -> None:
+    """JSON numeric values cannot impersonate a non-publishable Boolean state."""
+    candidate, _wheel = _candidate(tmp_path)
+    manifest_path = candidate / "release" / "release-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["publication"] = {"authorized": 0, "requested": 0}
+    _write_json(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="manifest identity"):
+        _verify_candidate()(
+            candidate,
+            repository=REPOSITORY,
+            pull_request=PULL_REQUEST,
+            head_sha=HEAD_SHA,
+        )
+
+
 def test_verify_candidate_rejects_identity_or_byte_drift(tmp_path: Path) -> None:
     """Caller identity and the recorded byte set must both remain exact."""
     candidate, wheel = _candidate(tmp_path)
@@ -204,6 +225,34 @@ def test_verify_candidate_rejects_manifest_symlink_before_reading(
     manifest_path.symlink_to(target)
 
     with pytest.raises(ValueError, match="direct regular file"):
+        _verify_candidate()(
+            candidate,
+            repository=REPOSITORY,
+            pull_request=PULL_REQUEST,
+            head_sha=HEAD_SHA,
+        )
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "maximum_bytes"),
+    [
+        ("pull-request-identity.json", MAX_METADATA_FILE_BYTES),
+        ("release/SHA256SUMS", MAX_METADATA_FILE_BYTES),
+        ("release/cqmgr-0.1.0-py3-none-any.whl", MAX_HASHED_FILE_BYTES),
+    ],
+)
+def test_verify_candidate_rejects_oversized_files_before_consuming_them(
+    tmp_path: Path,
+    relative_path: str,
+    maximum_bytes: int,
+) -> None:
+    """Untrusted metadata and assets have strict pre-read size ceilings."""
+    candidate, _wheel = _candidate(tmp_path)
+    target = candidate / relative_path
+    with target.open("r+b") as stream:
+        stream.truncate(maximum_bytes + 1)
+
+    with pytest.raises(ValueError, match="size"):
         _verify_candidate()(
             candidate,
             repository=REPOSITORY,
