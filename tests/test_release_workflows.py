@@ -11,6 +11,7 @@ import yaml
 ROOT = Path(__file__).parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 SHA_PIN = re.compile(r"[^@\s]+@[0-9a-f]{40}\Z")
+LIVE_TIMEOUT_MINUTES = 25
 
 
 def _mapping(value: object, context: str) -> dict[str, object]:
@@ -309,6 +310,129 @@ def test_live_read_only_workflow_has_separate_identity_and_environment_gate() ->
     assert "update" not in canary.lower()
     assert "delete" not in canary.lower()
     assert "validateonly" not in canary.lower()
+
+
+def test_trusted_live_workflow_binds_same_repo_head_and_same_run_candidate() -> None:
+    """The reusable trust boundary rejects forks and verifies exact caller bytes."""
+    workflow = (WORKFLOWS / "trusted-live-read-only.yml").read_text()
+    triggers = _yaml_block(workflow, "on", indent=0)
+    inputs = _yaml_block(workflow, "inputs", indent=4)
+    trust = _workflow_job_mapping(workflow, "trust-caller")
+    trust_text = _workflow_job(workflow, "trust-caller")
+    qualify = _workflow_job_mapping(workflow, "qualify-candidate")
+    qualify_text = _workflow_job(workflow, "qualify-candidate")
+    expected_guard = (
+        "github.event_name == 'pull_request' && "
+        "github.event.pull_request.head.repo.full_name == github.repository"
+    )
+
+    assert _yaml_mapping_keys(triggers, indent=2) == {"workflow_call"}
+    assert _yaml_mapping_keys(inputs, indent=6) == {
+        "head-sha",
+        "pull-request-number",
+    }
+    assert "type: string" in _yaml_block(inputs, "head-sha", indent=6)
+    assert "required: true" in _yaml_block(inputs, "head-sha", indent=6)
+    assert "type: number" in _yaml_block(inputs, "pull-request-number", indent=6)
+    assert "required: true" in _yaml_block(
+        inputs,
+        "pull-request-number",
+        indent=6,
+    )
+    assert "secrets:" not in triggers
+    assert trust.get("permissions") == {}
+    reject = _job_step(trust_text, "Reject untrusted caller context")
+    assert "github.event_name" in reject
+    assert "github.event.pull_request.head.repo.full_name" in reject
+    assert "github.event.pull_request.head.sha" in reject
+    assert "github.event.pull_request.number" in reject
+    assert 'test "${CALLER_REPOSITORY}" = "nisavid/cqmgr"' in reject
+    assert 'test "${HEAD_REPOSITORY}" = "${CALLER_REPOSITORY}"' in reject
+    assert 'test "${EXPECTED_HEAD_SHA}" = "${CALLER_HEAD_SHA}"' in reject
+    assert 'test "${EXPECTED_PR_NUMBER}" = "${CALLER_PR_NUMBER}"' in reject
+
+    assert qualify.get("needs") == "trust-caller"
+    assert qualify.get("if") == expected_guard
+    checkout = _job_step(qualify_text, "Checkout trusted workflow source")
+    assert "repository: ${{ job.workflow_repository }}" in checkout
+    assert "ref: ${{ job.workflow_sha }}" in checkout
+    assert "path: trusted" in checkout
+    assert "persist-credentials: false" in checkout
+    assert "github.event.pull_request.head.sha" not in checkout
+    download = _job_step(qualify_text, "Download same-run pull-request candidate")
+    assert "name: pull-request-candidate" in download
+    assert "path: candidate" in download
+    for forbidden in ("github-token:", "repository:", "run-id:"):
+        assert forbidden not in download
+    verify = _job_step(qualify_text, "Verify exact candidate identity and bytes")
+    assert "id: verify" in verify
+    assert "uv run --python 3.14 --no-project python" in verify
+    assert "trusted/scripts/verify_pull_request_candidate.py" in verify
+    assert "--candidate candidate" in verify
+    assert "EXPECTED_REPOSITORY: ${{ github.repository }}" in verify
+    assert "EXPECTED_PR_NUMBER: ${{ inputs.pull-request-number }}" in verify
+    assert "EXPECTED_HEAD_SHA: ${{ inputs.head-sha }}" in verify
+    assert '--repository "${EXPECTED_REPOSITORY}"' in verify
+    assert '--pull-request "${EXPECTED_PR_NUMBER}"' in verify
+    assert '--head-sha "${EXPECTED_HEAD_SHA}"' in verify
+    assert '--github-output "${GITHUB_OUTPUT}"' in verify
+
+
+def test_trusted_live_workflow_uses_only_protected_installed_compute_reads() -> None:
+    """Credentials reach only the verified wheel's bounded Compute profile."""
+    workflow = (WORKFLOWS / "trusted-live-read-only.yml").read_text()
+    qualify = _workflow_job_mapping(workflow, "qualify-candidate")
+    qualify_text = _workflow_job(workflow, "qualify-candidate")
+    expected_guard = (
+        "github.event_name == 'pull_request' && "
+        "github.event.pull_request.head.repo.full_name == github.repository"
+    )
+
+    assert qualify.get("if") == expected_guard
+    assert qualify.get("environment") == "live-read-only"
+    assert qualify.get("runs-on") == "ubuntu-22.04"
+    assert qualify.get("timeout-minutes") == LIVE_TIMEOUT_MINUTES
+    assert qualify.get("permissions") == {
+        "contents": "read",
+        "id-token": "write",
+    }
+
+    verify = _job_step(qualify_text, "Verify exact candidate identity and bytes")
+    authenticate = _job_step(
+        qualify_text,
+        "Authenticate with workload identity federation",
+    )
+    qualification = _job_step(
+        qualify_text,
+        "Run installed bounded Compute qualification",
+    )
+    assert qualify_text.index(verify) < qualify_text.index(authenticate)
+    assert qualify_text.index(authenticate) < qualify_text.index(qualification)
+    assert (
+        "google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093"
+        in authenticate
+    )
+    assert "GCP_WORKLOAD_IDENTITY_PROVIDER" in authenticate
+    assert "GCP_SERVICE_ACCOUNT" in authenticate
+    assert "uv run --python 3.14 --no-project python" in qualification
+    assert "trusted/scripts/installed_live_adapter_qualification.py" in qualification
+    assert "VERIFIED_WHEEL: ${{ steps.verify.outputs.wheel }}" in qualification
+    assert '"${VERIFIED_WHEEL}"' in qualification
+    assert "--project-env GCP_PROJECT_ID" in qualification
+    assert "--output installed-live-adapter-evidence.json" in qualification
+    assert "GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}" in qualification
+    for forbidden in ("apply", "create", "update", "delete", "validateonly"):
+        assert re.search(rf"\b{forbidden}\b", qualification.lower()) is None
+
+    evidence = _job_step(qualify_text, "Upload sanitized evidence")
+    assert "if: always()" in evidence
+    assert (
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" in evidence
+    )
+    assert "name: pull-request-live-read-only-evidence" in evidence
+    assert "path: installed-live-adapter-evidence.json" in evidence
+    assert "if-no-files-found: warn" in evidence
+    assert "retention-days: 14" in evidence
 
 
 def test_release_publication_requires_the_exact_commit_live_canary() -> None:
