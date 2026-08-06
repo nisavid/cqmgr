@@ -42,6 +42,274 @@ def test_release_identity_binds_static_version_tag_repository_and_main() -> None
     }
 
 
+def test_pull_request_candidate_identity_binds_repo_number_and_exact_head() -> None:
+    """Qualification identifies PR bytes without claiming a tag or protected main."""
+    candidate_identity = cast("Any", _module()["pull_request_candidate_identity"])
+
+    identity = candidate_identity(
+        ROOT / "pyproject.toml",
+        repository="nisavid/cqmgr",
+        pull_request_number=123,
+        head_sha=COMMIT,
+    )
+
+    assert identity == {
+        "commit": COMMIT,
+        "mode": "pull-request",
+        "pull_request": "123",
+        "repository": "nisavid/cqmgr",
+        "version": "0.1.0",
+    }
+    assert "tag" not in identity
+
+
+@pytest.mark.parametrize(
+    ("values", "match"),
+    [
+        ({"repository": "other/project"}, "canonical repository"),
+        ({"pull_request_number": 0}, "positive integer"),
+        ({"pull_request_number": True}, "positive integer"),
+        ({"head_sha": "short"}, "head commit SHA"),
+        ({"head_sha": "A" * 40}, "head commit SHA"),
+    ],
+)
+def test_pull_request_candidate_identity_fails_closed_on_invalid_event_facts(
+    values: dict[str, object],
+    match: str,
+) -> None:
+    """Malformed or noncanonical event identity never enters qualification."""
+    candidate_identity = cast("Any", _module()["pull_request_candidate_identity"])
+    arguments: dict[str, object] = {
+        "repository": "nisavid/cqmgr",
+        "pull_request_number": 123,
+        "head_sha": COMMIT,
+    }
+    arguments.update(values)
+
+    with pytest.raises(ValueError, match=match):
+        candidate_identity(ROOT / "pyproject.toml", **arguments)
+
+
+def test_pull_request_bundle_is_verifiable_only_for_qualification(
+    tmp_path: Path,
+) -> None:
+    """Candidate bytes qualify, while release and publication paths reject them."""
+    module = _module()
+    candidate_identity = cast("Any", module["pull_request_candidate_identity"])
+    prepare_release_bundle = cast("Any", module["prepare_release_bundle"])
+    verify_release_bundle = cast("Any", module["verify_release_bundle"])
+    dist = tmp_path / "dist"
+    output = tmp_path / "candidate"
+    dist.mkdir()
+    (dist / "cqmgr-0.1.0-py3-none-any.whl").write_bytes(b"wheel")
+    (dist / "cqmgr-0.1.0.tar.gz").write_bytes(b"sdist")
+    identity = candidate_identity(
+        ROOT / "pyproject.toml",
+        repository="nisavid/cqmgr",
+        pull_request_number=123,
+        head_sha=COMMIT,
+    )
+
+    with pytest.raises(ValueError, match="non-publishable"):
+        prepare_release_bundle(dist, output, identity, "click==8.3.1")
+
+    prepare_release_bundle(
+        dist,
+        output,
+        identity,
+        "click==8.3.1",
+        qualification=True,
+    )
+
+    with pytest.raises(ValueError, match="non-publishable"):
+        verify_release_bundle(output, identity)
+    manifest = verify_release_bundle(output, identity, qualification=True)
+    assert manifest["pull_request"] == "123"
+    assert "tag" not in manifest
+    assert manifest["publication"] == {
+        "authorized": False,
+        "requested": False,
+    }
+
+
+def test_pull_request_bundle_cannot_claim_a_release_tag(tmp_path: Path) -> None:
+    """Qualification rejects candidate evidence that also pretends to be a release."""
+    module = _module()
+    canonical_json = cast("Any", module["_canonical_json"])
+    candidate_identity = cast("Any", module["pull_request_candidate_identity"])
+    prepare_release_bundle = cast("Any", module["prepare_release_bundle"])
+    verify_release_bundle = cast("Any", module["verify_release_bundle"])
+    dist = tmp_path / "dist"
+    output = tmp_path / "candidate"
+    dist.mkdir()
+    (dist / "cqmgr-0.1.0-py3-none-any.whl").write_bytes(b"wheel")
+    (dist / "cqmgr-0.1.0.tar.gz").write_bytes(b"sdist")
+    identity = candidate_identity(
+        ROOT / "pyproject.toml",
+        repository="nisavid/cqmgr",
+        pull_request_number=123,
+        head_sha=COMMIT,
+    )
+    prepare_release_bundle(
+        dist,
+        output,
+        identity,
+        "click==8.3.1",
+        qualification=True,
+    )
+    manifest_path = output / "release-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["tag"] = "v0.1.0"
+    manifest_path.write_bytes(canonical_json(manifest))
+    checksums_path = output / "SHA256SUMS"
+    checksums_path.write_text(
+        "\n".join(
+            (
+                f"{hashlib.sha256(manifest_path.read_bytes()).hexdigest()}"
+                "  release-manifest.json"
+                if line.endswith("  release-manifest.json")
+                else line
+            )
+            for line in checksums_path.read_text(encoding="utf-8").splitlines()
+        )
+        + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    with pytest.raises(ValueError, match="identity fields"):
+        verify_release_bundle(output, identity, qualification=True)
+
+
+def test_pull_request_verification_recomputes_the_event_identity(
+    tmp_path: Path,
+) -> None:
+    """A consumer distrusts downloaded identity and binds it to its own PR context."""
+    module = _module()
+    candidate_identity = cast("Any", module["pull_request_candidate_identity"])
+    prepare_release_bundle = cast("Any", module["prepare_release_bundle"])
+    verify_pull_request_candidate = cast(
+        "Any",
+        module["verify_pull_request_candidate"],
+    )
+    dist = tmp_path / "dist"
+    output = tmp_path / "candidate"
+    dist.mkdir()
+    (dist / "cqmgr-0.1.0-py3-none-any.whl").write_bytes(b"wheel")
+    (dist / "cqmgr-0.1.0.tar.gz").write_bytes(b"sdist")
+    identity = candidate_identity(
+        ROOT / "pyproject.toml",
+        repository="nisavid/cqmgr",
+        pull_request_number=123,
+        head_sha=COMMIT,
+    )
+    prepare_release_bundle(
+        dist,
+        output,
+        identity,
+        "click==8.3.1",
+        qualification=True,
+    )
+
+    manifest = verify_pull_request_candidate(
+        output,
+        identity,
+        ROOT / "pyproject.toml",
+        repository="nisavid/cqmgr",
+        pull_request_number=123,
+        head_sha=COMMIT,
+    )
+
+    assert manifest["commit"] == COMMIT
+    with pytest.raises(ValueError, match="event identity"):
+        verify_pull_request_candidate(
+            output,
+            identity,
+            ROOT / "pyproject.toml",
+            repository="nisavid/cqmgr",
+            pull_request_number=123,
+            head_sha="b" * 40,
+        )
+
+
+def test_pull_request_cli_prepares_and_independently_verifies_candidate(
+    tmp_path: Path,
+) -> None:
+    """The workflow-facing commands keep PR preparation in qualification mode."""
+    main = cast("Any", _module()["main"])
+    dist = tmp_path / "dist"
+    output = tmp_path / "candidate"
+    identity = tmp_path / "candidate-identity.json"
+    requirements = tmp_path / "requirements.txt"
+    dist.mkdir()
+    (dist / "cqmgr-0.1.0-py3-none-any.whl").write_bytes(b"wheel")
+    (dist / "cqmgr-0.1.0.tar.gz").write_bytes(b"sdist")
+    requirements.write_text("click==8.3.1\n", encoding="utf-8", newline="\n")
+
+    main(
+        [
+            "pull-request-identity",
+            "--project",
+            str(ROOT / "pyproject.toml"),
+            "--repository",
+            "nisavid/cqmgr",
+            "--pull-request",
+            "123",
+            "--head-commit",
+            COMMIT,
+            "--output",
+            str(identity),
+        ]
+    )
+    with pytest.raises(ValueError, match="non-publishable"):
+        main(
+            [
+                "prepare",
+                "--dist",
+                str(dist),
+                "--identity",
+                str(identity),
+                "--requirements",
+                str(requirements),
+                "--output",
+                str(tmp_path / "rejected-candidate"),
+            ]
+        )
+    main(
+        [
+            "prepare",
+            "--dist",
+            str(dist),
+            "--identity",
+            str(identity),
+            "--requirements",
+            str(requirements),
+            "--output",
+            str(output),
+            "--qualification",
+        ]
+    )
+    main(
+        [
+            "verify-pull-request",
+            "--release",
+            str(output),
+            "--identity",
+            str(identity),
+            "--project",
+            str(ROOT / "pyproject.toml"),
+            "--repository",
+            "nisavid/cqmgr",
+            "--pull-request",
+            "123",
+            "--head-commit",
+            COMMIT,
+        ]
+    )
+
+    assert json.loads(identity.read_text(encoding="utf-8"))["mode"] == ("pull-request")
+
+
 @pytest.mark.parametrize(
     "project_text",
     [

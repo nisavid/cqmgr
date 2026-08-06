@@ -531,8 +531,6 @@ def build_read_only_operations(  # noqa: PLR0915 - explicit composition root
         OfficialCloudQuotasPageClient,
     )
     from cqmgr.adapters.google.compute_catalog import (  # noqa: PLC0415
-        ComputeAcceleratorTypesPageClient,
-        ComputeMachineTypesPageClient,
         GoogleComputeAcceleratorTypeReader,
         GoogleComputeMachineTypeReader,
         OfficialComputeAcceleratorTypesPageClient,
@@ -656,23 +654,13 @@ def build_read_only_operations(  # noqa: PLR0915 - explicit composition root
         "MonitoringPageClient",
         monitoring_client,
     )
-    compute_accelerators_client = LazyClientProxy(
-        lambda: OfficialComputeAcceleratorTypesPageClient(
-            compute_v1.AcceleratorTypesClient(credentials=cast("Any", adc.credential()))
+    compute_accelerators = OfficialComputeAcceleratorTypesPageClient(
+        lambda: compute_v1.AcceleratorTypesClient(
+            credentials=cast("Any", adc.credential())
         )
     )
-    compute_accelerators = cast(
-        "ComputeAcceleratorTypesPageClient",
-        compute_accelerators_client,
-    )
-    compute_machine_types_client = LazyClientProxy(
-        lambda: OfficialComputeMachineTypesPageClient(
-            compute_v1.MachineTypesClient(credentials=cast("Any", adc.credential()))
-        )
-    )
-    compute_machine_types = cast(
-        "ComputeMachineTypesPageClient",
-        compute_machine_types_client,
+    compute_machine_types = OfficialComputeMachineTypesPageClient(
+        lambda: compute_v1.MachineTypesClient(credentials=cast("Any", adc.credential()))
     )
     tpu_catalog_client = LazyClientProxy(
         lambda: OfficialTpuCatalogPageClient(
@@ -695,8 +683,8 @@ def build_read_only_operations(  # noqa: PLR0915 - explicit composition root
         projects_client,
         cloud_quotas_client,
         monitoring_client,
-        compute_accelerators_client,
-        compute_machine_types_client,
+        compute_accelerators,
+        compute_machine_types,
         tpu_catalog_client,
         spot_advice_client,
     )
