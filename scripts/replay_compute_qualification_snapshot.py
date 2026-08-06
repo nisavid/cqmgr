@@ -15,6 +15,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from threading import Event
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
@@ -78,10 +79,14 @@ class _ReplayError(Exception):
 
 class _Transport:
     def __init__(self) -> None:
-        self.closed = False
+        self._closed = Event()
 
     def close(self) -> None:
-        self.closed = True
+        self._closed.set()
+
+    def wait_closed(self, timeout_seconds: float) -> bool:
+        """Wait a bounded interval for worker-owned close bookkeeping."""
+        return self._closed.wait(timeout_seconds)
 
 
 class _Pager:
@@ -362,6 +367,12 @@ async def _exercise_wrappers(snapshot: Mapping[str, object]) -> None:
     finally:
         await accelerator_wrapper.close()
         await machine_wrapper.close()
+    machine_transport_closed = machine_client.transport.wait_closed(
+        PROCESS_REAP_SECONDS
+    )
+    accelerator_transport_closed = accelerator_client.transport.wait_closed(
+        PROCESS_REAP_SECONDS
+    )
     if len(machine_result.scopes) != 1:
         raise _ReplayError
     machine_types = machine_result.scopes[0].machine_types
@@ -369,8 +380,8 @@ async def _exercise_wrappers(snapshot: Mapping[str, object]) -> None:
     if (
         not machine_client.called
         or not accelerator_client.called
-        or not machine_client.transport.closed
-        or not accelerator_client.transport.closed
+        or not machine_transport_closed
+        or not accelerator_transport_closed
         or machine_result.next_page_token != ""
         or accelerator_result.next_page_token != ""
         or machine_result.scopes[0].scope != f"zones/{ZONE}"
