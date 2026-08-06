@@ -9,7 +9,7 @@ import json
 import runpy
 import sys
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -34,6 +34,7 @@ EXPECTED_ELAPSED_SECONDS = 0.25
 CHILD_CHALLENGE_BYTES = 32
 CHILD_RESPONSE_BYTES = hashlib.sha256().digest_size
 CHILD_TIMEOUT_SECONDS = 60
+EXPECTED_WRAPPER_WORKERS = 2
 
 
 class _WaitableProcess(Protocol):
@@ -453,9 +454,20 @@ def test_replay_waits_for_deferred_transport_close(
     """A delivered page can precede its worker's transport-close bookkeeping."""
     workers_type = compute_catalog._BoundedDaemonWorkers  # noqa: SLF001
     finish_worker = workers_type._finish_worker  # noqa: SLF001
+    finish_lock = Lock()
+    finishes_started = 0
+    both_finishes_started = Event()
+    release_finishes = Event()
+    replay_completed = Event()
+    failures: list[BaseException] = []
 
     def delayed_finish(worker: object) -> None:
-        Event().wait(0.05)
+        nonlocal finishes_started
+        with finish_lock:
+            finishes_started += 1
+            if finishes_started == EXPECTED_WRAPPER_WORKERS:
+                both_finishes_started.set()
+        release_finishes.wait(5)
         finish_worker(cast("Any", worker))
 
     monkeypatch.setattr(workers_type, "_finish_worker", delayed_finish)
@@ -464,7 +476,25 @@ def test_replay_waits_for_deferred_transport_close(
         _script_globals()["_exercise_wrappers"],
     )
 
-    asyncio.run(exercise_wrappers(_snapshot()))
+    def replay() -> None:
+        try:
+            asyncio.run(exercise_wrappers(_snapshot()))
+        except BaseException as error:  # noqa: BLE001 - asserted by the test thread
+            failures.append(error)
+        finally:
+            replay_completed.set()
+
+    replay_thread = Thread(target=replay)
+    replay_thread.start()
+    both_started = both_finishes_started.wait(5)
+    completed_before_release = replay_completed.wait(0.05)
+    release_finishes.set()
+    replay_thread.join(5)
+
+    assert both_started is True
+    assert completed_before_release is False
+    assert replay_thread.is_alive() is False
+    assert failures == []
 
 
 def test_replay_exercises_installed_exact_zone_wrappers_and_writes_pass(
