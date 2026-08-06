@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import hashlib
 import json
 import os
 import re
 import secrets
 import selectors
-import signal
 import subprocess
 import sys
 import time
@@ -47,7 +45,6 @@ OPERATIONS = (
 
 _PR_PATTERN = re.compile(r"[1-9][0-9]*\Z")
 _COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
-_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _TIMESTAMP_PATTERN = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z"
 )
@@ -365,6 +362,8 @@ async def _exercise_wrappers(snapshot: Mapping[str, object]) -> None:
     finally:
         await accelerator_wrapper.close()
         await machine_wrapper.close()
+    if len(machine_result.scopes) != 1:
+        raise _ReplayError
     machine_types = machine_result.scopes[0].machine_types
     machine_accelerators = machine_types[0].accelerators if machine_types else ()
     if (
@@ -374,7 +373,6 @@ async def _exercise_wrappers(snapshot: Mapping[str, object]) -> None:
         or not accelerator_client.transport.closed
         or machine_result.next_page_token != ""
         or accelerator_result.next_page_token != ""
-        or len(machine_result.scopes) != 1
         or machine_result.scopes[0].scope != f"zones/{ZONE}"
         or machine_result.scopes[0].warning_code is not None
         or len(machine_types) != 1
@@ -500,13 +498,30 @@ def _child_command(arguments: argparse.Namespace) -> list[str]:
     ]
 
 
-def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+def _terminate_process_group(
+    process: subprocess.Popen[bytes],
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
+) -> None:
     """Terminate and reap the candidate's dedicated process group."""
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
     try:
+        runner(
+            [
+                "/usr/bin/sudo",
+                "-n",
+                "/usr/bin/pkill",
+                "-KILL",
+                "-g",
+                str(process.pid),
+                "--",
+                ".*",
+            ],
+            check=False,
+            stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+        )
         process.wait(timeout=PROCESS_REAP_SECONDS)
-    except subprocess.TimeoutExpired as error:
+    except (OSError, subprocess.TimeoutExpired) as error:
         raise _ReplayError from error
 
 
@@ -536,6 +551,9 @@ def _supervise_process(
     input_bytes: bytes,
     output_limit: int,
     timeout_seconds: float,
+    group_terminator: Callable[[subprocess.Popen[bytes]], None] = (
+        _terminate_process_group
+    ),
 ) -> bytes:
     """Bound output, time, and descendants for one isolated candidate child."""
     process = subprocess.Popen(  # noqa: S603 - exact trusted command construction
@@ -546,7 +564,7 @@ def _supervise_process(
         start_new_session=True,
     )
     if process.stdin is None or process.stdout is None:
-        _terminate_process_group(process)
+        group_terminator(process)
         raise _ReplayError
     selector = selectors.DefaultSelector()
     output = bytearray()
@@ -569,7 +587,7 @@ def _supervise_process(
             )
 
         return_code = process.returncode
-        _terminate_process_group(process)
+        group_terminator(process)
         group_terminated = True
         while selector.get_map():
             if not _read_process_output(
@@ -586,7 +604,7 @@ def _supervise_process(
         raise _ReplayError from error
     finally:
         if not group_terminated:
-            _terminate_process_group(process)
+            group_terminator(process)
         selector.close()
         process.stdout.close()
 
@@ -603,8 +621,10 @@ def _reap_candidate_uid(
         "-KILL",
         "-u",
         CANDIDATE_USER,
+        "--",
+        ".*",
     ]
-    probe_command = ["/usr/bin/pgrep", "-u", CANDIDATE_USER]
+    probe_command = ["/usr/bin/pgrep", "-u", CANDIDATE_USER, "--", ".*"]
     options = {
         "check": False,
         "stderr": subprocess.DEVNULL,

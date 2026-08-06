@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import runpy
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import pytest
 from google.cloud import compute_v1
+
+from cqmgr.adapters.google import compute_catalog
 
 if TYPE_CHECKING:
     import argparse
@@ -28,7 +31,15 @@ WORKFLOW_REF = (
 )
 EXPECTED_ELAPSED_SECONDS = 0.25
 CHILD_CHALLENGE_BYTES = 32
+CHILD_RESPONSE_BYTES = hashlib.sha256().digest_size
 CHILD_TIMEOUT_SECONDS = 60
+
+
+class _WaitableProcess(Protocol):
+    pid: int
+
+    def wait(self, timeout: float | None = None) -> int:
+        raise NotImplementedError
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -213,11 +224,13 @@ def test_replay_runs_candidate_in_an_isolated_bounded_child(
     assert command.index(trusted_python) > command.index("PYTHONNOUSERSITE=1")
     assert command[command.index(trusted_python) + 1 :][:2] == ["-I", "-S"]
     assert "--candidate-site-packages" in command
-    assert "candidate-env/bin/python" not in command
+    assert not any(
+        argument.endswith("candidate-env/bin/python") for argument in command
+    )
     assert "--child-only" in command
     assert "--output" not in command
     assert captured["input_bytes"] == challenge
-    assert captured["output_limit"] == CHILD_CHALLENGE_BYTES
+    assert captured["output_limit"] == CHILD_RESPONSE_BYTES
     assert captured["timeout_seconds"] == CHILD_TIMEOUT_SECONDS
     assert captured["cleaned"] is True
 
@@ -266,10 +279,28 @@ def test_candidate_uid_cleanup_kills_and_verifies_escaped_sessions() -> None:
     cast("Callable[..., None]", script_globals["_reap_candidate_uid"])(runner=run)
 
     assert commands == [
-        ["/usr/bin/sudo", "-n", "/usr/bin/pkill", "-KILL", "-u", "cqmgr-replay"],
-        ["/usr/bin/pgrep", "-u", "cqmgr-replay"],
-        ["/usr/bin/sudo", "-n", "/usr/bin/pkill", "-KILL", "-u", "cqmgr-replay"],
-        ["/usr/bin/pgrep", "-u", "cqmgr-replay"],
+        [
+            "/usr/bin/sudo",
+            "-n",
+            "/usr/bin/pkill",
+            "-KILL",
+            "-u",
+            "cqmgr-replay",
+            "--",
+            ".*",
+        ],
+        ["/usr/bin/pgrep", "-u", "cqmgr-replay", "--", ".*"],
+        [
+            "/usr/bin/sudo",
+            "-n",
+            "/usr/bin/pkill",
+            "-KILL",
+            "-u",
+            "cqmgr-replay",
+            "--",
+            ".*",
+        ],
+        ["/usr/bin/pgrep", "-u", "cqmgr-replay", "--", ".*"],
     ]
 
 
@@ -285,9 +316,41 @@ def test_candidate_uid_cleanup_fails_if_any_process_survives() -> None:
         cast("Callable[..., None]", script_globals["_reap_candidate_uid"])(runner=run)
 
 
-def test_bounded_child_supervisor_rejects_timeout_and_kills_process_group(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_process_group_termination_uses_privileged_exact_group() -> None:
+    """The trusted runner can terminate every UID in the candidate group."""
+    script_globals = _script_globals()
+    commands: list[list[str]] = []
+    waits: list[float] = []
+    process = SimpleNamespace(
+        pid=4242,
+        wait=lambda *, timeout: waits.append(timeout),
+    )
+
+    def run(command: list[str], **_options: object) -> object:
+        commands.append(command)
+        return SimpleNamespace(returncode=0)
+
+    cast("Callable[..., None]", script_globals["_terminate_process_group"])(
+        cast("_WaitableProcess", process),
+        runner=run,
+    )
+
+    assert commands == [
+        [
+            "/usr/bin/sudo",
+            "-n",
+            "/usr/bin/pkill",
+            "-KILL",
+            "-g",
+            "4242",
+            "--",
+            ".*",
+        ]
+    ]
+    assert waits == [5]
+
+
+def test_bounded_child_supervisor_rejects_timeout_and_kills_process_group() -> None:
     """A candidate cannot retain the trusted controller or its process group."""
     script_globals = _script_globals()
     os_module = cast("Any", script_globals["os"])
@@ -298,7 +361,10 @@ def test_bounded_child_supervisor_rejects_timeout_and_kills_process_group(
         killed_groups.append(process_group)
         original_killpg(process_group, signal_number)
 
-    monkeypatch.setattr(os_module, "killpg", kill_group)
+    def terminate(process: _WaitableProcess) -> None:
+        kill_group(process.pid, 9)
+        process.wait(timeout=5)
+
     replay_error = cast("type[Exception]", script_globals["_ReplayError"])
     supervise = cast("Callable[..., bytes]", script_globals["_supervise_process"])
 
@@ -308,14 +374,13 @@ def test_bounded_child_supervisor_rejects_timeout_and_kills_process_group(
             input_bytes=b"x",
             output_limit=1,
             timeout_seconds=0.05,
+            group_terminator=terminate,
         )
 
     assert killed_groups
 
 
-def test_bounded_child_supervisor_cleans_descendants_after_normal_exit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_bounded_child_supervisor_cleans_descendants_after_normal_exit() -> None:
     """A successful direct child cannot leave work alive during uploads."""
     script_globals = _script_globals()
     os_module = cast("Any", script_globals["os"])
@@ -326,7 +391,11 @@ def test_bounded_child_supervisor_cleans_descendants_after_normal_exit(
         killed_groups.append(process_group)
         original_killpg(process_group, signal_number)
 
-    monkeypatch.setattr(os_module, "killpg", kill_group)
+    def terminate(process: _WaitableProcess) -> None:
+        with contextlib.suppress(ProcessLookupError):
+            kill_group(process.pid, 9)
+        process.wait(timeout=5)
+
     supervise = cast("Callable[..., bytes]", script_globals["_supervise_process"])
     child = (
         "import subprocess,sys; "
@@ -339,10 +408,42 @@ def test_bounded_child_supervisor_cleans_descendants_after_normal_exit(
         input_bytes=b"",
         output_limit=1,
         timeout_seconds=5,
+        group_terminator=terminate,
     )
 
     assert output == b"x"
     assert killed_groups
+
+
+def test_replay_classifies_empty_machine_scope_as_contract_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing exact-zone scope fails through the replay contract."""
+
+    class EmptyMachineWrapper:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        async def machine_types_for_zone(self, **_kwargs: object) -> object:
+            return SimpleNamespace(scopes=(), next_page_token="")
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        compute_catalog,
+        "OfficialComputeMachineTypesPageClient",
+        EmptyMachineWrapper,
+    )
+    script_globals = _script_globals()
+    exercise_wrappers = cast(
+        "Callable[[Mapping[str, object]], Any]",
+        script_globals["_exercise_wrappers"],
+    )
+    replay_error = cast("type[Exception]", script_globals["_ReplayError"])
+
+    with pytest.raises(replay_error):
+        asyncio.run(exercise_wrappers(_snapshot()))
 
 
 def test_replay_exercises_installed_exact_zone_wrappers_and_writes_pass(

@@ -516,8 +516,8 @@ def test_trusted_live_workflow_isolates_collection_credentials() -> None:  # noq
     assert 'HOME="${RUNNER_TEMP}/credential-free-home"' in qualification
     assert "PYTHONNOUSERSITE=1" in qualification
     assert "if: always()" in cleanup
-    assert "/usr/bin/pkill -KILL -u" in cleanup
-    assert "/usr/bin/pgrep -u" in cleanup
+    assert "/usr/bin/pkill -KILL -u \"${CANDIDATE_USER}\" -- '.*'" in cleanup
+    assert "/usr/bin/pgrep -u \"${CANDIDATE_USER}\" -- '.*'" in cleanup
     assert "/usr/sbin/userdel" in cleanup
     snapshot_evidence = _job_step(
         replay_text,
