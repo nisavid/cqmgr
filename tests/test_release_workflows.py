@@ -316,15 +316,17 @@ def test_live_read_only_workflow_has_separate_identity_and_environment_gate() ->
     assert "validateonly" not in canary.lower()
 
 
-def test_trusted_live_workflow_binds_same_repo_head_and_same_run_candidate() -> None:
-    """The reusable trust boundary rejects forks and verifies exact caller bytes."""
+def test_trusted_live_workflow_splits_collection_and_replay() -> None:  # noqa: PLR0915
+    """Credentialed trusted code and credential-free candidate code use fresh jobs."""
     workflow = (WORKFLOWS / "trusted-live-read-only.yml").read_text()
     triggers = _yaml_block(workflow, "on", indent=0)
     inputs = _yaml_block(workflow, "inputs", indent=4)
     trust = _workflow_job_mapping(workflow, "trust-caller")
     trust_text = _workflow_job(workflow, "trust-caller")
-    qualify = _workflow_job_mapping(workflow, "qualify-candidate")
-    qualify_text = _workflow_job(workflow, "qualify-candidate")
+    collect = _workflow_job_mapping(workflow, "collect-live-snapshot")
+    collect_text = _workflow_job(workflow, "collect-live-snapshot")
+    replay = _workflow_job_mapping(workflow, "replay-candidate")
+    replay_text = _workflow_job(workflow, "replay-candidate")
     expected_guard = SAME_REPO_PULL_REQUEST_GUARD
 
     assert _yaml_mapping_keys(triggers, indent=2) == {"workflow_call"}
@@ -352,85 +354,184 @@ def test_trusted_live_workflow_binds_same_repo_head_and_same_run_candidate() -> 
     assert 'test "${EXPECTED_HEAD_SHA}" = "${CALLER_HEAD_SHA}"' in reject
     assert 'test "${EXPECTED_PR_NUMBER}" = "${CALLER_PR_NUMBER}"' in reject
 
-    assert qualify.get("needs") == "trust-caller"
-    assert qualify.get("if") == expected_guard
-    checkout = _job_step(qualify_text, "Checkout trusted workflow source")
-    assert "repository: ${{ job.workflow_repository }}" in checkout
-    assert "ref: ${{ job.workflow_sha }}" in checkout
-    assert "path: trusted" in checkout
-    assert "persist-credentials: false" in checkout
-    assert "github.event.pull_request.head.sha" not in checkout
-    download = _job_step(qualify_text, "Download same-run pull-request candidate")
-    assert "name: pull-request-candidate" in download
-    assert "path: candidate" in download
-    for forbidden in ("github-token:", "repository:", "run-id:"):
-        assert forbidden not in download
-    verify = _job_step(qualify_text, "Verify exact candidate identity and bytes")
-    assert "id: verify" in verify
-    assert "uv run --python 3.14 --no-project python" in verify
-    assert "trusted/scripts/verify_pull_request_candidate.py" in verify
-    assert "--candidate candidate" in verify
-    assert "EXPECTED_REPOSITORY: ${{ github.repository }}" in verify
-    assert "EXPECTED_PR_NUMBER: ${{ inputs.pull-request-number }}" in verify
-    assert "EXPECTED_HEAD_SHA: ${{ inputs.head-sha }}" in verify
-    assert '--repository "${EXPECTED_REPOSITORY}"' in verify
-    assert '--pull-request "${EXPECTED_PR_NUMBER}"' in verify
-    assert '--head-sha "${EXPECTED_HEAD_SHA}"' in verify
-    assert '--github-output "${GITHUB_OUTPUT}"' in verify
-
-
-def test_trusted_live_workflow_uses_only_protected_installed_compute_reads() -> None:
-    """Credentials reach only the verified wheel's bounded Compute profile."""
-    workflow = (WORKFLOWS / "trusted-live-read-only.yml").read_text()
-    qualify = _workflow_job_mapping(workflow, "qualify-candidate")
-    qualify_text = _workflow_job(workflow, "qualify-candidate")
-    expected_guard = SAME_REPO_PULL_REQUEST_GUARD
-
-    assert qualify.get("if") == expected_guard
-    assert qualify.get("environment") == "live-read-only"
-    assert qualify.get("runs-on") == "ubuntu-22.04"
-    assert qualify.get("timeout-minutes") == LIVE_TIMEOUT_MINUTES
-    assert qualify.get("permissions") == {
+    assert collect.get("needs") == "trust-caller"
+    assert collect.get("if") == expected_guard
+    assert collect.get("environment") == "live-read-only"
+    assert collect.get("permissions") == {
         "contents": "read",
         "id-token": "write",
     }
+    collect_checkout = _job_step(collect_text, "Checkout trusted workflow source")
+    assert "repository: ${{ job.workflow_repository }}" in collect_checkout
+    assert "ref: ${{ job.workflow_sha }}" in collect_checkout
+    assert "path: trusted" in collect_checkout
+    assert "persist-credentials: false" in collect_checkout
+    assert "pull-request-candidate" not in collect_text
+    assert "download-artifact@" not in collect_text
 
-    verify = _job_step(qualify_text, "Verify exact candidate identity and bytes")
+    assert replay.get("needs") == ["trust-caller", "collect-live-snapshot"]
+    assert replay.get("if") == expected_guard
+    assert replay.get("permissions") == {"contents": "read"}
+    assert "environment" not in replay
+    assert "id-token" not in replay_text
+    assert "secrets." not in replay_text
+    replay_checkout = _job_step(replay_text, "Checkout trusted workflow source")
+    assert "repository: ${{ job.workflow_repository }}" in replay_checkout
+    assert "ref: ${{ job.workflow_sha }}" in replay_checkout
+    assert "path: trusted" in replay_checkout
+    assert "persist-credentials: false" in replay_checkout
+    candidate = _job_step(replay_text, "Download same-run pull-request candidate")
+    assert "name: pull-request-candidate" in candidate
+    assert "path: candidate" in candidate
+    snapshot = _job_step(replay_text, "Download same-run live snapshot")
+    assert (
+        "name: pull-request-live-read-only-snapshot-${{ github.run_attempt }}"
+        in snapshot
+    )
+    assert "path: snapshot" in snapshot
+
+
+def test_trusted_live_workflow_isolates_collection_credentials() -> None:  # noqa: PLR0915
+    """No candidate bytes or cloud capability cross the fresh-job boundary."""
+    workflow = (WORKFLOWS / "trusted-live-read-only.yml").read_text()
+    collect = _workflow_job_mapping(workflow, "collect-live-snapshot")
+    collect_text = _workflow_job(workflow, "collect-live-snapshot")
+    replay = _workflow_job_mapping(workflow, "replay-candidate")
+    replay_text = _workflow_job(workflow, "replay-candidate")
+    expected_guard = SAME_REPO_PULL_REQUEST_GUARD
+
+    assert collect.get("if") == expected_guard
+    assert collect.get("environment") == "live-read-only"
+    assert collect.get("runs-on") == "ubuntu-22.04"
+    assert collect.get("timeout-minutes") == LIVE_TIMEOUT_MINUTES
+    assert collect.get("permissions") == {
+        "contents": "read",
+        "id-token": "write",
+    }
     authenticate = _job_step(
-        qualify_text,
+        collect_text,
         "Authenticate with workload identity federation",
     )
-    qualification = _job_step(
-        qualify_text,
-        "Run installed bounded Compute qualification",
+    pin = _job_step(collect_text, "Verify immutable workflow source")
+    collection = _job_step(
+        collect_text,
+        "Collect bounded Compute snapshot",
     )
-    assert qualify_text.index(verify) < qualify_text.index(authenticate)
-    assert qualify_text.index(authenticate) < qualify_text.index(qualification)
+    assert collect_text.index(pin) < collect_text.index(authenticate)
+    assert collect_text.index(authenticate) < collect_text.index(collection)
+    assert "job.workflow_ref" in pin
+    assert "job.workflow_sha" in pin
+    assert "nisavid/cqmgr/.github/workflows/trusted-live-read-only.yml@" in pin
     assert (
         "google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093"
         in authenticate
     )
     assert "GCP_WORKLOAD_IDENTITY_PROVIDER" in authenticate
     assert "GCP_SERVICE_ACCOUNT" in authenticate
-    assert "uv run --python 3.14 --no-project python" in qualification
-    assert "trusted/scripts/installed_live_adapter_qualification.py" in qualification
-    assert "VERIFIED_WHEEL: ${{ steps.verify.outputs.wheel }}" in qualification
-    assert '"${VERIFIED_WHEEL}"' in qualification
-    assert "--project-env GCP_PROJECT_ID" in qualification
-    assert "--output installed-live-adapter-evidence.json" in qualification
-    assert "GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}" in qualification
+    assert "trusted/scripts/collect_compute_qualification_snapshot.py" in collection
+    assert "--project-env GCP_PROJECT_ID" in collection
+    assert "--output live-qualification-snapshot.json" in collection
+    assert "GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}" in collection
     for forbidden in ("apply", "create", "update", "delete", "validateonly"):
-        assert re.search(rf"\b{forbidden}\b", qualification.lower()) is None
+        assert re.search(rf"\b{forbidden}\b", collection.lower()) is None
+    for forbidden in (
+        "pull-request-candidate",
+        "verify_pull_request_candidate",
+        "installed_live_adapter_qualification",
+        "uv tool install",
+    ):
+        assert forbidden not in collect_text
 
-    evidence = _job_step(qualify_text, "Upload sanitized evidence")
-    assert "if: always()" in evidence
+    snapshot = _job_step(collect_text, "Upload sanitized live snapshot")
     assert (
-        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" in evidence
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" in snapshot
     )
-    assert "name: pull-request-live-read-only-evidence" in evidence
-    assert "path: installed-live-adapter-evidence.json" in evidence
-    assert "if-no-files-found: warn" in evidence
-    assert "retention-days: 14" in evidence
+    assert (
+        "name: pull-request-live-read-only-snapshot-${{ github.run_attempt }}"
+        in snapshot
+    )
+    assert "path: live-qualification-snapshot.json" in snapshot
+    assert "if-no-files-found: error" in snapshot
+    assert "retention-days: 14" in snapshot
+
+    assert "environment" not in replay
+    assert replay.get("permissions") == {"contents": "read"}
+    assert "google-github-actions/auth@" not in replay_text
+    for forbidden in (
+        "secrets.",
+        "id-token",
+        "GCP_",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_GHA_CREDS_PATH",
+        "ACTIONS_ID_TOKEN",
+    ):
+        assert forbidden not in replay_text
+    verify = _job_step(replay_text, "Verify exact candidate identity and bytes")
+    snapshot_verify = _job_step(
+        replay_text,
+        "Verify live snapshot identity and bytes",
+    )
+    install = _job_step(replay_text, "Install exact candidate wheel")
+    qualification = _job_step(replay_text, "Replay installed Compute snapshot")
+    cleanup = _job_step(replay_text, "Reap isolated candidate identity")
+    assert replay_text.index(verify) < replay_text.index(snapshot_verify)
+    assert replay_text.index(snapshot_verify) < replay_text.index(install)
+    assert replay_text.index(install) < replay_text.index(qualification)
+    assert replay_text.index(qualification) < replay_text.index(cleanup)
+    assert "trusted/scripts/verify_pull_request_candidate.py" in verify
+    assert "trusted/scripts/replay_compute_qualification_snapshot.py" in snapshot_verify
+    assert "--verify-only" in snapshot_verify
+    assert "exec env -i" in snapshot_verify
+    assert 'HOME="${RUNNER_TEMP}/credential-free-home"' in snapshot_verify
+    assert 'UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR}"' in snapshot_verify
+    assert "VERIFIED_WHEEL: ${{ steps.verify.outputs.wheel }}" in install
+    assert '"${VERIFIED_WHEEL}"' in install
+    assert "candidate-env/bin/python -I -S -c" in install
+    assert "candidate_site_packages=" in install
+    assert '>> "${GITHUB_OUTPUT}"' in install
+    assert "trusted/scripts/replay_compute_qualification_snapshot.py" in qualification
+    assert "uv run --python 3.14 --no-project python" in qualification
+    assert "--candidate-python" not in qualification
+    assert '--candidate-site-packages "${CANDIDATE_SITE_PACKAGES}"' in qualification
+    assert '--candidate-home "${CANDIDATE_HOME}"' in qualification
+    assert "/usr/sbin/useradd" in qualification
+    assert "--system" in qualification
+    assert "--no-create-home" in qualification
+    assert "--shell /usr/sbin/nologin" in qualification
+    assert "CANDIDATE_USER=cqmgr-replay" in qualification
+    assert (
+        'sudo -n -u "${CANDIDATE_USER}" -- test ! -w "${GITHUB_WORKSPACE}"'
+        in qualification
+    )
+    assert (
+        'sudo -n -u "${CANDIDATE_USER}" -- test ! -w "${RUNNER_TEMP}"' in qualification
+    )
+    assert (
+        "candidate-env/bin/python trusted/scripts/"
+        "replay_compute_qualification_snapshot.py" not in qualification
+    )
+    assert "--snapshot snapshot/live-qualification-snapshot.json" in qualification
+    assert "--output installed-snapshot-replay-evidence.json" in qualification
+    assert "env -i" in qualification
+    assert 'HOME="${RUNNER_TEMP}/credential-free-home"' in qualification
+    assert "PYTHONNOUSERSITE=1" in qualification
+    assert "if: always()" in cleanup
+    assert "/usr/bin/pkill -KILL -u" in cleanup
+    assert "/usr/bin/pgrep -u" in cleanup
+    assert "/usr/sbin/userdel" in cleanup
+    snapshot_evidence = _job_step(
+        replay_text,
+        "Upload sanitized snapshot verification evidence",
+    )
+    assert replay_text.index(cleanup) < replay_text.index(snapshot_evidence)
+    assert "if: always()" in snapshot_evidence
+    assert "path: snapshot-verification-evidence.json" in snapshot_evidence
+    assert "if-no-files-found: warn" in snapshot_evidence
+    evidence = _job_step(replay_text, "Upload sanitized replay evidence")
+    assert "if: always()" in evidence
+    assert "path: installed-snapshot-replay-evidence.json" in evidence
+    assert "if-no-files-found: error" in evidence
+    assert "installed_live_adapter_qualification.py" not in workflow
 
 
 def test_release_publication_requires_the_exact_commit_live_canary() -> None:

@@ -435,6 +435,17 @@ failure path retains the same sanitized evidence shape without command
 arguments, provider payloads, resource scope, project identity, principal, or
 credential detail.
 
+Pull-request snapshot replay treats candidate behavior as review-trusted for
+semantic qualification and capability-untrusted everywhere else. Candidate
+code runs without cloud or GitHub credentials under a dedicated ephemeral
+operating-system identity that cannot write the workspace, runner temporary
+directory, or parent-owned evidence. The trusted controller uses a fresh
+challenge to reject stale completion records, reaps and verifies every process
+owned by that identity, and writes the final evidence only after cleanup. The
+challenge proves liveness; it does not replace code review or claim to prove
+the intent of arbitrary Python code that deliberately special-cases the
+qualification harness.
+
 The identity deliberately lacks quota-update, service-enablement, and resource
 provisioning permissions. The ordinary canary composition contains no create,
 update, patch, delete, quota-request Preview, Apply, or `validateOnly` port. The

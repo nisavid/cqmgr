@@ -41,23 +41,101 @@ jobs:
           [[ "${EXPECTED_HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]
           [[ "${EXPECTED_PR_NUMBER}" =~ ^[1-9][0-9]*$ ]]
 
-  qualify-candidate:
-    name: Protected installed Compute qualification
+  collect-live-snapshot:
+    name: Protected live snapshot collection
     needs: trust-caller
     if: >-
       github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     environment: live-read-only
     permissions:
-      # Required only to check out the immutable reusable-workflow revision.
+      # Read only the immutable workflow revision.
       contents: read
-      # Required only by the pinned workload-identity authentication step.
+      # Mint only this job's workload-identity token.
       id-token: write
     runs-on: ubuntu-22.04
     timeout-minutes: 25
     steps:
       - name: Checkout trusted workflow source
-        # GitHub.com binds these properties to the called workflow revision;
-        # there is intentionally no mutable or GHES compatibility fallback.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Verify immutable workflow source
+        shell: bash
+        env:
+          EXPECTED_WORKFLOW_REF: ${{ job.workflow_ref }}
+          EXPECTED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "${EXPECTED_WORKFLOW_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          test "${EXPECTED_WORKFLOW_REF}" = "nisavid/cqmgr/.github/workflows/trusted-live-read-only.yml@${EXPECTED_WORKFLOW_SHA}"
+          test "$(git -C trusted rev-parse HEAD)" = "${EXPECTED_WORKFLOW_SHA}"
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.11.30
+          python-version: "3.14"
+          enable-cache: false
+
+      - name: Synchronize trusted runtime
+        working-directory: trusted
+        run: uv sync --locked --no-dev --python 3.14
+
+      - name: Authenticate with workload identity federation
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Collect bounded Compute snapshot
+        env:
+          EXPECTED_HEAD_SHA: ${{ inputs.head-sha }}
+          EXPECTED_PR_NUMBER: ${{ inputs.pull-request-number }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_WORKFLOW_REF: ${{ job.workflow_ref }}
+          EXPECTED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+        run: >-
+          trusted/.venv/bin/python
+          trusted/scripts/collect_compute_qualification_snapshot.py
+          --repository "${EXPECTED_REPOSITORY}"
+          --pull-request "${EXPECTED_PR_NUMBER}"
+          --head-sha "${EXPECTED_HEAD_SHA}"
+          --workflow-ref "${EXPECTED_WORKFLOW_REF}"
+          --workflow-sha "${EXPECTED_WORKFLOW_SHA}"
+          --run-id "${RUN_ID}"
+          --run-attempt "${RUN_ATTEMPT}"
+          --project-env GCP_PROJECT_ID
+          --output live-qualification-snapshot.json
+
+      - name: Upload sanitized live snapshot
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pull-request-live-read-only-snapshot-${{ github.run_attempt }}
+          path: live-qualification-snapshot.json
+          if-no-files-found: error
+          retention-days: 14
+
+  replay-candidate:
+    name: Credential-free installed Compute replay
+    needs:
+      - trust-caller
+      - collect-live-snapshot
+    if: >-
+      github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      # Read only the immutable workflow revision; no OIDC capability is granted.
+      contents: read
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout trusted workflow source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ job.workflow_repository }}
@@ -78,6 +156,12 @@ jobs:
           name: pull-request-candidate
           path: candidate
 
+      - name: Download same-run live snapshot
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pull-request-live-read-only-snapshot-${{ github.run_attempt }}
+          path: snapshot
+
       - name: Verify exact candidate identity and bytes
         id: verify
         shell: bash
@@ -94,28 +178,138 @@ jobs:
           --head-sha "${EXPECTED_HEAD_SHA}"
           --github-output "${GITHUB_OUTPUT}"
 
-      - name: Authenticate with workload identity federation
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-
-      - name: Run installed bounded Compute qualification
+      - name: Verify live snapshot identity and bytes
         env:
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          VERIFIED_WHEEL: ${{ steps.verify.outputs.wheel }}
-        run: >-
-          uv run --python 3.14 --no-project python
-          trusted/scripts/installed_live_adapter_qualification.py
-          "${VERIFIED_WHEEL}"
-          --project-env GCP_PROJECT_ID
-          --output installed-live-adapter-evidence.json
+          EXPECTED_HEAD_SHA: ${{ inputs.head-sha }}
+          EXPECTED_PR_NUMBER: ${{ inputs.pull-request-number }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 "${RUNNER_TEMP}/credential-free-home"
+          exec env -i \
+            HOME="${RUNNER_TEMP}/credential-free-home" \
+            LANG=C.UTF-8 \
+            LC_ALL=C.UTF-8 \
+            PATH="${PATH}" \
+            PYTHONNOUSERSITE=1 \
+            UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR}" \
+            uv run --python 3.14 --no-project python \
+            trusted/scripts/replay_compute_qualification_snapshot.py \
+            --snapshot snapshot/live-qualification-snapshot.json \
+            --repository "${EXPECTED_REPOSITORY}" \
+            --pull-request "${EXPECTED_PR_NUMBER}" \
+            --head-sha "${EXPECTED_HEAD_SHA}" \
+            --workflow-sha "${EXPECTED_WORKFLOW_SHA}" \
+            --run-id "${RUN_ID}" \
+            --run-attempt "${RUN_ATTEMPT}" \
+            --output snapshot-verification-evidence.json \
+            --verify-only
 
-      - name: Upload sanitized evidence
+      - name: Install exact candidate wheel
+        id: candidate
+        env:
+          VERIFIED_WHEEL: ${{ steps.verify.outputs.wheel }}
+        run: |
+          set -euo pipefail
+          uv venv candidate-env --python 3.14
+          CANDIDATE_SITE_PACKAGES="$(
+            candidate-env/bin/python -I -S -c \
+              'import sysconfig; print(sysconfig.get_path("purelib"))'
+          )"
+          case "${CANDIDATE_SITE_PACKAGES}" in
+            "${GITHUB_WORKSPACE}"/*) ;;
+            *) exit 1 ;;
+          esac
+          printf 'candidate_site_packages=%s\n' \
+            "${CANDIDATE_SITE_PACKAGES}" >> "${GITHUB_OUTPUT}"
+          uv pip install --python candidate-env/bin/python --no-build "${VERIFIED_WHEEL}"
+          test -d "${CANDIDATE_SITE_PACKAGES}/cqmgr"
+
+      - name: Replay installed Compute snapshot
+        env:
+          CANDIDATE_SITE_PACKAGES: ${{ steps.candidate.outputs.candidate_site_packages }}
+          EXPECTED_HEAD_SHA: ${{ inputs.head-sha }}
+          EXPECTED_PR_NUMBER: ${{ inputs.pull-request-number }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 "${RUNNER_TEMP}/credential-free-home"
+          CANDIDATE_HOME="${RUNNER_TEMP}/cqmgr-candidate-home-${RUN_ID}-${RUN_ATTEMPT}"
+          CANDIDATE_USER=cqmgr-replay
+          if /usr/bin/id -u "${CANDIDATE_USER}" > /dev/null 2>&1; then
+            exit 1
+          fi
+          sudo -n /usr/sbin/useradd \
+            --system \
+            --no-create-home \
+            --home-dir "${CANDIDATE_HOME}" \
+            --shell /usr/sbin/nologin \
+            --user-group \
+            "${CANDIDATE_USER}"
+          sudo -n install \
+            -d -o "${CANDIDATE_USER}" -g "${CANDIDATE_USER}" -m 700 \
+            "${CANDIDATE_HOME}"
+          sudo -n -u "${CANDIDATE_USER}" -- test ! -w "${GITHUB_WORKSPACE}"
+          sudo -n -u "${CANDIDATE_USER}" -- test ! -w "${RUNNER_TEMP}"
+          exec env -i \
+            HOME="${RUNNER_TEMP}/credential-free-home" \
+            LANG=C.UTF-8 \
+            LC_ALL=C.UTF-8 \
+            PATH="${PATH}" \
+            PYTHONNOUSERSITE=1 \
+            UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR}" \
+            uv run --python 3.14 --no-project python \
+            trusted/scripts/replay_compute_qualification_snapshot.py \
+            --snapshot snapshot/live-qualification-snapshot.json \
+            --repository "${EXPECTED_REPOSITORY}" \
+            --pull-request "${EXPECTED_PR_NUMBER}" \
+            --head-sha "${EXPECTED_HEAD_SHA}" \
+            --workflow-sha "${EXPECTED_WORKFLOW_SHA}" \
+            --run-id "${RUN_ID}" \
+            --run-attempt "${RUN_ATTEMPT}" \
+            --candidate-site-packages "${CANDIDATE_SITE_PACKAGES}" \
+            --candidate-home "${CANDIDATE_HOME}" \
+            --output installed-snapshot-replay-evidence.json
+
+      - name: Reap isolated candidate identity
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          CANDIDATE_USER=cqmgr-replay
+          if /usr/bin/id -u "${CANDIDATE_USER}" > /dev/null 2>&1; then
+            for _ in 1 2 3 4 5; do
+              sudo -n /usr/bin/pkill -KILL -u "${CANDIDATE_USER}" || true
+              if ! /usr/bin/pgrep -u "${CANDIDATE_USER}" > /dev/null; then
+                break
+              fi
+            done
+            if /usr/bin/pgrep -u "${CANDIDATE_USER}" > /dev/null; then
+              exit 1
+            fi
+            sudo -n /usr/sbin/userdel "${CANDIDATE_USER}"
+          fi
+
+      - name: Upload sanitized snapshot verification evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: pull-request-live-read-only-evidence
-          path: installed-live-adapter-evidence.json
+          name: pull-request-snapshot-verification-evidence-${{ github.run_attempt }}
+          path: snapshot-verification-evidence.json
           if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload sanitized replay evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pull-request-installed-snapshot-replay-evidence-${{ github.run_attempt }}
+          path: installed-snapshot-replay-evidence.json
+          if-no-files-found: error
           retention-days: 14
