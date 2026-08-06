@@ -9,6 +9,7 @@ import json
 import runpy
 import sys
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -444,6 +445,26 @@ def test_replay_classifies_empty_machine_scope_as_contract_failure(
 
     with pytest.raises(replay_error):
         asyncio.run(exercise_wrappers(_snapshot()))
+
+
+def test_replay_waits_for_deferred_transport_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delivered page can precede its worker's transport-close bookkeeping."""
+    workers_type = compute_catalog._BoundedDaemonWorkers  # noqa: SLF001
+    finish_worker = workers_type._finish_worker  # noqa: SLF001
+
+    def delayed_finish(worker: object) -> None:
+        Event().wait(0.05)
+        finish_worker(cast("Any", worker))
+
+    monkeypatch.setattr(workers_type, "_finish_worker", delayed_finish)
+    exercise_wrappers = cast(
+        "Callable[[Mapping[str, object]], Any]",
+        _script_globals()["_exercise_wrappers"],
+    )
+
+    asyncio.run(exercise_wrappers(_snapshot()))
 
 
 def test_replay_exercises_installed_exact_zone_wrappers_and_writes_pass(
