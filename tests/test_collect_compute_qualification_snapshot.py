@@ -326,6 +326,9 @@ def test_collector_writes_only_the_canonical_project_aliased_snapshot(
         "machine",
         "snapshot",
     }
+    assert cast("Mapping[str, str]", snapshot["digests"])["snapshot"] == (
+        "sha256:7291502ce0be1dabc7c3cb6fb661a5612471ee93f2efebdb02afb2594825890d"
+    )
     assert RAW_PROJECT not in document
     assert "https://" not in document
     assert "unrelated" not in document

@@ -285,12 +285,12 @@ jobs:
           CANDIDATE_USER=cqmgr-replay
           if /usr/bin/id -u "${CANDIDATE_USER}" > /dev/null 2>&1; then
             for _ in 1 2 3 4 5; do
-              sudo -n /usr/bin/pkill -KILL -u "${CANDIDATE_USER}" || true
-              if ! /usr/bin/pgrep -u "${CANDIDATE_USER}" > /dev/null; then
+              sudo -n /usr/bin/pkill -KILL -u "${CANDIDATE_USER}" -- '.*' || true
+              if ! /usr/bin/pgrep -u "${CANDIDATE_USER}" -- '.*' > /dev/null; then
                 break
               fi
             done
-            if /usr/bin/pgrep -u "${CANDIDATE_USER}" > /dev/null; then
+            if /usr/bin/pgrep -u "${CANDIDATE_USER}" -- '.*' > /dev/null; then
               exit 1
             fi
             sudo -n /usr/sbin/userdel "${CANDIDATE_USER}"
