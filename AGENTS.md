@@ -30,14 +30,8 @@ maps, `tdd` for implementation, and `impeccable` for interface work.
 
 ## Git and validation
 
-This is a personal `nisavid` project. Use `Ivan D Vasin <ivan@nisavid.io>` for
-Git work and the `nisavid` GitHub account for repository mutations. Prefix
-branches with `ivan/`. Use Conventional Commits for commits and pull request
-titles.
-
-For every Git-backed task, use `checkpointing-and-publishing-git-work` at the
-start, at clean checkpoints, and before stopping. Every change requires
-`git diff --check`.
+Use Conventional Commits for commits and pull request titles. Every change
+requires `git diff --check`.
 
 ## Safety
 
