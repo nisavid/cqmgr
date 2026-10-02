@@ -239,7 +239,7 @@ def test_release_workflow_qualifies_resolutions_platforms_and_exact_install() ->
     for python in ("3.12", "3.13", "3.14"):
         assert f'- "{python}"' in installed
     for runner in (
-        "macos-14",
+        "macos-15",
         "macos-15-intel",
         "ubuntu-22.04",
         "ubuntu-24.04",
@@ -263,7 +263,7 @@ def test_release_workflow_qualifies_each_supported_terminal_shell() -> None:
     runner_matrix = _yaml_block(installed, "runner", indent=8)
 
     assert _yaml_list_values(runner_matrix, indent=10) == {
-        "macos-14",
+        "macos-15",
         "macos-15-intel",
         "ubuntu-22.04",
         "ubuntu-24.04",
