@@ -88,6 +88,20 @@ class ComputeAcceleratorPages:
             raise value
         return value
 
+    async def accelerator_types_for_zone(
+        self,
+        *,
+        project: str,
+        zone: str,
+        max_results: int,
+        page_token: str,
+        timeout_seconds: float,
+    ) -> ComputeAcceleratorTypesPage:
+        """Reject zonal dispatches in aggregate-only edge scenarios."""
+        del project, zone, max_results, page_token, timeout_seconds
+        message = "unexpected exact-zone accelerator-type read"
+        raise AssertionError(message)
+
 
 def _policy() -> GoogleReadPolicy:
     """Return one deterministic no-retry read policy."""

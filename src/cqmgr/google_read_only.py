@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from threading import RLock
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -131,11 +131,19 @@ class LazyClientProxy[ClientT]:
             _ = await result
 
 
-class OwnedClientPool:
-    """Best-effort shutdown for every lazy client owned by one invocation."""
+class AsyncCloseable(Protocol):
+    """Release invocation-owned resources asynchronously."""
 
-    def __init__(self, *clients: LazyClientProxy[Any]) -> None:
-        """Retain the complete set of invocation-scoped client proxies."""
+    async def aclose(self) -> None:
+        """Release owned resources."""
+        ...
+
+
+class OwnedClientPool:
+    """Best-effort shutdown for every client owned by one invocation."""
+
+    def __init__(self, *clients: AsyncCloseable) -> None:
+        """Retain the complete set of invocation-scoped asynchronous closeables."""
         self._clients = clients
 
     async def aclose(self) -> None:
