@@ -330,6 +330,9 @@ jobs:
 
   live-read-only:
     needs: build
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     name: Bounded keyless provider reads
     runs-on: ubuntu-22.04
     timeout-minutes: 25
@@ -388,6 +391,9 @@ jobs:
 
   installed-live-adapters:
     needs: build
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     name: Installed live-read adapter qualification
     runs-on: ubuntu-22.04
     timeout-minutes: 25

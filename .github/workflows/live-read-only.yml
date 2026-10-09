@@ -1,8 +1,6 @@
 name: Live read-only qualification
 
 on:
-  schedule:
-    - cron: "41 8 * * 1"
   workflow_dispatch:
 
 concurrency:
