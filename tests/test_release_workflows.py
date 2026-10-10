@@ -219,6 +219,49 @@ def test_release_workflow_builds_once_and_cannot_publish_a_manual_run() -> None:
     assert "skip-existing" not in workflow
 
 
+def test_release_schedule_keeps_ordinary_checks_and_gates_live_jobs() -> None:
+    """Schedules retain ordinary jobs; live jobs admit dispatch or version tags."""
+    workflow = (WORKFLOWS / "release.yml").read_text()
+    triggers = _yaml_block(workflow, "on", indent=0)
+    expected_guard = (
+        "github.event_name == 'workflow_dispatch' || "
+        "(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))"
+    )
+
+    assert _yaml_mapping_keys(triggers, indent=2) == {
+        "push",
+        "schedule",
+        "workflow_dispatch",
+    }
+    assert yaml.safe_load(_yaml_block(triggers, "push", indent=2)) == {
+        "push": {"tags": ["v*"]},
+    }
+    assert yaml.safe_load(_yaml_block(triggers, "schedule", indent=2)) == {
+        "schedule": [{"cron": "23 7 * * 1"}],
+    }
+
+    ordinary_jobs = {
+        "build": None,
+        "dependency-resolutions": None,
+        "installed-artifacts": "build",
+        "compatibility-canaries": "build",
+        "deep-tests": None,
+        "performance": None,
+    }
+    for name, needs in ordinary_jobs.items():
+        job = _workflow_job_mapping(workflow, name)
+        assert job.get("if") is None, name
+        assert job.get("needs") == needs, name
+
+    assert {
+        name: _workflow_job_mapping(workflow, name).get("if")
+        for name in ("live-read-only", "installed-live-adapters")
+    } == {
+        "live-read-only": expected_guard,
+        "installed-live-adapters": expected_guard,
+    }
+
+
 def test_release_workflow_qualifies_resolutions_platforms_and_exact_install() -> None:
     """Cover dependency, Python, OS, architecture, and installed-artifact gates."""
     workflow = (WORKFLOWS / "release.yml").read_text()
@@ -289,10 +332,7 @@ def test_live_read_only_workflow_has_separate_identity_and_environment_gate() ->
     triggers = _yaml_block(workflow, "on", indent=0)
     canary = _workflow_job(workflow, "canary")
 
-    assert _yaml_mapping_keys(triggers, indent=2) == {
-        "schedule",
-        "workflow_dispatch",
-    }
+    assert _yaml_mapping_keys(triggers, indent=2) == {"workflow_dispatch"}
     assert "environment: live-read-only" in canary
     assert "id-token: write" in canary
     assert "google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093" in (
