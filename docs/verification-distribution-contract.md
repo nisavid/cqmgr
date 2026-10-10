@@ -30,10 +30,14 @@ The package supports CPython `>=3.12,<3.15`. CI tests Python 3.12, 3.13, and
 
 | Platform family | V1 contract | Release evidence |
 | --- | --- | --- |
-| macOS | macOS 14 or newer on arm64 and x86_64 | Oldest and latest stable GitHub-hosted images, clean uv-tool installation, native Keychain smoke, terminal and package tests. |
+| macOS | macOS 15 or newer on arm64 and x86_64 | Oldest and latest stable GitHub-hosted images, clean uv-tool installation, native Keychain smoke, terminal and package tests. |
 | Linux | Ubuntu 22.04 or newer on glibc x86_64 and arm64 | Oldest and latest stable GitHub-hosted images, clean uv-tool installation, Secret Service smoke, terminal and package tests. |
 | Windows | Windows 11 or Windows Server 2022 or newer on x86_64 | Oldest and latest stable GitHub-hosted images, clean uv-tool installation, Credential Locker smoke, PowerShell and package tests. |
 | Windows arm64 | Compatibility canary | Promote only after wheel-only dependency resolution and the complete platform, terminal, keyring, and artifact matrix pass. |
+
+The current macOS workflow declarations use macOS 15. Intel runners are
+declared only for installed-artifact qualification. Qualification on the latest
+stable hosted image and broader architecture coverage remain pending.
 
 Preview runner images are canaries until stable. Musl Linux, 32-bit systems,
 BSD, and other operating systems are outside the V1 support promise. CI runner
