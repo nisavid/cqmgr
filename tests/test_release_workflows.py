@@ -300,12 +300,17 @@ def test_release_workflow_qualifies_resolutions_platforms_and_exact_install() ->
 
 
 def test_release_workflow_qualifies_each_supported_terminal_shell() -> None:
-    """Installed artifacts run under the representative native shell per OS."""
+    """Installed artifacts run each supported runner once under its native shell."""
     workflow = (WORKFLOWS / "release.yml").read_text()
     installed = _workflow_job(workflow, "installed-artifacts")
-    runner_matrix = _yaml_block(installed, "runner", indent=8)
+    installed_job = _workflow_job_mapping(workflow, "installed-artifacts")
+    strategy = _mapping(installed_job.get("strategy"), "installed-artifacts strategy")
+    matrix = _mapping(strategy.get("matrix"), "installed-artifacts matrix")
+    runners = matrix.get("runner")
+    assert isinstance(runners, list), "installed-artifacts runner matrix"
+    assert all(isinstance(runner, str) for runner in runners), "runner labels"
 
-    assert _yaml_list_values(runner_matrix, indent=10) == {
+    assert sorted(cast("list[str]", runners)) == [
         "macos-15",
         "macos-15-intel",
         "ubuntu-22.04",
@@ -313,7 +318,7 @@ def test_release_workflow_qualifies_each_supported_terminal_shell() -> None:
         "ubuntu-24.04-arm",
         "windows-2022",
         "windows-2025",
-    }
+    ]
 
     macos = _job_step(installed, "Smoke macOS artifacts from zsh")
     assert "if: runner.os == 'macOS'" in macos
@@ -324,6 +329,57 @@ def test_release_workflow_qualifies_each_supported_terminal_shell() -> None:
     linux = _job_step(installed, "Smoke Linux artifacts from bash with Secret Service")
     assert "if: runner.os == 'Linux'" in linux
     assert "shell: bash" in linux
+
+
+def test_package_smoke_declares_the_required_runners_once() -> None:
+    """Package smoke includes each required runner label exactly once."""
+    workflow = (WORKFLOWS / "python.yml").read_text()
+    package_smoke = _workflow_job_mapping(workflow, "package-smoke")
+    strategy = _mapping(package_smoke.get("strategy"), "package-smoke strategy")
+    matrix = _mapping(strategy.get("matrix"), "package-smoke matrix")
+    runners = matrix.get("os")
+    assert isinstance(runners, list), "package-smoke os matrix"
+    assert all(isinstance(runner, str) for runner in runners), "runner labels"
+
+    assert sorted(cast("list[str]", runners)) == [
+        "macos-15",
+        "ubuntu-22.04",
+        "windows-2022",
+    ]
+
+
+def test_post_publication_declares_the_required_runners_once() -> None:
+    """Post-publication includes each required runner label exactly once."""
+    workflow = (WORKFLOWS / "release.yml").read_text()
+    post_publication = _workflow_job_mapping(workflow, "post-publication")
+    strategy = _mapping(post_publication.get("strategy"), "post-publication strategy")
+    matrix = _mapping(strategy.get("matrix"), "post-publication matrix")
+    runners = matrix.get("runner")
+    assert isinstance(runners, list), "post-publication runner matrix"
+    assert all(isinstance(runner, str) for runner in runners), "runner labels"
+
+    assert sorted(cast("list[str]", runners)) == [
+        "macos-15",
+        "ubuntu-22.04",
+        "windows-2022",
+    ]
+
+
+def test_selected_workflow_jobs_select_their_declared_runner_axis() -> None:
+    """Each selected job selects runners from its declared matrix axis."""
+    for filename, name, axis in (
+        ("python.yml", "package-smoke", "os"),
+        ("performance.yml", "performance", "runner"),
+        ("release.yml", "installed-artifacts", "runner"),
+        ("release.yml", "post-publication", "runner"),
+    ):
+        workflow = (WORKFLOWS / filename).read_text()
+        job = _workflow_job_mapping(workflow, name)
+        runs_on = job.get("runs-on")
+        context = f"{filename}/{name} runs-on"
+        assert isinstance(runs_on, str), context
+        expected = r"\$\{\{\s*matrix\s*\.\s*" + axis + r"\s*\}\}"
+        assert re.fullmatch(expected, runs_on.strip()) is not None, context
 
 
 def test_live_read_only_workflow_has_separate_identity_and_environment_gate() -> None:
@@ -667,6 +723,19 @@ def test_release_performance_job_enforces_budgets_and_retains_failure_evidence()
     performance = _workflow_job(workflow, "performance")
     measure = _job_step(performance, "Measure and enforce performance budgets")
     upload = _job_step(performance, "Upload performance evidence")
+
+    performance_job = _workflow_job_mapping(workflow, "performance")
+    strategy = _mapping(performance_job.get("strategy"), "performance strategy")
+    matrix = _mapping(strategy.get("matrix"), "performance matrix")
+    runners = matrix.get("runner")
+    assert isinstance(runners, list), "performance runner matrix"
+    assert all(isinstance(runner, str) for runner in runners), "runner labels"
+
+    assert sorted(cast("list[str]", runners)) == [
+        "macos-15",
+        "ubuntu-22.04",
+        "windows-2022",
+    ]
 
     assert "uses: ./.github/workflows/performance.yml" in _workflow_job(
         release,
