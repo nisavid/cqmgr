@@ -360,7 +360,7 @@ the dependable screen-reader and automation surface.
 | Cadence | Required evidence |
 | --- | --- |
 | Every pull request | Locked sync and build; Ruff; Pyrefly; all Python 3.12–3.14 core contracts on Linux; representative smoke on every stable supported OS; CLI, Pilot, persistence, package, vulnerability, and license checks appropriate to the diff. No cloud identity is available to forked or otherwise untrusted pull requests. |
-| Scheduled | Full stable OS/architecture and Python matrix; compatibility canaries; real keyring backends; high-iteration property, mutation, crash, subprocess, and concurrency tests; fresh dependency resolution; bounded live-read-only provider canaries. |
+| Scheduled | Full stable OS/architecture and Python matrix; compatibility canaries; real keyring backends; high-iteration property, mutation, crash, subprocess, and concurrency tests; fresh dependency resolution. |
 | Release commit | Every supported platform at its oldest and latest stable image; every Python minor; real supported keyrings; source distribution and wheel installation; exact dependency and artifact policy; all deep tests; hermetic release-relative exhaustive catalog evidence; live-read-only canaries; provenance and publication preflight. |
 | Post-publication | Exact-version PyPI uv-tool installation and offline smoke on the supported matrix; published hashes, attestations, GitHub Release assets, tag, version, and commit agreement. |
 
@@ -461,7 +461,15 @@ templates; any request outside the allowlist fails the canary. The workflow
 never enables an API, changes quota, creates capacity, or relies on ambient
 `gcloud` state.
 
-Scheduled canaries and the exact release commit's canaries are release gates.
+Scheduled release qualification runs ordinary checks without protected live
+qualification. `.github/workflows/live-read-only.yml` is manual-only. In
+`.github/workflows/release.yml`, `live-read-only` and
+`installed-live-adapters` run on manual dispatch or a push of a `v*` version
+tag. Publication requires the exact release commit's provider canary and the
+candidate wheel's installed-adapter qualification to succeed in the same run.
+The separate trusted pull-request snapshot contract defines collection and
+credential-free replay.
+
 The release canary exhausts every page matching each declared source selection
 and every discovered supported Cloud TPU location required by its declared
 two-provider evidence set. A complete filtered Compute machine-type source is
