@@ -690,10 +690,7 @@ def test_release_publication_qualifies_installed_live_read_adapters() -> None:
     assert "GCP_PROJECT_ID" in qualification
     assert "scripts/installed_live_adapter_qualification.py" in qualification
     assert "--project-env GCP_PROJECT_ID" in qualification
-    assert (
-        "candidate/release/cqmgr-${{ needs.build.outputs.version }}-py3-none-any.whl"
-        in qualification
-    )
+    assert "candidate/release/cqmgr-${VERSION}-py3-none-any.whl" in qualification
     candidate = _job_step(qualification, "Download immutable release candidate")
     assert "uses: actions/download-artifact@" in candidate
     assert "name: release-candidate" in candidate
@@ -711,6 +708,39 @@ def test_release_publication_qualifies_installed_live_read_adapters() -> None:
         publish_needs,
         indent=6,
     )
+
+
+def test_live_candidate_dependencies_are_verified_before_cloud_authentication() -> None:
+    """Cloud authority is acquired only after the exact locked install succeeds."""
+    workflow = (WORKFLOWS / "release.yml").read_text()
+    build = _workflow_job(workflow, "build")
+    qualification = _workflow_job(workflow, "installed-live-adapters")
+    verify = _job_step(qualification, "Verify candidate and locked runtime resolution")
+    install = _job_step(qualification, "Install hash-verified candidate environment")
+    authentication = _job_step(
+        qualification,
+        "Authenticate with workload identity federation",
+    )
+    live = _job_step(qualification, "Qualify installed live-read adapters")
+
+    assert "release-requirements.txt" in _job_step(
+        build, "Upload immutable release candidate"
+    )
+    assert "scripts/release_qualification.py verify" in verify
+    assert (
+        "uv export --locked --offline --no-dev --no-emit-project --no-header" in verify
+    )
+    assert "cmp release-requirements.txt candidate/release-requirements.txt" in verify
+    assert "uv pip sync" in install
+    assert "--require-hashes --only-binary :all:" in install
+    assert "candidate/release-requirements.txt" in install
+    assert "--no-deps --no-index --offline --no-build" in install
+    assert "uv pip check" in install
+    assert qualification.index(verify) < qualification.index(install)
+    assert qualification.index(install) < qualification.index(authentication)
+    assert qualification.index(authentication) < qualification.index(live)
+    assert '"${RUNNER_TEMP}/cqmgr-live/bin/cqmgr"' in live
+    assert "uv " not in qualification[qualification.index(authentication) :]
 
 
 def test_release_performance_job_enforces_budgets_and_retains_failure_evidence() -> (

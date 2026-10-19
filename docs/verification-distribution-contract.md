@@ -471,6 +471,16 @@ qualification. `.github/workflows/live-read-only.yml` is manual-only. In
 `installed-live-adapters` run on manual dispatch or a push of a `v*` version
 tag. Publication requires the exact release commit's provider canary and the
 candidate wheel's installed-adapter qualification to succeed in the same run.
+Before acquiring Google credentials, installed-adapter qualification verifies
+the candidate bundle, compares the build's exported runtime requirements with
+the committed lock, and installs that exact dependency closure with required
+hashes and binary-only artifacts. It installs the verified candidate wheel
+offline without dependency resolution and checks the installed dependency
+closure. The credentialed qualification script accepts only the prepared
+executable and runs the two bounded reads; it performs no package installation.
+Its sanitized evidence contains one record for each read. Installation failure
+prevents authentication and qualification through the workflow's normal step
+failure gate.
 The separate trusted pull-request snapshot contract defines collection and
 credential-free replay.
 

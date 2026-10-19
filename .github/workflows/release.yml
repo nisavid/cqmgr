@@ -88,7 +88,7 @@ jobs:
 
       - name: Export locked runtime resolution
         run: >-
-          uv export --locked --no-dev --no-emit-project
+          uv export --locked --no-dev --no-emit-project --no-header
           --format requirements-txt --output-file release-requirements.txt
 
       - name: Audit runtime vulnerabilities
@@ -125,6 +125,7 @@ jobs:
           path: |
             release/*
             release-identity.json
+            release-requirements.txt
           if-no-files-found: error
           retention-days: 14
 
@@ -407,12 +408,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Authenticate with workload identity federation
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-
       - name: Install uv and Python
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
@@ -426,12 +421,41 @@ jobs:
           name: release-candidate
           path: candidate
 
+      - name: Verify candidate and locked runtime resolution
+        run: |
+          set -euo pipefail
+          python scripts/release_qualification.py verify \
+            --release candidate/release \
+            --identity candidate/release-identity.json
+          uv export --locked --offline --no-dev --no-emit-project --no-header \
+            --format requirements-txt --output-file release-requirements.txt
+          cmp release-requirements.txt candidate/release-requirements.txt
+
+      - name: Install hash-verified candidate environment
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          uv venv --python python "${RUNNER_TEMP}/cqmgr-live"
+          uv pip sync --python "${RUNNER_TEMP}/cqmgr-live/bin/python" \
+            --require-hashes --only-binary :all: candidate/release-requirements.txt
+          uv pip install --python "${RUNNER_TEMP}/cqmgr-live/bin/python" \
+            --no-deps --no-index --offline --no-build \
+            "candidate/release/cqmgr-${VERSION}-py3-none-any.whl"
+          uv pip check --python "${RUNNER_TEMP}/cqmgr-live/bin/python"
+
+      - name: Authenticate with workload identity federation
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
       - name: Qualify installed live-read adapters
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
         run: >-
           python scripts/installed_live_adapter_qualification.py
-          candidate/release/cqmgr-${{ needs.build.outputs.version }}-py3-none-any.whl
+          "${RUNNER_TEMP}/cqmgr-live/bin/cqmgr"
           --project-env GCP_PROJECT_ID
           --output installed-live-adapter-evidence.json
 
