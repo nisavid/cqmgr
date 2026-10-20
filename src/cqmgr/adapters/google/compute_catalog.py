@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from threading import Lock, Thread
-from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Protocol
 
 from google.cloud import compute_v1
 
@@ -188,9 +188,8 @@ class ComputeAcceleratorTypesPage:
     warning_code: str | None = None
 
 
-@runtime_checkable
 class ComputeAcceleratorTypesPageClient(Protocol):
-    """Materialize one official Compute accelerator-types page asynchronously."""
+    """Materialize aggregate and exact-zone Compute accelerator-type pages."""
 
     async def accelerator_types(
         self,
@@ -203,11 +202,6 @@ class ComputeAcceleratorTypesPageClient(Protocol):
     ) -> ComputeAcceleratorTypesPage:
         """Return one materialized aggregated-list page."""
         raise NotImplementedError
-
-
-@runtime_checkable
-class ComputeAcceleratorTypesZonalPageClient(Protocol):
-    """Materialize official Compute accelerator pages for exact zones."""
 
     async def accelerator_types_for_zone(
         self,
@@ -227,13 +221,15 @@ class OfficialComputeAcceleratorTypesPageClient:
 
     def __init__(
         self,
-        client: compute_v1.AcceleratorTypesClient,
+        client_factory: Callable[[], compute_v1.AcceleratorTypesClient],
         *,
         maximum_workers: int = 4,
     ) -> None:
-        """Bind one client and cap concurrent daemon-worker dispatches."""
+        """Bind one lazy client factory and cap daemon-worker dispatches."""
         _require_positive(maximum_workers, "Compute catalog maximum_workers")
-        self._client = client
+        self._client_factory = client_factory
+        self._client: compute_v1.AcceleratorTypesClient | None = None
+        self._client_lock = Lock()
         self._workers = _BoundedDaemonWorkers[ComputeAcceleratorTypesPage](
             self._close_transport,
             maximum_workers=maximum_workers,
@@ -286,9 +282,23 @@ class OfficialComputeAcceleratorTypesPageClient:
         """Release promptly while active sync calls retain their transport."""
         await self._workers.close()
 
+    async def aclose(self) -> None:
+        """Release this invocation-owned wrapper."""
+        await self.close()
+
     def _close_transport(self) -> None:
         """Close the generated transport once no sync call owns it."""
-        self._client.transport.close()
+        with self._client_lock:
+            client = self._client
+        if client is not None:
+            client.transport.close()
+
+    def _get_client(self) -> compute_v1.AcceleratorTypesClient:
+        """Construct the generated client on its first provider call."""
+        with self._client_lock:
+            if self._client is None:
+                self._client = self._client_factory()
+            return self._client
 
     def _accelerator_types(
         self,
@@ -305,7 +315,7 @@ class OfficialComputeAcceleratorTypesPageClient:
             page_token=page_token,
             return_partial_success=return_partial_success,
         )
-        pager = self._client.aggregated_list(
+        pager = self._get_client().aggregated_list(
             request=request,
             retry=None,
             timeout=timeout_seconds,
@@ -341,7 +351,7 @@ class OfficialComputeAcceleratorTypesPageClient:
             max_results=max_results,
             page_token=page_token,
         )
-        pager = self._client.list(
+        pager = self._get_client().list(
             request=request,
             retry=None,
             timeout=timeout_seconds,
@@ -378,9 +388,8 @@ class ComputeMachineTypesPage:
     warning_code: str | None = None
 
 
-@runtime_checkable
 class ComputeMachineTypesPageClient(Protocol):
-    """Materialize one official Compute aggregated-list page asynchronously."""
+    """Materialize aggregate and exact-zone Compute machine-type pages."""
 
     async def machine_types(
         self,
@@ -393,11 +402,6 @@ class ComputeMachineTypesPageClient(Protocol):
     ) -> ComputeMachineTypesPage:
         """Return one materialized aggregated-list page."""
         ...
-
-
-@runtime_checkable
-class ComputeMachineTypesZonalPageClient(Protocol):
-    """Materialize official Compute machine pages for exact zones."""
 
     async def machine_types_for_zone(
         self,
@@ -417,13 +421,15 @@ class OfficialComputeMachineTypesPageClient:
 
     def __init__(
         self,
-        client: compute_v1.MachineTypesClient,
+        client_factory: Callable[[], compute_v1.MachineTypesClient],
         *,
         maximum_workers: int = 4,
     ) -> None:
-        """Bind one client and cap concurrent daemon-worker dispatches."""
+        """Bind one lazy client factory and cap daemon-worker dispatches."""
         _require_positive(maximum_workers, "Compute catalog maximum_workers")
-        self._client = client
+        self._client_factory = client_factory
+        self._client: compute_v1.MachineTypesClient | None = None
+        self._client_lock = Lock()
         self._workers = _BoundedDaemonWorkers[ComputeMachineTypesPage](
             self._close_transport,
             maximum_workers=maximum_workers,
@@ -476,9 +482,23 @@ class OfficialComputeMachineTypesPageClient:
         """Release promptly while active sync calls retain their transport."""
         await self._workers.close()
 
+    async def aclose(self) -> None:
+        """Release this invocation-owned wrapper."""
+        await self.close()
+
     def _close_transport(self) -> None:
         """Close the generated transport once no sync call owns it."""
-        self._client.transport.close()
+        with self._client_lock:
+            client = self._client
+        if client is not None:
+            client.transport.close()
+
+    def _get_client(self) -> compute_v1.MachineTypesClient:
+        """Construct the generated client on its first provider call."""
+        with self._client_lock:
+            if self._client is None:
+                self._client = self._client_factory()
+            return self._client
 
     def _machine_types(
         self,
@@ -495,7 +515,7 @@ class OfficialComputeMachineTypesPageClient:
             page_token=page_token,
             return_partial_success=return_partial_success,
         )
-        pager = self._client.aggregated_list(
+        pager = self._get_client().aggregated_list(
             request=request,
             retry=None,
             timeout=timeout_seconds,
@@ -531,7 +551,7 @@ class OfficialComputeMachineTypesPageClient:
             max_results=max_results,
             page_token=page_token,
         )
-        pager = self._client.list(
+        pager = self._get_client().list(
             request=request,
             retry=None,
             timeout=timeout_seconds,
@@ -562,9 +582,7 @@ class GoogleComputeAcceleratorTypeReader:
 
     def __init__(
         self,
-        client: (
-            ComputeAcceleratorTypesPageClient | ComputeAcceleratorTypesZonalPageClient
-        ),
+        client: ComputeAcceleratorTypesPageClient,
         policy: GoogleReadPolicy,
         *,
         page_size: int = 100,
@@ -592,18 +610,6 @@ class GoogleComputeAcceleratorTypeReader:
             raise TypeError(msg)
         project = request.context.project.project_id
         zones = request.zones
-        aggregated_client: ComputeAcceleratorTypesPageClient | None = None
-        zonal_client: ComputeAcceleratorTypesZonalPageClient | None = None
-        if zones is None:
-            if not isinstance(self._client, ComputeAcceleratorTypesPageClient):
-                msg = "Compute accelerator client lacks aggregated list support"
-                raise TypeError(msg)
-            aggregated_client = self._client
-        else:
-            if not isinstance(self._client, ComputeAcceleratorTypesZonalPageClient):
-                msg = "Compute accelerator client lacks exact-zone list support"
-                raise TypeError(msg)
-            zonal_client = self._client
         expectation = (
             LocationCoverageExpectation.REQUESTED
             if zones is not None
@@ -623,17 +629,14 @@ class GoogleComputeAcceleratorTypeReader:
             zone = zones[zone_index] if zones is not None else None
             attempted += 1
             if zone is None:
-                client = cast(
-                    "ComputeAcceleratorTypesPageClient",
-                    aggregated_client,
-                )
+                read_page = self._client.accelerator_types
                 result = await self._policy.call(
                     request.context,
                     provider="compute",
                     phase="compute-accelerator-types-read",
                     identity=f"compute-accelerator-types:{project}:{token}",
-                    dispatch=lambda timeout, page_token=token, client=client: (
-                        client.accelerator_types(
+                    dispatch=(
+                        lambda timeout, page_token=token, read=read_page: read(
                             project=project,
                             max_results=self._page_size,
                             page_token=page_token,
@@ -643,20 +646,17 @@ class GoogleComputeAcceleratorTypeReader:
                     ),
                 )
             else:
-                client = cast(
-                    "ComputeAcceleratorTypesZonalPageClient",
-                    zonal_client,
-                )
+                read_zone_page = self._client.accelerator_types_for_zone
                 result = await self._policy.call(
                     request.context,
                     provider="compute",
                     phase="compute-accelerator-types-read",
                     identity=(f"compute-accelerator-types:{project}:{zone}:{token}"),
                     dispatch=(
-                        lambda timeout, page_token=token, zone=zone, client=client: (
-                            client.accelerator_types_for_zone(
+                        lambda timeout, page_token=token, z=zone, read=read_zone_page: (
+                            read(
                                 project=project,
-                                zone=zone,
+                                zone=z,
                                 max_results=self._page_size,
                                 page_token=page_token,
                                 timeout_seconds=timeout,
@@ -789,7 +789,7 @@ class GoogleComputeMachineTypeReader:
 
     def __init__(
         self,
-        client: ComputeMachineTypesPageClient | ComputeMachineTypesZonalPageClient,
+        client: ComputeMachineTypesPageClient,
         policy: GoogleReadPolicy,
         *,
         page_size: int = 100,
@@ -815,18 +815,6 @@ class GoogleComputeMachineTypeReader:
             raise TypeError(msg)
         project = request.context.project.project_id
         zones = request.zones
-        aggregated_client: ComputeMachineTypesPageClient | None = None
-        zonal_client: ComputeMachineTypesZonalPageClient | None = None
-        if zones is None:
-            if not isinstance(self._client, ComputeMachineTypesPageClient):
-                msg = "Compute machine client lacks aggregated list support"
-                raise TypeError(msg)
-            aggregated_client = self._client
-        else:
-            if not isinstance(self._client, ComputeMachineTypesZonalPageClient):
-                msg = "Compute machine client lacks exact-zone list support"
-                raise TypeError(msg)
-            zonal_client = self._client
         expectation = (
             LocationCoverageExpectation.REQUESTED
             if zones is not None
@@ -846,14 +834,14 @@ class GoogleComputeMachineTypeReader:
             zone = zones[zone_index] if zones is not None else None
             attempted += 1
             if zone is None:
-                client = cast("ComputeMachineTypesPageClient", aggregated_client)
+                read_page = self._client.machine_types
                 result = await self._policy.call(
                     request.context,
                     provider="compute",
                     phase="compute-machine-types-read",
                     identity=f"compute-machine-types:{project}:{token}",
-                    dispatch=lambda timeout, page_token=token, client=client: (
-                        client.machine_types(
+                    dispatch=(
+                        lambda timeout, page_token=token, read=read_page: read(
                             project=project,
                             max_results=self._page_size,
                             page_token=page_token,
@@ -863,17 +851,17 @@ class GoogleComputeMachineTypeReader:
                     ),
                 )
             else:
-                client = cast("ComputeMachineTypesZonalPageClient", zonal_client)
+                read_zone_page = self._client.machine_types_for_zone
                 result = await self._policy.call(
                     request.context,
                     provider="compute",
                     phase="compute-machine-types-read",
                     identity=f"compute-machine-types:{project}:{zone}:{token}",
                     dispatch=(
-                        lambda timeout, page_token=token, zone=zone, client=client: (
-                            client.machine_types_for_zone(
+                        lambda timeout, page_token=token, z=zone, read=read_zone_page: (
+                            read(
                                 project=project,
-                                zone=zone,
+                                zone=z,
                                 max_results=self._page_size,
                                 page_token=page_token,
                                 timeout_seconds=timeout,

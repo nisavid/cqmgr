@@ -19,8 +19,10 @@ from google.cloud.location import locations_pb2
 
 from cqmgr.adapters.google.compute_catalog import (
     ComputeAcceleratorTypesPage,
+    ComputeAcceleratorTypesPageClient,
     ComputeAcceleratorTypesScope,
     ComputeMachineTypesPage,
+    ComputeMachineTypesPageClient,
     ComputeMachineTypesScope,
     GoogleComputeAcceleratorTypeReader,
     GoogleComputeMachineTypeReader,
@@ -63,6 +65,26 @@ from cqmgr.domain.scopes import ResourceScope, ResourceScopeKind
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
+
+    async def _complete_compute_contracts(
+        accelerator_types: ComputeAcceleratorTypesPageClient,
+        machine_types: ComputeMachineTypesPageClient,
+    ) -> None:
+        await accelerator_types.accelerator_types_for_zone(
+            project="fixture-project",
+            zone="us-central1-a",
+            max_results=1,
+            page_token="",
+            timeout_seconds=1.0,
+        )
+        await machine_types.machine_types_for_zone(
+            project="fixture-project",
+            zone="us-central1-a",
+            max_results=1,
+            page_token="",
+            timeout_seconds=1.0,
+        )
+
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "google"
 NOW = datetime(2026, 7, 22, 8, tzinfo=UTC)
@@ -1134,7 +1156,7 @@ def test_official_compute_wrapper_uses_partial_success_without_retry() -> None:
     client = Client()
     result = asyncio.run(
         OfficialComputeMachineTypesPageClient(
-            cast("compute_v1.MachineTypesClient", client)
+            lambda: cast("compute_v1.MachineTypesClient", client)
         ).machine_types(
             project="public-project",
             max_results=17,
@@ -1185,7 +1207,7 @@ def test_official_compute_accelerator_wrapper_uses_aggregated_partial_success() 
     client = Client()
     result = asyncio.run(
         OfficialComputeAcceleratorTypesPageClient(
-            cast("compute_v1.AcceleratorTypesClient", client)
+            lambda: cast("compute_v1.AcceleratorTypesClient", client)
         ).accelerator_types(
             project="public-project",
             max_results=OFFICIAL_PAGE_SIZE,
@@ -1230,7 +1252,7 @@ def test_official_compute_machine_wrapper_uses_exact_zonal_list() -> None:
     client = Client()
     result = asyncio.run(
         OfficialComputeMachineTypesPageClient(
-            cast("compute_v1.MachineTypesClient", client)
+            lambda: cast("compute_v1.MachineTypesClient", client)
         ).machine_types_for_zone(
             project="public-project",
             zone="us-central1-a",
@@ -1275,7 +1297,7 @@ def test_official_compute_accelerator_wrapper_uses_exact_zonal_list() -> None:
     client = Client()
     result = asyncio.run(
         OfficialComputeAcceleratorTypesPageClient(
-            cast("compute_v1.AcceleratorTypesClient", client)
+            lambda: cast("compute_v1.AcceleratorTypesClient", client)
         ).accelerator_types_for_zone(
             project="public-project",
             zone="us-central1-a",
@@ -1324,7 +1346,7 @@ def test_official_compute_wrapper_bounds_sync_dispatch_concurrency() -> None:
 
     client = Client()
     wrapper = OfficialComputeMachineTypesPageClient(
-        cast("compute_v1.MachineTypesClient", client),
+        lambda: cast("compute_v1.MachineTypesClient", client),
         maximum_workers=1,
     )
 
@@ -1369,7 +1391,7 @@ def test_cancelled_compute_waiter_holds_slot_until_sync_worker_finishes() -> Non
 
     client = Client()
     wrapper = OfficialComputeMachineTypesPageClient(
-        cast("compute_v1.MachineTypesClient", client),
+        lambda: cast("compute_v1.MachineTypesClient", client),
         maximum_workers=1,
     )
 
