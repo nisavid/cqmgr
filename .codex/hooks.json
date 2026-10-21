@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; launcher=\"$root/.agents/skills/impeccable/scripts/impeccable\"; [ ! -f \"$launcher\" ] || \"$launcher\" hook",
-            "commandWindows": "cmd /d /c for /f \"delims=\" %r in ('git rev-parse --show-toplevel 2^>nul') do @if exist \"%r\\.agents\\skills\\impeccable\\scripts\\impeccable.cmd\" \"%r\\.agents\\skills\\impeccable\\scripts\\impeccable.cmd\" hook",
+            "commandWindows": "cmd /d /c for /f \"delims=\" %r in ('git rev-parse --show-toplevel') do @if exist \"%r\\.agents\\skills\\impeccable\\scripts\\impeccable.cmd\" \"%r\\.agents\\skills\\impeccable\\scripts\\impeccable.cmd\" hook",
             "timeout": 5,
             "statusMessage": "Checking UI changes"
           }
@@ -20,7 +20,7 @@
           {
             "type": "command",
             "command": "root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; launcher=\"$root/.agents/skills/impeccable/scripts/impeccable\"; [ ! -f \"$launcher\" ] || \"$launcher\" hook",
-            "commandWindows": "cmd /d /c for /f \"delims=\" %r in ('git rev-parse --show-toplevel 2^>nul') do @if exist \"%r\\.agents\\skills\\impeccable\\scripts\\impeccable.cmd\" \"%r\\.agents\\skills\\impeccable\\scripts\\impeccable.cmd\" hook",
+            "commandWindows": "cmd /d /c for /f \"delims=\" %r in ('git rev-parse --show-toplevel') do @if exist \"%r\\.agents\\skills\\impeccable\\scripts\\impeccable.cmd\" \"%r\\.agents\\skills\\impeccable\\scripts\\impeccable.cmd\" hook",
             "timeout": 30,
             "statusMessage": "Design deep pass"
           }
