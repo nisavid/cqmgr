@@ -1883,14 +1883,352 @@ def _recovery_record(plan: QuotaPlan) -> ApplyRecord:
                     child.preference_name
                     or (
                         f"{SCOPE.canonical_name}/locations/global/"
-                        f"quotaPreferences/recovery-{child.child_id}"
+                        "quotaPreferences/cqmgr-"
+                        + {
+                            "GPU-DIRECT": "ce86eb7bc9c916c9b40eaa3f74bf3b74",
+                            "GPU-ALL": "1d5640887fd0d88400b9466218741964",
+                        }[child.slice_identity.quota_id]
                     )
                 ),
                 etag=child.preference_etag,
+                preference_existed=child.preference_name is not None,
+                baseline=child.effective,
             )
             for child in plan.children
         ),
     )
+
+
+def test_recovery_rejects_a_record_target_outside_the_authenticated_plan() -> None:
+    """A valid Plan cannot authorize a different durable quota target."""
+    plan = _single_plan()
+    repository = _MemoryPlanRepository(plan)
+    repository.acquire_lease(repository.encoded.digest, KEY, NOW)
+    repository.state = PlanLedgerState.DISPATCHED
+    record = _recovery_record(plan)
+    records = _MemoryApplyRecords()
+    records.record = replace(
+        record,
+        children=(replace(record.children[0], target=QuotaQuantity(99, UNIT)),),
+    )
+    retained = records.record
+    writer = _ScriptedWriter()
+    resolver = _ScriptedResolver()
+    audit = _MemoryAuditJournal()
+
+    result, *_ = _apply(
+        plan,
+        writer,
+        repository=repository,
+        records=records,
+        audit=audit,
+        unknown_resolver=resolver,
+    )
+
+    assert writer.requests == []
+    assert resolver.requests == []
+    assert audit.drafts == []
+    assert records.record == retained
+    assert repository.state is PlanLedgerState.DISPATCHED
+    assert result.outcome.code == StableSymbol("apply-record-plan-mismatch")
+    assert result.outcome.exit_class is ExitClass.STALE_OR_CONFLICTING
+    assert result.data.children == ()
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        "prepared",
+        "dispatched",
+        "accepted-prefix",
+        "interrupted",
+        "accepted",
+        "failed",
+        "consumed",
+        "quarantined-unknown",
+        "quarantined-prewrite",
+    ],
+)
+@pytest.mark.parametrize(
+    "changed_field",
+    [
+        "intent_id",
+        "plan_digest",
+        "resource_scope",
+        "kind",
+        "child_id",
+        "slice_identity",
+        "target",
+        "preference_identity",
+        "etag",
+        "preference_existed",
+        "baseline",
+        "order",
+        "count",
+    ],
+)
+def test_recovery_binds_every_immutable_field_before_record_side_effects(
+    checkpoint: str, changed_field: str
+) -> None:
+    """Every recovery branch rejects intent drift without using foreign evidence."""
+    plan = _plan()
+    repository = _MemoryPlanRepository(plan)
+    repository.acquire_lease(repository.encoded.digest, KEY, NOW)
+    repository.state = PlanLedgerState.DISPATCHED
+    record = _recovery_record(plan)
+    if checkpoint == "prepared":
+        repository.state = PlanLedgerState.LEASED
+    elif checkpoint in {"accepted-prefix", "accepted", "consumed"}:
+        children = (
+            record.children[:1] if checkpoint == "accepted-prefix" else record.children
+        )
+        for child in children:
+            record = record.record_dispatch_intent(child.child_id, NOW).record_outcome(
+                child.child_id,
+                ApplyChildDisposition.ACCEPTED,
+                StableSymbol("submitted"),
+                NOW,
+            )
+        if checkpoint != "accepted-prefix":
+            record = record.finalize(NOW)
+        if checkpoint == "consumed":
+            repository.state = PlanLedgerState.CONSUMED
+    elif checkpoint == "interrupted":
+        record = record.record_dispatch_intent("direct", NOW)
+    elif checkpoint in {"failed", "quarantined-unknown"}:
+        disposition = (
+            ApplyChildDisposition.FAILED
+            if checkpoint == "failed"
+            else ApplyChildDisposition.UNKNOWN
+        )
+        record = (
+            record.record_dispatch_intent("direct", NOW)
+            .record_outcome("direct", disposition, StableSymbol("provider-failed"), NOW)
+            .finalize(NOW)
+        )
+        if checkpoint == "quarantined-unknown":
+            repository.state = PlanLedgerState.QUARANTINED
+    elif checkpoint == "quarantined-prewrite":
+        record = record.stop_remaining_unattempted(NOW)
+        repository.state = PlanLedgerState.QUARANTINED
+        repository.resume_outcome = PlanRepositoryOutcome(
+            PlanRepositoryStatus.QUARANTINED,
+            plan_bytes=repository.encoded.bytes,
+            state=repository.state,
+            reason=StableSymbol("dispatch-intent-persistence-failed"),
+            authenticated=True,
+        )
+    record = _changed_recovery_intent(record, changed_field)
+    records = _MemoryApplyRecords()
+    records.record = record
+    audit = _MemoryAuditJournal()
+    writer = _ScriptedWriter()
+    resolver = _ScriptedResolver()
+    initial_state = repository.state
+
+    result, *_ = _apply(
+        plan,
+        writer,
+        repository=repository,
+        records=records,
+        audit=audit,
+        unknown_resolver=resolver,
+    )
+
+    assert result.outcome.code == StableSymbol(
+        "apply-recovery-unavailable"
+        if changed_field in {"intent_id", "plan_digest", "resource_scope"}
+        else "apply-record-plan-mismatch"
+    )
+    assert not result.boundary.reached
+    assert result.data.children == ()
+    assert writer.requests == []
+    assert resolver.requests == []
+    assert audit.drafts == []
+    assert records.record == record
+    assert records.resolutions == []
+    assert repository.state is initial_state
+
+
+def _changed_recovery_intent(  # noqa: PLR0911
+    record: ApplyRecord, field_name: str
+) -> ApplyRecord:
+    child = record.children[0]
+    if field_name == "intent_id":
+        return replace(record, intent_id="sha256:" + "f" * 64)
+    if field_name == "plan_digest":
+        return replace(record, plan_digest="sha256:" + "f" * 64)
+    if field_name == "resource_scope":
+        scope = ResourceScope(ResourceScopeKind.PROJECT, "projects/987654321")
+        return replace(
+            record,
+            resource_scope=scope,
+            children=tuple(
+                replace(
+                    item,
+                    slice_identity=replace(item.slice_identity, resource_scope=scope),
+                )
+                for item in record.children
+            ),
+        )
+    if field_name == "kind":
+        return replace(record, kind=PlanKind.SINGLE)
+    if field_name == "order":
+        return replace(record, children=tuple(reversed(record.children)))
+    if field_name == "count":
+        return replace(record, children=record.children[:1])
+    changes: dict[str, object] = {
+        "child_id": "other",
+        "slice_identity": replace(child.slice_identity, quota_id="OTHER-QUOTA"),
+        "target": QuotaQuantity(99, UNIT),
+        "preference_identity": (
+            f"{SCOPE.canonical_name}/locations/global/quotaPreferences/other"
+        ),
+        "etag": "other-etag",
+        "preference_existed": True,
+        "baseline": QuotaQuantity(99, UNIT),
+    }
+    return replace(
+        record,
+        children=(
+            replace(child, **{field_name: changes[field_name]}),  # type: ignore[bad-argument-type]
+            *record.children[1:],
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "ledger_state", [PlanLedgerState.AVAILABLE, PlanLedgerState.DISPATCHED]
+)
+def test_copied_authentic_apply_record_causes_zero_provider_or_audit_writes(
+    tmp_path: Path, ledger_state: PlanLedgerState
+) -> None:
+    """A byte-for-byte copy cannot redirect a single-child Plan's authority."""
+    plan = _single_plan()
+    other_plan = replace(plan, target=QuotaQuantity(99, UNIT))
+    repository = _MemoryPlanRepository(plan)
+    repository.acquire_lease(repository.encoded.digest, KEY, NOW)
+    repository.state = ledger_state
+    records = LocalApplyRecordRepository(tmp_path)
+    other_record = _recovery_record(other_plan)
+    assert (
+        records.create(other_record, KEY).status is ApplyRecordRepositoryStatus.STORED
+    )
+    source = (
+        tmp_path
+        / "apply-records"
+        / (other_record.intent_id.removeprefix("sha256:") + ".json")
+    )
+    destination = (
+        tmp_path
+        / "apply-records"
+        / (repository.encoded.digest.removeprefix("sha256:") + ".json")
+    )
+    authentic_bytes = source.read_bytes()
+    destination.write_bytes(authentic_bytes)
+    destination.chmod(0o600)
+    writer = _ScriptedWriter()
+    audit = _MemoryAuditJournal()
+    operations = ApplyPlanOperations(
+        repository=cast("PlanRepository", repository),
+        apply_records=records,
+        audit=cast("AuditJournal", audit),
+        codec=cast("PlanCodecPort", PlanCodec()),
+        revalidator=cast(
+            "ApplyRevalidator", _ScriptedRevalidator(_valid_revalidation(plan))
+        ),
+        writer=writer,
+        unknown_resolver=_ScriptedResolver(),
+    )
+
+    result = asyncio.run(
+        operations.apply(
+            ApplyRequest(
+                digest=repository.encoded.digest,
+                authentication_key=KEY,
+                local_installation_id="installation-123",
+                resource_scope_acknowledgement=SCOPE,
+                principal=PRINCIPAL,
+                contact_binding=CONTACT,
+                contact_value="operator@example.com",
+                now=NOW + timedelta(minutes=1),
+            )
+        )
+    )
+
+    assert result.outcome.code == StableSymbol("apply-record-unavailable")
+    assert writer.requests == []
+    assert audit.drafts == []
+    assert repository.state is ledger_state
+    assert source.read_bytes() == destination.read_bytes() == authentic_bytes
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        ApplyRecordRepositoryStatus.CONFLICT,
+        ApplyRecordRepositoryStatus.FAILED,
+        ApplyRecordRepositoryStatus.AVAILABLE,
+    ],
+)
+def test_apply_never_treats_unavailable_record_evidence_as_a_new_intent(
+    status: ApplyRecordRepositoryStatus,
+) -> None:
+    """Only a missing record permits fresh preflight and intent publication."""
+
+    class UnavailableRecords(_MemoryApplyRecords):
+        @override
+        def load(
+            self, _intent_id: str, _key: SecretValue
+        ) -> ApplyRecordRepositoryOutcome:
+            return ApplyRecordRepositoryOutcome(status)
+
+    writer = _ScriptedWriter()
+    result, repository, _, audit = _apply(_plan(), writer, records=UnavailableRecords())
+
+    assert result.outcome.code == StableSymbol("apply-record-unavailable")
+    assert repository.state is PlanLedgerState.AVAILABLE
+    assert writer.requests == []
+    assert audit.drafts == []
+
+
+@pytest.mark.parametrize("kind", [PlanKind.SINGLE, PlanKind.BUNDLE])
+def test_recovery_preserves_legacy_absent_baselines_and_bound_write_actions(
+    kind: PlanKind,
+) -> None:
+    """Legacy records resume exact creates or amendments without invented evidence."""
+    plan = _single_plan() if kind is PlanKind.SINGLE else _plan()
+    repository = _MemoryPlanRepository(plan)
+    repository.acquire_lease(repository.encoded.digest, KEY, NOW)
+    repository.state = PlanLedgerState.DISPATCHED
+    record = _recovery_record(plan)
+    records = _MemoryApplyRecords()
+    records.record = replace(
+        record,
+        children=tuple(replace(child, baseline=None) for child in record.children),
+    )
+    writer = _ScriptedWriter(
+        *(
+            QuotaPreferenceWriteResult(accepted=True, outcome=StableSymbol("submitted"))
+            for _ in plan.children
+        )
+    )
+
+    result, *_ = _apply(plan, writer, repository=repository, records=records)
+
+    assert result.boundary.reached
+    assert len(writer.requests) == len(plan.children)
+    for written, planned in zip(writer.requests, plan.children, strict=True):
+        assert written.slice_identity == planned.slice_identity
+        assert written.target == planned.target
+        assert written.current_etag == planned.preference_etag
+        assert written.action is (
+            QuotaPreferenceWriteAction.AMEND
+            if kind is PlanKind.SINGLE
+            else QuotaPreferenceWriteAction.CREATE
+        )
+    assert records.record is not None
+    assert all(child.baseline is None for child in records.record.children)
 
 
 def test_recovery_rejects_missing_authority_and_invalid_authenticated_plan() -> None:

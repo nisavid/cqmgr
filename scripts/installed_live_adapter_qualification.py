@@ -16,11 +16,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
 EXPECTED_SCHEMA = "cqmgr.operation-result/v1"
-INSTALL_TIMEOUT_SECONDS = 300.0
 CHECK_TIMEOUT_SECONDS = 600.0
 TIMEOUT_EXIT_CODE = 124
 FAILED_EXECUTION_EXIT_CODE = 1
-EXPECTED_EVIDENCE_COUNT = 3
+EXPECTED_EVIDENCE_COUNT = 2
 ALLOWED_PARENT_ENVIRONMENT = (
     "GOOGLE_APPLICATION_CREDENTIALS",
     "PATH",
@@ -29,9 +28,9 @@ ALLOWED_PARENT_ENVIRONMENT = (
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Qualify an installed cqmgr wheel with live read-only operations.",
+        description="Qualify a preinstalled cqmgr executable with bounded live reads.",
     )
-    parser.add_argument("wheel", type=Path)
+    parser.add_argument("executable", type=Path)
     parser.add_argument("--project-env", required=True)
     parser.add_argument("--output", required=True, type=Path)
     return parser
@@ -175,7 +174,7 @@ def main(
     environ: Mapping[str, str] = os.environ,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> int:
-    """Install one wheel and qualify its public live-read commands."""
+    """Qualify prepared public live-read commands without installing any code."""
     arguments = _parser().parse_args(argv)
     project_id = environ.get(arguments.project_env)
     if not project_id:
@@ -199,7 +198,6 @@ def main(
         dir=arguments.output.parent,
     ) as temporary:
         root = Path(temporary)
-        tool_bin = root / "bin"
         child_environment = {
             key: value
             for key in ALLOWED_PARENT_ENVIRONMENT
@@ -209,8 +207,6 @@ def main(
         child_environment.update(
             {
                 "HOME": str(root / "home"),
-                "UV_TOOL_BIN_DIR": str(tool_bin),
-                "UV_TOOL_DIR": str(root / "tools"),
                 "XDG_CACHE_HOME": str(root / "xdg-cache"),
                 "XDG_CONFIG_HOME": str(root / "xdg-config"),
                 "XDG_DATA_HOME": str(root / "xdg-data"),
@@ -218,93 +214,61 @@ def main(
             }
         )
 
-        install_started = monotonic()
-        try:
-            installed = _run(
-                runner,
+        executable = str(arguments.executable.resolve())
+        resource_scope = f"projects/{project_id}"
+        commands = (
+            (
+                "quota-list",
                 [
-                    "uv",
-                    "tool",
-                    "install",
-                    "--no-build",
-                    "--python",
-                    "3.14",
-                    str(arguments.wheel),
+                    executable,
+                    "quota",
+                    "list",
+                    "--resource-scope",
+                    resource_scope,
+                    "--service",
+                    "compute",
+                    "--limit",
+                    "20",
+                    "--output",
+                    "json",
+                    "--no-color",
+                    "--quiet",
                 ],
-                environment=child_environment,
-                timeout=INSTALL_TIMEOUT_SECONDS,
-            )
-            install_exit_code = installed.returncode
-        except subprocess.TimeoutExpired:
-            install_exit_code = TIMEOUT_EXIT_CODE
-        except OSError:
-            install_exit_code = FAILED_EXECUTION_EXIT_CODE
-        evidence.append(
-            _safe_record(
-                check="candidate-install",
-                exit_code=install_exit_code,
-                elapsed_ms=_elapsed_ms(install_started, monotonic),
-                schema="not-applicable",
-                outcome=("successful" if install_exit_code == 0 else "unsuccessful"),
-            )
+            ),
+            (
+                "quota-resolve",
+                [
+                    executable,
+                    "quota",
+                    "resolve",
+                    "compute-instance",
+                    "--resource-scope",
+                    resource_scope,
+                    "--machine-type",
+                    "a3-highgpu-8g",
+                    "--instance-count",
+                    "1",
+                    "--provisioning-model",
+                    "standard",
+                    "--candidate",
+                    "us-central1-a",
+                    "--output",
+                    "json",
+                    "--no-color",
+                    "--quiet",
+                ],
+            ),
         )
-
-        if install_exit_code == 0:
-            executable = str(tool_bin / "cqmgr")
-            resource_scope = f"projects/{project_id}"
-            commands = (
-                (
-                    "quota-list",
-                    [
-                        executable,
-                        "quota",
-                        "list",
-                        "--resource-scope",
-                        resource_scope,
-                        "--service",
-                        "compute",
-                        "--limit",
-                        "20",
-                        "--output",
-                        "json",
-                        "--no-color",
-                        "--quiet",
-                    ],
-                ),
-                (
-                    "quota-resolve",
-                    [
-                        executable,
-                        "quota",
-                        "resolve",
-                        "compute-instance",
-                        "--resource-scope",
-                        resource_scope,
-                        "--machine-type",
-                        "a3-highgpu-8g",
-                        "--instance-count",
-                        "1",
-                        "--provisioning-model",
-                        "standard",
-                        "--candidate",
-                        "us-central1-a",
-                        "--output",
-                        "json",
-                        "--no-color",
-                        "--quiet",
-                    ],
-                ),
-            )
-            for label, command in commands:
-                evidence.append(
-                    _execute_check(
-                        label=label,
-                        command=command,
-                        runner=runner,
-                        environment=child_environment,
-                        monotonic=monotonic,
-                    )
+        for label, command in commands:
+            evidence.append(
+                _execute_check(
+                    label=label,
+                    command=command,
+                    runner=runner,
+                    environment=child_environment,
+                    monotonic=monotonic,
                 )
+            )
 
     _write_evidence(arguments.output, evidence)
     qualified = (

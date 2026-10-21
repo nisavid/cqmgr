@@ -1,0 +1,45 @@
+name: Live source security
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .agents/skills/impeccable/scripts/**
+      - tests/security/live-source.test.mjs
+      - .github/workflows/live-source.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - .agents/skills/impeccable/scripts/**
+      - tests/security/live-source.test.mjs
+      - .github/workflows/live-source.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-reader:
+    name: Live source on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15, windows-2022]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - name: Check syntax
+        run: |
+          node --check .agents/skills/impeccable/scripts/live-server.mjs
+          node --check .agents/skills/impeccable/scripts/live/source-reader.mjs
+          node --check tests/security/live-source.test.mjs
+      - name: Exercise source reader over HTTP
+        run: node --test tests/security/live-source.test.mjs
