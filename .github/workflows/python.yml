@@ -42,6 +42,9 @@ jobs:
       - name: Synchronize locked environment
         run: uv sync --locked --python 3.14
 
+      - name: Run agent tooling regression tests
+        run: node --test tests/tooling/*.test.mjs
+
       - name: Check formatting
         run: uv run --locked --no-sync ruff format --check .
 
