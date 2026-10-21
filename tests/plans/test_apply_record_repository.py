@@ -2,7 +2,7 @@
 
 import hmac
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -40,7 +40,7 @@ INVALID_SCALAR = 42
 def _record() -> ApplyRecord:
     return ApplyRecord(
         intent_id="sha256:" + ("a" * 64),
-        plan_digest="sha256:" + ("b" * 64),
+        plan_digest="sha256:" + ("a" * 64),
         kind=PlanKind.SINGLE,
         resource_scope=SCOPE,
         created_at=NOW,
@@ -84,6 +84,56 @@ def test_apply_record_round_trips_and_rejects_stale_revision(tmp_path: Path) -> 
     assert updated.status is ApplyRecordRepositoryStatus.STORED
     assert stale.status is ApplyRecordRepositoryStatus.CONFLICT
     assert repository.load(record.intent_id, SecretValue(b"x" * 32)).status is (
+        ApplyRecordRepositoryStatus.CONFLICT
+    )
+
+
+def test_apply_record_cannot_be_readdressed_under_another_intent(
+    tmp_path: Path,
+) -> None:
+    """An authentic record grants no authority at another digest address."""
+    repository = LocalApplyRecordRepository(tmp_path)
+    record = replace(_record(), plan_digest=_record().intent_id)
+    created = repository.create(record, KEY)
+    assert created.status is ApplyRecordRepositoryStatus.STORED
+    source = tmp_path / "apply-records" / ("a" * 64 + ".json")
+    destination = tmp_path / "apply-records" / ("c" * 64 + ".json")
+    destination.write_bytes(source.read_bytes())
+    destination.chmod(0o600)
+
+    assert repository.load("sha256:" + "c" * 64, KEY).status is (
+        ApplyRecordRepositoryStatus.CONFLICT
+    )
+    assert repository.load(record.intent_id, KEY).record == created.record
+
+
+@pytest.mark.parametrize("relocation", ["intent", "child"])
+def test_resolution_evidence_cannot_be_readdressed(
+    tmp_path: Path, relocation: str
+) -> None:
+    """An authentic resolution belongs to exactly one intent and child address."""
+    repository = LocalApplyRecordRepository(tmp_path)
+    intent_id = _record().intent_id
+    appended = repository.append_unknown_resolution(
+        intent_id, "single", UnknownDispatchResolution.ACCEPTED, NOW, KEY
+    )
+    assert appended.status is ApplyRecordRepositoryStatus.STORED
+    source_directory = tmp_path / "apply-resolutions" / ("a" * 64)
+    source = next(source_directory.glob("*.json"))
+    requested_intent = intent_id
+    if relocation == "intent":
+        requested_intent = "sha256:" + "c" * 64
+        destination_directory = tmp_path / "apply-resolutions" / ("c" * 64)
+        destination_directory.mkdir(mode=0o700)
+        destination = destination_directory / source.name
+    else:
+        destination = source_directory / ("f" * 64 + ".json")
+    destination.write_bytes(source.read_bytes())
+    destination.chmod(0o600)
+    if relocation == "child":
+        source.unlink()
+
+    assert repository.load_unknown_resolutions(requested_intent, KEY).status is (
         ApplyRecordRepositoryStatus.CONFLICT
     )
 
@@ -168,7 +218,7 @@ def test_repository_finds_later_dispatched_apply_for_exact_preference_set(
     later = replace(
         selected,
         intent_id="sha256:" + ("c" * 64),
-        plan_digest="sha256:" + ("d" * 64),
+        plan_digest="sha256:" + ("c" * 64),
         created_at=NOW + timedelta(seconds=1),
     )
     assert repository.create(selected, KEY).status is ApplyRecordRepositoryStatus.STORED
@@ -209,7 +259,7 @@ def test_repository_order_detects_in_progress_supersession_despite_wall_clock(
     candidate = replace(
         selected,
         intent_id="sha256:" + ("c" * 64),
-        plan_digest="sha256:" + ("d" * 64),
+        plan_digest="sha256:" + ("c" * 64),
         created_at=NOW + timedelta(seconds=clock_delta),
     )
     assert repository.create(selected, KEY).status is ApplyRecordRepositoryStatus.STORED
@@ -242,7 +292,7 @@ def test_repository_supersession_order_fails_closed_for_legacy_records(
     candidate = replace(
         selected,
         intent_id="sha256:" + ("c" * 64),
-        plan_digest="sha256:" + ("d" * 64),
+        plan_digest="sha256:" + ("c" * 64),
     )
     assert repository.create(selected, KEY).status is ApplyRecordRepositoryStatus.STORED
     created_candidate = repository.create(candidate, KEY)
@@ -284,12 +334,12 @@ def test_repository_rejects_duplicate_authenticated_creation_sequences(
     candidate = replace(
         selected,
         intent_id="sha256:" + ("c" * 64),
-        plan_digest="sha256:" + ("d" * 64),
+        plan_digest="sha256:" + ("c" * 64),
     )
     future = replace(
         selected,
         intent_id="sha256:" + ("e" * 64),
-        plan_digest="sha256:" + ("f" * 64),
+        plan_digest="sha256:" + ("e" * 64),
     )
     assert repository.create(selected, KEY).status is ApplyRecordRepositoryStatus.STORED
     assert (
@@ -325,7 +375,7 @@ def test_repository_create_rejects_untrusted_retained_record(tmp_path: Path) -> 
     candidate = replace(
         selected,
         intent_id="sha256:" + ("c" * 64),
-        plan_digest="sha256:" + ("d" * 64),
+        plan_digest="sha256:" + ("c" * 64),
     )
     assert repository.create(selected, KEY).status is ApplyRecordRepositoryStatus.STORED
     path = (
@@ -353,7 +403,7 @@ def test_repository_supersession_query_requires_later_accepted_exact_match(
     later_unaccepted = replace(
         selected,
         intent_id="sha256:" + ("c" * 64),
-        plan_digest="sha256:" + ("d" * 64),
+        plan_digest="sha256:" + ("c" * 64),
         created_at=NOW + timedelta(seconds=1),
     )
     unrelated_child = replace(
@@ -363,7 +413,7 @@ def test_repository_supersession_query_requires_later_accepted_exact_match(
     later_unrelated = replace(
         selected,
         intent_id="sha256:" + ("e" * 64),
-        plan_digest="sha256:" + ("f" * 64),
+        plan_digest="sha256:" + ("e" * 64),
         created_at=NOW + timedelta(seconds=2),
         children=(unrelated_child,),
     )
@@ -391,7 +441,7 @@ def test_repository_supersession_query_fails_closed_on_untrusted_local_record(
     invalid = replace(
         selected,
         intent_id="sha256:" + ("c" * 64),
-        plan_digest="sha256:" + ("d" * 64),
+        plan_digest="sha256:" + ("c" * 64),
         created_at=NOW + timedelta(seconds=1),
     )
     assert repository.create(selected, KEY).status is ApplyRecordRepositoryStatus.STORED
@@ -496,6 +546,30 @@ def test_repository_supersession_query_rejects_cross_identity_record(
     assert outcome.record is None
 
 
+def test_supersession_scan_rejects_a_selected_record_removed_during_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """External deletion during enumeration never proves a safe supersession."""
+    repository = LocalApplyRecordRepository(tmp_path)
+    record = _record()
+    assert repository.create(record, KEY).status is ApplyRecordRepositoryStatus.STORED
+    path = tmp_path / "apply-records" / ("a" * 64 + ".json")
+    original_glob = Path.glob
+
+    def remove_before_listing(directory: Path, pattern: str) -> Iterator[Path]:
+        path.unlink()
+        return original_glob(directory, pattern)
+
+    monkeypatch.setattr(Path, "glob", remove_before_listing)
+
+    assert (
+        repository.find_superseding_record(
+            record.intent_id, frozenset({record.children[0].preference_identity}), KEY
+        ).status
+        is ApplyRecordRepositoryStatus.CONFLICT
+    )
+
+
 def test_apply_record_repository_rejects_invalid_missing_and_conflicting_inputs(
     tmp_path: Path,
 ) -> None:
@@ -525,6 +599,15 @@ def test_apply_record_repository_rejects_invalid_missing_and_conflicting_inputs(
 
     assert repository.create(record, KEY).status is (ApplyRecordRepositoryStatus.STORED)
     assert repository.create(record, KEY).status is (ApplyRecordRepositoryStatus.STORED)
+    conflicting_target = replace(
+        record,
+        children=(
+            replace(record.children[0], target=QuotaQuantity(99, QuotaUnit("1"))),
+        ),
+    )
+    assert repository.create(conflicting_target, KEY).status is (
+        ApplyRecordRepositoryStatus.CONFLICT
+    )
     conflict = replace(
         record,
         plan_digest="sha256:" + ("c" * 64),
@@ -741,6 +824,8 @@ def _authenticate(mapping: dict[str, object]) -> str:
 @pytest.mark.parametrize(
     "mutation",
     [
+        lambda record: record.update(plan_digest="sha256:" + "b" * 64),
+        lambda record: record.update(intent_id="invalid", plan_digest="invalid"),
         lambda record: record.update(extra=True),
         lambda record: record.update(children={}),
         lambda record: record["children"][0]["slice_identity"].update(dimensions={}),
@@ -787,6 +872,7 @@ def test_authenticated_apply_record_schema_corruption_fails_closed(
 @pytest.mark.parametrize(
     "mutation",
     [
+        lambda envelope: envelope["resolution"].update(intent_id="invalid"),
         lambda envelope: envelope.update(extra=True),
         lambda envelope: envelope.update(schema="unknown"),
         lambda envelope: envelope.update(resolution=[]),

@@ -260,6 +260,13 @@ class ApplyPlanOperations:
                 request,
                 on_progress=on_progress,
             )
+        if existing.status is not ApplyRecordRepositoryStatus.MISSING:
+            return _result(
+                request,
+                reached=False,
+                outcome="apply-record-unavailable",
+                exit_class=ExitClass.STALE_OR_CONFLICTING,
+            )
         loaded = self._repository.load(
             request.digest,
             request.authentication_key,
@@ -654,12 +661,30 @@ class ApplyPlanOperations:
         on_progress: ApplyProgressObserver | None,
     ) -> OperationResult[ApplyData]:
         """Recover an already-consumed Apply without re-dispatching an intent."""
+        if (
+            record.intent_id != request.digest
+            or record.plan_digest != request.digest
+            or record.resource_scope != request.resource_scope_acknowledgement
+        ):
+            return _result(
+                request,
+                reached=False,
+                outcome="apply-recovery-unavailable",
+                exit_class=ExitClass.STALE_OR_CONFLICTING,
+            )
         resumed = self._repository.resume_dispatched(
             request.digest,
             request.authentication_key,
             request.now,
         )
         plan = self._authenticated_resumed_plan(resumed, request)
+        if plan is not None and not _record_matches_plan(record, plan, request):
+            return _result(
+                request,
+                reached=False,
+                outcome="apply-record-plan-mismatch",
+                exit_class=ExitClass.STALE_OR_CONFLICTING,
+            )
         consumed_terminal = (
             resumed.status is PlanRepositoryStatus.CONSUMED
             and plan is not None
@@ -668,9 +693,6 @@ class ApplyPlanOperations:
                 ApplyRecordState.ACCEPTED,
                 ApplyRecordState.FAILED,
             }
-            and record.intent_id == request.digest
-            and record.plan_digest == request.digest
-            and record.resource_scope == request.resource_scope_acknowledgement
         )
         if consumed_terminal:
             return self._project_consumed_terminal(record, request, plan)
@@ -1823,6 +1845,38 @@ def _apply_record(plan: QuotaPlan, request: ApplyRequest) -> ApplyRecord:
             )
             for child in plan.children
         ),
+    )
+
+
+def _record_matches_plan(
+    record: ApplyRecord, plan: QuotaPlan, request: ApplyRequest
+) -> bool:
+    """Bind immutable recovery intent to the independently authenticated Plan."""
+    expected = _apply_record(plan, request)
+    return (
+        record.kind == expected.kind
+        and len(record.children) == len(expected.children)
+        and all(
+            (
+                child.child_id,
+                child.slice_identity,
+                child.target,
+                child.preference_identity,
+                child.etag,
+                child.preference_existed,
+            )
+            == (
+                planned.child_id,
+                planned.slice_identity,
+                planned.target,
+                planned.preference_identity,
+                planned.etag,
+                planned.preference_existed,
+            )
+            # Pre-Watch V1 records have no baseline; retain that explicit absence.
+            and (child.baseline is None or child.baseline == planned.baseline)
+            for child, planned in zip(record.children, expected.children, strict=True)
+        )
     )
 
 
