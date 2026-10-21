@@ -93,11 +93,11 @@ async function overlay({ delayRenewal = false, offscreen = false, component = nu
           const variant = Number(new URL(url).pathname.match(/v(\d+)\.svelte$/)?.[1]);
           assert.ok(variant > 0, 'unexpected component module');
           component.imports.push(variant);
-          if (variant === 2 && component.holdImport) {
+          if (variant === (component.holdVariant || 2) && component.holdImport) {
             await new Promise(resolve => { component.releaseImport = resolve; });
             component.importCompleted = true;
           }
-          if (variant === 2 && component.broken) throw new Error('fixture variant 2 failed to compile');
+          if (variant === (component.brokenVariant || 2) && component.broken) throw new Error('fixture variant failed to compile');
           exports = { default: { variant } };
         }
         const module = new vm.SyntheticModule(Object.keys(exports), function () {
@@ -346,6 +346,46 @@ test('a newer variant selection wins over a held Retry import', async () => {
     assert.equal(o.core.debugState().mountedSvelteVariant, 1);
     assert.equal(o.w.document.getElementById('user').dataset.fixtureVariant, '1');
     assert.equal(o.events.filter(e => e.type === 'variant_mounted').length, previousMounts + 1);
+    assert.deepEqual(o.errors, []);
+  } finally { o.dom.window.close(); }
+});
+
+
+test('a superseded automatic repair cannot remove the newer Retry preview', async () => {
+  const component = {
+    broken: true, brokenVariant: 1, imports: [], holdVariant: 1,
+    manifest: {
+      id: null, previewMode: 'svelte-component', framework: 'svelte', count: 2,
+      componentDir: 'variants', runtimeModule: '/variants/runtime.js',
+      originalMarkup: '<section id="user">User selection</section>',
+    },
+  };
+  const o = await overlay({ component });
+  try {
+    o.configureUser();
+    const sessionId = o.userGo();
+    component.manifest.id = sessionId;
+    const done = { type: 'done', id: sessionId, previewMode: 'svelte-component', previewFile: 'variants/manifest.json' };
+    o.send(done);
+    await until(() => o.core.root().querySelector('[data-impeccable-mount-retry]')
+      && !o.core.debugState().hasSvelteComponentSession);
+    component.broken = false;
+    component.holdImport = true;
+    o.send(done);
+    await until(() => component.releaseImport);
+    component.holdImport = false;
+    o.core.root().querySelector('[data-impeccable-mount-retry]').click();
+    await until(() => o.core.debugState().mountedSvelteVariant === 1 && o.core.debugState().state === 'CYCLING');
+    const mounts = o.events.filter(e => e.type === 'variant_mounted').length;
+    component.releaseImport();
+    await until(() => component.importCompleted);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(o.core.debugState().currentSessionId, sessionId);
+    assert.equal(o.core.debugState().hasSvelteComponentSession, true);
+    assert.equal(o.core.debugState().mountedSvelteVariant, 1);
+    assert.equal(o.w.document.getElementById('user').dataset.fixtureVariant, '1');
+    assert.equal(o.core.root().querySelector('[data-impeccable-mount-retry]'), null);
+    assert.equal(o.events.filter(e => e.type === 'variant_mounted').length, mounts);
     assert.deepEqual(o.errors, []);
   } finally { o.dom.window.close(); }
 });

@@ -5822,7 +5822,11 @@
     return true;
   }
 
-  async function injectSvelteComponentsFromManifest(manifestPath, sessionId, requestedVariant = 0, mayInject = () => true) {
+  async function injectSvelteComponentsFromManifest(manifestPath, sessionId, requestedVariant = 0, ownsParentInteraction = () => true) {
+    // Automatic republishes must also stop when a newer Retry or selection
+    // supersedes them; cancellation must never reach failure teardown.
+    const revision = variantInteractionRevision;
+    const mayInject = () => ownsParentInteraction() && variantInteractionRevision === revision;
     if (!mayInject()) return;
     // Every (re)injection is a fresh attempt: reset the failure dedupe so a
     // republish that is STILL broken at the same URL reports again instead of
