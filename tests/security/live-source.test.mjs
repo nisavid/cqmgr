@@ -9,6 +9,7 @@ import test from 'node:test';
 
 const serverScript = fileURLToPath(new URL('../../.agents/skills/impeccable/scripts/live-server.mjs', import.meta.url));
 
+/** Start the real HTTP server in an isolated project and clean it up after the test. */
 async function startServer(t, setup = () => {}) {
   const temporary = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'live-source-')));
   const cwd = path.join(temporary, 'project');
@@ -69,7 +70,7 @@ test('source rejects a project symlink to an external file', { timeout: 10000 },
   assert.doesNotMatch(await response.text(), /external sentinel/);
 });
 
-test('source rejects parent links, chained links, and sibling-prefix absolute paths', { timeout: 10000 }, async t => {
+test('source rejects parent links, chained links, and sibling-prefix escapes', { timeout: 10000 }, async t => {
   const server = await startServer(t, ({ cwd }) => {
     const sibling = `${cwd}-private`;
     fs.mkdirSync(sibling);
@@ -85,6 +86,9 @@ test('source rejects parent links, chained links, and sibling-prefix absolute pa
   const absolute = await server.source(`${server.cwd}-private/secret.html`);
   assert.equal(absolute.status, 400);
   assert.doesNotMatch(await absolute.text(), /external sentinel/);
+  const relativeSibling = await server.source(`../${path.basename(server.cwd)}-private/secret.html`);
+  assert.equal(relativeSibling.status, 403);
+  assert.doesNotMatch(await relativeSibling.text(), /external sentinel/);
 });
 
 test('source preserves templates, generated JSON, safe aliases, and live rereads', { timeout: 10000 }, async t => {

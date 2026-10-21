@@ -2,12 +2,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 export class SourceReadError extends Error {
+  /** Carry a source-reader failure's HTTP status and public response text. */
   constructor(status, message) {
     super(message);
     this.status = status;
   }
 }
 
+/** Check strict descendant containment using native path-segment boundaries. */
 function isBelow(root, target) {
   const relative = path.relative(root, target);
   return relative !== '' && relative !== '..'
