@@ -1,0 +1,401 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-21T16:15:36.241457Z",
+  "title": "Design System: Cloud Quota Manager",
+  "extensions": {
+    "colorMeta": {
+      "dark-rock": {
+        "role": "neutral",
+        "displayName": "Dark Rock",
+        "tonalRamp": [
+          "oklch(15.00% 0.01001 248.30)",
+          "oklch(26.43% 0.01001 248.30)",
+          "oklch(37.86% 0.01001 248.30)",
+          "oklch(49.29% 0.01001 248.30)",
+          "oklch(60.71% 0.01001 248.30)",
+          "oklch(72.14% 0.01001 248.30)",
+          "oklch(83.57% 0.01001 248.30)",
+          "oklch(95.00% 0.01001 248.30)"
+        ]
+      },
+      "instrument-rock": {
+        "role": "neutral",
+        "displayName": "Instrument Rock",
+        "tonalRamp": [
+          "oklch(15.00% 0.01407 248.34)",
+          "oklch(26.43% 0.01407 248.34)",
+          "oklch(37.86% 0.01407 248.34)",
+          "oklch(49.29% 0.01407 248.34)",
+          "oklch(60.71% 0.01407 248.34)",
+          "oklch(72.14% 0.01407 248.34)",
+          "oklch(83.57% 0.01407 248.34)",
+          "oklch(95.00% 0.01407 248.34)"
+        ]
+      },
+      "navigation-rock": {
+        "role": "neutral",
+        "displayName": "Navigation Rock",
+        "tonalRamp": [
+          "oklch(15.00% 0.01211 248.33)",
+          "oklch(26.43% 0.01211 248.33)",
+          "oklch(37.86% 0.01211 248.33)",
+          "oklch(49.29% 0.01211 248.33)",
+          "oklch(60.71% 0.01211 248.33)",
+          "oklch(72.14% 0.01211 248.33)",
+          "oklch(83.57% 0.01211 248.33)",
+          "oklch(95.00% 0.01211 248.33)"
+        ]
+      },
+      "panel-rock": {
+        "role": "neutral",
+        "displayName": "Panel Rock",
+        "tonalRamp": [
+          "oklch(15.00% 0.01288 243.39)",
+          "oklch(26.43% 0.01288 243.39)",
+          "oklch(37.86% 0.01288 243.39)",
+          "oklch(49.29% 0.01288 243.39)",
+          "oklch(60.71% 0.01288 243.39)",
+          "oklch(72.14% 0.01288 243.39)",
+          "oklch(83.57% 0.01288 243.39)",
+          "oklch(95.00% 0.01288 243.39)"
+        ]
+      },
+      "status-rock": {
+        "role": "neutral",
+        "displayName": "Status Rock",
+        "tonalRamp": [
+          "oklch(15.00% 0.01273 243.35)",
+          "oklch(26.43% 0.01273 243.35)",
+          "oklch(37.86% 0.01273 243.35)",
+          "oklch(49.29% 0.01273 243.35)",
+          "oklch(60.71% 0.01273 243.35)",
+          "oklch(72.14% 0.01273 243.35)",
+          "oklch(83.57% 0.01273 243.35)",
+          "oklch(95.00% 0.01273 243.35)"
+        ]
+      },
+      "evidence-rock": {
+        "role": "neutral",
+        "displayName": "Evidence Rock",
+        "tonalRamp": [
+          "oklch(15.00% 0.01575 240.56)",
+          "oklch(26.43% 0.01575 240.56)",
+          "oklch(37.86% 0.01575 240.56)",
+          "oklch(49.29% 0.01575 240.56)",
+          "oklch(60.71% 0.01575 240.56)",
+          "oklch(72.14% 0.01575 240.56)",
+          "oklch(83.57% 0.01575 240.56)",
+          "oklch(95.00% 0.01575 240.56)"
+        ]
+      },
+      "control-metal": {
+        "role": "secondary",
+        "displayName": "Control Metal",
+        "tonalRamp": [
+          "oklch(15.00% 0.01592 248.34)",
+          "oklch(26.43% 0.01592 248.34)",
+          "oklch(37.86% 0.01592 248.34)",
+          "oklch(49.29% 0.01592 248.34)",
+          "oklch(60.71% 0.01592 248.34)",
+          "oklch(72.14% 0.01592 248.34)",
+          "oklch(83.57% 0.01592 248.34)",
+          "oklch(95.00% 0.01592 248.34)"
+        ]
+      },
+      "blue-steel-selection": {
+        "role": "primary",
+        "displayName": "Blue Steel Selection",
+        "tonalRamp": [
+          "oklch(15.00% 0.04954 247.07)",
+          "oklch(26.43% 0.04954 247.07)",
+          "oklch(37.86% 0.04954 247.07)",
+          "oklch(49.29% 0.04954 247.07)",
+          "oklch(60.71% 0.04954 247.07)",
+          "oklch(72.14% 0.04954 247.07)",
+          "oklch(83.57% 0.04954 247.07)",
+          "oklch(95.00% 0.04954 247.07)"
+        ]
+      },
+      "bright-metal": {
+        "role": "secondary",
+        "displayName": "Bright Metal",
+        "tonalRamp": [
+          "oklch(15.00% 0.01771 245.21)",
+          "oklch(26.43% 0.01771 245.21)",
+          "oklch(37.86% 0.01771 245.21)",
+          "oklch(49.29% 0.01771 245.21)",
+          "oklch(60.71% 0.01771 245.21)",
+          "oklch(72.14% 0.01771 245.21)",
+          "oklch(83.57% 0.01771 245.21)",
+          "oklch(95.00% 0.01771 245.21)"
+        ]
+      },
+      "structural-metal": {
+        "role": "secondary",
+        "displayName": "Structural Metal",
+        "tonalRamp": [
+          "oklch(15.00% 0.01934 242.67)",
+          "oklch(26.43% 0.01934 242.67)",
+          "oklch(37.86% 0.01934 242.67)",
+          "oklch(49.29% 0.01934 242.67)",
+          "oklch(60.71% 0.01934 242.67)",
+          "oklch(72.14% 0.01934 242.67)",
+          "oklch(83.57% 0.01934 242.67)",
+          "oklch(95.00% 0.01934 242.67)"
+        ]
+      },
+      "fine-metal": {
+        "role": "secondary",
+        "displayName": "Fine Metal",
+        "tonalRamp": [
+          "oklch(15.00% 0.02221 243.36)",
+          "oklch(26.43% 0.02221 243.36)",
+          "oklch(37.86% 0.02221 243.36)",
+          "oklch(49.29% 0.02221 243.36)",
+          "oklch(60.71% 0.02221 243.36)",
+          "oklch(72.14% 0.02221 243.36)",
+          "oklch(83.57% 0.02221 243.36)",
+          "oklch(95.00% 0.02221 243.36)"
+        ]
+      },
+      "stone-text": {
+        "role": "neutral",
+        "displayName": "Stone Text",
+        "tonalRamp": [
+          "oklch(15.00% 0.00419 236.50)",
+          "oklch(26.43% 0.00419 236.50)",
+          "oklch(37.86% 0.00419 236.50)",
+          "oklch(49.29% 0.00419 236.50)",
+          "oklch(60.71% 0.00419 236.50)",
+          "oklch(72.14% 0.00419 236.50)",
+          "oklch(83.57% 0.00419 236.50)",
+          "oklch(95.00% 0.00419 236.50)"
+        ]
+      },
+      "selected-text": {
+        "role": "neutral",
+        "displayName": "Selected Text",
+        "tonalRamp": [
+          "oklch(15.00% 0.00000 0.00)",
+          "oklch(26.43% 0.00000 0.00)",
+          "oklch(37.86% 0.00000 0.00)",
+          "oklch(49.29% 0.00000 0.00)",
+          "oklch(60.71% 0.00000 0.00)",
+          "oklch(72.14% 0.00000 0.00)",
+          "oklch(83.57% 0.00000 0.00)",
+          "oklch(95.00% 0.00000 0.00)"
+        ]
+      },
+      "evidence-text": {
+        "role": "neutral",
+        "displayName": "Evidence Text",
+        "tonalRamp": [
+          "oklch(15.00% 0.02121 241.36)",
+          "oklch(26.43% 0.02121 241.36)",
+          "oklch(37.86% 0.02121 241.36)",
+          "oklch(49.29% 0.02121 241.36)",
+          "oklch(60.71% 0.02121 241.36)",
+          "oklch(72.14% 0.02121 241.36)",
+          "oklch(83.57% 0.02121 241.36)",
+          "oklch(95.00% 0.02121 241.36)"
+        ]
+      },
+      "status-text": {
+        "role": "neutral",
+        "displayName": "Status Text",
+        "tonalRamp": [
+          "oklch(15.00% 0.00942 242.85)",
+          "oklch(26.43% 0.00942 242.85)",
+          "oklch(37.86% 0.00942 242.85)",
+          "oklch(49.29% 0.00942 242.85)",
+          "oklch(60.71% 0.00942 242.85)",
+          "oklch(72.14% 0.00942 242.85)",
+          "oklch(83.57% 0.00942 242.85)",
+          "oklch(95.00% 0.00942 242.85)"
+        ]
+      },
+      "coverage-text": {
+        "role": "neutral",
+        "displayName": "Coverage Text",
+        "tonalRamp": [
+          "oklch(15.00% 0.01305 244.28)",
+          "oklch(26.43% 0.01305 244.28)",
+          "oklch(37.86% 0.01305 244.28)",
+          "oklch(49.29% 0.01305 244.28)",
+          "oklch(60.71% 0.01305 244.28)",
+          "oklch(72.14% 0.01305 244.28)",
+          "oklch(83.57% 0.01305 244.28)",
+          "oklch(95.00% 0.01305 244.28)"
+        ]
+      },
+      "technical-text": {
+        "role": "neutral",
+        "displayName": "Technical Text",
+        "tonalRamp": [
+          "oklch(15.00% 0.01738 236.75)",
+          "oklch(26.43% 0.01738 236.75)",
+          "oklch(37.86% 0.01738 236.75)",
+          "oklch(49.29% 0.01738 236.75)",
+          "oklch(60.71% 0.01738 236.75)",
+          "oklch(72.14% 0.01738 236.75)",
+          "oklch(83.57% 0.01738 236.75)",
+          "oklch(95.00% 0.01738 236.75)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "body": {
+        "displayName": "Terminal body",
+        "purpose": "User-owned terminal monospace; no bundled font or CSS-pixel size scale."
+      },
+      "active-label": {
+        "displayName": "Selected workspace label",
+        "purpose": "Explicit Textual bold selection; no separate terminal font family."
+      }
+    },
+    "breakpoints": [
+      {
+        "name": "medium-terminal",
+        "value": "80 terminal columns"
+      },
+      {
+        "name": "wide-terminal",
+        "value": "120 terminal columns"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Workspace tab — inactive",
+      "kind": "button",
+      "refersTo": "workspace-tab",
+      "description": "Static sample of the explicit inactive Textual workspace button colors and 16-column content. It is not a browser control.",
+      "html": "<pre class=\"ds-tab\" role=\"img\" aria-label=\"Inactive Quotas workspace tab\">     Quotas     </pre>",
+      "css": ".ds-tab { display: inline-block; margin: 0; font-family: monospace; white-space: pre; background: #2a3138; color: #eef1f3; }"
+    },
+    {
+      "name": "Workspace tab — selected",
+      "kind": "button",
+      "refersTo": "workspace-tab-active",
+      "description": "Static sample of the explicit selected Textual workspace button colors and bold label. Selection is named for assistive technology.",
+      "html": "<pre class=\"ds-tab-selected\" role=\"img\" aria-label=\"Quotas workspace tab, selected\">     Quotas     </pre>",
+      "css": ".ds-tab-selected { display: inline-block; margin: 0; font-family: monospace; font-weight: 700; white-space: pre; background: #334c63; color: #ffffff; }"
+    },
+    {
+      "name": "Workspace navigation",
+      "kind": "nav",
+      "description": "Static sample of the three implemented workspace labels. Literal character spacing illustrates terminal columns; it is not responsive browser navigation.",
+      "html": "<pre class=\"ds-nav\" role=\"img\" aria-label=\"Workspace navigation: Quotas selected; Obtainability; Audit\"><span class=\"ds-nav-selected\">     Quotas     </span> <span class=\"ds-nav-tab\"> Obtainability  </span> <span class=\"ds-nav-tab\">     Audit      </span></pre>",
+      "css": ".ds-nav { margin: 0; font-family: monospace; white-space: pre; overflow: auto; background: #1b2025; color: #eef1f3; } .ds-nav-tab { background: #2a3138; } .ds-nav-selected { background: #334c63; color: #ffffff; font-weight: 700; }"
+    },
+    {
+      "name": "Text field content",
+      "kind": "input",
+      "description": "Static labeled field-content sample only. Production Input/Select/Checkbox styling and focus remain native Textual behavior; no browser input skin is specified.",
+      "html": "<pre class=\"ds-field-content\" role=\"img\" aria-label=\"Text field content: Resource scope, projects/123456789\">Resource scope\nprojects/123456789</pre>",
+      "css": ".ds-field-content { margin: 0; font-family: monospace; white-space: pre-wrap; background: #1d2328; color: #eef1f3; }"
+    },
+    {
+      "name": "Integrated detail pane",
+      "kind": "custom",
+      "refersTo": "integrated-pane",
+      "description": "Static evidence sample on the implemented pane ground. Border glyph and literal whitespace illustrate terminal structure without defining browser stroke or padding tokens.",
+      "html": "<pre class=\"ds-pane\" role=\"img\" aria-label=\"Quota detail: compute.googleapis.com, GPUS-ALL-REGIONS-per-project; discovered, cataloged, guided, mutable\"> <span class=\"ds-pane-edge\" aria-hidden=\"true\">│</span> Quota detail\n <span class=\"ds-pane-edge\" aria-hidden=\"true\">│</span> compute.googleapis.com\n <span class=\"ds-pane-edge\" aria-hidden=\"true\">│</span> GPUS-ALL-REGIONS-per-project\n <span class=\"ds-pane-edge\" aria-hidden=\"true\">│</span> discovered=yes cataloged=yes\n <span class=\"ds-pane-edge\" aria-hidden=\"true\">│</span> guided=yes mutable=yes</pre>",
+      "css": ".ds-pane { margin: 0; font-family: monospace; white-space: pre; overflow: auto; background: #1d2328; color: #eef1f3; } .ds-pane-edge { color: #67727b; }"
+    },
+    {
+      "name": "Instrument bar",
+      "kind": "custom",
+      "refersTo": "instrument-bar",
+      "description": "Static explicit-scope content sample on the implemented instrument ground. The principal is deferred rather than fabricated.",
+      "html": "<pre class=\"ds-instrument\"> projects/123456789\n authenticated principal deferred (offline)\n<span class=\"ds-instrument-edge\" aria-hidden=\"true\">──────────────────────────────────────────</span></pre>",
+      "css": ".ds-instrument { margin: 0; font-family: monospace; white-space: pre; overflow: auto; background: #22282e; color: #eef1f3; } .ds-instrument-edge { color: #89939c; }"
+    },
+    {
+      "name": "Status and coverage",
+      "kind": "custom",
+      "refersTo": "status-line",
+      "description": "Static sample of authoritative status words. These fixture-derived completeness facts illustrate rendering and do not claim live provider evidence.",
+      "html": "<pre class=\"ds-status\"> COMPLETE — operation boundary reached\n<span class=\"ds-status-coverage\"> Compute quotas: complete (1/1 pages)\n Cloud TPU quotas: complete (1/1 pages)</span></pre>",
+      "css": ".ds-status { margin: 0; font-family: monospace; white-space: pre-wrap; background: #20262b; color: #dce2e7; } .ds-status-coverage { color: #cbd3da; }"
+    },
+    {
+      "name": "Copy CLI evidence",
+      "kind": "custom",
+      "refersTo": "copy-cli",
+      "description": "Static, selectable canonical read-only command content on the implemented evidence ground. No secret or Apply acknowledgement is supplied.",
+      "html": "<pre class=\"ds-copy-cli\"><code> cqmgr quota list --resource-scope projects/123456789 --limit 100 --output human </code></pre>",
+      "css": ".ds-copy-cli { margin: 0; font-family: monospace; white-space: pre-wrap; background: #232b31; color: #d9e7f2; } .ds-copy-cli code { font-family: inherit; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Mineral Instrument",
+    "overview": "Cloud Quota Manager is a precise operational instrument composed from believable natural materials. Rock carries structure, metal carries boundaries and control, and gemstones carry compact live signals. The material language is timeless and functional: it should feel carefully made, not themed.\n\nThe primary user works in a terminal beside an editor or cloud tool, often for long sessions in subdued ambient light. Dark surfaces therefore use quiet rock tones rather than generic black; light surfaces, when implemented, must use pale stone without becoming paper-beige. The implemented Textual TUI expresses the world through flat dark tones, integrated panes, metal-colored boundaries, and a restrained blue-steel selection. CLI output preserves meaning through words, alignment, spacing, and optional terminal color. Neither surface pretends to render materials the terminal cannot support.\n\nPeter Zumthor's Therme Vals guides stone composition, Grand Seiko Zaratsu finishing guides brushed-versus-polished metal contrast, and Smithsonian gem photography guides believable color depth and facets. The system explicitly rejects both the Diablo Immortal inventory aesthetic and a provider-console mimic: no loot-like jewel overload, ornate dark frames, constant glow, game-status spectacle, sprawling undifferentiated tables, or request flows that hide the exact quota slice and its consequences.\n\nThis record replaces the pre-implementation seed with the current terminal projection. The frontmatter records explicit color assignments from `src/cqmgr/adapters/tui/app.py` and terminal typography semantics. It is not a browser theme or a claim that every part of the material direction is built. Light-mode values, humanist fonts for future non-terminal surfaces, a complete gem-signal palette, texture, luster, and custom motion remain unresolved or unimplemented. The sidecar contains static documentation samples, not a web implementation of the product.",
+    "keyCharacteristics": [
+      "Structural stone, precise metal, vivid gemstone signals",
+      "Integrated workbench panes rather than floating card grids",
+      "Dense operational clarity with exact evidence close at hand",
+      "Material realism scaled to the rendering surface",
+      "Ornament reserved for meaning, state, and control"
+    ],
+    "rules": [
+      {
+        "name": "The Material Role Rule",
+        "body": "Rock structures, metal defines, and gemstones signal. Never exchange those roles merely for visual variety.",
+        "section": "colors"
+      },
+      {
+        "name": "The Believable Matter Rule",
+        "body": "Material effects must reflect plausible depth, facet, polish, and luster. Stylized noise, glassmorphism, and decorative texture are forbidden.",
+        "section": "colors"
+      },
+      {
+        "name": "The Rare Light Rule",
+        "body": "A gemstone glows only for an active state, attention, or notification. Every light has an authoritative word or symbol equivalent.",
+        "section": "colors"
+      },
+      {
+        "name": "The Separator Rule",
+        "body": "Content separators may be thin silver or gold and feather at their ends. Structural separators are thicker, flatter metals and run the full required length. The current terminal implementation uses solid cell boundaries; feathering is direction, not an implemented effect.",
+        "section": "colors"
+      },
+      {
+        "name": "The Terminal Ownership Rule",
+        "body": "Nerd-font glyphs may enrich a capable terminal but can never be required for identity, navigation, state, or action.",
+        "section": "typography"
+      },
+      {
+        "name": "The Evidence Type Rule",
+        "body": "Monospace distinguishes exact evidence; it does not make all prose feel like a daemon log.",
+        "section": "typography"
+      },
+      {
+        "name": "The Integrated Panel Rule",
+        "body": "A pane belongs to its surrounding instrument; it does not float above it merely to manufacture hierarchy.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Earned Glow Rule",
+        "body": "Glow is local, subtle, and caused by a live semantic state. Ambient decorative bloom is forbidden.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "**Do** use rock for structural surfaces, metal for boundaries and controls,   and gemstones for compact semantic signals.",
+      "**Do** use rows, tables, panes, and integrated panels for ordinary product   structure; reserve card-like treatment for self-contained portable artifacts.",
+      "**Do** keep exact quota identity, authenticated principal, provider evidence,   warnings, and planned mutation consequences visible before confirmation.",
+      "**Do** adapt material realism to the rendering surface while preserving the   same semantic roles in CLI, TUI, and structured output.",
+      "**Do** pair every color, icon, emoji, or optional Nerd-font glyph with   authoritative language or an accessible label.",
+      "**Do** preserve terminal-owned typography, native keyboard behavior, and   meaningful no-color output when extending the implemented projection."
+    ],
+    "donts": [
+      "**Don't** build a provider-console mimic: a sprawling quota table or request   wizard that hides exact slice identity, companion constraints,   desired-versus-effective state, and mutation consequences.",
+      "**Don't** build a raw API console that exposes provider trivia instead of   operator intent, authoritative evidence, and valid next actions.",
+      "**Don't** use generic dashboard card grids, decorative terminal nostalgia,   neon cyberpunk, gratuitous animation, or unfamiliar controls invented for   visual novelty.",
+      "**Don't** imitate Diablo Immortal inventory UI with loot-like jewel overload,   ornate dark frames, constant glow, or game-status spectacle.",
+      "**Don't** use cream, sand, parchment, or beige as the reflexive light-mode   background; light stone must remain visibly mineral and product-specific.",
+      "**Don't** use colored side stripes, gradient text, glassmorphism, nested   cards, or border-plus-wide-shadow ghost cards.",
+      "**Don't** promote documentation swatches, browser preview mechanics, or   unresolved material effects into implemented product tokens."
+    ]
+  }
+}
