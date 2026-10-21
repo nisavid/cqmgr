@@ -8,9 +8,9 @@ import os
 import shutil
 import subprocess
 import sys
+import typing
 import zipfile
 from pathlib import Path
-from typing import Any, cast
 
 import pytest
 import yaml
@@ -23,12 +23,14 @@ pytestmark = pytest.mark.skipif(
 
 
 def _release_step(name: str) -> str:
-    workflow = cast(
-        "dict[str, Any]",
+    workflow = typing.cast(
+        "dict[str, typing.Any]",
         yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text()),
     )
     steps = workflow["jobs"]["installed-live-adapters"]["steps"]
-    return next(cast("str", step["run"]) for step in steps if step.get("name") == name)
+    return next(
+        typing.cast("str", step["run"]) for step in steps if step.get("name") == name
+    )
 
 
 def _wheel(
