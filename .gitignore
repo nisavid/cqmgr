@@ -7,3 +7,9 @@ __pycache__/
 dist/
 mutants/
 release-requirements.txt
+
+# Impeccable downloads the engine for each developer platform.
+.agents/skills/impeccable/scripts/bin/
+
+# Isolated Impeccable DOM test dependencies.
+tests/tooling/node_modules/
