@@ -182,6 +182,7 @@
   // agent-target pick, cleared with the session; a user's pick never sets it).
   let editBadgeSuppressed = false;
   let svelteComponentSession = null;
+  let variantInteractionRevision = 0;
   let svelteRuntimePromise = null;
   let pendingSvelteComponentRetryObserver = null;
   // The persistent mount-error card. A failed import/mount used to wipe local
@@ -5665,9 +5666,13 @@
     return clone || rootEl;
   }
 
-  async function mountSvelteComponentVariant(variantNum) {
-    if (!svelteComponentSession || !variantNum) return false;
-    const { manifest, mountTargetEl, sessionId } = svelteComponentSession;
+  async function mountSvelteComponentVariant(variantNum, mayMount = () => true) {
+    if (!svelteComponentSession || !variantNum || !mayMount()) return false;
+    const componentSession = svelteComponentSession;
+    const revision = variantInteractionRevision;
+    const isCurrent = () => mayMount() && variantInteractionRevision === revision
+      && svelteComponentSession === componentSession;
+    const { manifest, mountTargetEl, sessionId } = componentSession;
     // Resolved before the first await so the failure report can name the module
     // the browser could not reach, whichever step threw.
     const extension = manifest.componentExtension || 'svelte';
@@ -5688,13 +5693,16 @@
       const previousAnchor = getMountedSvelteComponentAnchor(svelteComponentSession) || selectedElement;
       svelteComponentSession.swapAnchor = makeFrozenAnchor(previousAnchor) || svelteComponentSession.swapAnchor || null;
       const runtime = await loadSvelteRuntime(manifest.runtimeModule, manifest);
+      if (!isCurrent()) return false;
       const imported = await importFirstReachable(candidates, true);
+      if (!isCurrent()) return false;
       moduleUrl = imported.url;
       const mod = imported.mod;
       const Component = mod.default;
       if (svelteComponentSession.mountedInstance && runtime.unmount) {
-        await runtime.unmount(svelteComponentSession.mountedInstance);
-        svelteComponentSession.mountedInstance = null;
+        await runtime.unmount(componentSession.mountedInstance);
+        if (!isCurrent()) return false;
+        componentSession.mountedInstance = null;
       }
       svelteComponentSession.mountedInstance = runtime.mount(Component, {
         target: mountTargetEl,
@@ -5714,7 +5722,7 @@
         selectedElement = nextAnchor;
       } else {
         requestAnimationFrame(() => {
-          if (svelteComponentSession?.sessionId !== sessionId) return;
+          if (!isCurrent()) return;
           const settledAnchor = getMountedSvelteComponentAnchor(svelteComponentSession);
           if (!settledAnchor) return;
           if (!isSvelteInsertManifest(manifest)) {
@@ -5732,9 +5740,10 @@
       }
       return true;
     } catch (err) {
-      if (svelteComponentSession?.sessionId === sessionId) {
-        svelteComponentSession.swapAnchor = null;
-      }
+      if (!isCurrent()) return false;
+      const message = await describeMountFailure(manifest, err);
+      if (!isCurrent()) return false;
+      componentSession.swapAnchor = null;
       console.error('[impeccable] Failed to mount component variant ' + variantNum + ' for ' + sessionId + ':', err);
       reportVariantMountFailed(sessionId, variantNum, moduleUrl, err);
       // Every mount failure gets the card, so the variant-switch path (which
@@ -5742,7 +5751,7 @@
       showMountErrorCard(sessionId, {
         variant: variantNum,
         url: moduleUrl,
-        message: await describeMountFailure(manifest, err),
+        message,
       });
       return false;
     }
@@ -5813,7 +5822,8 @@
     return true;
   }
 
-  async function injectSvelteComponentsFromManifest(manifestPath, sessionId, requestedVariant = 0) {
+  async function injectSvelteComponentsFromManifest(manifestPath, sessionId, requestedVariant = 0, mayInject = () => true) {
+    if (!mayInject()) return;
     // Every (re)injection is a fresh attempt: reset the failure dedupe so a
     // republish that is STILL broken at the same URL reports again instead of
     // being swallowed while the agent believes the repair landed.
@@ -5821,8 +5831,10 @@
     const url = 'http://localhost:' + PORT + '/source?token=' + TOKEN + '&path=' + encodeURIComponent(manifestPath);
     try {
       const res = await fetch(url);
+      if (!mayInject()) return;
       if (!res.ok) throw new Error(String(res.status));
       const manifest = JSON.parse(await res.text());
+      if (!mayInject()) return;
       if (manifest.id !== sessionId) {
         // A manifest at the expected path belonging to a different session is
         // an agent-side publish error. Left as a bare return it stranded the
@@ -5839,6 +5851,7 @@
       }
 
       const paramsByVariant = await loadSvelteComponentParams(manifest);
+      if (!mayInject()) return;
       const availableVariants = Number(manifest.arrivedVariants) || Number(manifest.count) || 1;
       const retryVariant = Number.isInteger(requestedVariant) && requestedVariant > 0 && requestedVariant <= availableVariants
         ? requestedVariant : 0;
@@ -5863,13 +5876,15 @@
         expectedVariants = Number(manifest.count) || expectedVariants || arrivedVariants;
         const previousVariant = visibleVariant > 0 && visibleVariant <= arrivedVariants ? visibleVariant : 1;
         visibleVariant = retryVariant || previousVariant;
-        const remounted = await mountSvelteComponentVariant(visibleVariant || 1);
+        const remounted = await mountSvelteComponentVariant(visibleVariant || 1, mayInject);
+        if (!mayInject()) return;
         if (!remounted) {
           // Keep the last usable comparison visible if the requested retry
           // still fails. Its error card continues to name the failed variant.
           if (retryVariant && retryVariant !== previousVariant) {
             visibleVariant = previousVariant;
-            await mountSvelteComponentVariant(previousVariant);
+            await mountSvelteComponentVariant(previousVariant, mayInject);
+            if (!mayInject()) return;
             showOrUpdateCyclingBar();
           }
           // The mount already reported the failure and raised the card.
@@ -5897,7 +5912,7 @@
           ? visibleVariant
           : (savedVisibleVariant > 0 && savedVisibleVariant <= arrivedVariants ? savedVisibleVariant : 1));
         enterRecoveryWaitingForAnchor({ checkpointReason: 'component_preview_anchor_missing', trackScroll: true });
-        waitForSvelteComponentTargetAndRetry({ manifestPath, sessionId, manifest, requestedVariant: retryVariant });
+        waitForSvelteComponentTargetAndRetry({ manifestPath, sessionId, manifest, requestedVariant: retryVariant, mayInject });
         return;
       }
 
@@ -5950,7 +5965,8 @@
         ? previousVisibleVariant
         : (savedVisibleVariant > 0 && savedVisibleVariant <= arrivedVariants ? savedVisibleVariant : 1));
 
-      const mounted = await mountSvelteComponentVariant(visibleVariant);
+      const mounted = await mountSvelteComponentVariant(visibleVariant, mayInject);
+      if (!mayInject()) return;
       if (!mounted) {
         // The compiled component threw (e.g. a Svelte compile error in the
         // variant file). mountSvelteComponentVariant already reported the
@@ -5973,6 +5989,7 @@
       completeParameterGenerationIfReady();
       console.log('[impeccable] Mounted ' + arrivedVariants + ' ' + manifest.framework + ' component variants.');
     } catch (err) {
+      if (!mayInject()) return;
       console.error('[impeccable] Failed to mount component-preview variants:', err);
       // Report the manifest PATH, never the fetch URL: that URL carries the
       // live helper token and this string is journaled.
@@ -5986,21 +6003,22 @@
     }
   }
 
-  function waitForSvelteComponentTargetAndRetry({ manifestPath, sessionId, manifest, requestedVariant = 0 }) {
+  function waitForSvelteComponentTargetAndRetry({ manifestPath, sessionId, manifest, requestedVariant = 0, mayInject = () => true }) {
     if (pendingSvelteComponentRetryObserver) pendingSvelteComponentRetryObserver.disconnect();
-    pendingSvelteComponentRetryObserver = new MutationObserver(() => {
-      if (svelteComponentSession?.sessionId === sessionId) {
-        pendingSvelteComponentRetryObserver.disconnect();
-        pendingSvelteComponentRetryObserver = null;
+    const observer = new MutationObserver(() => {
+      if (!mayInject() || svelteComponentSession?.sessionId === sessionId) {
+        observer.disconnect();
+        if (pendingSvelteComponentRetryObserver === observer) pendingSvelteComponentRetryObserver = null;
         return;
       }
       const liveEl = findLiveElementForSvelteManifest(manifest);
       if (!liveEl?.parentElement) return;
-      pendingSvelteComponentRetryObserver.disconnect();
-      pendingSvelteComponentRetryObserver = null;
-      injectSvelteComponentsFromManifest(manifestPath, sessionId, requestedVariant);
+      observer.disconnect();
+      if (pendingSvelteComponentRetryObserver === observer) pendingSvelteComponentRetryObserver = null;
+      injectSvelteComponentsFromManifest(manifestPath, sessionId, requestedVariant, mayInject);
     });
-    pendingSvelteComponentRetryObserver.observe(document.body, { childList: true, subtree: true });
+    pendingSvelteComponentRetryObserver = observer;
+    observer.observe(document.body, { childList: true, subtree: true });
   }
 
   //
@@ -6175,7 +6193,15 @@
     // attempt against an unchanged broken module would look silent.
     lastReportedMountFailure = null;
     if (state !== 'CYCLING') setLiveState('GENERATING');
-    injectSvelteComponentsFromManifest(manifestPath, sessionId, info.variant);
+    // A refreshed manifest or module import may finish after the user leaves
+    // this comparison. Retain ownership across every asynchronous retry step.
+    const revision = liveInteractionRevision;
+    const variantRevision = ++variantInteractionRevision;
+    const mayInject = () => currentSessionId === sessionId
+      && variantInteractionRevision === variantRevision
+      && liveInteractionRevision === revision && !!evtSource
+      && state !== 'SAVING' && state !== 'CONFIRMED' && !isSessionHandled(sessionId);
+    injectSvelteComponentsFromManifest(manifestPath, sessionId, info.variant, mayInject);
   }
 
   // Tear down a component preview that could not mount, WITHOUT touching
@@ -6613,15 +6639,20 @@
     if (next === visibleVariant) return;
 
     const previous = visibleVariant;
+    const sessionId = currentSessionId;
+    const revision = ++variantInteractionRevision;
+    const isCurrent = () => currentSessionId === sessionId && variantInteractionRevision === revision;
     variantSelectionInFlight = true;
     const selectionPromise = (async () => {
       visibleVariant = next;
       showOrUpdateCyclingBar();
       saveSession();
-      const shown = await showVariantInDOM(currentSessionId, next); // calls refreshParamsPanel itself
+      const shown = await showVariantInDOM(sessionId, next); // calls refreshParamsPanel itself
+      if (!isCurrent()) return;
       if (!shown) {
         visibleVariant = previous;
-        await showVariantInDOM(currentSessionId, previous);
+        await showVariantInDOM(sessionId, previous);
+        if (!isCurrent()) return;
         showOrUpdateCyclingBar();
         saveSession();
         return;
