@@ -16,16 +16,12 @@ SCRIPT = (
     Path(__file__).parents[1] / "scripts" / "installed_live_adapter_qualification.py"
 )
 PROJECT = "private-qualification-project"
-EXPECTED_CALL_COUNT = 3
-QUOTA_LIST_INVOCATION = 2
-INSTALL_FAILURE_EXIT_CODE = 23
-INSTALL_FAILURE_ELAPSED_MS = 100
+EXPECTED_CALL_COUNT = 2
+QUOTA_LIST_INVOCATION = 1
 SAFE_CHILD_ENVIRONMENT_KEYS = {
     "GOOGLE_APPLICATION_CREDENTIALS",
     "HOME",
     "PATH",
-    "UV_TOOL_BIN_DIR",
-    "UV_TOOL_DIR",
     "XDG_CACHE_HOME",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
@@ -66,14 +62,13 @@ def _assert_evidence_digest(record: dict[str, object]) -> None:
     assert record["digest"] == f"sha256:{expected}"
 
 
-def test_cli_installs_and_qualifies_exact_candidate_without_retaining_identity(
+def test_cli_only_runs_preinstalled_candidate_without_retaining_identity(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The CLI owns installation, exact commands, and aggregate-only evidence."""
+    """The credentialed CLI only runs exact reads and retains aggregate evidence."""
     main = cast("Any", _module()["main"])
-    wheel = tmp_path / "cqmgr-0.1.0-py3-none-any.whl"
-    wheel.write_bytes(b"immutable candidate")
+    executable = tmp_path / "bin" / "cqmgr"
     output = tmp_path / "qualification.json"
     calls: list[tuple[list[str], dict[str, str]]] = []
 
@@ -89,8 +84,7 @@ def test_cli_installs_and_qualifies_exact_candidate_without_retaining_identity(
         assert check is False
         assert timeout > 0
         calls.append((command, env))
-        if command[:3] == ["uv", "tool", "install"]:
-            return subprocess.CompletedProcess(command, 0, b"", b"")
+        assert Path(command[0]) == executable
         return subprocess.CompletedProcess(
             command,
             0,
@@ -101,10 +95,10 @@ def test_cli_installs_and_qualifies_exact_candidate_without_retaining_identity(
             b"private provider diagnostic",
         )
 
-    times = iter((1.0, 1.1, 2.0, 2.2, 3.0, 3.3))
+    times = iter((1.0, 1.1, 2.0, 2.2))
     exit_code = main(
         [
-            str(wheel),
+            str(executable),
             "--project-env",
             "QUALIFICATION_PROJECT",
             "--output",
@@ -133,18 +127,8 @@ def test_cli_installs_and_qualifies_exact_candidate_without_retaining_identity(
 
     assert exit_code == 0
     assert len(calls) == EXPECTED_CALL_COUNT
-    install, quota_list, quota_resolve = calls
-    assert install[0] == [
-        "uv",
-        "tool",
-        "install",
-        "--no-build",
-        "--python",
-        "3.14",
-        str(wheel),
-    ]
-    executable = quota_list[0][0]
-    assert executable != "cqmgr"
+    quota_list, quota_resolve = calls
+    assert quota_list[0][0] == str(executable)
     assert quota_list[0][1:] == [
         "quota",
         "list",
@@ -160,7 +144,7 @@ def test_cli_installs_and_qualifies_exact_candidate_without_retaining_identity(
         "--quiet",
     ]
     assert quota_resolve[0] == [
-        executable,
+        str(executable),
         "quota",
         "resolve",
         "compute-instance",
@@ -188,8 +172,6 @@ def test_cli_installs_and_qualifies_exact_candidate_without_retaining_identity(
         )
         for key in (
             "HOME",
-            "UV_TOOL_BIN_DIR",
-            "UV_TOOL_DIR",
             "XDG_CACHE_HOME",
             "XDG_CONFIG_HOME",
             "XDG_DATA_HOME",
@@ -199,7 +181,6 @@ def test_cli_installs_and_qualifies_exact_candidate_without_retaining_identity(
 
     evidence = json.loads(output.read_text(encoding="utf-8"))
     assert [record["check"] for record in evidence] == [
-        "candidate-install",
         "quota-list",
         "quota-resolve",
     ]
@@ -213,12 +194,8 @@ def test_cli_installs_and_qualifies_exact_candidate_without_retaining_identity(
             "schema",
         }
         _assert_evidence_digest(record)
-    assert evidence[0]["schema"] == "not-applicable"
-    assert evidence[0]["outcome"] == "successful"
-    assert evidence[1]["schema"] == "supported"
-    assert evidence[1]["outcome"] == "successful"
-    assert evidence[2]["schema"] == "supported"
-    assert evidence[2]["outcome"] == "successful"
+    assert all(record["schema"] == "supported" for record in evidence)
+    assert all(record["outcome"] == "successful" for record in evidence)
     retained = output.read_text(encoding="utf-8")
     assert PROJECT not in retained
     assert "private-provider-data" not in retained
@@ -234,8 +211,7 @@ def test_missing_project_blocks_with_one_sanitized_input_failure(
 ) -> None:
     """Missing qualification input fails before install with attributable evidence."""
     main = cast("Any", _module()["main"])
-    wheel = tmp_path / "cqmgr-0.1.0-py3-none-any.whl"
-    wheel.write_bytes(b"immutable candidate")
+    executable = tmp_path / "bin" / "cqmgr"
     output = tmp_path / "qualification.json"
     calls: list[list[str]] = []
 
@@ -249,7 +225,7 @@ def test_missing_project_blocks_with_one_sanitized_input_failure(
 
     exit_code = main(
         [
-            str(wheel),
+            str(executable),
             "--project-env",
             "QUALIFICATION_PROJECT",
             "--output",
@@ -281,71 +257,35 @@ def test_missing_project_blocks_with_one_sanitized_input_failure(
     assert PROJECT not in output.read_text(encoding="utf-8")
 
 
-def test_candidate_install_failure_blocks_with_one_sanitized_record(
+def test_missing_preinstalled_executable_retains_only_sanitized_failures(
     tmp_path: Path,
 ) -> None:
-    """A failed immutable-candidate install emits no child-process details."""
+    """A missing executable fails both reads without trying a fallback install."""
     main = cast("Any", _module()["main"])
-    wheel = tmp_path / "cqmgr-0.1.0-py3-none-any.whl"
-    wheel.write_bytes(b"immutable candidate")
     output = tmp_path / "qualification.json"
-    calls: list[list[str]] = []
 
-    def runner(
-        command: list[str],
-        **kwargs: object,
-    ) -> subprocess.CompletedProcess[bytes]:
-        del kwargs
-        calls.append(command)
-        return subprocess.CompletedProcess(
-            command,
-            INSTALL_FAILURE_EXIT_CODE,
-            b"private install output",
-            b"private install diagnostic",
-        )
-
-    times = iter((1.0, 1.1))
     exit_code = main(
         [
-            str(wheel),
+            str(tmp_path / "missing-cqmgr"),
             "--project-env",
             "QUALIFICATION_PROJECT",
             "--output",
             str(output),
         ],
-        runner=runner,
-        environ={
-            "QUALIFICATION_PROJECT": PROJECT,
-            "GOOGLE_APPLICATION_CREDENTIALS": "/private/credential.json",
-            "GITHUB_TOKEN": "private-github-token",
-            "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "private-oidc-token",
-            "ACTIONS_ID_TOKEN_REQUEST_URL": "https://private-oidc.invalid",
-        },
-        monotonic=lambda: next(times),
+        environ={"QUALIFICATION_PROJECT": PROJECT},
     )
 
     assert exit_code == 1
-    assert len(calls) == 1
     evidence = json.loads(output.read_text(encoding="utf-8"))
-    assert len(evidence) == 1
-    record = evidence[0]
-    assert set(record) == {
-        "check",
-        "digest",
-        "elapsed_ms",
-        "exit_code",
-        "outcome",
-        "schema",
-    }
-    assert record["check"] == "candidate-install"
-    assert record["elapsed_ms"] == INSTALL_FAILURE_ELAPSED_MS
-    assert record["exit_code"] == INSTALL_FAILURE_EXIT_CODE
-    assert record["outcome"] == "unsuccessful"
-    assert record["schema"] == "not-applicable"
-    _assert_evidence_digest(record)
+    assert [record["check"] for record in evidence] == ["quota-list", "quota-resolve"]
+    assert all(record["exit_code"] == 1 for record in evidence)
+    assert all(record["outcome"] == "unsuccessful" for record in evidence)
+    assert all(record["schema"] == "unsupported" for record in evidence)
+    for record in evidence:
+        _assert_evidence_digest(record)
     retained = output.read_text(encoding="utf-8")
     assert PROJECT not in retained
-    assert "private" not in retained
+    assert "missing-cqmgr" not in retained
 
 
 def test_schema_or_outcome_failure_blocks_after_retaining_sanitized_evidence(
@@ -353,12 +293,10 @@ def test_schema_or_outcome_failure_blocks_after_retaining_sanitized_evidence(
 ) -> None:
     """Both installed checks run, while either invalid result blocks release."""
     main = cast("Any", _module()["main"])
-    wheel = tmp_path / "cqmgr-0.1.0-py3-none-any.whl"
-    wheel.write_bytes(b"immutable candidate")
+    executable = tmp_path / "bin" / "cqmgr"
     output = tmp_path / "qualification.json"
     responses = iter(
         (
-            subprocess.CompletedProcess([], 0, b"", b""),
             subprocess.CompletedProcess(
                 [],
                 0,
@@ -384,10 +322,10 @@ def test_schema_or_outcome_failure_blocks_after_retaining_sanitized_evidence(
         del command, kwargs
         return next(responses)
 
-    times = iter((1.0, 1.1, 2.0, 2.1, 3.0, 3.1))
+    times = iter((1.0, 1.1, 2.0, 2.1))
     exit_code = main(
         [
-            str(wheel),
+            str(executable),
             "--project-env",
             "QUALIFICATION_PROJECT",
             "--output",
@@ -400,10 +338,10 @@ def test_schema_or_outcome_failure_blocks_after_retaining_sanitized_evidence(
 
     assert exit_code == 1
     evidence = json.loads(output.read_text(encoding="utf-8"))
-    assert evidence[1]["schema"] == "unsupported"
-    assert evidence[1]["outcome"] == "successful"
-    assert evidence[2]["schema"] == "supported"
-    assert evidence[2]["outcome"] == "unsuccessful"
+    assert evidence[0]["schema"] == "unsupported"
+    assert evidence[0]["outcome"] == "successful"
+    assert evidence[1]["schema"] == "supported"
+    assert evidence[1]["outcome"] == "unsuccessful"
     assert PROJECT not in output.read_text(encoding="utf-8")
 
 
@@ -412,8 +350,7 @@ def test_child_failures_always_emit_only_sanitized_evidence(
 ) -> None:
     """Timeout and malformed-output details never escape the in-memory boundary."""
     main = cast("Any", _module()["main"])
-    wheel = tmp_path / "cqmgr-0.1.0-py3-none-any.whl"
-    wheel.write_bytes(b"immutable candidate")
+    executable = tmp_path / "bin" / "cqmgr"
     output = tmp_path / "qualification.json"
     invocation = 0
 
@@ -424,8 +361,6 @@ def test_child_failures_always_emit_only_sanitized_evidence(
         nonlocal invocation
         del kwargs
         invocation += 1
-        if invocation == 1:
-            return subprocess.CompletedProcess(command, 0, b"", b"")
         if invocation == QUOTA_LIST_INVOCATION:
             raise subprocess.TimeoutExpired(
                 command,
@@ -440,10 +375,10 @@ def test_child_failures_always_emit_only_sanitized_evidence(
             b"private provider diagnostic",
         )
 
-    times = iter((1.0, 1.1, 2.0, 2.1, 3.0, 3.1))
+    times = iter((1.0, 1.1, 2.0, 2.1))
     exit_code = main(
         [
-            str(wheel),
+            str(executable),
             "--project-env",
             "QUALIFICATION_PROJECT",
             "--output",
@@ -456,14 +391,12 @@ def test_child_failures_always_emit_only_sanitized_evidence(
 
     assert exit_code == 1
     evidence = json.loads(output.read_text(encoding="utf-8"))
-    assert [record["exit_code"] for record in evidence] == [0, 124, 0]
+    assert [record["exit_code"] for record in evidence] == [124, 0]
     assert [record["schema"] for record in evidence] == [
-        "not-applicable",
         "unsupported",
         "unsupported",
     ]
     assert [record["outcome"] for record in evidence] == [
-        "successful",
         "unsuccessful",
         "unsuccessful",
     ]

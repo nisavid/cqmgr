@@ -425,17 +425,21 @@ limit can cover at least one request for each of the 10 fixed sources plus two
 child requests for every allowed TPU location. Exceeding any runtime bound fails
 closed after retaining sanitized incomplete evidence.
 
-The installed-adapter release gate downloads the exact candidate wheel and
-installs it with `uv tool install --no-build --python 3.14` into ephemeral uv
-tool and XDG state. It runs the installed executable, rather than the source
-checkout, for one bounded Compute quota list and one exact Compute-instance
-resolution. The project identifier enters the orchestrator only through
-`GCP_PROJECT_ID`; the orchestrator constructs the resource scope in memory and
-passes it to each installed command. Child output remains in memory and must be
-an operation result with schema `cqmgr.operation-result/v1` and success exit
-class. Retained evidence contains only the check label, exit code, elapsed
-time, schema and outcome classifications, and a digest of those fields. Every
-failure path retains the same sanitized evidence shape without command
+The installed-adapter release gate verifies the candidate bundle and compares
+the build's exported runtime requirements with the committed lock. Before
+authentication, it installs the hash-verified, binary-only dependency closure
+into an isolated Python 3.14 virtual environment, installs the exact verified
+candidate wheel offline without dependency resolution, and checks the
+installed closure. It runs the prepared executable, rather than the source
+checkout, with ephemeral XDG state for one bounded Compute quota list and one
+exact Compute-instance resolution. The project identifier enters the
+orchestrator only through `GCP_PROJECT_ID`; the orchestrator constructs the
+resource scope in memory and passes it to each installed command. Child output
+remains in memory and must be an operation result with schema
+`cqmgr.operation-result/v1` and success exit class. Retained evidence contains
+only the check label, exit code, elapsed time, schema and outcome
+classifications, and a digest of those fields, with one record for each read.
+Every failure path retains the same sanitized evidence shape without command
 arguments, provider payloads, resource scope, project identity, principal, or
 credential detail.
 
@@ -471,6 +475,16 @@ qualification. `.github/workflows/live-read-only.yml` is manual-only. In
 `installed-live-adapters` run on manual dispatch or a push of a `v*` version
 tag. Publication requires the exact release commit's provider canary and the
 candidate wheel's installed-adapter qualification to succeed in the same run.
+Before acquiring Google credentials, installed-adapter qualification verifies
+the candidate bundle, compares the build's exported runtime requirements with
+the committed lock, and installs that exact dependency closure with required
+hashes and binary-only artifacts. It installs the verified candidate wheel
+offline without dependency resolution and checks the installed dependency
+closure. The credentialed qualification script accepts only the prepared
+executable and runs the two bounded reads; it performs no package installation.
+Its sanitized evidence contains one record for each read. Installation failure
+prevents authentication and qualification through the workflow's normal step
+failure gate.
 The separate trusted pull-request snapshot contract defines collection and
 credential-free replay.
 
