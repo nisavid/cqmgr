@@ -727,11 +727,13 @@ def test_live_candidate_dependencies_are_verified_before_cloud_authentication() 
         build, "Upload immutable release candidate"
     )
     assert "scripts/release_qualification.py verify" in verify
+    assert "uv run --no-project --offline --python 3.14" in verify
     assert (
         "uv export --locked --offline --no-dev --no-emit-project --no-header" in verify
     )
     assert "cmp release-requirements.txt candidate/release-requirements.txt" in verify
     assert "uv pip sync" in install
+    assert 'uv venv --python 3.14 "${RUNNER_TEMP}/cqmgr-live"' in install
     assert "--require-hashes --only-binary :all:" in install
     assert "candidate/release-requirements.txt" in install
     assert "--no-deps --no-index --offline --no-build" in install
@@ -739,6 +741,7 @@ def test_live_candidate_dependencies_are_verified_before_cloud_authentication() 
     assert qualification.index(verify) < qualification.index(install)
     assert qualification.index(install) < qualification.index(authentication)
     assert qualification.index(authentication) < qualification.index(live)
+    assert '"${RUNNER_TEMP}/cqmgr-live/bin/python"' in live
     assert '"${RUNNER_TEMP}/cqmgr-live/bin/cqmgr"' in live
     assert "uv " not in qualification[qualification.index(authentication) :]
 

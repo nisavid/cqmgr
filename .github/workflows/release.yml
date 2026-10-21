@@ -424,7 +424,8 @@ jobs:
       - name: Verify candidate and locked runtime resolution
         run: |
           set -euo pipefail
-          python scripts/release_qualification.py verify \
+          uv run --no-project --offline --python 3.14 \
+            python scripts/release_qualification.py verify \
             --release candidate/release \
             --identity candidate/release-identity.json
           uv export --locked --offline --no-dev --no-emit-project --no-header \
@@ -436,7 +437,7 @@ jobs:
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
-          uv venv --python python "${RUNNER_TEMP}/cqmgr-live"
+          uv venv --python 3.14 "${RUNNER_TEMP}/cqmgr-live"
           uv pip sync --python "${RUNNER_TEMP}/cqmgr-live/bin/python" \
             --require-hashes --only-binary :all: candidate/release-requirements.txt
           uv pip install --python "${RUNNER_TEMP}/cqmgr-live/bin/python" \
@@ -454,7 +455,8 @@ jobs:
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
         run: >-
-          python scripts/installed_live_adapter_qualification.py
+          "${RUNNER_TEMP}/cqmgr-live/bin/python"
+          scripts/installed_live_adapter_qualification.py
           "${RUNNER_TEMP}/cqmgr-live/bin/cqmgr"
           --project-env GCP_PROJECT_ID
           --output installed-live-adapter-evidence.json

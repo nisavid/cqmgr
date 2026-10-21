@@ -425,17 +425,21 @@ limit can cover at least one request for each of the 10 fixed sources plus two
 child requests for every allowed TPU location. Exceeding any runtime bound fails
 closed after retaining sanitized incomplete evidence.
 
-The installed-adapter release gate downloads the exact candidate wheel and
-installs it with `uv tool install --no-build --python 3.14` into ephemeral uv
-tool and XDG state. It runs the installed executable, rather than the source
-checkout, for one bounded Compute quota list and one exact Compute-instance
-resolution. The project identifier enters the orchestrator only through
-`GCP_PROJECT_ID`; the orchestrator constructs the resource scope in memory and
-passes it to each installed command. Child output remains in memory and must be
-an operation result with schema `cqmgr.operation-result/v1` and success exit
-class. Retained evidence contains only the check label, exit code, elapsed
-time, schema and outcome classifications, and a digest of those fields. Every
-failure path retains the same sanitized evidence shape without command
+The installed-adapter release gate verifies the candidate bundle and compares
+the build's exported runtime requirements with the committed lock. Before
+authentication, it installs the hash-verified, binary-only dependency closure
+into an isolated Python 3.14 virtual environment, installs the exact verified
+candidate wheel offline without dependency resolution, and checks the
+installed closure. It runs the prepared executable, rather than the source
+checkout, with ephemeral XDG state for one bounded Compute quota list and one
+exact Compute-instance resolution. The project identifier enters the
+orchestrator only through `GCP_PROJECT_ID`; the orchestrator constructs the
+resource scope in memory and passes it to each installed command. Child output
+remains in memory and must be an operation result with schema
+`cqmgr.operation-result/v1` and success exit class. Retained evidence contains
+only the check label, exit code, elapsed time, schema and outcome
+classifications, and a digest of those fields, with one record for each read.
+Every failure path retains the same sanitized evidence shape without command
 arguments, provider payloads, resource scope, project identity, principal, or
 credential detail.
 

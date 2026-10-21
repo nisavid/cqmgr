@@ -17,8 +17,8 @@ import yaml
 
 ROOT = Path(__file__).parents[1]
 pytestmark = pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="The installed live-read release job runs on Linux.",
+    sys.platform != "linux" or sys.version_info[:2] != (3, 14),
+    reason="The installed live-read release job runs on Linux with Python 3.14.",
 )
 
 
@@ -31,6 +31,17 @@ def _release_step(name: str) -> str:
     return next(
         typing.cast("str", step["run"]) for step in steps if step.get("name") == name
     )
+
+
+def _without_ambient_python(tmp_path: Path) -> dict[str, str]:
+    bin_dir = tmp_path / "ambient-bin"
+    bin_dir.mkdir()
+    python = bin_dir / "python"
+    python.write_text("#!/bin/sh\necho 'ambient Python must not run' >&2\nexit 97\n")
+    python.chmod(0o755)
+    environment = dict(os.environ)
+    environment["PATH"] = f"{bin_dir}{os.pathsep}{environment.get('PATH', '')}"
+    return environment
 
 
 def _wheel(
@@ -74,7 +85,7 @@ def _installation(
     release.mkdir(parents=True)
     _wheel(release, "cqmgr", "0.1.0", candidate=True)
     (candidate / "release-requirements.txt").write_text(requirements)
-    environment = dict(os.environ)
+    environment = _without_ambient_python(tmp_path)
     environment.update(
         {
             "RUNNER_TEMP": str(tmp_path / "runner"),
@@ -181,6 +192,7 @@ def test_changed_build_requirements_block_before_installation(tmp_path: Path) ->
             _release_step("Verify candidate and locked runtime resolution"),
         ],
         cwd=tmp_path,
+        env=_without_ambient_python(tmp_path),
         capture_output=True,
         text=True,
         check=False,
