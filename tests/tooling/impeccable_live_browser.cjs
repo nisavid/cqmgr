@@ -44,11 +44,12 @@ async function overlay({ delayRenewal = false, offscreen = false, component = nu
     const body = options?.body ? JSON.parse(options.body) : null;
     if (component && url.includes('/source?')) {
       const sourcePath = new URL(url).searchParams.get('path');
+      const sourceBody = JSON.stringify(sourcePath.endsWith('manifest.json') ? component.manifest : {});
       if (sourcePath.endsWith('manifest.json') && component.holdManifest) {
         await new Promise(resolve => { component.releaseManifest = resolve; });
       }
       if (sourcePath.endsWith('manifest.json')) component.manifestReads = (component.manifestReads || 0) + 1;
-      return { ok: true, text: async () => JSON.stringify(sourcePath.endsWith('manifest.json') ? component.manifest : {}) };
+      return { ok: true, text: async () => sourceBody };
     }
     if (url.includes('/agent-target-claim?')) {
       claims.push(body);
@@ -385,6 +386,146 @@ test('a superseded automatic repair cannot remove the newer Retry preview', asyn
     assert.equal(o.core.debugState().mountedSvelteVariant, 1);
     assert.equal(o.w.document.getElementById('user').dataset.fixtureVariant, '1');
     assert.equal(o.core.root().querySelector('[data-impeccable-mount-retry]'), null);
+    assert.equal(o.events.filter(e => e.type === 'variant_mounted').length, mounts);
+    assert.deepEqual(o.errors, []);
+  } finally { o.dom.window.close(); }
+});
+
+
+for (const publication of ['variants', 'params', 'params while selecting']) {
+  test(`a newer selection preserves a held ${publication} publication`, async () => {
+    const component = {
+      broken: false, imports: [],
+      manifest: {
+        id: null, previewMode: 'svelte-component', framework: 'svelte', count: 2,
+        componentDir: 'variants', runtimeModule: '/variants/runtime.js',
+        originalMarkup: '<section id="user">User selection</section>',
+      },
+    };
+    const o = await overlay({ component });
+    try {
+      o.configureUser();
+      const sessionId = o.userGo();
+      component.manifest.id = sessionId;
+      const done = { type: 'done', id: sessionId, previewMode: 'svelte-component', previewFile: 'variants/manifest.json' };
+      o.send(done);
+      await until(() => o.core.debugState().mountedSvelteVariant === 1);
+      component.manifest = { ...component.manifest, count: 3 };
+      component.holdManifest = true;
+      const reads = component.manifestReads;
+      o.send(publication !== 'variants' ? { ...done, type: 'variant_progress', publicationKind: 'params' } : done);
+      await until(() => component.releaseManifest);
+      component.holdImport = publication === 'params while selecting';
+      o.core.getById('impeccable-live-variant-next').click();
+      if (component.holdImport) await until(() => component.releaseImport);
+      else await until(() => o.core.debugState().mountedSvelteVariant === 2);
+      component.releaseManifest();
+      await until(() => component.manifestReads > reads);
+      await new Promise(resolve => setImmediate(resolve));
+      if (component.holdImport) {
+        assert.equal(o.core.debugState().mountedSvelteVariant, 1, 'metadata must not replace the pending selection');
+        component.releaseImport();
+        await until(() => o.core.debugState().mountedSvelteVariant === 2
+          && o.core.debugState().savedSession.parameterState === 'none');
+      }
+      assert.equal(o.core.debugState().visibleVariant, 2);
+      assert.equal(o.core.debugState().mountedSvelteVariant, 2);
+      assert.equal(o.core.debugState().arrivedVariants, 3);
+      if (publication !== 'variants') {
+        assert.equal(o.core.debugState().savedSession.parameterState, 'none');
+        assert.equal(o.core.root().querySelector('[aria-label="Tune controls are still being prepared"]'), null);
+      }
+      o.core.getById('impeccable-live-variant-next').click();
+      await until(() => o.core.debugState().mountedSvelteVariant === 3);
+      assert.equal(o.w.document.getElementById('user').dataset.fixtureVariant, '3');
+      assert.equal(o.core.debugState().currentSessionId, sessionId);
+      assert.deepEqual(o.errors, []);
+    } finally { o.dom.window.close(); }
+  });
+  }
+
+
+test('metadata from an older refresh does not expose Accept before Retry mounts', async () => {
+  const component = {
+    broken: true, brokenVariant: 1, holdVariant: 1, imports: [],
+    manifest: {
+      id: null, previewMode: 'svelte-component', framework: 'svelte', count: 2,
+      componentDir: 'variants', runtimeModule: '/variants/runtime.js',
+      originalMarkup: '<section id="user">User selection</section>',
+    },
+  };
+  const o = await overlay({ component });
+  try {
+    o.configureUser();
+    const sessionId = o.userGo();
+    component.manifest.id = sessionId;
+    const done = { type: 'done', id: sessionId, previewMode: 'svelte-component', previewFile: 'variants/manifest.json' };
+    o.send(done);
+    await until(() => o.core.root().querySelector('[data-impeccable-mount-retry]')
+      && !o.core.debugState().hasSvelteComponentSession);
+    component.broken = false;
+    component.holdManifest = true;
+    o.send(done);
+    await until(() => component.releaseManifest);
+    component.holdManifest = false;
+    component.holdImport = true;
+    o.core.root().querySelector('[data-impeccable-mount-retry]').click();
+    await until(() => component.releaseImport);
+    const reads = component.manifestReads;
+    component.releaseManifest();
+    await until(() => component.manifestReads > reads);
+    await new Promise(resolve => setImmediate(resolve));
+    const acceptButton = () => [...o.core.root().querySelectorAll('button')].find(b => b.textContent === '\u2713 Accept');
+    assert.equal(o.core.debugState().state, 'GENERATING');
+    assert.equal(o.core.debugState().mountedSvelteVariant, 0);
+    assert.equal(acceptButton(), undefined, 'Accept requires a successfully mounted preview');
+    assert.equal(o.events.filter(e => e.type === 'accept').length, 0);
+    component.releaseImport();
+    await until(() => o.core.debugState().mountedSvelteVariant === 1 && o.core.debugState().state === 'CYCLING');
+    assert.ok(acceptButton(), 'successful Retry must restore ordinary Accept');
+    assert.deepEqual(o.errors, []);
+  } finally { o.dom.window.close(); }
+});
+
+
+test('an older manifest response cannot replace an adopted newer publication', async () => {
+  const component = {
+    broken: false, imports: [],
+    manifest: {
+      id: null, previewMode: 'svelte-component', framework: 'svelte', count: 2,
+      componentDir: 'variants', runtimeModule: '/variants/runtime.js',
+      originalMarkup: '<section id="user">User selection</section>',
+    },
+  };
+  const o = await overlay({ component });
+  try {
+    o.configureUser();
+    const sessionId = o.userGo();
+    component.manifest.id = sessionId;
+    const done = { type: 'done', id: sessionId, previewMode: 'svelte-component', previewFile: 'variants/manifest.json' };
+    o.send(done);
+    await until(() => o.core.debugState().mountedSvelteVariant === 1);
+    component.holdManifest = true;
+    o.send(done);
+    await until(() => component.releaseManifest);
+    component.holdManifest = false;
+    component.manifest = { ...component.manifest, count: 3 };
+    o.send(done);
+    await until(() => o.core.debugState().arrivedVariants === 3);
+    o.core.getById('impeccable-live-variant-next').click();
+    await until(() => o.core.debugState().mountedSvelteVariant === 2);
+    o.core.getById('impeccable-live-variant-next').click();
+    await until(() => o.core.debugState().mountedSvelteVariant === 3);
+    const reads = component.manifestReads;
+    const mounts = o.events.filter(e => e.type === 'variant_mounted').length;
+    component.releaseManifest();
+    await until(() => component.manifestReads > reads);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(o.core.debugState().arrivedVariants, 3);
+    assert.equal(o.core.debugState().expectedVariants, 3);
+    assert.equal(o.core.debugState().visibleVariant, 3);
+    assert.equal(o.core.debugState().mountedSvelteVariant, 3);
+    assert.equal(o.w.document.getElementById('user').dataset.fixtureVariant, '3');
     assert.equal(o.events.filter(e => e.type === 'variant_mounted').length, mounts);
     assert.deepEqual(o.errors, []);
   } finally { o.dom.window.close(); }

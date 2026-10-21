@@ -183,6 +183,8 @@
   let editBadgeSuppressed = false;
   let svelteComponentSession = null;
   let variantInteractionRevision = 0;
+  let svelteManifestRequestRevision = 0;
+  let adoptedSvelteManifestRevision = 0;
   let svelteRuntimePromise = null;
   let pendingSvelteComponentRetryObserver = null;
   // The persistent mount-error card. A failed import/mount used to wipe local
@@ -5822,11 +5824,18 @@
     return true;
   }
 
-  async function injectSvelteComponentsFromManifest(manifestPath, sessionId, requestedVariant = 0, ownsParentInteraction = () => true) {
-    // Automatic republishes must also stop when a newer Retry or selection
-    // supersedes them; cancellation must never reach failure teardown.
+  async function injectSvelteComponentsFromManifest(manifestPath, sessionId, requestedVariant = 0, ownsParentInteraction = () => true, requestRevision = ++svelteManifestRequestRevision) {
+    // A newer selection owns rendering, but still needs publication metadata
+    // from this refresh. Ended/replaced sessions own neither.
     const revision = variantInteractionRevision;
-    const mayInject = () => ownsParentInteraction() && variantInteractionRevision === revision;
+    const configurationRevision = liveInteractionRevision;
+    const startingSessionId = currentSessionId;
+    const mayInject = () => ownsParentInteraction()
+      && requestRevision >= adoptedSvelteManifestRevision
+      && liveInteractionRevision === configurationRevision && !!evtSource
+      && !isSessionHandled(sessionId) && state !== 'SAVING' && state !== 'CONFIRMED'
+      && (currentSessionId === startingSessionId || currentSessionId === sessionId);
+    const mayMount = () => mayInject() && variantInteractionRevision === revision;
     if (!mayInject()) return;
     // Every (re)injection is a fresh attempt: reset the failure dedupe so a
     // republish that is STILL broken at the same URL reports again instead of
@@ -5840,6 +5849,7 @@
       const manifest = JSON.parse(await res.text());
       if (!mayInject()) return;
       if (manifest.id !== sessionId) {
+        if (!mayMount()) return;
         // A manifest at the expected path belonging to a different session is
         // an agent-side publish error. Left as a bare return it stranded the
         // bar in GENERATING with no explanation and no event.
@@ -5856,6 +5866,7 @@
 
       const paramsByVariant = await loadSvelteComponentParams(manifest);
       if (!mayInject()) return;
+      adoptedSvelteManifestRevision = requestRevision;
       const availableVariants = Number(manifest.arrivedVariants) || Number(manifest.count) || 1;
       const retryVariant = Number.isInteger(requestedVariant) && requestedVariant > 0 && requestedVariant <= availableVariants
         ? requestedVariant : 0;
@@ -5878,17 +5889,27 @@
         svelteComponentSession.paramsByVariant = paramsByVariant;
         arrivedVariants = availableVariants;
         expectedVariants = Number(manifest.count) || expectedVariants || arrivedVariants;
+        if (!mayMount()) {
+          if (state === 'CYCLING' && !variantSelectionInFlight
+            && svelteComponentSession.mountedVariant === visibleVariant && visibleVariant > 0) {
+            refreshParamsPanel();
+            showOrUpdateCyclingBar();
+            completeParameterGenerationIfReady();
+          }
+          saveSession();
+          return;
+        }
         const previousVariant = visibleVariant > 0 && visibleVariant <= arrivedVariants ? visibleVariant : 1;
         visibleVariant = retryVariant || previousVariant;
-        const remounted = await mountSvelteComponentVariant(visibleVariant || 1, mayInject);
-        if (!mayInject()) return;
+        const remounted = await mountSvelteComponentVariant(visibleVariant || 1, mayMount);
+        if (!mayMount()) return;
         if (!remounted) {
           // Keep the last usable comparison visible if the requested retry
           // still fails. Its error card continues to name the failed variant.
           if (retryVariant && retryVariant !== previousVariant) {
             visibleVariant = previousVariant;
-            await mountSvelteComponentVariant(previousVariant, mayInject);
-            if (!mayInject()) return;
+            await mountSvelteComponentVariant(previousVariant, mayMount);
+            if (!mayMount()) return;
             showOrUpdateCyclingBar();
           }
           // The mount already reported the failure and raised the card.
@@ -5905,6 +5926,7 @@
         return;
       }
 
+      if (!mayMount()) return;
       const liveEl = findLiveElementForSvelteManifest(manifest);
       if (!liveEl?.parentElement) {
         console.warn('[impeccable] Could not find original element in live DOM.');
@@ -5916,7 +5938,7 @@
           ? visibleVariant
           : (savedVisibleVariant > 0 && savedVisibleVariant <= arrivedVariants ? savedVisibleVariant : 1));
         enterRecoveryWaitingForAnchor({ checkpointReason: 'component_preview_anchor_missing', trackScroll: true });
-        waitForSvelteComponentTargetAndRetry({ manifestPath, sessionId, manifest, requestedVariant: retryVariant, mayInject });
+        waitForSvelteComponentTargetAndRetry({ manifestPath, sessionId, manifest, requestedVariant: retryVariant, mayInject: mayMount, requestRevision });
         return;
       }
 
@@ -5969,8 +5991,8 @@
         ? previousVisibleVariant
         : (savedVisibleVariant > 0 && savedVisibleVariant <= arrivedVariants ? savedVisibleVariant : 1));
 
-      const mounted = await mountSvelteComponentVariant(visibleVariant, mayInject);
-      if (!mayInject()) return;
+      const mounted = await mountSvelteComponentVariant(visibleVariant, mayMount);
+      if (!mayMount()) return;
       if (!mounted) {
         // The compiled component threw (e.g. a Svelte compile error in the
         // variant file). mountSvelteComponentVariant already reported the
@@ -5993,7 +6015,7 @@
       completeParameterGenerationIfReady();
       console.log('[impeccable] Mounted ' + arrivedVariants + ' ' + manifest.framework + ' component variants.');
     } catch (err) {
-      if (!mayInject()) return;
+      if (!mayMount()) return;
       console.error('[impeccable] Failed to mount component-preview variants:', err);
       // Report the manifest PATH, never the fetch URL: that URL carries the
       // live helper token and this string is journaled.
@@ -6007,7 +6029,7 @@
     }
   }
 
-  function waitForSvelteComponentTargetAndRetry({ manifestPath, sessionId, manifest, requestedVariant = 0, mayInject = () => true }) {
+  function waitForSvelteComponentTargetAndRetry({ manifestPath, sessionId, manifest, requestedVariant = 0, mayInject = () => true, requestRevision }) {
     if (pendingSvelteComponentRetryObserver) pendingSvelteComponentRetryObserver.disconnect();
     const observer = new MutationObserver(() => {
       if (!mayInject() || svelteComponentSession?.sessionId === sessionId) {
@@ -6019,7 +6041,7 @@
       if (!liveEl?.parentElement) return;
       observer.disconnect();
       if (pendingSvelteComponentRetryObserver === observer) pendingSvelteComponentRetryObserver = null;
-      injectSvelteComponentsFromManifest(manifestPath, sessionId, requestedVariant, mayInject);
+      injectSvelteComponentsFromManifest(manifestPath, sessionId, requestedVariant, mayInject, requestRevision);
     });
     pendingSvelteComponentRetryObserver = observer;
     observer.observe(document.body, { childList: true, subtree: true });
@@ -6200,9 +6222,8 @@
     // A refreshed manifest or module import may finish after the user leaves
     // this comparison. Retain ownership across every asynchronous retry step.
     const revision = liveInteractionRevision;
-    const variantRevision = ++variantInteractionRevision;
+    variantInteractionRevision += 1;
     const mayInject = () => currentSessionId === sessionId
-      && variantInteractionRevision === variantRevision
       && liveInteractionRevision === revision && !!evtSource
       && state !== 'SAVING' && state !== 'CONFIRMED' && !isSessionHandled(sessionId);
     injectSvelteComponentsFromManifest(manifestPath, sessionId, info.variant, mayInject);
@@ -6659,12 +6680,14 @@
         if (!isCurrent()) return;
         showOrUpdateCyclingBar();
         saveSession();
+        completeParameterGenerationIfReady();
         return;
       }
       updateSelectedElement();
       showOrUpdateCyclingBar();
       positionBar();
       saveSession();
+      completeParameterGenerationIfReady();
       if (checkpointReason) queueCheckpoint(checkpointReason);
     })();
     variantSelectionPromise = selectionPromise;
