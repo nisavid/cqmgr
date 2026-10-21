@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { test } = require('node:test');
+const vm = require('node:vm');
 const { JSDOM, VirtualConsole } = require('jsdom');
 const scripts = path.resolve(__dirname, '../../.agents/skills/impeccable/scripts');
 
@@ -16,7 +17,7 @@ async function until(predicate) {
   assert.fail('overlay did not reach the expected protocol state');
 }
 
-async function overlay({ delayRenewal = false, offscreen = false } = {}) {
+async function overlay({ delayRenewal = false, offscreen = false, component = null } = {}) {
   const errors = [];
   const console = new VirtualConsole();
   console.on('jsdomError', error => errors.push(error));
@@ -41,6 +42,10 @@ async function overlay({ delayRenewal = false, offscreen = false } = {}) {
   let releaseRenewal;
   w.fetch = async (url, options) => {
     const body = options?.body ? JSON.parse(options.body) : null;
+    if (component && url.includes('/source?')) {
+      const sourcePath = new URL(url).searchParams.get('path');
+      return { ok: true, text: async () => JSON.stringify(sourcePath.endsWith('manifest.json') ? component.manifest : {}) };
+    }
     if (url.includes('/agent-target-claim?')) {
       claims.push(body);
       if (delayRenewal && body.eligible && claims.filter(c => c.eligible).length === 2) {
@@ -60,7 +65,42 @@ async function overlay({ delayRenewal = false, offscreen = false } = {}) {
     close() {}
   };
   for (const file of ['live-browser-dom.js', 'live-browser-session.js', 'live-browser.js']) {
-    w.eval(fs.readFileSync(path.join(scripts, file), 'utf8'));
+    const context = dom.getInternalVMContext();
+    const script = new vm.Script(fs.readFileSync(path.join(scripts, file), 'utf8'), {
+      filename: file,
+      // The compiled modules/dev-server boundary is a fixture. The complete
+      // overlay's selection, error card, manifest refresh and Retry stay real.
+      importModuleDynamically: async url => {
+        assert.ok(component, 'unexpected component import');
+        let exports;
+        if (new URL(url).pathname.endsWith('/runtime.js')) {
+          exports = {
+            mount(Component, { target }) {
+              const section = target.ownerDocument.createElement('section');
+              section.id = 'user';
+              section.textContent = `Rendered variant ${Component.variant}`;
+              section.dataset.fixtureVariant = String(Component.variant);
+              target.replaceChildren(section);
+              return { target };
+            },
+            unmount(instance) { instance.target.replaceChildren(); },
+          };
+        } else {
+          const variant = Number(new URL(url).pathname.match(/v(\d+)\.svelte$/)?.[1]);
+          assert.ok(variant > 0, 'unexpected component module');
+          component.imports.push(variant);
+          if (variant === 2 && component.broken) throw new Error('fixture variant 2 failed to compile');
+          exports = { default: { variant } };
+        }
+        const module = new vm.SyntheticModule(Object.keys(exports), function () {
+          for (const [name, value] of Object.entries(exports)) this.setExport(name, value);
+        }, { context });
+        await module.link(() => assert.fail('fixture modules have no imports'));
+        await module.evaluate();
+        return module;
+      },
+    });
+    script.runInContext(context);
   }
   await until(() => source?.onmessage);
   const core = w.__IMPECCABLE_LIVE_CHROME_CORE__;
@@ -146,6 +186,50 @@ for (const boundary of ['scroll', 'renewal']) {
       assert.ok(o.claims.some(c => c.eligible === false && c.reason === 'manual_apply_in_flight'));
       assert.equal(o.events.filter(e => e.type === 'generate').length, 0);
       assert.equal(o.results.length, 0);
+      assert.deepEqual(o.errors, []);
+    } finally { o.dom.window.close(); }
+  });
+}
+
+for (const repaired of [false, true]) {
+  test(`Retry targets the failed component variant when repair ${repaired ? 'succeeds' : 'still fails'}`, async () => {
+    const component = {
+      broken: true, imports: [],
+      manifest: {
+        id: null, previewMode: 'svelte-component', framework: 'svelte', count: 2,
+        componentDir: 'variants', runtimeModule: '/variants/runtime.js',
+        originalMarkup: '<section id="user">User selection</section>',
+      },
+    };
+    const o = await overlay({ component });
+    try {
+      o.configureUser();
+      const sessionId = o.userGo();
+      component.manifest.id = sessionId;
+      o.send({ type: 'done', id: sessionId, previewMode: 'svelte-component', previewFile: 'variants/manifest.json' });
+      await until(() => o.core.debugState().state === 'CYCLING');
+      assert.equal(o.core.debugState().mountedSvelteVariant, 1);
+      o.core.getById('impeccable-live-variant-next').click();
+      await until(() => o.events.some(e => e.type === 'variant_mount_failed' && e.variant === 2)
+        && o.core.debugState().visibleVariant === 1 && o.core.debugState().mountedSvelteVariant === 1);
+      const priorAttempts = component.imports.length;
+      component.broken = !repaired;
+      o.core.root().querySelector('[data-impeccable-mount-retry]').click();
+      await until(() => component.imports.length > priorAttempts);
+      assert.equal(component.imports[priorAttempts], 2, 'Retry must import the failed variant, not the fallback');
+      if (repaired) {
+        await until(() => o.core.debugState().mountedSvelteVariant === 2);
+        assert.equal(o.core.debugState().visibleVariant, 2);
+        assert.equal(o.w.document.getElementById('user').dataset.fixtureVariant, '2');
+        assert.equal(o.core.root().querySelector('[data-impeccable-mount-retry]'), null);
+      } else {
+        await until(() => o.events.filter(e => e.type === 'variant_mount_failed' && e.variant === 2).length === 2);
+        await until(() => o.core.debugState().visibleVariant === 1 && o.core.debugState().mountedSvelteVariant === 1);
+        assert.equal(o.w.document.getElementById('user').dataset.fixtureVariant, '1');
+        assert.ok(o.core.root().querySelector('[data-impeccable-mount-retry]'), 'failed retry must keep its error card');
+      }
+      assert.equal(o.core.debugState().currentSessionId, sessionId);
+      assert.equal(o.events.filter(e => e.type === 'generate').length, 1);
       assert.deepEqual(o.errors, []);
     } finally { o.dom.window.close(); }
   });

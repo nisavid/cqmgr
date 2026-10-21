@@ -5813,7 +5813,7 @@
     return true;
   }
 
-  async function injectSvelteComponentsFromManifest(manifestPath, sessionId) {
+  async function injectSvelteComponentsFromManifest(manifestPath, sessionId, requestedVariant = 0) {
     // Every (re)injection is a fresh attempt: reset the failure dedupe so a
     // republish that is STILL broken at the same URL reports again instead of
     // being swallowed while the agent believes the repair landed.
@@ -5840,6 +5840,8 @@
 
       const paramsByVariant = await loadSvelteComponentParams(manifest);
       const availableVariants = Number(manifest.arrivedVariants) || Number(manifest.count) || 1;
+      const retryVariant = Number.isInteger(requestedVariant) && requestedVariant > 0 && requestedVariant <= availableVariants
+        ? requestedVariant : 0;
       const componentPreviewMode = isFrameworkComponentPreviewMode(manifest.previewMode)
         ? manifest.previewMode
         : 'svelte-component';
@@ -5859,9 +5861,17 @@
         svelteComponentSession.paramsByVariant = paramsByVariant;
         arrivedVariants = availableVariants;
         expectedVariants = Number(manifest.count) || expectedVariants || arrivedVariants;
-        visibleVariant = visibleVariant > 0 && visibleVariant <= arrivedVariants ? visibleVariant : 1;
+        const previousVariant = visibleVariant > 0 && visibleVariant <= arrivedVariants ? visibleVariant : 1;
+        visibleVariant = retryVariant || previousVariant;
         const remounted = await mountSvelteComponentVariant(visibleVariant || 1);
         if (!remounted) {
+          // Keep the last usable comparison visible if the requested retry
+          // still fails. Its error card continues to name the failed variant.
+          if (retryVariant && retryVariant !== previousVariant) {
+            visibleVariant = previousVariant;
+            await mountSvelteComponentVariant(previousVariant);
+            showOrUpdateCyclingBar();
+          }
           // The mount already reported the failure and raised the card.
           // Advancing to CYCLING here would show a bar claiming variants are
           // ready over a page where nothing rendered.
@@ -5883,11 +5893,11 @@
         expectedVariants = Number(manifest.count) || expectedVariants || arrivedVariants;
         const saved = loadSession();
         const savedVisibleVariant = saved && saved.id === sessionId ? saved.visible : 0;
-        visibleVariant = visibleVariant > 0 && visibleVariant <= arrivedVariants
+        visibleVariant = retryVariant || (visibleVariant > 0 && visibleVariant <= arrivedVariants
           ? visibleVariant
-          : (savedVisibleVariant > 0 && savedVisibleVariant <= arrivedVariants ? savedVisibleVariant : 1);
+          : (savedVisibleVariant > 0 && savedVisibleVariant <= arrivedVariants ? savedVisibleVariant : 1));
         enterRecoveryWaitingForAnchor({ checkpointReason: 'component_preview_anchor_missing', trackScroll: true });
-        waitForSvelteComponentTargetAndRetry({ manifestPath, sessionId, manifest });
+        waitForSvelteComponentTargetAndRetry({ manifestPath, sessionId, manifest, requestedVariant: retryVariant });
         return;
       }
 
@@ -5936,9 +5946,9 @@
       expectedVariants = Number(manifest.count) || expectedVariants || arrivedVariants;
       const saved = loadSession();
       const savedVisibleVariant = saved && saved.id === sessionId ? saved.visible : 0;
-      visibleVariant = previousVisibleVariant > 0 && previousVisibleVariant <= arrivedVariants
+      visibleVariant = retryVariant || (previousVisibleVariant > 0 && previousVisibleVariant <= arrivedVariants
         ? previousVisibleVariant
-        : (savedVisibleVariant > 0 && savedVisibleVariant <= arrivedVariants ? savedVisibleVariant : 1);
+        : (savedVisibleVariant > 0 && savedVisibleVariant <= arrivedVariants ? savedVisibleVariant : 1));
 
       const mounted = await mountSvelteComponentVariant(visibleVariant);
       if (!mounted) {
@@ -5976,7 +5986,7 @@
     }
   }
 
-  function waitForSvelteComponentTargetAndRetry({ manifestPath, sessionId, manifest }) {
+  function waitForSvelteComponentTargetAndRetry({ manifestPath, sessionId, manifest, requestedVariant = 0 }) {
     if (pendingSvelteComponentRetryObserver) pendingSvelteComponentRetryObserver.disconnect();
     pendingSvelteComponentRetryObserver = new MutationObserver(() => {
       if (svelteComponentSession?.sessionId === sessionId) {
@@ -5988,7 +5998,7 @@
       if (!liveEl?.parentElement) return;
       pendingSvelteComponentRetryObserver.disconnect();
       pendingSvelteComponentRetryObserver = null;
-      injectSvelteComponentsFromManifest(manifestPath, sessionId);
+      injectSvelteComponentsFromManifest(manifestPath, sessionId, requestedVariant);
     });
     pendingSvelteComponentRetryObserver.observe(document.body, { childList: true, subtree: true });
   }
@@ -6165,7 +6175,7 @@
     // attempt against an unchanged broken module would look silent.
     lastReportedMountFailure = null;
     if (state !== 'CYCLING') setLiveState('GENERATING');
-    injectSvelteComponentsFromManifest(manifestPath, sessionId);
+    injectSvelteComponentsFromManifest(manifestPath, sessionId, info.variant);
   }
 
   // Tear down a component preview that could not mount, WITHOUT touching

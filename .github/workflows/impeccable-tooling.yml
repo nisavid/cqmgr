@@ -48,4 +48,4 @@ jobs:
         working-directory: tests/tooling
         run: npm ci --ignore-scripts
       - name: Exercise delayed agent targets and normal generation
-        run: node --test tests/tooling/impeccable_live_browser.cjs
+        run: node --experimental-vm-modules --test tests/tooling/impeccable_live_browser.cjs
