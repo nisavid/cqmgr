@@ -134,7 +134,7 @@ class LocalApplyRecordRepository:
         self, record: ApplyRecord, authentication_key: SecretValue
     ) -> ApplyRecordRepositoryOutcome:
         """Create one revision-zero record without replacement."""
-        if record.revision != 0:
+        if record.revision != 0 or record.intent_id != record.plan_digest:
             return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.CONFLICT)
         try:
             key = _key_bytes(authentication_key)
@@ -209,6 +209,8 @@ class LocalApplyRecordRepository:
         self, record: ApplyRecord, authentication_key: SecretValue
     ) -> ApplyRecordRepositoryOutcome:
         """Commit only the next authenticated record revision."""
+        if record.intent_id != record.plan_digest:
+            return ApplyRecordRepositoryOutcome(ApplyRecordRepositoryStatus.CONFLICT)
         try:
             key = _key_bytes(authentication_key)
             path = self._path(record.intent_id)
@@ -485,9 +487,15 @@ class LocalApplyRecordRepository:
         if not isinstance(supplied, str) or not hmac.compare_digest(expected, supplied):
             return None
         try:
-            return _decode_record(raw["record"])
+            record = _decode_record(raw["record"])
+            # The authenticated identity must also bind the address used to read it.
+            bound = (
+                record.intent_id == record.plan_digest
+                and self._path(record.intent_id) == path
+            )
         except (KeyError, TypeError, ValueError):
             return None
+        return record if bound else None
 
     def _read_resolution(
         self,
@@ -521,7 +529,7 @@ class LocalApplyRecordRepository:
             ):
                 return None
             _require_resolution_fields(mapping)
-            return UnknownResolutionEvidence(
+            evidence = UnknownResolutionEvidence(
                 intent_id=_string(mapping["intent_id"]),
                 child_id=_string(mapping["child_id"]),
                 resolution=UnknownDispatchResolution(_string(mapping["resolution"])),
@@ -530,8 +538,12 @@ class LocalApplyRecordRepository:
                 lineage_etag=_optional_string(mapping.get("lineage_etag")),
                 lineage_trace_id=_optional_string(mapping.get("lineage_trace_id")),
             )
+            expected_path = self._resolution_directory(evidence.intent_id) / (
+                f"{hashlib.sha256(evidence.child_id.encode()).hexdigest()}.json"
+            )
         except (KeyError, TypeError, ValueError):
             return None
+        return evidence if path == expected_path else None
 
     def _with_lock(
         self, operation: Callable[[], ApplyRecordRepositoryOutcome]
