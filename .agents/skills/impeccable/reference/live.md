@@ -542,6 +542,8 @@ When native subagents are available, delegate source edits to `impeccable_manual
 
 If `repair` is present, the previous Apply changed source but final validation failed. Fix the current source and return the same canonical JSON result; do not roll files back yourself. The browser will ask the user before any rollback.
 
+Apply and repair use built-in source checks. Do not run checkout-defined validation commands as part of either operation, including `package.json` scripts named `impeccable:manual-edit-validate`. A configured hook produces a `manual_edit_validation_skipped` warning; it does not gate Apply or trigger repair. Clicking Apply authorizes the copy edits, not execution of project code.
+
 After source edits finish, reply exactly once with `node .agents/skills/impeccable/scripts/live-poll.mjs --reply EVENT_ID done --data '{"status":"done","appliedEntryIds":["8hexid"],"failed":[],"files":["src/page.html"],"notes":[]}'`. Use `status:"partial"` or `status:"error"` with `failed[]` when not every entry applied. Then poll again. Never reply without the event id; `--reply done --file ...` is invalid for manual Apply.
 
 ## Exit
