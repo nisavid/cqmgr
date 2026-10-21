@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "description": "Isolated DOM fixtures for the repo-installed Impeccable overlay",
+  "devDependencies": {
+    "jsdom": "30.1.3"
+  }
+}
