@@ -34,6 +34,7 @@ import { validateEvent } from './live/event-validation.mjs';
 import { selectAvailablePendingEvent } from './live/poll-lanes.mjs';
 import { createManualEditRoutes } from './live/manual-edit-routes.mjs';
 import { LIVE_COMMANDS } from './live/vocabulary.mjs';
+import { readProjectSource, SourceReadError } from './live/source-reader.mjs';
 import {
   getDesignSidecarPath,
   getLiveDir,
@@ -844,12 +845,13 @@ function createRequestHandler({ detectScript, liveScriptParts }) {
       const token = url.searchParams.get('token');
       if (token !== state.token) { res.writeHead(401); res.end('Unauthorized'); return; }
       const filePath = url.searchParams.get('path');
-      if (!filePath || filePath.includes('..')) { res.writeHead(400); res.end('Bad path'); return; }
-      const absPath = path.resolve(process.cwd(), filePath);
-      if (!absPath.startsWith(process.cwd())) { res.writeHead(403); res.end('Forbidden'); return; }
       let content;
-      try { content = fs.readFileSync(absPath, 'utf-8'); }
-      catch { res.writeHead(404); res.end('File not found'); return; }
+      try { content = readProjectSource(process.cwd(), filePath); }
+      catch (error) {
+        res.writeHead(error instanceof SourceReadError ? error.status : 404);
+        res.end(error instanceof SourceReadError ? error.message : 'File not found');
+        return;
+      }
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(content);
       return;
