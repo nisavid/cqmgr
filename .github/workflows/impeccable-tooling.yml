@@ -1,0 +1,52 @@
+name: Impeccable tooling
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hooks:
+    name: Impeccable hooks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Exercise root and nested session hooks
+        run: python -m unittest discover -s tests -p test_impeccable_hooks.py
+
+  browser:
+    name: Impeccable browser protocol
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Node for the DOM test dependency
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+      - name: Install isolated DOM test dependency
+        run: npm install --prefix "$RUNNER_TEMP/impeccable-tests" --ignore-scripts --no-package-lock jsdom@30.1.3
+      - name: Exercise delayed agent targets and normal generation
+        env:
+          NODE_PATH: ${{ runner.temp }}/impeccable-tests/node_modules
+        run: node --test tests/tooling/impeccable_live_browser.cjs
