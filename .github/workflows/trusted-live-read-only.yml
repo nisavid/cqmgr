@@ -75,7 +75,7 @@ jobs:
           test "$(git -C trusted rev-parse HEAD)" = "${EXPECTED_WORKFLOW_SHA}"
 
       - name: Install uv and Python
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: 0.11.30
           python-version: "3.14"
@@ -115,7 +115,7 @@ jobs:
           --output live-qualification-snapshot.json
 
       - name: Upload sanitized live snapshot
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pull-request-live-read-only-snapshot-${{ github.run_attempt }}
           path: live-qualification-snapshot.json
@@ -144,20 +144,20 @@ jobs:
           persist-credentials: false
 
       - name: Install uv and Python
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: 0.11.30
           python-version: "3.14"
           enable-cache: false
 
       - name: Download same-run pull-request candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: pull-request-candidate
           path: candidate
 
       - name: Download same-run live snapshot
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: pull-request-live-read-only-snapshot-${{ github.run_attempt }}
           path: snapshot
@@ -298,7 +298,7 @@ jobs:
 
       - name: Upload sanitized snapshot verification evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pull-request-snapshot-verification-evidence-${{ github.run_attempt }}
           path: snapshot-verification-evidence.json
@@ -307,7 +307,7 @@ jobs:
 
       - name: Upload sanitized replay evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pull-request-installed-snapshot-replay-evidence-${{ github.run_attempt }}
           path: installed-snapshot-replay-evidence.json
